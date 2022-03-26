@@ -26,5 +26,5 @@ jobs:
       - name: Installing Dependencies and Project [pip]
         run: |
           python -m pip install pip --upgrade pip
-          pip install -e .[tests]
+          pip install -e ".[tests]"
           pytest .
