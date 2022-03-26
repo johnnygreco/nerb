@@ -1,5 +1,5 @@
 from . import utils
-from .regex_builder import Nerb
+from .regex_builder import NERB
 
 from pathlib import Path
 package_path: Path = Path(__file__).parent

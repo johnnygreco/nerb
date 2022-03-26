@@ -9,10 +9,10 @@ from typing import Optional
 from . import utils
 
 
-__all__ = ['Nerb']
+__all__ = ['NERB']
 
 
-class Nerb:
+class NERB:
     """Class for building regex using yaml configuration files."""
 
     def __init__(self, pattern_config: Path | str | dict[str, str]):

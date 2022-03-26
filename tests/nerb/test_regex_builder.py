@@ -1,5 +1,5 @@
 # Project
-from nerb import Nerb
+from nerb import NERB
 
 
 class TestRegexBuilder:
@@ -10,7 +10,7 @@ class TestRegexBuilder:
     def test_isolate_named_capture_group(self, music_pattern_config):
         """Test that we correctly isolate the named capture group and return the appropriate regex result."""
 
-        regex = Nerb(music_pattern_config)
+        regex = NERB(music_pattern_config)
 
         kw = dict(
             regex_name='music',
