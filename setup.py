@@ -10,6 +10,6 @@ setup(
     install_requires=[
         'pyyaml==6.0',
     ],
-    extra_requires={'tests': 'pytest'},
+    extras_require={'tests': 'pytest'},
     python_requires='>=3.8',
 )
