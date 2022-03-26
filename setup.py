@@ -1,5 +1,6 @@
 from setuptools import setup, find_packages
 
+
 setup(
     name='nerb',
     description='Named-Entity Regex Builder',
