@@ -18,14 +18,15 @@ class NERB:
     def __init__(self, pattern_config: Path | str | dict[str, str]):
 
         if isinstance(pattern_config, (Path, str)):
-            self.pattern_config = utils.load_yaml_config()
+            self.pattern_config = utils.load_yaml_config(pattern_config)
 
         elif isinstance(pattern_config, dict):
             self.pattern_config = pattern_config
 
         else:
             raise TypeError(
-                f'{type(pattern_config)} is not a valid type for pattern_config. Must be of type Path, str, or dict.'
+                f'{type(pattern_config)} is not a valid type for pattern_config. '
+                'Must be of type Path, str, or dict.'
             )
 
         self._build_regex()

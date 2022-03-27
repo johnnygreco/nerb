@@ -23,8 +23,13 @@ jobs:
         uses: actions/setup-python@v2
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Installing Dependencies and Project [pip]
+      - name: Installation
         run: |
           python -m pip install pip --upgrade pip
           pip install -e .[tests]
+      - name: Unit Tests
+        run: |
           pytest .
+      - name: Type Checking
+        run: |
+          mypy src/nerb
