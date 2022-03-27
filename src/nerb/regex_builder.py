@@ -33,7 +33,7 @@ class NERB:
 
         pattern_config = dict(
             music={
-                'ARTIST': r'coheed(?:\sand\scambria)?}|theloniou\smonk',
+                'ARTIST': r'coheed(?:\sand\scambria)?}|thelonious\smonk',
                 'GENRE': r'(?:progressive|alternative|punk)rock|pop|jazz|rap'
             }
         )

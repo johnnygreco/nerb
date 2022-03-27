@@ -21,7 +21,7 @@ def music_pattern_config() -> dict[str, dict[str, str]]:
     pattern_config = dict(
         music={
             'ARTIST': r'coheed(?:\sand\scambria)?|foo\sfighters|incubus|miles\sdavis|'
-                      r'john\smayer|theloniou\smonk|jay\sz|eminem',
+                      r'john\smayer|thelonious\smonk|jay\sz|eminem',
             'GENRE': r'(?:progressive|alternative|punk)rock|pop|jazz|rap'
         }
     )
