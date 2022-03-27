@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # Standard library
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Callable, Optional
 
