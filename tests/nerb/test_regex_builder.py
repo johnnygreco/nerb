@@ -13,8 +13,8 @@ class TestRegexBuilder:
         regex = NERB(music_pattern_config)
 
         kw = dict(
-            regex_name='music',
-            group_name='ARTIST',
+            entity_group='music',
+            entity='ARTIST',
             text='Miles Davis is my favorite jazz artist. '
                  'Incubus is great, but I like progressive rock and am a big fan of Coheed.'
         )

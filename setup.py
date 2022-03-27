@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='nerb',
-    description='Named-Entity Regex Builder',
+    description='Named Entity Regex Builder (NERB): Streamlined named capture groups',
     author='Johnny Greco',
     version='0.0.1',
     packages=find_packages(where='src'),
