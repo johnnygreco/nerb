@@ -29,7 +29,7 @@ class NERB:
     Examples
     --------
     A pattern_config dict with an entity group called 'music', which is
-    composed entities 'ARTIST' and 'GENRE', might look like this:
+    composed of entities 'ARTIST' and 'GENRE', might look like this:
 
         pattern_config = dict(
             music={
