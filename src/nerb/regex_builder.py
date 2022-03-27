@@ -39,7 +39,7 @@ class NERB:
         )
 
     This pattern config will create a `NERB` instance with a `music` compiled
-    regex attribute, which 'ARTIST' and 'GENRE' named capture groups.
+    regex attribute with 'ARTIST' and 'GENRE' named capture groups.
     """
 
     def __init__(
