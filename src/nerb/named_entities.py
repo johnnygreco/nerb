@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
-__all__ = ['NamedEntity']
+__all__ = ['NamedEntity', 'NamedEntityList']
 
 
 @dataclass(frozen=True)

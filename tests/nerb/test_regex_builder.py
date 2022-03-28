@@ -3,9 +3,7 @@ from nerb import NERB
 
 
 class TestRegexBuilder:
-    """
-    Class for testing general functionality of the RegexBuilder.
-    """
+    """Class for testing methods of the NERB regex builder."""
 
     def test_isolate_named_capture_group(self, music_pattern_config):
         """Test that we correctly isolate the named capture group and return the appropriate regex result."""

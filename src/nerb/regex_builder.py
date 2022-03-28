@@ -187,6 +187,8 @@ class NERB:
                 result = matches
                 
         else:
-            raise NameError(f"'{method}' is not a valid regex method. Allowed values: search, finditer, or findall.")  
+            raise NameError(
+                f"'{method}' is not a valid regex method. Allowed values: search, finditer, or findall."
+            )
               
         return result
