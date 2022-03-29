@@ -37,6 +37,15 @@ class TestRegexBuilder:
         assert nerb_regex_yaml.ARTIST_names == nerb_regex.ARTIST_names
         assert nerb_regex_yaml.GENRE_names == nerb_regex.GENRE_names
 
+    def test_add_word_boundaries(self, test_data_path):
+        """That word boundaries are added when add_word_boundaries = True."""
+
+        nerb_regex = NERB(test_data_path / 'music_entities.yaml', add_word_boundaries=True)
+        assert not nerb_regex.ARTIST.search('NOPECoheed and cambria')
+
+        nerb_regex = NERB(test_data_path / 'music_entities.yaml', add_word_boundaries=False)
+        assert nerb_regex.ARTIST.search('NOPECoheed and cambria')
+
     def test_extract_named_entity(self, nerb_regex, prog_rock_wiki):
         """Test the extract named entity method on the Progressive Rock Wikipedia page."""
 

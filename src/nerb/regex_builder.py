@@ -103,9 +103,10 @@ class NERB:
             term_dict = {}
             setattr(self, f'{entity}_names', list(self.pattern_config[entity].keys()))
 
-            for name, regex in self.pattern_config[entity].items():
+            for name, pattern in self.pattern_config[entity].items():
                 # Add word boundaries to all terms.
-                term_dict[name.replace(' ', '_')] = self._add_word_boundaries(regex)
+                pattern = self._add_word_boundaries(pattern) if self.add_word_boundaries else fr'{pattern}'
+                term_dict[name.replace(' ', '_')] = pattern
 
             # Build final pattern and compile regex.
             pattern = '|'.join([fr'(?P<{k}>{v})' for k, v in term_dict.items()])
