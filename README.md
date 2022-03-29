@@ -73,7 +73,7 @@ nerb_regex = NERB('music_entities.yaml', add_word_boundaries=True)
 ```
 > NOTE: `add_word_boundaries` is `True` by default. This tells `NERB` to add word boundaries to every term in the regex patterns within the config file.
 
-The `NERB` object automatically builds compiled regexes called `ARTIST` and `GENRE`, which are composed of named capture groups, where the name of the groups are the keys (i.e., `Coheed`, `The Doors`, etc). You can access the `re.compile` objects as attributes:
+The `NERB` object automatically builds compiled regexes called `ARTIST` and `GENRE`, which are composed of named capture groups, where the group names are the keys (i.e., `Coheed`, `The Doors`, etc). You can access the `re.compile` objects as attributes:
 
 ```python 
 nerb_regex.ARTIST
@@ -112,7 +112,7 @@ NamedEntityList(
 )
 ```
 
-Alternatively, you can apply the comipled regex directectly using the `ARTIST` attribute:
+Alternatively, you can apply the compiled regex directly using the `ARTIST` attribute:
 
 ```python
 for match in nerb_regex.ARTIST.finditer(prog_rock_wiki):
@@ -141,4 +141,3 @@ Pink_Floyd
 > NOTE: `NERB` automatically turns spaces into underscores when building the named capture group regex patterns.
 
 The code and data for this example are in the [examples directory](https://github.com/johnnygreco/nerb/tree/main/examples).
-
