@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # Standard library
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,9 @@ class NERB:
     flags : re.RegexFlag or int, optional
         Regular Expresion flags to be applied to all
         compiled regex (default: re.IGNORECASE).
+    add_word_boundaries : bool, optional
+        If True, add word boundaries to all terms in the regex
+        patterns (default: True).
 
     Examples
     --------
@@ -50,14 +54,16 @@ class NERB:
     def __init__(
         self,
         pattern_config: Path | str | dict[str, dict[str, str]],
-        flags: re.RegexFlag | int = re.IGNORECASE
+        add_word_boundaries: bool = True
     ):
+
+        self.add_word_boundaries = add_word_boundaries
 
         if isinstance(pattern_config, (Path, str)):
             self.pattern_config = utils.load_yaml_config(pattern_config)
 
         elif isinstance(pattern_config, dict):
-            self.pattern_config = pattern_config
+            self.pattern_config = deepcopy(pattern_config)
 
         else:
             raise TypeError(
@@ -65,7 +71,6 @@ class NERB:
                 'Must be of type Path, str, or dict.'
             )
 
-        self.flags = flags
         self._build_regex()
 
     @staticmethod
@@ -92,6 +97,9 @@ class NERB:
 
         for entity in self.pattern_config.keys():
 
+            # Get flags. Pop '_flags' keyword if it exists.
+            flags = self._generate_regex_flags(entity)
+
             term_dict = {}
             setattr(self, f'{entity}_names', list(self.pattern_config[entity].keys()))
 
@@ -101,7 +109,18 @@ class NERB:
 
             # Build final pattern and compile regex.
             pattern = '|'.join([fr'(?P<{k}>{v})' for k, v in term_dict.items()])
-            setattr(self, entity, re.compile(pattern, flags=self.flags))
+            setattr(self, entity, re.compile(pattern, flags=flags))
+
+    def _generate_regex_flags(self, entity: str) -> re.RegexFlag:
+        """Generate regex flags from input config if the '_flags' parameter is given."""
+        flags = self.pattern_config[entity].pop('_flags', 0)
+        if not isinstance(flags, int):
+            flags = flags if isinstance(flags, list) else [flags]
+            combined_flags = getattr(re, flags[0].upper())
+            for flag in flags[1:]:
+                combined_flags |= getattr(re, flag.upper())
+            flags = combined_flags
+        return flags
 
     @property
     def entity_list(self):

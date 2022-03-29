@@ -1,0 +1,19 @@
+ARTIST:
+  Coheed: 'Coheed(?:\s(?:and|\&)\sCambria)?'
+  The Doors: '[Tt]he\Doors'
+  Dream Theater: 'Dream\sTheater'
+  Foo Fighters: 'Foo\sFighters'
+  The Grateful Dead: '(?:[Tt]he\s)?Grateful\sDead|[Tt]he\sWarlocks'
+  Jay Z: 'Jay(?:\s|-)Z|Shawn(?:\sCorey\s)?\sCarter'
+  Mars Volta: 'Mars\sVolta'
+  Miles Davis: 'Miles\sDavis'
+  Pink Floyd: 'Pink\sFloyd'
+  Thelonious Monk: 'Thelonious\sMonk'
+  The Who: '[Tt]he\sWho'
+
+GENRE:
+  _flags: IGNORECASE
+  Hip Hop: 'rap|hip\shop'
+  Jazz: '(?:smooth\s)?jazz'
+  Pop: 'pop(?:ular)?'
+  Rock: '(?:(?:prog(:?ressive)?|alternative|punk)\s)?rock|rock\s(?:and|\&|n)\sroll'

@@ -16,36 +16,45 @@ class TestRegexBuilder:
 
     def test_nerb_init(self, nerb_regex):
         """Test that the NERB instance is instantiated correctly"""
+
+        artists = [
+            'Coheed', 'The Doors', 'Dream Theater', 'Foo Fighters', 'The Grateful Dead', 'Jay Z',
+            'Mars Volta', 'Miles Davis', 'Pink Floyd', 'Thelonious Monk', 'The Who'
+        ]
         assert len(nerb_regex.pattern_config) == 2
         assert nerb_regex.entity_list == ['ARTIST', 'GENRE']
         assert nerb_regex.GENRE_names == ['Hip Hop', 'Jazz', 'Pop', 'Rock']
-        assert nerb_regex.ARTIST_names == ['Coheed', 'Foo Fighters', 'Jay Z', 'Mars Volta',
-                                           'Miles Davis', 'Thelonious Monk']
+        assert nerb_regex.ARTIST_names == artists
 
     def test_nerb_from_yaml(self, test_data_path, nerb_regex):
         """Test that a NERB instance created from a yaml file works as expected."""
 
-        nerb_regex_yaml = NERB(test_data_path / 'music.yaml')
+        nerb_regex_yaml = NERB(test_data_path / 'music_entities.yaml')
         assert len(nerb_regex_yaml.pattern_config) == 2
-        assert nerb_regex_yaml.entity_list == ['ARTIST', 'GENRE']
-        assert nerb_regex_yaml.GENRE_names == ['Hip Hop', 'Jazz', 'Pop', 'Rock']
-        assert nerb_regex_yaml.ARTIST_names == ['Coheed', 'Foo Fighters', 'Jay Z', 'Mars Volta',
-                                                'Miles Davis', 'Thelonious Monk']
-        assert nerb_regex.ARTIST.pattern == nerb_regex_yaml.ARTIST.pattern
-        assert nerb_regex.GENRE.pattern == nerb_regex_yaml.GENRE.pattern
+        assert nerb_regex_yaml.entity_list == nerb_regex.entity_list
+        assert nerb_regex_yaml.ARTIST.pattern == nerb_regex.ARTIST.pattern
+        assert nerb_regex_yaml.GENRE.pattern == nerb_regex.GENRE.pattern
+        assert nerb_regex_yaml.ARTIST_names == nerb_regex.ARTIST_names
+        assert nerb_regex_yaml.GENRE_names == nerb_regex.GENRE_names
 
     def test_extract_named_entity(self, nerb_regex, prog_rock_wiki):
-        """Test the extract named entity method."""
+        """Test the extract named entity method on the Progressive Rock Wikipedia page."""
 
         artist = nerb_regex.extract_named_entity('ARTIST', prog_rock_wiki)
-        assert len(artist) == 2
-        assert artist.get_unique_names() == {'Coheed', 'Mars Volta'}
+        assert len(artist) == 17
+        assert artist.get_unique_names() == {'Coheed', 'Dream Theater', 'Mars Volta',
+                                             'Pink Floyd', 'The Grateful Dead', 'The Who'}
         assert prog_rock_wiki[artist[0].span[0]: artist[0].span[1]] == artist[0].string
-        assert artist[1].string == 'Mars Volta'
 
         genre = nerb_regex.extract_named_entity('GENRE', prog_rock_wiki)
         assert len(genre) == 198
         assert genre.get_unique_names() == {'Jazz', 'Pop', 'Rock'}
+
+    def test_set_flags(self, nerb_regex):
+        """Test that flags are set when they are passed using the '_flags' config option."""
+        text = 'thelonious monk is my favorite JaZz artist.'
+        assert nerb_regex.ARTIST.search(text) == None
+        assert nerb_regex.GENRE.search(text).group() == 'JaZz'
 
     def test_isolate_named_capture_group(self, nerb_regex):
         """Test that we correctly isolate the named capture group and return the appropriate regex result."""
@@ -68,4 +77,4 @@ class TestRegexBuilder:
 
         result = nerb_regex.isolate_named_capture_group(name='Foo Fighters', method='findall', **kw)
         assert len(result) == 1
-        assert result[0][1] == 'Foo Fighters'
+        assert result[0][3] == 'Foo Fighters'
