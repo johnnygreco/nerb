@@ -7,7 +7,7 @@ except NameError:
     __NERB_SETUP__ = False
 
 if not __NERB_SETUP__:
-    from . import utils
+    from .utils import load_yaml_config
     from .regex_builder import NERB
     from .named_entities import NamedEntity, NamedEntityList
 

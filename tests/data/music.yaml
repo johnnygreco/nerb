@@ -1,0 +1,14 @@
+ARTIST:
+  Coheed: coheed(?:\s(?:and|\&)\scambria)?
+  Foo Fighters: foo\sfighters
+  Jay Z: jay\sz
+  Mars Volta: mars\svolta
+  Miles Davis: miles\sdavis
+  Thelonious Monk: thelonious\smonk
+
+GENRE:
+  Hip Hop: rap|hip\shop
+  Jazz: (?:smooth\s)?jazz
+  Pop: pop(?:ular)?
+  Rock: (?:(?:prog(:?ressive)?|alternative|punk)\s)?rock|rock\s(?:and|\&|n)\sroll
+  

@@ -14,6 +14,7 @@ __all__ = ['NamedEntity', 'NamedEntityList']
 class NamedEntity:
     name: str
     entity: str
+    string: str
     span: tuple[int, int]
 
 
@@ -44,12 +45,8 @@ class NamedEntityList:
         for elem in entity_list:
             self.append(elem)
 
-    def get_unique_entities(self) -> set[str]:
-        """Return set of the unique entities in this NamedEntityList."""
-        return set([entity.entity for entity in self])
-
     def get_unique_names(self) -> set[str]:
-        """Return set of the unique names of the named entities in this NamedEntityList."""
+        """Return set of the unique names in this NamedEntityList."""
         return set([entity.name for entity in self])
 
     def sort(self, key: Callable, *, reverse: bool = False) -> None:

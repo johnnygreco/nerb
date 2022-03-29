@@ -20,7 +20,7 @@ class NERB:
     Parameters
     ----------
     pattern_config : Path or str or dict
-        Configuration with the entity groups and regex patterns. If
+        Configuration with the named entities and regex patterns. If
         Path or str, must be the full path to a yaml config file.
     flags : re.RegexFlag or int, optional
         Regular Expresion flags to be applied to all
@@ -28,18 +28,23 @@ class NERB:
 
     Examples
     --------
-    A pattern_config dict with an entity group called 'music', which is
-    composed of entities 'ARTIST' and 'GENRE', might look like this:
+    A pattern_config dict for a music document might look like this:
 
         pattern_config = dict(
-            music={
-                'ARTIST': r'coheed(?:\sand\scambria)?}|thelonious\smonk',
-                'GENRE': r'(?:progressive|alternative|punk)rock|pop|jazz|rap'
+            ARTIST = {
+                'Coheed': r'coheed(?:\sand\scambria)?',
+                'Thelonious Monk': r'thelonious\smonk',
+            },
+            GENRE = {
+                'Rock': r'(?:(?:progressive|alternative|punk)\s)?rock|rock\s(?:and\s)roll',
+                'Jazz': r'(?:smooth\s)?jazz',
+                'Hip Hop': r'rap|hip\shop',
+                'Pop': r'pop(?:ular)?'
             }
         )
 
-    This pattern config will create a `NERB` instance with a 'music' compiled
-    regex attribute with 'ARTIST' and 'GENRE' named capture groups.
+    This pattern config will create a NERB instance with ARTIST and GENRE entities, which
+    are accessible via compiled regex attributes composed of named capture groups.
     """
 
     def __init__(
@@ -85,51 +90,57 @@ class NERB:
     def _build_regex(self):
         """Build and compile vocab regex patterns."""
 
-        for entity_group in self.pattern_config.keys():
+        for entity in self.pattern_config.keys():
 
             term_dict = {}
-            setattr(self, f'{entity_group}_entities', list(self.pattern_config[entity_group].keys()))
+            setattr(self, f'{entity}_names', list(self.pattern_config[entity].keys()))
 
-            for name, regex in self.pattern_config[entity_group].items():
+            for name, regex in self.pattern_config[entity].items():
                 # Add word boundaries to all terms.
-                term_dict[name] = self._add_word_boundaries(regex)
+                term_dict[name.replace(' ', '_')] = self._add_word_boundaries(regex)
 
             # Build final pattern and compile regex.
             pattern = '|'.join([fr'(?P<{k}>{v})' for k, v in term_dict.items()])
-            setattr(self, entity_group, re.compile(pattern, flags=self.flags))
+            setattr(self, entity, re.compile(pattern, flags=self.flags))
 
-    def extract_named_entities(self, entity_group: str, text: str) -> NamedEntityList:
+    @property
+    def entity_list(self):
+        return list(self.pattern_config.keys())
+
+    def extract_named_entity(self, entity: str, text: str) -> NamedEntityList:
         """
-        Extract entities of the given entity group from the given text.
+        Extract names of the given entity group from the given text.
 
         Parameters
         ----------
-        entity_group : str
-            Name of compiled regex attribute that contains the named capture group.
+        entity : str
+            Entity to extract from text.
         text : str
-            The regex method will be applied to this text.
+            Text from which to extract the given entity.
 
         Returns
         -------
-        entity_list: NamedEntityList
+        named_entity_list: NamedEntityList
             List of extracted named entities.
         """
 
-        if not hasattr(self, entity_group):
-            raise AttributeError(f'This NERB instance does not have a compiled regex named {entity_group}.')
-        regex = getattr(self, entity_group)
+        if not hasattr(self, entity):
+            raise AttributeError(f'This NERB instance does not have a compiled regex called {entity}.')
+        regex = getattr(self, entity)
 
-        entity_list = NamedEntityList()
+        named_entity_list = NamedEntityList()
         for match in regex.finditer(text):
-            entity = NamedEntity(name=match.group(), entity=match.lastgroup, span=match.span())
-            entity_list.append(entity)
+            name = match.lastgroup.replace('_', ' ')
+            named_entity_list.append(
+                NamedEntity(entity=entity, name=name, string=match.group(), span=match.span())
+            )
 
-        return entity_list
+        return named_entity_list
 
     def isolate_named_capture_group(
         self, 
-        entity_group: str,
         entity: str,
+        name: str,
         text: str,
         method: str = 'search'
     ) -> Optional[re.Match | list[re.Match] | list[tuple[str]]]:
@@ -139,9 +150,9 @@ class NERB:
         
         Parameters
         ----------
-        entity_group : str
-            Name of compiled regex attribute that contains the named capture group.
         entity : str
+            Entity compiled regex attribute that contains the named capture group.
+        name : str
             Named capture group to be isolated.
         text : str
             The regex method will be applied to this text.
@@ -161,27 +172,28 @@ class NERB:
         """
         
         result = None
-        regex = getattr(self, entity_group)
+        regex = getattr(self, entity)
         named_groups = list(regex.groupindex.keys())
-        
-        if entity not in named_groups:
-            raise KeyError(f"'{entity}' is not a valid group name for '{entity_group}'. "
+        name = name.replace(' ', '_')
+
+        if name not in named_groups:
+            raise KeyError(f"'{name}' is not a valid group name for '{entity}'. "
                            f'Allowed values: {named_groups}.')
         
         if method == 'search':
             # The search method returns the first occurrence of the pattern.
             for m in regex.finditer(text):
-                if m.lastgroup == entity:
+                if m.lastgroup == name:
                     result = m
                     break
                 
         elif method == 'finditer':
-            matches = [m for m in regex.finditer(text) if m.lastgroup == entity]
+            matches = [m for m in regex.finditer(text) if m.lastgroup == name]
             if len(matches) > 0:
                 result = matches
                 
         elif method == 'findall':
-            group_idx = regex.groupindex[entity] - 1
+            group_idx = regex.groupindex[name] - 1
             matches = [m for m in regex.findall(text) if m[group_idx] != '']
             if len(matches) > 0:
                 result = matches
@@ -192,3 +204,6 @@ class NERB:
             )
               
         return result
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}(entities: {self.entity_list.__repr__()})'
