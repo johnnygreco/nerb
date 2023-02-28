@@ -145,5 +145,5 @@ The code and data for this example are in the [examples directory](https://githu
 ---
 
 
-[^1]: <a href="https://www.urbandictionary.com/define.php?term=nerb"><img width="400" alt="Screen Shot 2023-02-28 at 3 13 37 PM" align="middle" src="https://user-images.githubusercontent.com/10998105/221968480-7dec83d8-8092-405f-9c0d-80009242d335.png"></a>
+[^1]: <a href="https://www.urbandictionary.com/define.php?term=nerb" target="_blank"><img width="400" alt="Screen Shot 2023-02-28 at 3 13 37 PM" align="middle" src="https://user-images.githubusercontent.com/10998105/221968480-7dec83d8-8092-405f-9c0d-80009242d335.png"></a>
 
