@@ -14,7 +14,7 @@ Have you ever had a project with a large but _human-manageable_ list of entities
 text dataset? If so, you have probably had the pleasure (burden?) of working with a codebase that is littered with 
 ginormous regex objects with lots of named capture groups, making your code difficult to parse and develop 😫.
 
-The Named Entity Regex Builder (NERB) is a lightweight package that will build your compiled regex objects 
+The Named Entity Regex Builder (NERB[^1]) is a lightweight package that will build your compiled regex objects 
 based on patterns set in a dictionary or yaml config file, which significantly cleans up your code and makes 
 it _much_ easier to modify your regex patterns during development 😀.
 
@@ -141,3 +141,9 @@ Pink_Floyd
 > NOTE: `NERB` automatically turns spaces into underscores when building the named capture group regex patterns.
 
 The code and data for this example are in the [examples directory](https://github.com/johnnygreco/nerb/tree/main/examples).
+
+---
+
+
+[^1]: <a href="https://www.urbandictionary.com/define.php?term=nerb"><img width="400" alt="Screen Shot 2023-02-28 at 3 13 37 PM" align="middle" src="https://user-images.githubusercontent.com/10998105/221968480-7dec83d8-8092-405f-9c0d-80009242d335.png"></a>
+
