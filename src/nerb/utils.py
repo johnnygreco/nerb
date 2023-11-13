@@ -6,8 +6,7 @@ from pathlib import Path
 # Third-party
 import yaml
 
-
-__all__ = ['load_yaml_config']
+__all__ = ["load_yaml_config"]
 
 
 def load_yaml_config(file_path: str | Path) -> dict:

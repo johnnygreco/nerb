@@ -6,8 +6,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-
-__all__ = ['NamedEntity', 'NamedEntityList']
+__all__ = ["NamedEntity", "NamedEntityList"]
 
 
 @dataclass(frozen=True)
@@ -28,8 +27,7 @@ class NamedEntityList:
     def append(self, entity: NamedEntity):
         """Append entity to this list, where the element must be of type NamedEntity."""
         if not isinstance(entity, NamedEntity):
-            raise TypeError(
-                f'{self.__class__.__name__} holds {NamedEntity} objects. You gave {type(entity)}.')
+            raise TypeError(f"{self.__class__.__name__} holds {NamedEntity} objects. You gave {type(entity)}.")
         self._list.append(entity)
 
     def copy(self):
@@ -38,9 +36,7 @@ class NamedEntityList:
     def extend(self, entity_list: NamedEntityList | list[NamedEntity]):
         """Extend list. Similar to the standard python list object, extend takes an iterable as an argument."""
         if not isinstance(entity_list, (NamedEntityList, list)):
-            raise TypeError(
-                f'Expected object of type {self.__class__.__name__} or list. You gave {type(entity_list)}.'
-            )
+            raise TypeError(f"Expected object of type {self.__class__.__name__} or list. You gave {type(entity_list)}.")
 
         for elem in entity_list:
             self.append(elem)
@@ -82,7 +78,7 @@ class NamedEntityList:
         return len(self._list)
 
     def __repr__(self):
-        repr = '\n'.join([f'[{i}] {p.__repr__()}' for i, p in enumerate(self)])
-        repr = re.sub(r'^', ' ' * 4, repr, flags=re.M)
-        repr = f'(\n{repr}\n)' if len(self) > 0 else f'([])'
-        return f'{self.__class__.__name__}{repr}'
+        repr = "\n".join([f"[{i}] {p.__repr__()}" for i, p in enumerate(self)])
+        repr = re.sub(r"^", " " * 4, repr, flags=re.M)
+        repr = f"(\n{repr}\n)" if len(self) > 0 else "([])"
+        return f"{self.__class__.__name__}{repr}"

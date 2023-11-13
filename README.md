@@ -71,7 +71,7 @@ We can now create a `NERB` regex object:
 from nerb import NERB
 nerb_regex = NERB('music_entities.yaml', add_word_boundaries=True)
 ```
-> NOTE: `add_word_boundaries` is `True` by default. This tells `NERB` to add word boundaries to every term in the regex patterns within the config file.
+> NOTE: We set `add_word_boundaries` to `True`. This tells `NERB` to add word boundaries to every term in the regex patterns within the config file.
 
 The `NERB` object automatically builds compiled regexes called `ARTIST` and `GENRE`, which are composed of named capture groups, where the group names are the keys (i.e., `Coheed`, `The Doors`, etc). You can access the `re.compile` objects as attributes:
 
