@@ -40,7 +40,8 @@ make help
 
 ## MCP Server
 
-NERB includes a local MCP server for agent workflows on Python 3.10 and newer:
+NERB includes a local MCP server for agent workflows on Python 3.10 and newer. Core NERB still supports Python 3.8;
+MCP support follows the official Python MCP SDK's Python version floor.
 
 ```shell
 uv run nerb-mcp
@@ -63,7 +64,8 @@ Minimal MCP client configuration:
 MCP config tools read only the `config_path` passed by the client. The `add_detector`, `update_detector`, and
 `remove_detector` tools write only that explicit `config_path`, using NERB's atomic config save helper. Extraction tools
 read either provided `text` or an explicit `file_path`; pass exactly one. `extract_inline` accepts detector definitions
-directly and does not read or write a config file.
+directly and does not read or write a config file. If `nerb-mcp` is invoked in an environment without MCP support, it
+exits with a clear compatibility error.
 
 ## Example Usage
 

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import re
+import sys
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
-
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
 
 from . import __version__
 from .config import (
@@ -26,12 +25,48 @@ from .extraction import extract_named_entities_records, extract_named_entity_rec
 from .regex_builder import NERB
 
 Transport = Literal["stdio", "sse", "streamable-http"]
+MCP_PYTHON_REQUIRES = (3, 10)
+MCP_UNAVAILABLE_MESSAGE = (
+    "NERB MCP support requires Python 3.10 or newer and the optional MCP SDK dependency. "
+    "Core NERB APIs and the `nerb` CLI remain available on Python 3.8."
+)
 
-mcp = FastMCP("NERB")
+
+class NerbMcpUnavailableError(RuntimeError):
+    """Raised when MCP tools are used where the MCP SDK is unavailable."""
+
+
+class _UnavailableMcp:
+    """Import-safe stand-in used on Python versions unsupported by the MCP SDK."""
+
+    def tool(self, *args: Any, **kwargs: Any) -> Any:
+        def decorator(func: Any) -> Any:
+            return func
+
+        return decorator
+
+    def run(self, *args: Any, **kwargs: Any) -> NoReturn:
+        raise NerbMcpUnavailableError(MCP_UNAVAILABLE_MESSAGE)
+
+
+def _load_mcp_sdk() -> tuple[Any, type[Exception]]:
+    if sys.version_info < MCP_PYTHON_REQUIRES:
+        return _UnavailableMcp(), NerbMcpUnavailableError
+
+    try:
+        fastmcp_module = importlib.import_module("mcp.server.fastmcp")
+        exceptions_module = importlib.import_module("mcp.server.fastmcp.exceptions")
+    except ImportError:
+        return _UnavailableMcp(), NerbMcpUnavailableError
+
+    return fastmcp_module.FastMCP("NERB"), exceptions_module.ToolError
+
+
+mcp, _ToolError = _load_mcp_sdk()
 
 
 def _raise_tool_error(message: str) -> NoReturn:
-    raise ToolError(message)
+    raise _ToolError(message)
 
 
 def _tool_config_path(config_path: str) -> Path:
@@ -299,6 +334,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--version", action="version", version=f"nerb-mcp {__version__}")
     args = parser.parse_args(argv)
+    if isinstance(mcp, _UnavailableMcp):
+        print(f"Error: {MCP_UNAVAILABLE_MESSAGE}", file=sys.stderr)
+        raise SystemExit(1)
+
     mcp.run(transport=cast(Transport, args.transport))
 
 

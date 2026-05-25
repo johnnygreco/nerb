@@ -6,7 +6,7 @@ description: Use when implementing, testing, or documenting NERB Model Context P
 # NERB MCP Tools
 
 NERB exposes a local MCP server through `src/nerb/mcp_server.py` and the `nerb-mcp` console entry point on Python 3.10
-and newer.
+and newer. Core NERB remains Python 3.8-compatible; MCP support follows the official Python MCP SDK's floor.
 
 ## Surface
 
@@ -19,7 +19,7 @@ MCP tools wrap the same helpers used by the Python API and CLI:
 - return JSON-compatible data with `entity`, `name`, `string`, `start`, and `end`
 
 Avoid broad filesystem access. Tools read only explicit config/document paths or provided text, and writes go through
-explicit config paths.
+explicit config paths. On Python versions unsupported by the MCP SDK, `nerb-mcp` exits with a clear compatibility error.
 
 ## Local Workflow
 

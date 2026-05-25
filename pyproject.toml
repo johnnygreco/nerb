@@ -55,9 +55,4 @@ ignore_missing_imports = true
 module = ["click", "click.*", "typer", "typer.*"]
 follow_imports = "skip"
 
-[[tool.mypy.overrides]]
-module = ["mcp", "mcp.*"]
-follow_imports = "skip"
-ignore_missing_imports = true
-
 [tool.ty]

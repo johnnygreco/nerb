@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-# ruff: noqa: E402
 import asyncio
 import json
 from importlib.metadata import entry_points
@@ -8,13 +7,12 @@ from importlib.metadata import entry_points
 import pytest
 from typer.testing import CliRunner
 
-pytest.importorskip("mcp")
-
-from mcp.server.fastmcp.exceptions import ToolError
-
 from nerb import NERB, extract_named_entities_records, extract_named_entity_records, load_config, save_config
 from nerb.cli import app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
+from nerb.mcp_server import (
+    _ToolError as ToolError,
+)
 from nerb.mcp_server import (
     add_detector,
     extract_all_entities,
@@ -27,6 +25,8 @@ from nerb.mcp_server import (
     update_detector,
     validate_config,
 )
+
+pytest.importorskip("mcp", reason="The MCP SDK supports Python 3.10+.")
 
 
 def _console_script_entry_points():

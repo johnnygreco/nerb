@@ -85,7 +85,8 @@ Minimal local MCP client config:
 
 MCP config tools read only the explicit `config_path` passed by the client. Config write tools require `config_path` and
 save atomically through `save_config`. Extraction tools read exactly one source, either provided `text` or an explicit
-document `file_path`. `extract_inline` uses provided detector definitions and does not read or write a config file.
+document `file_path`. `extract_inline` uses provided detector definitions and does not read or write a config file. If
+`nerb-mcp` is invoked on Python versions unsupported by the MCP SDK, it exits with a clear compatibility error.
 
 ## Common Pitfalls
 
