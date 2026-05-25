@@ -29,16 +29,14 @@ pip install nerb
 ```
 
 If you would like to contribute to the code (awesome!), install the development version by
-cloning this repository and syncing the development dependencies with uv:
+cloning this repository and using the Makefile for uv-based development tasks:
 
 ```shell
 git clone https://github.com/johnnygreco/nerb.git
 cd nerb
-uv sync --all-extras
-uv run pytest
-uv run ruff check .
-uv run ruff format --check .
-uv run ty check
+make sync
+make check
+make help
 ```
 
 ## Example Usage
