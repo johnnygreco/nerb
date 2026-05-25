@@ -94,6 +94,22 @@ GENRE:
 ```
 > NOTE: `GENRE` is also included as an entity in the config file. Notice that we set the `IGNORECASE` flag using the special `_flags` keyword. If we need more than one flag, we can pass them as a list of flags (e.g., `[IGNORECASE, MULTILINE]`).
 
+## CLI Authoring Loop
+
+Use the CLI helpers to test and debug detector patterns before committing them to a config file:
+
+```shell
+uv run nerb test ARTIST "Pink Floyd" "Pink\sFloyd" --text "Pink Floyd played progressive rock."
+uv run nerb test ARTIST "Pink Floyd" --config music_entities.yaml --text "Pink Floyd played progressive rock."
+uv run nerb test ARTIST "Pink Floyd" --config music_entities.yaml --document prog_rock_wiki.txt --format json
+uv run nerb compile ARTIST --config music_entities.yaml
+uv run nerb doctor --config music_entities.yaml --format json
+```
+
+`nerb test` accepts a literal `PATTERN` for one-off checks or omits `PATTERN` to test a saved detector from
+`--config`. `nerb compile` prints the final named-capture regex for an entity, and `nerb doctor` validates config shape,
+regex compilation, flags, and suspicious detector names.
+
 We can now create a `NERB` regex object:
 
 ```python

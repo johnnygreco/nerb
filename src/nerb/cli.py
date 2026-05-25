@@ -8,6 +8,8 @@ from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
 import typer
 import yaml
+from yaml.constructor import ConstructorError
+from yaml.resolver import BaseResolver
 
 from . import __version__
 from .config import (
@@ -28,7 +30,10 @@ from .regex_builder import NERB
 
 COMMAND_ERROR_EXIT_CODE = 1
 OUTPUT_FORMATS = {"json", "jsonl", "table"}
+AUTHORING_OUTPUT_FORMATS = {"json", "text"}
 RECORD_COLUMNS = ["entity", "name", "string", "start", "end"]
+DIAGNOSTIC_ERROR = "error"
+DIAGNOSTIC_WARNING = "warning"
 
 app = typer.Typer(
     add_completion=False,
@@ -192,12 +197,24 @@ def _command_config_explicit(ctx: typer.Context, config: Optional[Path]) -> bool
     return config is not None or bool(ctx.obj and ctx.obj.get("config_explicit"))
 
 
-def _normalize_output_format(output_format: str) -> str:
+def _normalize_format_choice(output_format: str, choices: Set[str]) -> str:
     normalized_format = output_format.lower()
-    if normalized_format not in OUTPUT_FORMATS:
-        choices = ", ".join(sorted(OUTPUT_FORMATS))
-        _exit_error(f"Unsupported output format {output_format!r}. Expected one of: {choices}.")
+    if normalized_format not in choices:
+        formatted_choices = ", ".join(sorted(choices))
+        _exit_error(f"Unsupported output format {output_format!r}. Expected one of: {formatted_choices}.")
     return normalized_format
+
+
+def _normalize_output_format(output_format: str) -> str:
+    return _normalize_format_choice(output_format, OUTPUT_FORMATS)
+
+
+def _normalize_authoring_output_format(output_format: str) -> str:
+    return _normalize_format_choice(output_format, AUTHORING_OUTPUT_FORMATS)
+
+
+def _pattern_count(pattern_config: PatternConfig) -> int:
+    return sum(len([name for name in entity_config if name != FLAGS_KEY]) for entity_config in pattern_config.values())
 
 
 def _resolve_extraction_arguments(
@@ -304,6 +321,13 @@ def _load_extraction_config(
     return validate_pattern_config(pattern_config)
 
 
+def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) -> NERB:
+    try:
+        return NERB(pattern_config, add_word_boundaries=word_boundaries)
+    except (ConfigError, re.error, ValueError) as exc:
+        _exit_error(f"Could not compile detectors: {exc}")
+
+
 def _extract_records(
     pattern_config: PatternConfig,
     selected_entity: Optional[str],
@@ -311,15 +335,65 @@ def _extract_records(
     *,
     word_boundaries: bool,
 ) -> List[Dict[str, Any]]:
-    try:
-        extractor = NERB(pattern_config, add_word_boundaries=word_boundaries)
-    except (ConfigError, re.error, ValueError) as exc:
-        _exit_error(f"Could not compile detectors: {exc}")
+    extractor = _compile_extractor(pattern_config, word_boundaries=word_boundaries)
 
     if selected_entity is None:
         return extract_named_entities_records(extractor, text)
 
     return extract_named_entity_records(extractor, selected_entity, text)
+
+
+def _inline_detector_config(
+    entity: str,
+    name: str,
+    pattern: str,
+    *,
+    flags: Optional[List[str]],
+    config_path: Path,
+) -> PatternConfig:
+    entity_config: Dict[str, Any] = {}
+    flag_config = _flag_config(entity, config_path, flags)
+    if flag_config is not None:
+        entity_config[FLAGS_KEY] = flag_config
+    entity_config[name] = pattern
+
+    try:
+        return validate_pattern_config({entity: entity_config})
+    except ConfigError as exc:
+        _exit_error(f"Could not compile inline detector {entity}:{name}: {exc}")
+
+
+def _saved_detector_config(pattern_config: PatternConfig, entity: str, name: str, config_path: Path) -> PatternConfig:
+    if entity not in pattern_config:
+        _exit_error(f"Entity {entity!r} does not exist in {config_path}.")
+
+    entity_config = pattern_config[entity]
+    if name == FLAGS_KEY or name not in entity_config:
+        _exit_error(f"Pattern {name!r} does not exist for entity {entity!r} in {config_path}.")
+
+    selected_entity_config: Dict[str, Any] = {}
+    if FLAGS_KEY in entity_config:
+        selected_entity_config[FLAGS_KEY] = entity_config[FLAGS_KEY]
+    selected_entity_config[name] = entity_config[name]
+    return validate_pattern_config({entity: selected_entity_config})
+
+
+def _test_detector_config(
+    config_path: Path,
+    entity: str,
+    name: str,
+    pattern: Optional[str],
+    *,
+    flags: Optional[List[str]],
+) -> PatternConfig:
+    if pattern is not None:
+        return _inline_detector_config(entity, name, pattern, flags=flags, config_path=config_path)
+
+    if flags:
+        _exit_error("--flag can only be used when testing a literal PATTERN.")
+
+    pattern_config = _load_command_config(config_path)
+    return _saved_detector_config(pattern_config, entity, name, config_path)
 
 
 def _table_cell(value: Any) -> str:
@@ -352,6 +426,286 @@ def _echo_records(records: List[Dict[str, Any]], output_format: str) -> None:
         return
 
     typer.echo(_format_records_table(records))
+
+
+def _compiled_regex_payload(entity: str, entity_config: Dict[str, Any], regex: Any) -> Dict[str, Any]:
+    groups = [
+        {"name": group_name.replace("_", " "), "group": group_name, "index": index}
+        for group_name, index in sorted(regex.groupindex.items(), key=lambda item: item[1])
+    ]
+    payload: Dict[str, Any] = {
+        "entity": entity,
+        "pattern": regex.pattern,
+        "flags": int(regex.flags),
+        "groups": groups,
+    }
+    if FLAGS_KEY in entity_config:
+        payload["configured_flags"] = entity_config[FLAGS_KEY]
+    return payload
+
+
+def _echo_compiled_regex(
+    entity: str,
+    pattern_config: PatternConfig,
+    output_format: str,
+    *,
+    config_path: Path,
+    word_boundaries: bool,
+) -> None:
+    if entity not in pattern_config:
+        _exit_error(f"Entity {entity!r} does not exist in {config_path}.")
+
+    entity_config = pattern_config[entity]
+    extractor = _compile_extractor({entity: entity_config}, word_boundaries=word_boundaries)
+    regex = getattr(extractor, entity)
+    normalized_format = _normalize_authoring_output_format(output_format)
+    if normalized_format == "json":
+        typer.echo(json.dumps(_compiled_regex_payload(entity, entity_config, regex), ensure_ascii=False))
+        return
+
+    typer.echo(regex.pattern)
+
+
+def _diagnostic(
+    level: str,
+    code: str,
+    message: str,
+    *,
+    entity: Optional[str] = None,
+    name: Optional[str] = None,
+    line: Optional[int] = None,
+) -> Dict[str, Any]:
+    diagnostic: Dict[str, Any] = {"level": level, "code": code, "message": message}
+    if entity is not None:
+        diagnostic["entity"] = entity
+    if name is not None:
+        diagnostic["name"] = name
+    if line is not None:
+        diagnostic["line"] = line
+    return diagnostic
+
+
+def _load_yaml_with_duplicate_diagnostics(config_path: Path) -> Tuple[Any, List[Dict[str, Any]], bool]:
+    diagnostics: List[Dict[str, Any]] = []
+
+    class DuplicateKeyLoader(yaml.SafeLoader):
+        pass
+
+    def construct_mapping(loader: Any, node: Any, deep: bool = False) -> Dict[Any, Any]:
+        mapping: Dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                key_exists = key in mapping
+            except TypeError as exc:
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key",
+                    key_node.start_mark,
+                ) from exc
+
+            if key_exists:
+                diagnostics.append(
+                    _diagnostic(
+                        DIAGNOSTIC_ERROR,
+                        "duplicate_yaml_key",
+                        f"Duplicate YAML key {key!r}; the later value overrides an earlier value.",
+                        line=key_node.start_mark.line + 1,
+                    )
+                )
+
+            value = loader.construct_object(value_node, deep=deep)
+            mapping[key] = value
+        return mapping
+
+    DuplicateKeyLoader.add_constructor(BaseResolver.DEFAULT_MAPPING_TAG, construct_mapping)
+
+    try:
+        with config_path.open(encoding="utf-8") as file:
+            return yaml.load(file, Loader=DuplicateKeyLoader), diagnostics, True
+    except yaml.YAMLError as exc:
+        diagnostics.append(
+            _diagnostic(
+                DIAGNOSTIC_ERROR,
+                "yaml_parse_error",
+                f"Could not parse YAML config at {config_path}: {exc}",
+            )
+        )
+        return None, diagnostics, False
+    except OSError as exc:
+        diagnostics.append(
+            _diagnostic(
+                DIAGNOSTIC_ERROR,
+                "read_error",
+                f"Could not read config at {config_path}: {exc}",
+            )
+        )
+        return None, diagnostics, False
+
+
+def _diagnose_suspicious_names(raw_config: Any) -> List[Dict[str, Any]]:
+    diagnostics: List[Dict[str, Any]] = []
+    if not isinstance(raw_config, dict):
+        return diagnostics
+
+    for entity, entity_config in raw_config.items():
+        if isinstance(entity, str) and entity != entity.strip():
+            diagnostics.append(
+                _diagnostic(
+                    DIAGNOSTIC_WARNING,
+                    "suspicious_entity_name",
+                    f"Entity name {entity!r} has leading or trailing whitespace.",
+                    entity=entity,
+                )
+            )
+
+        if not isinstance(entity, str) or not isinstance(entity_config, dict):
+            continue
+
+        normalized_names: Dict[str, str] = {}
+        casefolded_names: Dict[str, str] = {}
+        for name in entity_config:
+            if not isinstance(name, str) or name == FLAGS_KEY:
+                continue
+
+            if name != name.strip():
+                diagnostics.append(
+                    _diagnostic(
+                        DIAGNOSTIC_WARNING,
+                        "suspicious_pattern_name",
+                        f"Pattern name {name!r} has leading or trailing whitespace.",
+                        entity=entity,
+                        name=name,
+                    )
+                )
+
+            normalized_name = name.replace(" ", "_")
+            previous_name = normalized_names.get(normalized_name)
+            if previous_name is not None and previous_name != name:
+                diagnostics.append(
+                    _diagnostic(
+                        DIAGNOSTIC_ERROR,
+                        "duplicate_group_name",
+                        f"Pattern names {previous_name!r} and {name!r} both compile to group {normalized_name!r}.",
+                        entity=entity,
+                        name=name,
+                    )
+                )
+            else:
+                normalized_names[normalized_name] = name
+
+            casefolded_name = name.casefold()
+            previous_case_name = casefolded_names.get(casefolded_name)
+            if previous_case_name is not None and previous_case_name != name:
+                diagnostics.append(
+                    _diagnostic(
+                        DIAGNOSTIC_WARNING,
+                        "case_variant_pattern_name",
+                        f"Pattern names {previous_case_name!r} and {name!r} differ only by case.",
+                        entity=entity,
+                        name=name,
+                    )
+                )
+            else:
+                casefolded_names[casefolded_name] = name
+
+    return diagnostics
+
+
+def _diagnose_compiled_entities(pattern_config: PatternConfig) -> List[Dict[str, Any]]:
+    diagnostics: List[Dict[str, Any]] = []
+    for entity, entity_config in pattern_config.items():
+        try:
+            NERB({entity: entity_config})
+        except (ConfigError, re.error, ValueError) as exc:
+            diagnostics.append(
+                _diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    "compile_error",
+                    f"Entity {entity!r} could not be compiled: {exc}",
+                    entity=entity,
+                )
+            )
+    return diagnostics
+
+
+def _doctor_payload(
+    config_path: Path,
+    pattern_config: Optional[PatternConfig],
+    diagnostics: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    error_count = len([diagnostic for diagnostic in diagnostics if diagnostic["level"] == DIAGNOSTIC_ERROR])
+    warning_count = len([diagnostic for diagnostic in diagnostics if diagnostic["level"] == DIAGNOSTIC_WARNING])
+    summary_config = pattern_config or {}
+    return {
+        "config": str(config_path),
+        "valid": error_count == 0,
+        "summary": {
+            "entities": len(summary_config),
+            "patterns": _pattern_count(summary_config),
+            "errors": error_count,
+            "warnings": warning_count,
+        },
+        "diagnostics": diagnostics,
+    }
+
+
+def _format_doctor_text(payload: Dict[str, Any]) -> str:
+    summary = payload["summary"]
+    lines = [f"Config doctor: {payload['config']}"]
+    if payload["valid"]:
+        lines.append(f"OK: config is valid ({summary['entities']} entities, {summary['patterns']} patterns).")
+    else:
+        lines.append(f"Found {summary['errors']} errors and {summary['warnings']} warnings.")
+
+    for diagnostic in payload["diagnostics"]:
+        location = []
+        if "line" in diagnostic:
+            location.append(f"line {diagnostic['line']}")
+        if "entity" in diagnostic:
+            location.append(f"entity {diagnostic['entity']!r}")
+        if "name" in diagnostic:
+            location.append(f"name {diagnostic['name']!r}")
+        location_text = f" ({', '.join(location)})" if location else ""
+        lines.append(f"{diagnostic['level'].upper()} [{diagnostic['code']}]{location_text}: {diagnostic['message']}")
+
+    return "\n".join(lines)
+
+
+def _run_doctor(config_path: Path) -> Dict[str, Any]:
+    if not config_path.exists():
+        _exit_error(f"Config file does not exist at {config_path}.")
+
+    raw_config, diagnostics, raw_config_loaded = _load_yaml_with_duplicate_diagnostics(config_path)
+    if raw_config_loaded:
+        diagnostics.extend(_diagnose_suspicious_names(raw_config))
+
+    pattern_config: Optional[PatternConfig] = None
+    if raw_config_loaded:
+        try:
+            pattern_config = load_config(config_path)
+        except ConfigError as exc:
+            diagnostics.append(
+                _diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    "validation_error",
+                    f"Config is invalid at {config_path}: {exc}",
+                )
+            )
+        except OSError as exc:
+            diagnostics.append(
+                _diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    "read_error",
+                    f"Could not read config at {config_path}: {exc}",
+                )
+            )
+
+    if pattern_config is not None:
+        diagnostics.extend(_diagnose_compiled_entities(pattern_config))
+
+    return _doctor_payload(config_path, pattern_config, diagnostics)
 
 
 @app.callback()
@@ -420,6 +774,84 @@ def extract(
     )
     records = _extract_records(pattern_config, selected_entity, document_text, word_boundaries=word_boundaries)
     _echo_records(records, output_format)
+
+
+@app.command("test")
+def test_detector(
+    ctx: typer.Context,
+    entity: str = typer.Argument(..., help="Detector entity name."),
+    name: str = typer.Argument(..., help="Pattern name."),
+    pattern: Optional[str] = typer.Argument(None, help="Literal regex pattern. Omit to use a saved detector."),
+    document: Optional[Path] = typer.Option(None, "--document", "-d", help="Document path to test against."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+    text: Optional[str] = typer.Option(None, "--text", help="Literal document text to test against."),
+    flags: Optional[List[str]] = typer.Option(
+        None,
+        "--flag",
+        help=f"Regex flag name for a literal PATTERN's {FLAGS_KEY}. May be repeated or comma-separated.",
+    ),
+    output_format: str = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        help="Output format: json, jsonl, or table.",
+    ),
+    word_boundaries: bool = typer.Option(
+        False,
+        "--word-boundaries",
+        help="Add regex word boundaries around the detector pattern.",
+    ),
+    config: Optional[Path] = _config_option(),
+) -> None:
+    """Test one detector against literal text, standard input, or a document."""
+    document_text = _read_extraction_text(document, read_stdin=read_stdin, text=text)
+    config_path = _command_config_path(ctx, config)
+    pattern_config = _test_detector_config(config_path, entity, name, pattern, flags=flags)
+    records = _extract_records(pattern_config, entity, document_text, word_boundaries=word_boundaries)
+    _echo_records(records, output_format)
+
+
+@app.command("compile")
+def compile_entity(
+    ctx: typer.Context,
+    entity: str = typer.Argument(..., help="Detector entity name."),
+    output_format: str = typer.Option("text", "--format", "-f", help="Output format: json or text."),
+    word_boundaries: bool = typer.Option(
+        False,
+        "--word-boundaries",
+        help="Add regex word boundaries before printing the compiled pattern.",
+    ),
+    config: Optional[Path] = _config_option(),
+) -> None:
+    """Print the compiled regex for one configured entity."""
+    config_path = _command_config_path(ctx, config)
+    pattern_config = _load_command_config(config_path)
+    _echo_compiled_regex(
+        pattern_config=pattern_config,
+        entity=entity,
+        output_format=output_format,
+        config_path=config_path,
+        word_boundaries=word_boundaries,
+    )
+
+
+@app.command("doctor")
+def doctor_config(
+    ctx: typer.Context,
+    output_format: str = typer.Option("text", "--format", "-f", help="Output format: json or text."),
+    config: Optional[Path] = _config_option(),
+) -> None:
+    """Validate and diagnose detector config authoring issues."""
+    config_path = _command_config_path(ctx, config)
+    payload = _run_doctor(config_path)
+    normalized_format = _normalize_authoring_output_format(output_format)
+    if normalized_format == "json":
+        typer.echo(json.dumps(payload, ensure_ascii=False))
+    else:
+        typer.echo(_format_doctor_text(payload))
+
+    if not payload["valid"]:
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
 
 
 @app.command("init")
@@ -558,10 +990,9 @@ def validate_config(
     except OSError as exc:
         _exit_error(f"Could not read config at {config_path}: {exc}")
 
-    pattern_count = sum(
-        len([name for name in entity_config if name != FLAGS_KEY]) for entity_config in pattern_config.values()
+    typer.echo(
+        f"Config is valid: {config_path} ({len(pattern_config)} entities, {_pattern_count(pattern_config)} patterns)."
     )
-    typer.echo(f"Config is valid: {config_path} ({len(pattern_config)} entities, {pattern_count} patterns).")
 
 
 def main() -> None:
