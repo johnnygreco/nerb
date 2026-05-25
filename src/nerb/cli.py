@@ -1,7 +1,10 @@
+import json
+import re
+import sys
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Set, Union
+from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
 
 import typer
 import yaml
@@ -20,8 +23,12 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
+from .extraction import extract_named_entities_records, extract_named_entity_records
+from .regex_builder import NERB
 
 COMMAND_ERROR_EXIT_CODE = 1
+OUTPUT_FORMATS = {"json", "jsonl", "table"}
+RECORD_COLUMNS = ["entity", "name", "string", "start", "end"]
 
 app = typer.Typer(
     add_completion=False,
@@ -181,6 +188,172 @@ def _yaml_text(config: Dict[str, Any]) -> str:
     return yaml.safe_dump(config, sort_keys=False, default_flow_style=False, allow_unicode=True).rstrip()
 
 
+def _command_config_explicit(ctx: typer.Context, config: Optional[Path]) -> bool:
+    return config is not None or bool(ctx.obj and ctx.obj.get("config_explicit"))
+
+
+def _normalize_output_format(output_format: str) -> str:
+    normalized_format = output_format.lower()
+    if normalized_format not in OUTPUT_FORMATS:
+        choices = ", ".join(sorted(OUTPUT_FORMATS))
+        _exit_error(f"Unsupported output format {output_format!r}. Expected one of: {choices}.")
+    return normalized_format
+
+
+def _resolve_extraction_arguments(
+    entity: Optional[str],
+    document: Optional[Path],
+    *,
+    all_entities: bool,
+) -> Tuple[Optional[str], Optional[Path]]:
+    if all_entities:
+        if entity is not None and document is None:
+            return None, Path(entity)
+
+        if entity is not None and document is not None:
+            _exit_error("Do not provide ENTITY when using --all; pass only DOCUMENT, --stdin, or --text.")
+
+        return None, document
+
+    if entity is None:
+        _exit_error("ENTITY is required unless --all is used.")
+
+    return entity, document
+
+
+def _read_extraction_text(document: Optional[Path], *, read_stdin: bool, text: Optional[str]) -> str:
+    source_count = sum([document is not None, read_stdin, text is not None])
+    if source_count != 1:
+        _exit_error("Provide exactly one input source: DOCUMENT, --stdin, or --text.")
+
+    if text is not None:
+        return text
+
+    if read_stdin:
+        return sys.stdin.read()
+
+    if document is None:
+        _exit_error("Provide exactly one input source: DOCUMENT, --stdin, or --text.")
+
+    if not document.exists():
+        _exit_error(f"Document file does not exist at {document}.")
+
+    if not document.is_file():
+        _exit_error(f"Document path is not a file: {document}.")
+
+    try:
+        return document.read_text(encoding="utf-8")
+    except OSError as exc:
+        _exit_error(f"Could not read document at {document}: {exc}")
+
+
+def _parse_pattern_definition(raw_value: str) -> Tuple[str, str]:
+    name, separator, pattern = raw_value.partition("=")
+    if not separator or not name.strip():
+        _exit_error(f"Malformed --pattern value {raw_value!r}. Expected NAME=REGEX.")
+    return name.strip(), pattern
+
+
+def _parse_detector_definition(raw_value: str) -> Tuple[str, str, str]:
+    detector_name, separator, pattern = raw_value.partition("=")
+    entity, entity_separator, name = detector_name.partition(":")
+    if not separator or not entity_separator or not entity.strip() or not name.strip():
+        _exit_error(f"Malformed --detector value {raw_value!r}. Expected ENTITY:NAME=REGEX.")
+    return entity.strip(), name.strip(), pattern
+
+
+def _add_inline_pattern(config: PatternConfig, entity: str, name: str, pattern: str) -> PatternConfig:
+    try:
+        return add_entity_pattern(config, entity, name, pattern)
+    except ConfigError as exc:
+        _exit_error(f"Could not add inline detector {entity}:{name}: {exc}")
+
+
+def _load_extraction_config(
+    ctx: typer.Context,
+    config_path: Path,
+    config: Optional[Path],
+    *,
+    inline_patterns: List[str],
+    inline_detectors: List[str],
+    selected_entity: Optional[str],
+) -> PatternConfig:
+    if inline_patterns and selected_entity is None:
+        _exit_error("--pattern requires ENTITY and cannot be used with --all.")
+
+    has_inline_detectors = bool(inline_patterns or inline_detectors)
+    config_is_required = not has_inline_detectors or config_path.exists() or _command_config_explicit(ctx, config)
+    pattern_config = _load_command_config(config_path) if config_is_required else {}
+
+    for raw_pattern in inline_patterns:
+        if selected_entity is None:
+            _exit_error("--pattern requires ENTITY and cannot be used with --all.")
+        name, pattern = _parse_pattern_definition(raw_pattern)
+        pattern_config = _add_inline_pattern(pattern_config, selected_entity, name, pattern)
+
+    for raw_detector in inline_detectors:
+        entity, name, pattern = _parse_detector_definition(raw_detector)
+        pattern_config = _add_inline_pattern(pattern_config, entity, name, pattern)
+
+    if selected_entity is not None and selected_entity not in pattern_config:
+        _exit_error(f"Entity {selected_entity!r} is not configured in {config_path} or inline detectors.")
+
+    if selected_entity is None and not pattern_config:
+        _exit_error("No detector patterns are configured; pass --config or --detector.")
+
+    return validate_pattern_config(pattern_config)
+
+
+def _extract_records(
+    pattern_config: PatternConfig,
+    selected_entity: Optional[str],
+    text: str,
+    *,
+    word_boundaries: bool,
+) -> List[Dict[str, Any]]:
+    try:
+        extractor = NERB(pattern_config, add_word_boundaries=word_boundaries)
+    except (ConfigError, re.error, ValueError) as exc:
+        _exit_error(f"Could not compile detectors: {exc}")
+
+    if selected_entity is None:
+        return extract_named_entities_records(extractor, text)
+
+    return extract_named_entity_records(extractor, selected_entity, text)
+
+
+def _table_cell(value: Any) -> str:
+    return str(value).replace("\n", "\\n").replace("\t", "\\t")
+
+
+def _format_records_table(records: List[Dict[str, Any]]) -> str:
+    if not records:
+        return "No matches."
+
+    rows = [[_table_cell(record[column]) for column in RECORD_COLUMNS] for record in records]
+    widths = [
+        max(len(RECORD_COLUMNS[index]), *(len(row[index]) for row in rows)) for index in range(len(RECORD_COLUMNS))
+    ]
+    header = "  ".join(column.ljust(widths[index]) for index, column in enumerate(RECORD_COLUMNS))
+    separator = "  ".join("-" * widths[index] for index in range(len(RECORD_COLUMNS)))
+    body = "\n".join("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)) for row in rows)
+    return f"{header}\n{separator}\n{body}"
+
+
+def _echo_records(records: List[Dict[str, Any]], output_format: str) -> None:
+    normalized_format = _normalize_output_format(output_format)
+    if normalized_format == "json":
+        typer.echo(json.dumps(records, ensure_ascii=False))
+        return
+
+    if normalized_format == "jsonl":
+        for record in records:
+            typer.echo(json.dumps(record, ensure_ascii=False))
+        return
+
+    typer.echo(_format_records_table(records))
+
+
 @app.callback()
 def callback(
     ctx: typer.Context,
@@ -199,7 +372,54 @@ def callback(
     ),
 ) -> None:
     """Build and manage named entity regex detector configs."""
-    ctx.obj = {"config_path": resolve_default_config_path(config)}
+    ctx.obj = {"config_path": resolve_default_config_path(config), "config_explicit": config is not None}
+
+
+@app.command("extract")
+def extract(
+    ctx: typer.Context,
+    entity: Optional[str] = typer.Argument(None, help="Detector entity name, unless --all is used."),
+    document: Optional[Path] = typer.Argument(None, help="Document path to extract from."),
+    all_entities: bool = typer.Option(False, "--all", help="Extract all configured detector entities."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+    text: Optional[str] = typer.Option(None, "--text", help="Literal document text to extract from."),
+    inline_patterns: Optional[List[str]] = typer.Option(
+        None,
+        "--pattern",
+        help="Inline detector for ENTITY as NAME=REGEX. May be repeated.",
+    ),
+    inline_detectors: Optional[List[str]] = typer.Option(
+        None,
+        "--detector",
+        help="Inline detector as ENTITY:NAME=REGEX. May be repeated.",
+    ),
+    output_format: str = typer.Option(
+        "table",
+        "--format",
+        "-f",
+        help="Output format: json, jsonl, or table.",
+    ),
+    word_boundaries: bool = typer.Option(
+        False,
+        "--word-boundaries",
+        help="Add regex word boundaries around configured detector patterns.",
+    ),
+    config: Optional[Path] = _config_option(),
+) -> None:
+    """Extract configured named entities from a document."""
+    selected_entity, document_path = _resolve_extraction_arguments(entity, document, all_entities=all_entities)
+    document_text = _read_extraction_text(document_path, read_stdin=read_stdin, text=text)
+    config_path = _command_config_path(ctx, config)
+    pattern_config = _load_extraction_config(
+        ctx,
+        config_path,
+        config,
+        inline_patterns=inline_patterns or [],
+        inline_detectors=inline_detectors or [],
+        selected_entity=selected_entity,
+    )
+    records = _extract_records(pattern_config, selected_entity, document_text, word_boundaries=word_boundaries)
+    _echo_records(records, output_format)
 
 
 @app.command("init")
