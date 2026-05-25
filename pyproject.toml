@@ -11,12 +11,14 @@ authors = [{ name = "Johnny Greco" }]
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
 dependencies = [
+    "mcp>=1.27,<2 ; python_version >= '3.10'",
     "PyYAML>=6.0",
     "typer>=0.12",
 ]
 
 [project.scripts]
 nerb = "nerb.cli:main"
+nerb-mcp = "nerb.mcp_server:main"
 
 [project.optional-dependencies]
 tests = ["mypy>=1.14,<1.15", "pytest>=7.0"]
@@ -52,5 +54,10 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = ["click", "click.*", "typer", "typer.*"]
 follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = ["mcp", "mcp.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
 
 [tool.ty]

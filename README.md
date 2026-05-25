@@ -38,6 +38,33 @@ make check
 make help
 ```
 
+## MCP Server
+
+NERB includes a local MCP server for agent workflows on Python 3.10 and newer:
+
+```shell
+uv run nerb-mcp
+```
+
+Minimal MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "nerb": {
+      "command": "uv",
+      "args": ["run", "nerb-mcp"],
+      "cwd": "/path/to/nerb"
+    }
+  }
+}
+```
+
+MCP config tools read only the `config_path` passed by the client. The `add_detector`, `update_detector`, and
+`remove_detector` tools write only that explicit `config_path`, using NERB's atomic config save helper. Extraction tools
+read either provided `text` or an explicit `file_path`; pass exactly one. `extract_inline` accepts detector definitions
+directly and does not read or write a config file.
+
 ## Example Usage
 
 Suppose we want to extract some musical artists from the [Progressive Rock Wikipedia page](https://en.wikipedia.org/wiki/Progressive_rock). We'll put the groups we are searching for in a config file called `music_entities.yaml`: 

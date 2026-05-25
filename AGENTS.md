@@ -28,7 +28,8 @@ Equivalent direct command:
 uv sync --all-extras
 ```
 
-The installed console script is `nerb`. Current CLI commands are `init`, `add`, `list`, `show`, `remove`, and `validate`.
+The installed console scripts are `nerb` and, on Python 3.10+, `nerb-mcp`. Current CLI commands are `extract`, `init`,
+`add`, `list`, `show`, `remove`, and `validate`.
 
 ## Verification
 
@@ -60,14 +61,39 @@ make build
 - Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.8 and 3.13.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
 
+## MCP Server
+
+Launch the local stdio MCP server from the repo with:
+
+```shell
+uv run nerb-mcp
+```
+
+Minimal local MCP client config:
+
+```json
+{
+  "mcpServers": {
+    "nerb": {
+      "command": "uv",
+      "args": ["run", "nerb-mcp"],
+      "cwd": "/path/to/nerb"
+    }
+  }
+}
+```
+
+MCP config tools read only the explicit `config_path` passed by the client. Config write tools require `config_path` and
+save atomically through `save_config`. Extraction tools read exactly one source, either provided `text` or an explicit
+document `file_path`. `extract_inline` uses provided detector definitions and does not read or write a config file.
+
 ## Common Pitfalls
 
 - `NERB_CONFIG_PATH` overrides the platform default config path; explicit `--config` or function arguments take precedence.
 - Empty top-level configs are valid, but every non-empty entity must have at least one pattern.
 - `_flags` is reserved for regex flags and cannot be used as a detector pattern name.
 - Pattern names are converted from spaces to underscores for regex group names; invalid group names must fail validation.
-- CLI extraction commands are not present on `main` yet. Do not document or rely on `nerb extract` until the CLI extraction issue lands.
-- MCP support is pending in issue #8. Until `src/nerb/mcp_server.py` and an entry point such as `nerb-mcp` exist, do not treat MCP commands as available. See `.agents/skills/nerb-mcp-tools/SKILL.md` for the planned local workflow.
+- MCP support uses the official Python MCP SDK, which currently requires Python 3.10 or newer.
 
 ## Reusable Skills
 
@@ -75,5 +101,5 @@ Use these when the task matches:
 
 - `.agents/skills/nerb-cli-config/SKILL.md`: CLI commands and detector config behavior.
 - `.agents/skills/nerb-extraction-surfaces/SKILL.md`: extraction behavior, records, and public API compatibility.
-- `.agents/skills/nerb-mcp-tools/SKILL.md`: pending MCP tool implementation and launch/test workflow.
+- `.agents/skills/nerb-mcp-tools/SKILL.md`: MCP tool implementation and launch/test workflow.
 - `.agents/skills/nerb-release-publishing/SKILL.md`: release, build, and publishing workflow changes.
