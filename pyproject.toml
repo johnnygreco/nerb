@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nerb"
+version = "0.0.5"
+description = "Named Entity Regex Builder (NERB): Streamlining named capture groups"
+readme = "README.md"
+authors = [{ name = "Johnny Greco" }]
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+tests = ["mypy>=1.14,<1.15", "pytest>=7.0"]
+dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "setuptools>=61", "ty>=0.0.39"]
+
+[project.urls]
+Homepage = "https://github.com/johnnygreco/nerb"
+Repository = "https://github.com/johnnygreco/nerb"
+Issues = "https://github.com/johnnygreco/nerb/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.8"
+strict_optional = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+disable_error_code = ["attr-defined"]
+
+[[tool.mypy.overrides]]
+module = "yaml.*"
+ignore_missing_imports = true
+
+[tool.ty]
