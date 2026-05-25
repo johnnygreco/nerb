@@ -3,6 +3,7 @@ import re
 
 # Third-party
 import pytest
+import yaml
 
 # Project
 from nerb import (
@@ -51,6 +52,22 @@ def test_load_config_rejects_schema_errors(tmp_path):
         load_config(config_path)
 
 
+def test_load_config_rejects_invalid_regex_pattern(tmp_path):
+    config_path = tmp_path / "entities.yaml"
+    config_path.write_text("ARTIST:\n  Coheed: '('\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="not a valid regex pattern"):
+        load_config(config_path)
+
+
+def test_load_config_rejects_invalid_detector_name(tmp_path):
+    config_path = tmp_path / "entities.yaml"
+    config_path.write_text("ARTIST:\n  AC/DC: 'AC/DC'\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="not a valid regex group name"):
+        load_config(config_path)
+
+
 def test_add_entity_pattern_returns_updated_copy():
     config = {"ARTIST": {"Coheed": r"Coheed(?:\sand\sCambria)?"}}
 
@@ -70,6 +87,19 @@ def test_add_entity_pattern_refuses_and_replaces_duplicates():
 
     assert updated == {"ARTIST": {"Coheed": r"Coheed(?:\sand\sCambria)?"}}
     assert config == {"ARTIST": {"Coheed": "Coheed"}}
+
+
+def test_add_entity_pattern_rejects_invalid_pattern_name_and_regex():
+    config = {"ARTIST": {"Coheed": "Coheed"}}
+
+    with pytest.raises(ConfigError, match="not a valid regex group name"):
+        add_entity_pattern(config, "ARTIST", "AC/DC", "AC/DC")
+
+    with pytest.raises(ConfigError, match="reserved"):
+        add_entity_pattern(config, "ARTIST", "_flags", "IGNORECASE")
+
+    with pytest.raises(ConfigError, match="not a valid regex pattern"):
+        add_entity_pattern(config, "ARTIST", "Rush", "(")
 
 
 def test_remove_entity_pattern_returns_updated_copy():
@@ -94,6 +124,11 @@ def test_validate_regex_flags():
         validate_regex_flags("NOT_A_FLAG")
 
 
+def test_validate_regex_flags_rejects_unknown_integer_bits():
+    with pytest.raises(ConfigError, match="unknown regex flag bits"):
+        validate_regex_flags(512)
+
+
 def test_resolve_default_config_path_creates_empty_config(monkeypatch, tmp_path):
     config_path = tmp_path / "detectors.yaml"
     monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(config_path))
@@ -103,6 +138,22 @@ def test_resolve_default_config_path_creates_empty_config(monkeypatch, tmp_path)
     assert resolved_path == config_path
     assert config_path.exists()
     assert load_config(config_path) == {}
+
+
+def test_save_config_keeps_existing_file_when_atomic_write_fails(monkeypatch, tmp_path):
+    config_path = save_config({"ARTIST": {"Coheed": "Coheed"}}, tmp_path / "entities.yaml")
+
+    def raise_after_partial_write(config, file, **kwargs):
+        file.write("ARTIST:\n  Rush: ")
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(yaml, "dump", raise_after_partial_write)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        save_config({"ARTIST": {"Rush": "Rush"}}, config_path)
+
+    assert load_config(config_path) == {"ARTIST": {"Coheed": "Coheed"}}
+    assert list(tmp_path.glob(".entities.yaml.*.tmp")) == []
 
 
 def test_saved_config_round_trips_through_nerb(tmp_path, music_pattern_config, prog_rock_wiki):

@@ -4,9 +4,10 @@ from __future__ import annotations
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 # Third-party
 import yaml
@@ -31,7 +32,7 @@ DEFAULT_CONFIG_ENV_VAR = "NERB_CONFIG_PATH"
 DEFAULT_CONFIG_FILENAME = "detectors.yaml"
 FLAGS_KEY = "_flags"
 
-PatternConfig = dict[str, dict[str, Any]]
+PatternConfig = Dict[str, Dict[str, Any]]
 
 
 class ConfigError(ValueError):
@@ -46,6 +47,42 @@ def _yaml_loader():
 def _yaml_dumper():
     """Return the fastest safe YAML dumper available for this PyYAML build."""
     return getattr(yaml, "CSafeDumper", yaml.SafeDumper)
+
+
+def _known_regex_flag_bits() -> int:
+    """Return the bitmask containing every known re.RegexFlag bit."""
+    known_bits = 0
+    for flag in re.RegexFlag:
+        known_bits |= flag.value
+    return known_bits
+
+
+def _validate_regex_flag_bits(flags: int) -> None:
+    """Raise ConfigError when an integer flag bitmask contains unknown bits."""
+    unknown_bits = flags & ~_known_regex_flag_bits()
+    if unknown_bits:
+        raise ConfigError(f"{flags!r} contains unknown regex flag bits: {unknown_bits!r}.")
+
+
+def _validate_detector_name(entity: str, name: str) -> str:
+    """Validate a pattern name as the regex group name NERB will build."""
+    group_name = name.replace(" ", "_")
+    try:
+        re.compile(f"(?P<{group_name}>x)")
+    except re.error as exc:
+        raise ConfigError(
+            f"Pattern name {name!r} for entity {entity!r} is not a valid regex group name after "
+            "spaces are converted to underscores."
+        ) from exc
+    return group_name
+
+
+def _validate_regex_pattern(entity: str, name: str, pattern: str, flags: re.RegexFlag) -> None:
+    """Compile a regex pattern so invalid detector patterns fail during config validation."""
+    try:
+        re.compile(pattern, flags=flags)
+    except (re.error, ValueError) as exc:
+        raise ConfigError(f"Pattern {name!r} for entity {entity!r} is not a valid regex pattern.") from exc
 
 
 def _default_user_config_path() -> Path:
@@ -100,9 +137,11 @@ def validate_regex_flags(flags: Any) -> re.RegexFlag:
         raise ConfigError("Regex flags must be an integer, string, or list; booleans are not valid flags.")
 
     if isinstance(flags, re.RegexFlag):
+        _validate_regex_flag_bits(flags.value)
         return flags
 
     if isinstance(flags, int):
+        _validate_regex_flag_bits(flags)
         try:
             return re.RegexFlag(flags)
         except ValueError as exc:
@@ -151,6 +190,8 @@ def validate_pattern_config(config: Any) -> PatternConfig:
         if not isinstance(entity_config, Mapping):
             raise ConfigError(f"Entity {entity!r} must map to pattern names and regex strings.")
 
+        raw_flags = entity_config.get(FLAGS_KEY, 0)
+        regex_flags = validate_regex_flags(raw_flags)
         validated_entity: dict[str, Any] = {}
         pattern_count = 0
         for name, pattern in entity_config.items():
@@ -158,13 +199,14 @@ def validate_pattern_config(config: Any) -> PatternConfig:
                 raise ConfigError(f"Pattern names for entity {entity!r} must be non-empty strings.")
 
             if name == FLAGS_KEY:
-                validate_regex_flags(pattern)
                 validated_entity[name] = list(pattern) if isinstance(pattern, list) else pattern
                 continue
 
             if not isinstance(pattern, str):
                 raise ConfigError(f"Pattern {name!r} for entity {entity!r} must be a regex string.")
 
+            _validate_detector_name(entity, name)
+            _validate_regex_pattern(entity, name, pattern, regex_flags)
             validated_entity[name] = pattern
             pattern_count += 1
 
@@ -195,20 +237,38 @@ def load_yaml_config(file_path: str | Path) -> PatternConfig:
 
 
 def save_config(config: Any, file_path: str | Path) -> Path:
-    """Validate and save a detector config to YAML using stable insertion order."""
+    """Validate and atomically save a detector config to YAML using stable insertion order."""
     config_path = Path(file_path).expanduser()
     validated_config = validate_pattern_config(config)
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    with config_path.open("w", encoding="utf-8") as file:
-        yaml.dump(
-            validated_config,
-            file,
-            Dumper=_yaml_dumper(),
-            sort_keys=False,
-            default_flow_style=False,
-            allow_unicode=True,
-        )
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=config_path.parent,
+            prefix=f".{config_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temp_path = Path(file.name)
+            yaml.dump(
+                validated_config,
+                file,
+                Dumper=_yaml_dumper(),
+                sort_keys=False,
+                default_flow_style=False,
+                allow_unicode=True,
+            )
+            file.flush()
+            os.fsync(file.fileno())
+
+        temp_path.replace(config_path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
 
     return config_path
 
@@ -233,8 +293,14 @@ def add_entity_pattern(
     if not isinstance(name, str) or not name:
         raise ConfigError("Pattern names must be non-empty strings.")
 
+    if name == FLAGS_KEY:
+        raise ConfigError(f"{FLAGS_KEY!r} is reserved for regex flags and cannot be used as a pattern name.")
+
     if not isinstance(pattern, str):
         raise ConfigError("Patterns must be regex strings.")
+
+    _validate_detector_name(entity, name)
+    _validate_regex_pattern(entity, name, pattern, re.RegexFlag(0))
 
     updated_config = validate_pattern_config(config)
     entity_config = dict(updated_config.get(entity, {}))
@@ -243,7 +309,7 @@ def add_entity_pattern(
 
     entity_config[name] = pattern
     updated_config[entity] = entity_config
-    return updated_config
+    return validate_pattern_config(updated_config)
 
 
 def remove_entity_pattern(config: Any, entity: str, name: str, *, missing_ok: bool = False) -> PatternConfig:
