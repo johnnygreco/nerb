@@ -82,7 +82,7 @@ def _validate_regex_pattern(entity: str, name: str, pattern: str, flags: re.Rege
     try:
         re.compile(pattern, flags=flags)
     except (re.error, ValueError) as exc:
-        raise ConfigError(f"Pattern {name!r} for entity {entity!r} is not a valid regex pattern.") from exc
+        raise ConfigError(f"Pattern {name!r} for entity {entity!r} is not a valid regex pattern: {exc}.") from exc
 
 
 def _default_user_config_path() -> Path:
