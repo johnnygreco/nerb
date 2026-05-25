@@ -14,7 +14,7 @@ __all__ = ["NERB"]
 
 
 class NERB:
-    """
+    r"""
     Named Entity Regex Builder (NERB): Streamlined named capture groups.
 
     Parameters

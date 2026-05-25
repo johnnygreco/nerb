@@ -62,12 +62,13 @@ class TestRegexBuilder:
         """Test the extract named entity method on the Progressive Rock Wikipedia page."""
 
         artist = nerb_regex.extract_named_entity("ARTIST", prog_rock_wiki)
-        assert len(artist) == 17
+        assert len(artist) == 19
         assert artist.get_unique_names() == {
             "Coheed",
             "Dream Theater",
             "Mars Volta",
             "Pink Floyd",
+            "The Doors",
             "The Grateful Dead",
             "The Who",
         }

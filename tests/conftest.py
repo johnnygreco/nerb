@@ -25,7 +25,7 @@ def music_pattern_config() -> dict[str, dict[str, str]]:
     pattern_config = dict(
         ARTIST={
             "Coheed": r"Coheed(?:\s(?:and|\&)\sCambria)?",
-            "The Doors": r"[Tt]he\Doors",
+            "The Doors": r"[Tt]he\sDoors",
             "Dream Theater": r"Dream\sTheater",
             "Foo Fighters": r"Foo\sFighters",
             "The Grateful Dead": r"(?:[Tt]he\s)?Grateful\sDead|[Tt]he\sWarlocks",

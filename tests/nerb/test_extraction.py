@@ -51,7 +51,7 @@ def test_extract_named_entities_with_fixture_config_and_document(music_pattern_c
         (entity.span[0], entity.span[1], entity.entity, entity.name, entity.string) for entity in entities
     ]
 
-    assert len(entities) == 215
+    assert len(entities) == 217
     assert len(entities) == len(nerb.extract_named_entity("ARTIST", prog_rock_wiki)) + len(
         nerb.extract_named_entity("GENRE", prog_rock_wiki)
     )
