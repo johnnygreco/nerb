@@ -1,6 +1,7 @@
 # NERB Examples
 
-Run these commands from the repository root. If you installed NERB with `pip`, use `nerb` instead of `uv run nerb`.
+Run these commands from the repository root. They use the source checkout so they work before the CLI release is
+available on PyPI. After installing a release that includes the CLI, use `nerb` instead of `uv run nerb`.
 
 ```shell
 uv run nerb validate --config examples/music_entities.yaml

@@ -9,22 +9,37 @@ is still available for applications that need compiled regex objects directly.
 
 ## Installation
 
-Install the released package:
+Install or upgrade the released package:
 
 ```shell
-pip install nerb
+pip install --upgrade nerb
+```
+
+After installing a release that includes CLI support, verify the command:
+
+```shell
 nerb --help
 ```
 
-When working from a clone, install the development environment with uv through the Makefile and prefix commands with
-`uv run`:
+The `nerb` CLI and `nerb-mcp` entry points are part of the next release containing these docs. If that release is not
+available on PyPI yet, run the CLI through a source checkout:
 
 ```shell
 git clone https://github.com/johnnygreco/nerb.git
 cd nerb
-make sync
+uv sync --all-extras
 uv run nerb --help
 ```
+
+You can also install from source:
+
+```shell
+pip install "git+https://github.com/johnnygreco/nerb.git"
+nerb --help
+```
+
+The command examples below use `nerb`. From a source checkout before the CLI release is published, use `uv run nerb`
+instead.
 
 ## Detector Configs
 
@@ -160,7 +175,7 @@ uv run nerb extract ARTIST examples/prog_rock_wiki.txt --config examples/music_e
 uv run python examples/prog_wiki.py
 ```
 
-If you installed NERB with `pip`, use `nerb` instead of `uv run nerb`.
+After installing a release that includes the CLI, use `nerb` instead of `uv run nerb`.
 
 ## Python API
 
