@@ -42,8 +42,9 @@ publish-test: ## Publish distributions to TestPyPI; requires CONFIRM=yes.
 		echo "Re-run explicitly as: make publish-test CONFIRM=yes"; \
 		exit 1; \
 	fi
+	rm -rf dist
 	$(MAKE) build
-	$(UV) publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple/
+	$(UV) publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple/ dist/*.tar.gz dist/*.whl
 
 publish: ## Publish distributions to PyPI; requires CONFIRM=yes.
 	@if [ "$(CONFIRM)" != "yes" ]; then \
@@ -51,5 +52,6 @@ publish: ## Publish distributions to PyPI; requires CONFIRM=yes.
 		echo "Re-run explicitly as: make publish CONFIRM=yes"; \
 		exit 1; \
 	fi
+	rm -rf dist
 	$(MAKE) build
-	$(UV) publish --check-url https://pypi.org/simple/
+	$(UV) publish --check-url https://pypi.org/simple/ dist/*.tar.gz dist/*.whl
