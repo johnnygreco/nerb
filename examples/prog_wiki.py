@@ -1,12 +1,20 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
 from nerb import NERB
 
-with open("prog_rock_wiki.txt") as file:
-    prog_rock_wiki = file.read()
+EXAMPLE_DIR = Path(__file__).resolve().parent
 
-nerb_regex = NERB("music_entities.yaml")
-artists = nerb_regex.extract_named_entity("ARTIST", prog_rock_wiki)
+config_path = EXAMPLE_DIR / "music_entities.yaml"
+document_path = EXAMPLE_DIR / "prog_rock_wiki.txt"
+document = document_path.read_text(encoding="utf-8")
 
-print(artists)
+extractor = NERB(config_path, add_word_boundaries=True)
+artist_records = extractor.extract_named_entity("ARTIST", document).to_records()
+all_records = extractor.extract_named_entities(document).to_records()
 
-for match in nerb_regex.ARTIST.finditer(prog_rock_wiki):
-    print(match.group())
+print(json.dumps(artist_records[:5], indent=2))
+print(f"{len(artist_records)} ARTIST matches")
+print(f"{len(all_records)} total matches")

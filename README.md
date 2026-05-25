@@ -1,53 +1,198 @@
-# 🏗️ Named Entity Regex Builder (NERB)
-#### _Streamlining named capture groups_
-
----
+# Named Entity Regex Builder (NERB)
 
 [![CI](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml/badge.svg)](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml)
-[![license](http://img.shields.io/badge/license-MIT-blue.svg?style=flat)](https://github.com/johnnygreco/nerb/blob/main/LICENSE)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](https://github.com/johnnygreco/nerb/blob/main/LICENSE)
 
+NERB extracts named entities with regex detector configs. The command line is the primary interface: create and check
+detector configs, extract records from text or documents, and test detector patterns before saving them. The Python API
+is still available for applications that need compiled regex objects directly.
 
-## Overview
+## Installation
 
-Have you ever had a project with a large but _human-manageable_ list of entities that you need to extract from a 
-text dataset? If so, you have probably had the pleasure (burden?) of working with a codebase that is littered with 
-ginormous regex objects with lots of named capture groups, making your code difficult to parse and develop 😫.
-
-The Named Entity Regex Builder (NERB[^1]) is a lightweight package that will build your compiled regex objects 
-based on patterns set in a dictionary or yaml config file, which significantly cleans up your code and makes 
-it _much_ easier to modify your regex patterns during development 😀.
-
-Let's go 🚀🚀🚀    
-
-## Installation 
-
-You can install the latest stable version of `nerb` using pip:
+Install the released package:
 
 ```shell
 pip install nerb
+nerb --help
 ```
 
-If you would like to contribute to the code (awesome!), install the development version by
-cloning this repository and using the Makefile for uv-based development tasks:
+When working from a clone, install the development environment with uv through the Makefile and prefix commands with
+`uv run`:
 
 ```shell
 git clone https://github.com/johnnygreco/nerb.git
 cd nerb
 make sync
-make check
-make help
+uv run nerb --help
 ```
+
+## Detector Configs
+
+A detector config is YAML. Top-level keys are entity names, and each entity maps detector names to regex patterns.
+`_flags` is reserved for regex flags on an entity.
+
+```yaml
+ARTIST:
+  Pink Floyd: 'Pink\sFloyd'
+  The Who: '[Tt]he\sWho'
+
+GENRE:
+  _flags: IGNORECASE
+  Rock: '(?:progressive\s)?rock'
+```
+
+NERB resolves the config path in this order:
+
+1. explicit `--config`
+2. `NERB_CONFIG_PATH`
+3. the platform user config path, such as `~/Library/Application Support/nerb/detectors.yaml` on macOS,
+   `$XDG_CONFIG_HOME/nerb/detectors.yaml` or `~/.config/nerb/detectors.yaml` on Linux, and
+   `%APPDATA%\nerb\detectors.yaml` on Windows
+
+## CLI Quickstart
+
+Use the default config path:
+
+```shell
+nerb init
+nerb add ARTIST "Pink Floyd" 'Pink\sFloyd'
+nerb add GENRE Rock rock --flag IGNORECASE
+nerb extract --all --text "Pink Floyd played progressive rock." --format json
+```
+
+Output:
+
+```json
+[{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}, {"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34}]
+```
+
+Use an explicit config file when you want project-local detectors:
+
+```shell
+nerb init --config ./detectors.yaml
+nerb add ARTIST "Pink Floyd" 'Pink\sFloyd' --config ./detectors.yaml
+nerb extract ARTIST --text "Pink Floyd played progressive rock." --config ./detectors.yaml --format json
+```
+
+Use the checked-in example config from this repository:
+
+```shell
+nerb validate --config examples/music_entities.yaml
+nerb extract ARTIST examples/prog_rock_wiki.txt --config examples/music_entities.yaml --format json
+```
+
+`extract` accepts exactly one input source: a document path, `--text`, or `--stdin`. Use `ENTITY` for one entity or
+`--all` for every entity in the config.
+
+## Inline Extraction
+
+For one-shot extraction, pass detectors directly on the command line. This does not require a saved config on a clean
+install.
+
+```shell
+nerb extract ARTIST --text "Pink Floyd played progressive rock." --pattern 'Pink Floyd=Pink\sFloyd' --format json
+```
+
+Output:
+
+```json
+[{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}]
+```
+
+Use `--detector ENTITY:NAME=REGEX` when extracting all inline entities:
+
+```shell
+nerb extract --all --text "Pink Floyd played progressive rock." \
+  --detector 'ARTIST:Pink Floyd=Pink\sFloyd' \
+  --detector 'GENRE:Rock=rock' \
+  --format jsonl
+```
+
+Output:
+
+```jsonl
+{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
+{"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34}
+```
+
+## Authoring Commands
+
+Use these commands while building and debugging detector configs:
+
+```shell
+nerb test ARTIST "Pink Floyd" 'Pink\sFloyd' --text "Pink Floyd played progressive rock."
+nerb test ARTIST "Pink Floyd" --config examples/music_entities.yaml --document examples/prog_rock_wiki.txt --format json
+nerb compile ARTIST --config examples/music_entities.yaml
+nerb doctor --config examples/music_entities.yaml
+nerb doctor --config examples/music_entities.yaml --format json
+```
+
+`test` checks a literal pattern or a saved detector against text. `compile` prints the final named-capture regex for an
+entity. `doctor` validates YAML, detector names, regex compilation, duplicate compiled group names, and other authoring
+issues. `init`, `add`, `list`, `show`, `remove`, and `validate` cover the basic config lifecycle.
+
+## Output Formats
+
+Extraction commands support `--format table`, `--format json`, and `--format jsonl`. Table output is the default for
+humans. JSON and JSONL return records with stable fields: `entity`, `name`, `string`, `start`, and `end`.
+
+JSON:
+
+```json
+[{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}]
+```
+
+JSONL:
+
+```jsonl
+{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
+{"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34}
+```
+
+## Examples
+
+The `examples/` directory contains a detector config, a sample document, a short Python API script, and an examples
+README. From a source checkout:
+
+```shell
+uv run nerb validate --config examples/music_entities.yaml
+uv run nerb extract ARTIST examples/prog_rock_wiki.txt --config examples/music_entities.yaml --format json
+uv run python examples/prog_wiki.py
+```
+
+If you installed NERB with `pip`, use `nerb` instead of `uv run nerb`.
+
+## Python API
+
+Use the Python API when you need compiled regex objects or want extraction inside another Python program:
+
+```python
+from pathlib import Path
+
+from nerb import NERB
+
+config_path = Path("examples/music_entities.yaml")
+document = Path("examples/prog_rock_wiki.txt").read_text(encoding="utf-8")
+
+extractor = NERB(config_path, add_word_boundaries=True)
+artist_records = extractor.extract_named_entity("ARTIST", document).to_records()
+all_records = extractor.extract_named_entities(document).to_records()
+
+print(artist_records[0])
+print(len(all_records))
+```
+
+Compiled entity regexes are also available as attributes, such as `extractor.ARTIST`.
 
 ## MCP Server
 
-NERB includes a local MCP server for agent workflows on Python 3.10 and newer. Core NERB still supports Python 3.8;
-MCP support follows the official Python MCP SDK's Python version floor.
+NERB includes a local stdio MCP server on Python 3.10 and newer:
 
 ```shell
 uv run nerb-mcp
 ```
 
-Minimal MCP client configuration:
+Minimal MCP client config:
 
 ```json
 {
@@ -61,133 +206,15 @@ Minimal MCP client configuration:
 }
 ```
 
-MCP config tools read only the `config_path` passed by the client. The `add_detector`, `update_detector`, and
-`remove_detector` tools write only that explicit `config_path`, using NERB's atomic config save helper. Extraction tools
-read either provided `text` or an explicit `file_path`; pass exactly one. `extract_inline` accepts detector definitions
-directly and does not read or write a config file. If `nerb-mcp` is invoked in an environment without MCP support, it
-exits with a clear compatibility error.
+MCP tools require explicit `config_path` values for config reads and writes. See `AGENTS.md` and
+`.agents/skills/nerb-mcp-tools/SKILL.md` for the local agent workflow details.
 
-## Example Usage
-
-Suppose we want to extract some musical artists from the [Progressive Rock Wikipedia page](https://en.wikipedia.org/wiki/Progressive_rock). We'll put the groups we are searching for in a config file called `music_entities.yaml`: 
-
-```yaml
-ARTIST:
-  Coheed: 'Coheed(?:\s(?:and|\&)\sCambria)?'
-  The Doors: '[Tt]he\Doors'
-  Dream Theater: 'Dream\sTheater'
-  Foo Fighters: 'Foo\sFighters'
-  The Grateful Dead: '(?:[Tt]he\s)?Grateful\sDead|[Tt]he\sWarlocks'
-  Jay Z: 'Jay(?:\s|-)Z|Shawn(?:\sCorey\s)?\sCarter'
-  Mars Volta: 'Mars\sVolta'
-  Miles Davis: 'Miles\sDavis'
-  Pink Floyd: 'Pink\sFloyd'
-  Thelonious Monk: 'Thelonious\sMonk'
-  The Who: '[Tt]he\sWho'
-
-GENRE:
-  _flags: IGNORECASE
-  Hip Hop: 'rap|hip\shop'
-  Jazz: '(?:smooth\s)?jazz'
-  Pop: 'pop(?:ular)?'
-  Rock: '(?:(?:prog(:?ressive)?|alternative|punk)\s)?rock|rock\s(?:and|\&|n)\sroll'
-```
-> NOTE: `GENRE` is also included as an entity in the config file. Notice that we set the `IGNORECASE` flag using the special `_flags` keyword. If we need more than one flag, we can pass them as a list of flags (e.g., `[IGNORECASE, MULTILINE]`).
-
-## CLI Authoring Loop
-
-Use the CLI helpers to test and debug detector patterns before committing them to a config file:
+## Development
 
 ```shell
-uv run nerb test ARTIST "Pink Floyd" "Pink\sFloyd" --text "Pink Floyd played progressive rock."
-uv run nerb test ARTIST "Pink Floyd" --config music_entities.yaml --text "Pink Floyd played progressive rock."
-uv run nerb test ARTIST "Pink Floyd" --config music_entities.yaml --document prog_rock_wiki.txt --format json
-uv run nerb compile ARTIST --config music_entities.yaml
-uv run nerb doctor --config music_entities.yaml --format json
+make sync
+make check
+make build
 ```
 
-`nerb test` accepts a literal `PATTERN` for one-off checks or omits `PATTERN` to test a saved detector from
-`--config`. `nerb compile` prints the final named-capture regex for an entity, and `nerb doctor` validates config shape,
-regex compilation, flags, and suspicious detector names.
-
-We can now create a `NERB` regex object:
-
-```python
-from nerb import NERB
-nerb_regex = NERB('music_entities.yaml', add_word_boundaries=True)
-```
-> NOTE: We set `add_word_boundaries` to `True`. This tells `NERB` to add word boundaries to every term in the regex patterns within the config file.
-
-The `NERB` object automatically builds compiled regexes called `ARTIST` and `GENRE`, which are composed of named capture groups, where the group names are the keys (i.e., `Coheed`, `The Doors`, etc). You can access the `re.compile` objects as attributes:
-
-```python 
-nerb_regex.ARTIST
-nerb_regex.GENRE
-```
-
-Suppose we have the text of the Wiki page in a file called `prog_rock_wiki.txt`. Then, we can extract the artists like this:
-```python
-with open('prog_rock_wiki.txt', 'r') as file:
-    prog_rock_wiki = file.read()
-
-artists = nerb_regex.extract_named_entity('ARTIST', prog_rock_wiki)
-```
-
-This `extract_named_entity` method returns a [`NamedEntityList`](https://github.com/johnnygreco/nerb/blob/main/src/nerb/named_entities.py) object:
-
-```
-NamedEntityList(
-    [0] NamedEntity(name='The Who', entity='ARTIST', string='the Who', span=(8755, 8762))
-    [1] NamedEntity(name='The Grateful Dead', entity='ARTIST', string='the Grateful Dead', span=(9342, 9359))
-    [2] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(9364, 9374))
-    [3] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(13766, 13776))
-    [4] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(16544, 16554))
-    [5] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(17316, 17326))
-    [6] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(17624, 17634))
-    [7] NamedEntity(name='The Who', entity='ARTIST', string='the Who', span=(20938, 20945))
-    [8] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(23737, 23747))
-    [9] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(25647, 25657))
-    [10] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(25797, 25807))
-    [11] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(29819, 29829))
-    [12] NamedEntity(name='Dream Theater', entity='ARTIST', string='Dream Theater', span=(32119, 32132))
-    [13] NamedEntity(name='Coheed', entity='ARTIST', string='Coheed and Cambria', span=(33005, 33023))
-    [14] NamedEntity(name='Mars Volta', entity='ARTIST', string='Mars Volta', span=(33033, 33043))
-    [15] NamedEntity(name='Dream Theater', entity='ARTIST', string='Dream Theater', span=(35321, 35334))
-    [16] NamedEntity(name='Pink Floyd', entity='ARTIST', string='Pink Floyd', span=(37839, 37849))
-)
-```
-
-Alternatively, you can apply the compiled regex directly using the `ARTIST` attribute:
-
-```python
-for match in nerb_regex.ARTIST.finditer(prog_rock_wiki):
-    print(match.group()) 
-```
-
-```
-The_Who
-The_Grateful_Dead
-Pink_Floyd
-Pink_Floyd
-Pink_Floyd
-Pink_Floyd
-Pink_Floyd
-The_Who
-Pink_Floyd
-Pink_Floyd
-Pink_Floyd
-Pink_Floyd
-Dream_Theater
-Coheed
-Mars_Volta
-Dream_Theater
-Pink_Floyd
-```
-> NOTE: `NERB` automatically turns spaces into underscores when building the named capture group regex patterns.
-
-The code and data for this example are in the [examples directory](https://github.com/johnnygreco/nerb/tree/main/examples).
-
----
-
-
-[^1]: <a href="https://www.urbandictionary.com/define.php?term=nerb" target="_blank" rel="noopener noreferrer"><img width="450" alt="Screen Shot 2023-02-28 at 3 13 37 PM" align="middle" src="https://user-images.githubusercontent.com/10998105/221968480-7dec83d8-8092-405f-9c0d-80009242d335.png"></a>
+`make check` runs Ruff linting and formatting checks, `mypy src/nerb`, `ty check`, and pytest.
