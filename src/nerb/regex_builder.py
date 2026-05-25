@@ -2,12 +2,11 @@ from __future__ import annotations
 
 # Standard library
 import re
-from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 # Project
-from . import utils
+from .config import FLAGS_KEY, PatternConfig, load_config, validate_pattern_config, validate_regex_flags
 from .named_entities import NamedEntity, NamedEntityList
 
 __all__ = ["NERB"]
@@ -50,14 +49,14 @@ class NERB:
     are accessible via compiled regex attributes composed of named capture groups.
     """
 
-    def __init__(self, pattern_config: Path | str | dict[str, dict[str, str]], add_word_boundaries: bool = False):
+    def __init__(self, pattern_config: Path | str | PatternConfig, add_word_boundaries: bool = False):
         self.add_word_boundaries = add_word_boundaries
 
         if isinstance(pattern_config, (Path, str)):
-            self.pattern_config = utils.load_yaml_config(pattern_config)
+            self.pattern_config = load_config(pattern_config)
 
         elif isinstance(pattern_config, dict):
-            self.pattern_config = deepcopy(pattern_config)
+            self.pattern_config = validate_pattern_config(pattern_config)
 
         else:
             raise TypeError(
@@ -88,14 +87,17 @@ class NERB:
     def _build_regex(self):
         """Build and compile vocab regex patterns."""
 
-        for entity in self.pattern_config.keys():
-            # Get flags. Pop '_flags' keyword if it exists.
+        for entity, entity_config in self.pattern_config.items():
+            # Get flags from the '_flags' keyword if it exists.
             flags = self._generate_regex_flags(entity)
 
             term_dict = {}
-            setattr(self, f"{entity}_names", list(self.pattern_config[entity].keys()))
+            setattr(self, f"{entity}_names", [name for name in entity_config.keys() if name != FLAGS_KEY])
 
-            for name, pattern in self.pattern_config[entity].items():
+            for name, pattern in entity_config.items():
+                if name == FLAGS_KEY:
+                    continue
+
                 # Add word boundaries to all terms.
                 pattern = self._add_word_boundaries(pattern) if self.add_word_boundaries else rf"{pattern}"
                 term_dict[name.replace(" ", "_")] = pattern
@@ -106,15 +108,7 @@ class NERB:
 
     def _generate_regex_flags(self, entity: str) -> re.RegexFlag:
         """Generate regex flags from input config if the '_flags' parameter is given."""
-        flags = self.pattern_config[entity].pop("_flags", 0)
-        if isinstance(flags, int):
-            return re.RegexFlag(flags)
-
-        flag_names = flags if isinstance(flags, list) else [flags]
-        combined_flags = re.RegexFlag(getattr(re, str(flag_names[0]).upper()))
-        for flag in flag_names[1:]:
-            combined_flags |= re.RegexFlag(getattr(re, str(flag).upper()))
-        return combined_flags
+        return validate_regex_flags(self.pattern_config[entity].get(FLAGS_KEY, 0))
 
     @property
     def entity_list(self):
