@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 from importlib.metadata import entry_points
 from importlib.metadata import version as package_version
 
 from typer.testing import CliRunner
 
-from nerb import NERB, load_config, save_config
+from nerb import NERB, extract_named_entities_records, extract_named_entity_records, load_config, save_config
 from nerb.cli import app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
 
@@ -24,7 +25,7 @@ def test_help_shows_command_structure():
 
     assert result.exit_code == 0
     assert "Usage:" in result.output
-    for command_name in ["init", "add", "list", "show", "remove", "validate"]:
+    for command_name in ["extract", "init", "add", "list", "show", "remove", "validate"]:
         assert command_name in result.output
     assert "--config" in result.output
     assert "--version" in result.output
@@ -49,6 +50,249 @@ def test_invalid_command_usage_returns_error():
     assert result.exit_code != 0
     assert "Missing argument" in result.output
     assert "ENTITY" in result.output
+
+
+def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
+    config_path = test_data_path / "music_entities.yaml"
+    document_path = test_data_path / "prog_rock_wiki.txt"
+    expected_records = extract_named_entity_records(NERB(config_path), "ARTIST", prog_rock_wiki)
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "ARTIST",
+            str(document_path),
+            "--config",
+            str(config_path),
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    records = json.loads(result.output)
+    assert records == expected_records
+    assert set(records[0]) == {"entity", "name", "string", "start", "end"}
+
+
+def test_extract_stdin_jsonl_matches_api_for_fixture_config(test_data_path, prog_rock_wiki):
+    config_path = test_data_path / "music_entities.yaml"
+    expected_records = extract_named_entity_records(NERB(config_path), "ARTIST", prog_rock_wiki)
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "ARTIST",
+            "--stdin",
+            "--config",
+            str(config_path),
+            "--format",
+            "jsonl",
+        ],
+        input=prog_rock_wiki,
+    )
+
+    assert result.exit_code == 0
+    records = [json.loads(line) for line in result.output.splitlines()]
+    assert records == expected_records
+
+
+def test_extract_all_json_matches_api_for_fixture_config(test_data_path, prog_rock_wiki):
+    config_path = test_data_path / "music_entities.yaml"
+    document_path = test_data_path / "prog_rock_wiki.txt"
+    expected_records = extract_named_entities_records(NERB(config_path), prog_rock_wiki)
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--all",
+            str(document_path),
+            "--config",
+            str(config_path),
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == expected_records
+
+
+def test_extract_uses_default_config_path_from_env(monkeypatch, tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "default-detectors.yaml")
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(config_path))
+
+    result = runner.invoke(app, ["extract", "ARTIST", "--text", "Rush released 2112.", "--format", "json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == [{"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": 0, "end": 4}]
+
+
+def test_extract_inline_pattern_from_literal_text_without_config(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "ARTIST",
+            "--text",
+            "Pink Floyd played progressive rock.",
+            "--pattern",
+            r"Pink Floyd=Pink\sFloyd",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == [
+        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
+    ]
+
+
+def test_extract_inline_detectors_from_file_without_config(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+    document_path = tmp_path / "doc.txt"
+    document_path.write_text("Pink Floyd played progressive rock.", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "--all",
+            str(document_path),
+            "--detector",
+            r"ARTIST:Pink Floyd=Pink\sFloyd",
+            "--detector",
+            "GENRE:Rock=rock",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == [
+        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10},
+        {"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34},
+    ]
+
+
+def test_extract_table_output_with_inline_pattern(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "ARTIST",
+            "--text",
+            "Pink Floyd played.",
+            "--pattern",
+            r"Pink Floyd=Pink\sFloyd",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "entity" in result.output
+    assert "name" in result.output
+    assert "string" in result.output
+    assert "ARTIST" in result.output
+    assert "Pink Floyd" in result.output
+
+
+def test_extract_word_boundaries_option_limits_inline_matches(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+
+    result = runner.invoke(
+        app,
+        [
+            "extract",
+            "TERM",
+            "--text",
+            "art article art",
+            "--pattern",
+            "Art=art",
+            "--word-boundaries",
+            "--format",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert [record["start"] for record in json.loads(result.output)] == [0, 12]
+
+
+def test_extract_no_matches_returns_empty_success(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+
+    result = runner.invoke(
+        app,
+        ["extract", "ARTIST", "--text", "No configured artists.", "--pattern", "Rush=Rush", "--format", "json"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == []
+
+
+def test_extract_reports_missing_document_file(test_data_path, tmp_path):
+    config_path = test_data_path / "music_entities.yaml"
+    missing_document_path = tmp_path / "missing.txt"
+
+    result = runner.invoke(app, ["extract", "ARTIST", str(missing_document_path), "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert f"Document file does not exist at {missing_document_path}" in result.output
+
+
+def test_extract_reports_unknown_entity(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+
+    result = runner.invoke(app, ["extract", "GENRE", "--text", "jazz", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "GENRE" in result.output
+    assert str(config_path) in result.output
+
+
+def test_extract_reports_invalid_config(tmp_path):
+    config_path = tmp_path / "invalid.yaml"
+    config_path.write_text("ARTIST:\n  Broken: '('\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["extract", "ARTIST", "--text", "Pink Floyd", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert f"Could not load config at {config_path}" in result.output
+    assert "not a valid regex pattern" in result.output
+
+
+def test_extract_reports_invalid_inline_regex(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+
+    result = runner.invoke(
+        app,
+        ["extract", "ARTIST", "--text", "Pink Floyd", "--pattern", "Broken=(", "--format", "json"],
+    )
+
+    assert result.exit_code == 1
+    assert "Could not add inline detector ARTIST:Broken" in result.output
+    assert "not a valid regex pattern" in result.output
+
+
+def test_extract_reports_malformed_inline_detector(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+
+    result = runner.invoke(
+        app,
+        ["extract", "--all", "--text", "Pink Floyd", "--detector", "ARTIST Pink Floyd=Pink Floyd"],
+    )
+
+    assert result.exit_code == 1
+    assert "Malformed --detector value" in result.output
+    assert "ENTITY:NAME=REGEX" in result.output
 
 
 def test_init_creates_config_and_refuses_existing_file(tmp_path):
