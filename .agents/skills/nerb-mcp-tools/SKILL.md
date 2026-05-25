@@ -5,35 +5,31 @@ description: Use when implementing, testing, or documenting NERB Model Context P
 
 # NERB MCP Tools
 
-MCP support is pending in issue #8. On current `main`, there is no `src/nerb/mcp_server.py`, no `nerb-mcp` entry point, and no MCP test module. Do not claim MCP commands are available until those files land.
+NERB exposes a local MCP server through `src/nerb/mcp_server.py` and the `nerb-mcp` console entry point on Python 3.10
+and newer. Core NERB remains Python 3.8-compatible; MCP support follows the official Python MCP SDK's floor.
 
-## Planned Surface
+## Surface
 
-When issue #8 lands, MCP tools should wrap the same helpers used by the Python API and CLI:
+MCP tools wrap the same helpers used by the Python API and CLI:
 
 - validate/load detector configs through `src/nerb/config.py`
-- add, update, remove, list, and show detector patterns through config helpers
+- add, update, remove, and list detector patterns through config helpers
 - extract one entity or all entities through `src/nerb/extraction.py`
 - support one-shot inline extraction without requiring a saved config
 - return JSON-compatible data with `entity`, `name`, `string`, `start`, and `end`
 
-Avoid broad filesystem access. Tools should read only explicit config/document paths or provided text, and writes should go through explicit config paths.
+Avoid broad filesystem access. Tools read only explicit config/document paths or provided text, and writes go through
+explicit config paths. On Python versions unsupported by the MCP SDK, `nerb-mcp` exits with a clear compatibility error.
 
-## Pending Local Workflow
+## Local Workflow
 
-Before #8 lands, verify the implementation is still absent with:
-
-```shell
-rg -n "mcp|nerb-mcp" pyproject.toml src tests README.md
-```
-
-After #8 lands, use the launch command documented by that implementation. The planned command from issue #8 is:
+Launch the stdio server locally with:
 
 ```shell
 uv run nerb-mcp
 ```
 
-If the implementation chooses a module command instead, use:
+The module command also works:
 
 ```shell
 uv run python -m nerb.mcp_server
@@ -53,7 +49,7 @@ Minimal local MCP client config after the entry point exists:
 }
 ```
 
-## Acceptance Checks After #8
+## Acceptance Checks
 
 ```shell
 uv run pytest tests/nerb/test_mcp*.py
