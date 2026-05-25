@@ -27,8 +27,9 @@ test: ## Run the test suite.
 
 check: lint type test ## Run linting, type checks, and tests.
 
-build: ## Build source and wheel distributions.
-	$(UV) build
+build: ## Build and validate source and wheel distributions.
+	$(UV) build --clear
+	$(UV) run --no-project --with twine twine check --strict dist/*
 
 clean: ## Remove local build outputs and tool caches.
 	rm -rf build dist .eggs *.egg-info src/*.egg-info
@@ -36,7 +37,7 @@ clean: ## Remove local build outputs and tool caches.
 	find . \( -path ./.git -o -path ./.venv \) -prune -o -type d -name __pycache__ -exec rm -rf {} +
 	find . \( -path ./.git -o -path ./.venv \) -prune -o -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
 
-publish-test: ## Publish distributions to TestPyPI; requires CONFIRM=yes.
+publish-test: ## Manually publish to TestPyPI with uv credentials; requires CONFIRM=yes.
 	@if [ "$(CONFIRM)" != "yes" ]; then \
 		echo "Refusing to publish to TestPyPI."; \
 		echo "Re-run explicitly as: make publish-test CONFIRM=yes"; \
@@ -46,7 +47,7 @@ publish-test: ## Publish distributions to TestPyPI; requires CONFIRM=yes.
 	$(MAKE) build
 	$(UV) publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple/ dist/*.tar.gz dist/*.whl
 
-publish: ## Publish distributions to PyPI; requires CONFIRM=yes.
+publish: ## Manually publish to PyPI with uv credentials; prefer the Publish workflow; requires CONFIRM=yes.
 	@if [ "$(CONFIRM)" != "yes" ]; then \
 		echo "Refusing to publish to PyPI."; \
 		echo "Re-run explicitly as: make publish CONFIRM=yes"; \

@@ -3,8 +3,7 @@
 
 ---
 
-[![tests](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml/badge.svg)](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml)
-[![mypy](https://github.com/johnnygreco/nerb/actions/workflows/mypy.yml/badge.svg)](https://github.com/johnnygreco/nerb/actions/workflows/mypy.yml)
+[![CI](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml/badge.svg)](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml)
 [![license](http://img.shields.io/badge/license-MIT-blue.svg?style=flat)](https://github.com/johnnygreco/nerb/blob/main/LICENSE)
 
 
