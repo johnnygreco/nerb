@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 # Project
 from . import utils
@@ -61,7 +61,7 @@ class NERB:
 
         else:
             raise TypeError(
-                f"{type(pattern_config)} is not a valid type for pattern_config. " "Must be of type Path, str, or dict."
+                f"{type(pattern_config)} is not a valid type for pattern_config. Must be of type Path, str, or dict."
             )
 
         self._build_regex()
@@ -107,13 +107,14 @@ class NERB:
     def _generate_regex_flags(self, entity: str) -> re.RegexFlag:
         """Generate regex flags from input config if the '_flags' parameter is given."""
         flags = self.pattern_config[entity].pop("_flags", 0)
-        if not isinstance(flags, int):
-            flags = flags if isinstance(flags, list) else [flags]
-            combined_flags = getattr(re, flags[0].upper())
-            for flag in flags[1:]:
-                combined_flags |= getattr(re, flag.upper())
-            flags = combined_flags
-        return flags
+        if isinstance(flags, int):
+            return re.RegexFlag(flags)
+
+        flag_names = flags if isinstance(flags, list) else [flags]
+        combined_flags = re.RegexFlag(getattr(re, str(flag_names[0]).upper()))
+        for flag in flag_names[1:]:
+            combined_flags |= re.RegexFlag(getattr(re, str(flag).upper()))
+        return combined_flags
 
     @property
     def entity_list(self):
@@ -149,7 +150,7 @@ class NERB:
 
     def isolate_named_capture_group(
         self, entity: str, name: str, text: str, method: str = "search"
-    ) -> Optional[re.Match | list[re.Match] | list[tuple[str]]]:
+    ) -> re.Match | list[re.Match] | list[tuple[str, ...]] | None:
         """
         Apply regex method to the given compiled regex attribute, isolating the results for the
         given named capture group.
@@ -183,7 +184,7 @@ class NERB:
         name = name.replace(" ", "_")
 
         if name not in named_groups:
-            raise KeyError(f"'{name}' is not a valid group name for '{entity}'. " f"Allowed values: {named_groups}.")
+            raise KeyError(f"'{name}' is not a valid group name for '{entity}'. Allowed values: {named_groups}.")
 
         if method == "search":
             # The search method returns the first occurrence of the pattern.
@@ -207,6 +208,9 @@ class NERB:
             raise NameError(f"'{method}' is not a valid regex method. Allowed values: search, finditer, or findall.")
 
         return result
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(f"{self.__class__.__name__!r} object has no attribute {name!r}.")
 
     def __repr__(self):
         return f"{self.__class__.__name__}(entities: {self.entity_list.__repr__()})"

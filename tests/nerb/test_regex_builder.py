@@ -77,7 +77,7 @@ class TestRegexBuilder:
     def test_set_flags(self, nerb_regex):
         """Test that flags are set when they are passed using the '_flags' config option."""
         text = "thelonious monk is my favorite JaZz artist."
-        assert nerb_regex.ARTIST.search(text) == None
+        assert nerb_regex.ARTIST.search(text) is None
         assert nerb_regex.GENRE.search(text).group() == "JaZz"
 
     def test_isolate_named_capture_group(self, nerb_regex):

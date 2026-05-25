@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
 __all__ = ["NamedEntity", "NamedEntityList"]
 
@@ -20,7 +20,7 @@ class NamedEntity:
 class NamedEntityList:
     """Named entity list class."""
 
-    def __init__(self, init_list: Optional[list] = None):
+    def __init__(self, init_list: list | None = None):
         init_list = [] if init_list is None else init_list
         self._list = init_list
 

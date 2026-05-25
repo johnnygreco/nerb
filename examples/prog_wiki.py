@@ -1,10 +1,10 @@
 from nerb import NERB
 
-with open('prog_rock_wiki.txt', 'r') as file:
+with open("prog_rock_wiki.txt") as file:
     prog_rock_wiki = file.read()
 
-nerb_regex = NERB('music_entities.yaml')
-artists = nerb_regex.extract_named_entity('ARTIST', prog_rock_wiki)
+nerb_regex = NERB("music_entities.yaml")
+artists = nerb_regex.extract_named_entity("ARTIST", prog_rock_wiki)
 
 print(artists)
 

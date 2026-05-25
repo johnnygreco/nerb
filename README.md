@@ -29,13 +29,16 @@ pip install nerb
 ```
 
 If you would like to contribute to the code (awesome!), install the development version by
-cloning this repository and pip installing the package in editable mode with the extra "tests" option
-for running unit tests and type checking:
+cloning this repository and syncing the development dependencies with uv:
 
 ```shell
 git clone https://github.com/johnnygreco/nerb.git
 cd nerb
-pip install -e ".[tests]"
+uv sync --all-extras
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run ty check
 ```
 
 ## Example Usage
@@ -146,4 +149,3 @@ The code and data for this example are in the [examples directory](https://githu
 
 
 [^1]: <a href="https://www.urbandictionary.com/define.php?term=nerb" target="_blank" rel="noopener noreferrer"><img width="450" alt="Screen Shot 2023-02-28 at 3 13 37 PM" align="middle" src="https://user-images.githubusercontent.com/10998105/221968480-7dec83d8-8092-405f-9c0d-80009242d335.png"></a>
-
