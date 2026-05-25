@@ -1,9 +1,7 @@
-from __future__ import annotations
-
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Dict, List, NoReturn, Optional, Set, Union
 
 import typer
 import yaml
@@ -56,7 +54,7 @@ def _config_option() -> Any:
     )
 
 
-def _command_config_path(ctx: typer.Context, config: Path | None) -> Path:
+def _command_config_path(ctx: typer.Context, config: Optional[Path]) -> Path:
     if config is not None:
         return resolve_default_config_path(config)
 
@@ -94,9 +92,9 @@ def _save_command_config(config: PatternConfig, config_path: Path) -> None:
         _exit_error(f"Could not write config at {config_path}: {exc}")
 
 
-def _canonical_flag_names(flags: list[str]) -> list[str]:
-    flag_names: list[str] = []
-    seen: set[str] = set()
+def _canonical_flag_names(flags: List[str]) -> List[str]:
+    flag_names: List[str] = []
+    seen: Set[str] = set()
     for raw_value in flags:
         for raw_flag in raw_value.split(","):
             flag_name = raw_flag.strip()
@@ -110,14 +108,14 @@ def _canonical_flag_names(flags: list[str]) -> list[str]:
     return flag_names
 
 
-def _flag_config(entity: str, config_path: Path, flags: list[str] | None) -> str | list[str] | None:
+def _flag_config(entity: str, config_path: Path, flags: Optional[List[str]]) -> Optional[Union[str, List[str]]]:
     if not flags:
         return None
 
     flag_names = _canonical_flag_names(flags)
     if not flag_names:
         _exit_error(f"Invalid _flags for entity {entity!r} in {config_path}: Regex flag names must not be empty.")
-    flag_config: str | list[str] = flag_names[0] if len(flag_names) == 1 else flag_names
+    flag_config: Union[str, List[str]] = flag_names[0] if len(flag_names) == 1 else flag_names
     try:
         validate_regex_flags(flag_config)
     except ConfigError as exc:
@@ -128,7 +126,7 @@ def _flag_config(entity: str, config_path: Path, flags: list[str] | None) -> str
 def _ensure_flag_update_allowed(
     config: PatternConfig,
     entity: str,
-    flag_config: str | list[str] | None,
+    flag_config: Optional[Union[str, List[str]]],
     *,
     force: bool,
     config_path: Path,
@@ -149,12 +147,14 @@ def _ensure_flag_update_allowed(
         _exit_error(message)
 
 
-def _with_entity_flags(config: PatternConfig, entity: str, flag_config: str | list[str] | None) -> PatternConfig:
+def _with_entity_flags(
+    config: PatternConfig, entity: str, flag_config: Optional[Union[str, List[str]]]
+) -> PatternConfig:
     if flag_config is None:
         return config
 
     updated_config = validate_pattern_config(config)
-    entity_config: dict[str, Any] = {FLAGS_KEY: flag_config}
+    entity_config: Dict[str, Any] = {FLAGS_KEY: flag_config}
     for name, pattern in updated_config[entity].items():
         if name != FLAGS_KEY:
             entity_config[name] = pattern
@@ -168,7 +168,7 @@ def _format_flags(flags: Any) -> str:
     return str(flags)
 
 
-def _echo_entity_listing(entity: str, entity_config: dict[str, Any]) -> None:
+def _echo_entity_listing(entity: str, entity_config: Dict[str, Any]) -> None:
     typer.echo(f"{entity}:")
     if FLAGS_KEY in entity_config:
         typer.echo(f"  {FLAGS_KEY}: {_format_flags(entity_config[FLAGS_KEY])}")
@@ -177,21 +177,21 @@ def _echo_entity_listing(entity: str, entity_config: dict[str, Any]) -> None:
             typer.echo(f"  {name}")
 
 
-def _yaml_text(config: dict[str, Any]) -> str:
+def _yaml_text(config: Dict[str, Any]) -> str:
     return yaml.safe_dump(config, sort_keys=False, default_flow_style=False, allow_unicode=True).rstrip()
 
 
 @app.callback()
 def callback(
     ctx: typer.Context,
-    version: bool | None = typer.Option(
+    version: Optional[bool] = typer.Option(
         None,
         "--version",
         callback=_version_callback,
         help="Show the installed package version and exit.",
         is_eager=True,
     ),
-    config: Path | None = typer.Option(
+    config: Optional[Path] = typer.Option(
         None,
         "--config",
         "-c",
@@ -206,7 +206,7 @@ def callback(
 def init_config(
     ctx: typer.Context,
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing detector config."),
-    config: Path | None = _config_option(),
+    config: Optional[Path] = _config_option(),
 ) -> None:
     """Create an empty detector config file."""
     config_path = _command_config_path(ctx, config)
@@ -225,13 +225,13 @@ def add_pattern(
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
     pattern: str = typer.Argument(..., help="Regex pattern."),
-    flags: list[str] | None = typer.Option(
+    flags: Optional[List[str]] = typer.Option(
         None,
         "--flag",
         help=f"Regex flag name for this entity's {FLAGS_KEY}. May be repeated or comma-separated.",
     ),
     force: bool = typer.Option(False, "--force", "-f", help="Replace an existing entity/name pattern."),
-    config: Path | None = _config_option(),
+    config: Optional[Path] = _config_option(),
 ) -> None:
     """Add a detector pattern to the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -254,8 +254,8 @@ def add_pattern(
 @app.command("list")
 def list_patterns(
     ctx: typer.Context,
-    entity: str | None = typer.Argument(None, help="Optional detector entity name."),
-    config: Path | None = _config_option(),
+    entity: Optional[str] = typer.Argument(None, help="Optional detector entity name."),
+    config: Optional[Path] = _config_option(),
 ) -> None:
     """List detector patterns in the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -278,8 +278,8 @@ def list_patterns(
 def show_pattern(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
-    name: str | None = typer.Argument(None, help="Optional pattern name."),
-    config: Path | None = _config_option(),
+    name: Optional[str] = typer.Argument(None, help="Optional pattern name."),
+    config: Optional[Path] = _config_option(),
 ) -> None:
     """Show configured detector patterns for an entity."""
     config_path = _command_config_path(ctx, config)
@@ -295,7 +295,7 @@ def show_pattern(
     if name not in entity_config:
         _exit_error(f"Pattern {name!r} does not exist for entity {entity!r} in {config_path}.")
 
-    selected_entity_config: dict[str, Any] = {}
+    selected_entity_config: Dict[str, Any] = {}
     if FLAGS_KEY in entity_config and name != FLAGS_KEY:
         selected_entity_config[FLAGS_KEY] = entity_config[FLAGS_KEY]
     selected_entity_config[name] = entity_config[name]
@@ -307,7 +307,7 @@ def remove_pattern(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
-    config: Path | None = _config_option(),
+    config: Optional[Path] = _config_option(),
 ) -> None:
     """Remove a detector pattern from the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -324,7 +324,7 @@ def remove_pattern(
 @app.command("validate")
 def validate_config(
     ctx: typer.Context,
-    config: Path | None = _config_option(),
+    config: Optional[Path] = _config_option(),
 ) -> None:
     """Validate the configured detector file."""
     config_path = _command_config_path(ctx, config)
