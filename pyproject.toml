@@ -10,7 +10,13 @@ readme = "README.md"
 authors = [{ name = "Johnny Greco" }]
 license = { file = "LICENSE" }
 requires-python = ">=3.8"
-dependencies = ["PyYAML>=6.0"]
+dependencies = [
+    "PyYAML>=6.0",
+    "typer>=0.12",
+]
+
+[project.scripts]
+nerb = "nerb.cli:main"
 
 [project.optional-dependencies]
 tests = ["mypy>=1.14,<1.15", "pytest>=7.0"]
@@ -42,5 +48,9 @@ disable_error_code = ["attr-defined"]
 [[tool.mypy.overrides]]
 module = "yaml.*"
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["click", "click.*", "typer", "typer.*"]
+follow_imports = "skip"
 
 [tool.ty]
