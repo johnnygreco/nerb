@@ -15,6 +15,12 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
+from .extraction import (
+    extract_named_entities,
+    extract_named_entities_records,
+    extract_named_entity,
+    extract_named_entity_records,
+)
 from .named_entities import NamedEntity, NamedEntityList
 from .regex_builder import NERB
 
@@ -34,6 +40,10 @@ __all__ = [
     "PatternConfig",
     "__version__",
     "add_entity_pattern",
+    "extract_named_entities",
+    "extract_named_entities_records",
+    "extract_named_entity",
+    "extract_named_entity_records",
     "load_config",
     "load_yaml_config",
     "package_path",

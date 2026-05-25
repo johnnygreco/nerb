@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 __all__ = ["NamedEntity", "NamedEntityList"]
 
@@ -15,6 +15,17 @@ class NamedEntity:
     entity: str
     string: str
     span: tuple[int, int]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize this entity with external ``start`` and ``end`` span offsets."""
+        start, end = self.span
+        return {
+            "entity": self.entity,
+            "name": self.name,
+            "string": self.string,
+            "start": start,
+            "end": end,
+        }
 
 
 class NamedEntityList:
@@ -57,6 +68,10 @@ class NamedEntityList:
             If True, sort in descending order.
         """
         self._list.sort(key=key, reverse=reverse)
+
+    def to_records(self) -> list[dict[str, Any]]:
+        """Serialize entities as records, preserving this list's deterministic order."""
+        return [entity.to_dict() for entity in self]
 
     def __add__(self, other: NamedEntityList):
         """Define what it means to add two list objects together."""

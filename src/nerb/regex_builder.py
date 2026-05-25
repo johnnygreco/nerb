@@ -7,7 +7,8 @@ from typing import Any
 
 # Project
 from .config import FLAGS_KEY, PatternConfig, load_config, validate_pattern_config, validate_regex_flags
-from .named_entities import NamedEntity, NamedEntityList
+from .extraction import extract_named_entities, extract_named_entity
+from .named_entities import NamedEntityList
 
 __all__ = ["NERB"]
 
@@ -131,16 +132,16 @@ class NERB:
             List of extracted named entities.
         """
 
-        if not hasattr(self, entity):
-            raise AttributeError(f"This NERB instance does not have a compiled regex called {entity}.")
-        regex = getattr(self, entity)
+        return extract_named_entity(self, entity, text)
 
-        named_entity_list = NamedEntityList()
-        for match in regex.finditer(text):
-            name = match.lastgroup.replace("_", " ")
-            named_entity_list.append(NamedEntity(entity=entity, name=name, string=match.group(), span=match.span()))
+    def extract_named_entities(self, text: str) -> NamedEntityList:
+        """
+        Extract all configured entity groups from the given text.
 
-        return named_entity_list
+        Results are sorted in deterministic document order: start offset, end offset,
+        entity, name, then matched string.
+        """
+        return extract_named_entities(self, text)
 
     def isolate_named_capture_group(
         self, entity: str, name: str, text: str, method: str = "search"
