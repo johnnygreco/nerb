@@ -207,8 +207,6 @@ dependencies = [
     { name = "typer", version = "0.20.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
     { name = "typer", version = "0.23.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.9.*'" },
     { name = "typer", version = "0.25.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
-    { name = "typing-extensions", version = "4.13.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.9'" },
-    { name = "typing-extensions", version = "4.15.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.9'" },
 ]
 
 [package.optional-dependencies]
@@ -240,7 +238,6 @@ requires-dist = [
     { name = "setuptools", marker = "extra == 'dev'", specifier = ">=61" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.39" },
     { name = "typer", specifier = ">=0.12" },
-    { name = "typing-extensions", specifier = ">=4.8" },
 ]
 provides-extras = ["tests", "dev"]
 

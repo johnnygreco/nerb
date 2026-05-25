@@ -1,12 +1,9 @@
-from __future__ import annotations
-
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
 from typing import Optional
 
 import typer
-from typing_extensions import Annotated
 
 from . import __version__
 from .config import DEFAULT_CONFIG_ENV_VAR, resolve_default_config_path
@@ -40,63 +37,58 @@ def _not_implemented(command_name: str) -> None:
     raise typer.Exit(COMMAND_NOT_IMPLEMENTED_EXIT_CODE)
 
 
-ConfigPathOption = Annotated[
-    Optional[Path],
-    typer.Option(
-        "--config",
-        "-c",
-        help=f"Detector config path. Defaults to ${DEFAULT_CONFIG_ENV_VAR} or the platform config path.",
-    ),
-]
-VersionOption = Annotated[
-    Optional[bool],
-    typer.Option(
+@app.callback()
+def callback(
+    ctx: typer.Context,
+    version: Optional[bool] = typer.Option(
+        None,
         "--version",
         callback=_version_callback,
         help="Show the installed package version and exit.",
         is_eager=True,
     ),
-]
-
-EntityArgument = Annotated[str, typer.Argument(help="Detector entity name.")]
-NameArgument = Annotated[str, typer.Argument(help="Pattern name.")]
-PatternArgument = Annotated[str, typer.Argument(help="Regex pattern.")]
-OptionalEntityArgument = Annotated[Optional[str], typer.Argument(help="Optional detector entity name.")]
-OptionalNameArgument = Annotated[Optional[str], typer.Argument(help="Optional pattern name.")]
-ReplaceOption = Annotated[bool, typer.Option("--replace", help="Replace an existing entity/name pattern.")]
-
-
-@app.callback()
-def callback(ctx: typer.Context, version: VersionOption = None, config: ConfigPathOption = None) -> None:
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help=f"Detector config path. Defaults to ${DEFAULT_CONFIG_ENV_VAR} or the platform config path.",
+    ),
+) -> None:
     """Build and manage named entity regex detector configs."""
     ctx.obj = {"config_path": resolve_default_config_path(config)}
 
 
 @app.command("add")
 def add_pattern(
-    entity: EntityArgument,
-    name: NameArgument,
-    pattern: PatternArgument,
-    replace: ReplaceOption = False,
+    entity: str = typer.Argument(..., help="Detector entity name."),
+    name: str = typer.Argument(..., help="Pattern name."),
+    pattern: str = typer.Argument(..., help="Regex pattern."),
+    replace: bool = typer.Option(False, "--replace", help="Replace an existing entity/name pattern."),
 ) -> None:
     """Add a detector pattern to the configured detector file."""
     _not_implemented("add")
 
 
 @app.command("list")
-def list_patterns(entity: OptionalEntityArgument = None) -> None:
+def list_patterns(entity: Optional[str] = typer.Argument(None, help="Optional detector entity name.")) -> None:
     """List detector patterns in the configured detector file."""
     _not_implemented("list")
 
 
 @app.command("show")
-def show_pattern(entity: EntityArgument, name: OptionalNameArgument = None) -> None:
+def show_pattern(
+    entity: str = typer.Argument(..., help="Detector entity name."),
+    name: Optional[str] = typer.Argument(None, help="Optional pattern name."),
+) -> None:
     """Show configured detector patterns for an entity."""
     _not_implemented("show")
 
 
 @app.command("remove")
-def remove_pattern(entity: EntityArgument, name: NameArgument) -> None:
+def remove_pattern(
+    entity: str = typer.Argument(..., help="Detector entity name."),
+    name: str = typer.Argument(..., help="Pattern name."),
+) -> None:
     """Remove a detector pattern from the configured detector file."""
     _not_implemented("remove")
 

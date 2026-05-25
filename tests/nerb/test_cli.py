@@ -10,6 +10,13 @@ from nerb.cli import COMMAND_NOT_IMPLEMENTED_EXIT_CODE, app
 runner = CliRunner()
 
 
+def _console_script_entry_points():
+    discovered_entry_points = entry_points()
+    if hasattr(discovered_entry_points, "select"):
+        return discovered_entry_points.select(group="console_scripts")
+    return discovered_entry_points.get("console_scripts", [])
+
+
 def test_help_shows_command_structure():
     result = runner.invoke(app, ["--help"])
 
@@ -29,7 +36,7 @@ def test_version_prints_installed_package_version():
 
 
 def test_console_script_entry_point_is_registered():
-    console_scripts = entry_points(group="console_scripts")
+    console_scripts = _console_script_entry_points()
 
     assert any(entry_point.name == "nerb" and entry_point.value == "nerb.cli:main" for entry_point in console_scripts)
 
