@@ -1,3 +1,6 @@
+# Standard library
+from copy import deepcopy
+
 # Third-party
 import pytest
 
@@ -79,6 +82,16 @@ class TestRegexBuilder:
         text = "thelonious monk is my favorite JaZz artist."
         assert nerb_regex.ARTIST.search(text) is None
         assert nerb_regex.GENRE.search(text).group() == "JaZz"
+
+    def test_nerb_init_does_not_remove_flags_from_pattern_config(self, music_pattern_config):
+        """Test that NERB reads regex flags without mutating the provided config."""
+        original_config = deepcopy(music_pattern_config)
+
+        nerb_regex = NERB(music_pattern_config)
+
+        assert music_pattern_config == original_config
+        assert nerb_regex.pattern_config["GENRE"]["_flags"] == "IGNORECASE"
+        assert nerb_regex.GENRE_names == ["Hip Hop", "Jazz", "Pop", "Rock"]
 
     def test_isolate_named_capture_group(self, nerb_regex):
         """Test that we correctly isolate the named capture group and return the appropriate regex result."""
