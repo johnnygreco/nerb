@@ -9,6 +9,11 @@ import yaml
 __all__ = ["load_yaml_config"]
 
 
+def _yaml_loader():
+    """Return the fastest safe YAML loader available for this PyYAML build."""
+    return getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
 def load_yaml_config(file_path: str | Path) -> dict:
     """
 
@@ -26,5 +31,5 @@ def load_yaml_config(file_path: str | Path) -> dict:
     file_path = Path(file_path)
 
     with open(file_path) as file:
-        config = yaml.load(file, Loader=yaml.CLoader)
+        config = yaml.load(file, Loader=_yaml_loader())
     return config

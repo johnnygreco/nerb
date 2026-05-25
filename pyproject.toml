@@ -8,7 +8,7 @@ version = "0.0.5"
 description = "Named Entity Regex Builder (NERB): Streamlining named capture groups"
 readme = "README.md"
 authors = [{ name = "Johnny Greco" }]
-license = { file = "LICENSE" }
+license = "MIT"
 requires-python = ">=3.8"
 dependencies = ["PyYAML>=6.0"]
 
