@@ -24,6 +24,9 @@ nerb-mcp = "nerb.mcp_server:main"
 tests = ["mypy>=1.14,<1.15", "pytest>=7.0"]
 dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "setuptools>=61", "ty>=0.0.39"]
 
+[dependency-groups]
+dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "setuptools>=61", "ty>=0.0.39"]
+
 [project.urls]
 Homepage = "https://github.com/johnnygreco/nerb"
 Repository = "https://github.com/johnnygreco/nerb"
@@ -56,3 +59,8 @@ module = ["click", "click.*", "typer", "typer.*"]
 follow_imports = "skip"
 
 [tool.ty]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+pythonpath = ["src"]
+testpaths = ["tests"]

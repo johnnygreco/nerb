@@ -8,6 +8,16 @@ import pytest
 
 # Project
 from nerb import repo_path
+from nerb.config import DEFAULT_CONFIG_ENV_VAR
+
+
+@pytest.fixture(autouse=True)
+def isolate_default_config_paths(monkeypatch, tmp_path) -> None:
+    """Keep tests from reading or writing the real per-user NERB config path."""
+    monkeypatch.delenv(DEFAULT_CONFIG_ENV_VAR, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
 
 
 @pytest.fixture

@@ -94,6 +94,17 @@ def test_config_mutation_tools_write_explicit_config_path(tmp_path):
     assert load_config(config_path) == {}
 
 
+def test_config_mutation_tools_report_duplicate_add(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+
+    with pytest.raises(ToolError) as duplicate_error:
+        add_detector(str(config_path), "ARTIST", "Rush", r"Rush(?:\s+band)?")
+
+    assert f"Could not add detector ARTIST:Rush in {config_path}" in str(duplicate_error.value)
+    assert "already exists" in str(duplicate_error.value)
+    assert load_config(config_path) == {"ARTIST": {"Rush": "Rush"}}
+
+
 def test_extract_entity_matches_cli_and_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
@@ -143,6 +154,22 @@ def test_extract_inline_does_not_require_or_write_config(monkeypatch, tmp_path):
     assert not missing_default_config.exists()
 
 
+def test_extract_inline_filters_entity_and_reads_document_file(tmp_path):
+    document_path = tmp_path / "doc.txt"
+    document_path.write_text("Rush played rock.", encoding="utf-8")
+
+    result = extract_inline(
+        {"ARTIST": {"Rush": "Rush"}, "GENRE": {"Rock": "rock"}},
+        file_path=str(document_path),
+        entity="GENRE",
+    )
+
+    assert result["entity"] == "GENRE"
+    assert result["source"] == {"type": "file", "path": str(document_path)}
+    assert result["record_count"] == 1
+    assert result["records"] == [{"entity": "GENRE", "name": "Rock", "string": "rock", "start": 12, "end": 16}]
+
+
 def test_mcp_tools_report_invalid_config_and_regex(tmp_path):
     invalid_config_path = tmp_path / "invalid.yaml"
     invalid_config_path.write_text("ARTIST:\n  Broken: '('\n", encoding="utf-8")
@@ -158,6 +185,14 @@ def test_mcp_tools_report_invalid_config_and_regex(tmp_path):
 
     assert "Inline detector definitions are invalid" in str(invalid_regex_error.value)
     assert "not a valid regex pattern" in str(invalid_regex_error.value)
+
+
+def test_mcp_tools_report_invalid_inline_detector_definitions():
+    with pytest.raises(ToolError) as invalid_inline_error:
+        extract_inline({"ARTIST": {"_flags": "IGNORECASE"}}, text="Rush")
+
+    assert "Inline detector definitions are invalid" in str(invalid_inline_error.value)
+    assert "must define at least one pattern" in str(invalid_inline_error.value)
 
 
 def test_mcp_tools_report_missing_entity_and_missing_file(tmp_path):

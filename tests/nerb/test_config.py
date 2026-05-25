@@ -140,6 +140,13 @@ def test_resolve_default_config_path_creates_empty_config(monkeypatch, tmp_path)
     assert load_config(config_path) == {}
 
 
+def test_resolve_default_config_path_uses_isolated_test_config_home(tmp_path):
+    resolved_path = resolve_default_config_path()
+
+    assert resolved_path == tmp_path / "xdg-config" / "nerb" / "detectors.yaml"
+    assert not resolved_path.exists()
+
+
 def test_save_config_keeps_existing_file_when_atomic_write_fails(monkeypatch, tmp_path):
     config_path = save_config({"ARTIST": {"Coheed": "Coheed"}}, tmp_path / "entities.yaml")
 
