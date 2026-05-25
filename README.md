@@ -105,29 +105,29 @@ For one-shot extraction, pass detectors directly on the command line. This does 
 install.
 
 ```shell
-nerb extract ARTIST --text "Pink Floyd played progressive rock." --pattern 'Pink Floyd=Pink\sFloyd' --format json
+nerb extract CITY --text "San Francisco hosts PyCon." --pattern 'San Francisco=San\sFrancisco' --format json
 ```
 
 Output:
 
 ```json
-[{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}]
+[{"entity": "CITY", "name": "San Francisco", "string": "San Francisco", "start": 0, "end": 13}]
 ```
 
 Use `--detector ENTITY:NAME=REGEX` when extracting all inline entities:
 
 ```shell
-nerb extract --all --text "Pink Floyd played progressive rock." \
-  --detector 'ARTIST:Pink Floyd=Pink\sFloyd' \
-  --detector 'GENRE:Rock=rock' \
+nerb extract --all --text "San Francisco hosts PyCon." \
+  --detector 'CITY:San Francisco=San\sFrancisco' \
+  --detector 'EVENT:PyCon=PyCon' \
   --format jsonl
 ```
 
 Output:
 
 ```jsonl
-{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
-{"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34}
+{"entity": "CITY", "name": "San Francisco", "string": "San Francisco", "start": 0, "end": 13}
+{"entity": "EVENT", "name": "PyCon", "string": "PyCon", "start": 20, "end": 25}
 ```
 
 ## Authoring Commands
