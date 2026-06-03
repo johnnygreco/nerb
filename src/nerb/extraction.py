@@ -20,11 +20,14 @@ __all__ = [
     "ExtractionError",
     "extract_batch",
     "extract_file",
+    "extract_report",
+    "extract_report_batch",
     "extract_named_entities",
     "extract_named_entities_records",
     "extract_named_entity",
     "extract_named_entity_records",
     "extract_text",
+    "explain_match",
 ]
 
 
@@ -178,6 +181,44 @@ def extract_batch(
             "documents_with_records": sum(1 for document in document_results if document["records"]),
         },
     }
+
+
+def extract_report(
+    bank: Mapping[str, Any],
+    text: str,
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a single-document extraction report."""
+    from .reports import extract_report as _extract_report
+
+    return _extract_report(bank, text, options=options)
+
+
+def extract_report_batch(
+    bank: Mapping[str, Any],
+    documents: Sequence[Mapping[str, Any]],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return extraction reports for a bounded batch."""
+    from .reports import extract_report_batch as _extract_report_batch
+
+    return _extract_report_batch(bank, documents, options=options)
+
+
+def explain_match(
+    bank: Mapping[str, Any],
+    entity_id: str,
+    name_id: str,
+    pattern_id: str,
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Explain one configured JSON-bank pattern."""
+    from .reports import explain_match as _explain_match
+
+    return _explain_match(bank, entity_id, name_id, pattern_id, options=options)
 
 
 def _extract_records(compiled: CompiledBank, text: str) -> list[MatchRecord]:

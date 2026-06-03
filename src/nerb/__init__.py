@@ -19,12 +19,15 @@ from .config import (
 from .engines import clear_compiled_bank_cache, compiled_bank_cache_info
 from .extraction import (
     ExtractionError,
+    explain_match,
     extract_batch,
     extract_file,
     extract_named_entities,
     extract_named_entities_records,
     extract_named_entity,
     extract_named_entity_records,
+    extract_report,
+    extract_report_batch,
     extract_text,
 )
 from .named_entities import NamedEntity, NamedEntityList
@@ -65,11 +68,14 @@ __all__ = [
     "compiled_bank_cache_info",
     "extract_batch",
     "extract_file",
+    "extract_report",
+    "extract_report_batch",
     "extract_named_entities",
     "extract_named_entities_records",
     "extract_named_entity",
     "extract_named_entity_records",
     "extract_text",
+    "explain_match",
     "hash_bank",
     "load_bank",
     "load_config",
