@@ -13,6 +13,7 @@ from .diagnostics import (
     DIAGNOSTIC_ERROR,
     DIAGNOSTIC_WARNING,
     FLAGS_DUPLICATE,
+    FLAGS_UNSUPPORTED,
     ID_INVALID,
     SCHEMA_ADDITIONAL_PROPERTY,
     SCHEMA_MIN_PROPERTIES,
@@ -251,6 +252,7 @@ def _required_property(error: ValidationError) -> str | None:
 
 
 def _diagnostic_code(error: ValidationError) -> str:
+    path_parts = list(error.path)
     if error.validator == "required":
         return SCHEMA_REQUIRED
     if error.validator == "additionalProperties":
@@ -259,6 +261,8 @@ def _diagnostic_code(error: ValidationError) -> str:
         return SCHEMA_MIN_PROPERTIES
     if error.validator == "type":
         return SCHEMA_TYPE
+    if error.validator == "enum" and len(path_parts) >= 2 and path_parts[-2] in {"default_regex_flags", "regex_flags"}:
+        return FLAGS_UNSUPPORTED
     return f"schema.{error.validator}"
 
 

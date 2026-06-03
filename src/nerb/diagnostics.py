@@ -12,7 +12,20 @@ SCHEMA_MIN_PROPERTIES = "schema.min_properties"
 SCHEMA_TYPE = "schema.type"
 ID_INVALID = "id.invalid"
 FLAGS_DUPLICATE = "flags.duplicate"
+FLAGS_UNSUPPORTED = "flags.unsupported"
 JSON_PARSE = "json.parse"
+ENGINE_UNSUPPORTED = "engine.unsupported"
+PATCH_INVALID = "patch.invalid"
+REGEX_CAPTURE_CONFLICT = "regex.capture_conflict"
+REGEX_COMPILE_ERROR = "regex.compile_error"
+REGEX_COMPOSE_COMPILE_ERROR = "regex.compose_compile_error"
+REGEX_EXPENSIVE_PROBE = "regex.expensive_probe"
+REGEX_EXPENSIVE_STATIC = "regex.expensive_static"
+REGEX_LITERAL_CANDIDATE = "regex.literal_candidate"
+REGEX_MATCHES_EMPTY = "regex.matches_empty"
+REGEX_NORMALIZATION_COMPILE_ERROR = "regex.normalization_compile_error"
+REGEX_NORMALIZED_CHANGED = "regex.normalized_changed"
+REGEX_SHORT_UNBOUNDED = "regex.short_unbounded"
 
 Diagnostic = dict[str, Any]
 
@@ -21,8 +34,21 @@ __all__ = [
     "DIAGNOSTIC_INFO",
     "DIAGNOSTIC_WARNING",
     "FLAGS_DUPLICATE",
+    "FLAGS_UNSUPPORTED",
+    "ENGINE_UNSUPPORTED",
     "ID_INVALID",
     "JSON_PARSE",
+    "PATCH_INVALID",
+    "REGEX_CAPTURE_CONFLICT",
+    "REGEX_COMPILE_ERROR",
+    "REGEX_COMPOSE_COMPILE_ERROR",
+    "REGEX_EXPENSIVE_PROBE",
+    "REGEX_EXPENSIVE_STATIC",
+    "REGEX_LITERAL_CANDIDATE",
+    "REGEX_MATCHES_EMPTY",
+    "REGEX_NORMALIZATION_COMPILE_ERROR",
+    "REGEX_NORMALIZED_CHANGED",
+    "REGEX_SHORT_UNBOUNDED",
     "SCHEMA_ADDITIONAL_PROPERTY",
     "SCHEMA_MIN_PROPERTIES",
     "SCHEMA_REQUIRED",
@@ -42,6 +68,7 @@ def diagnostic(
     why: str | None = None,
     suggested_fix: str | None = None,
     suggested_patch: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> Diagnostic:
     """Build a JSON-compatible diagnostic object with stable core fields."""
     item: Diagnostic = {"severity": severity, "code": code, "path": path, "message": message}
@@ -51,6 +78,8 @@ def diagnostic(
         item["suggested_fix"] = suggested_fix
     if suggested_patch is not None:
         item["suggested_patch"] = suggested_patch
+    if metadata is not None:
+        item["metadata"] = metadata
     return item
 
 
