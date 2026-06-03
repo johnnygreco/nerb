@@ -135,7 +135,10 @@ def canonicalize_bank(bank: Mapping[str, Any]) -> dict[str, Any]:
 
 def hash_bank(bank: Mapping[str, Any]) -> str:
     """Return a sha256 hash computed from canonical JSON."""
-    canonical_bank = canonicalize_bank(bank)
+    return _hash_canonical_bank(canonicalize_bank(bank))
+
+
+def _hash_canonical_bank(canonical_bank: Mapping[str, Any]) -> str:
     payload = json.dumps(canonical_bank, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 

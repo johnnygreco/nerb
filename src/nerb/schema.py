@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Iterable, Mapping
@@ -12,9 +13,12 @@ from jsonschema.validators import extend
 from .diagnostics import (
     DIAGNOSTIC_ERROR,
     DIAGNOSTIC_WARNING,
+    EVAL_REFS_LARGE,
     FLAGS_DUPLICATE,
     FLAGS_UNSUPPORTED,
     ID_INVALID,
+    METADATA_LARGE,
+    METADATA_TOO_LARGE,
     SCHEMA_ADDITIONAL_PROPERTY,
     SCHEMA_MIN_PROPERTIES,
     SCHEMA_REQUIRED,
@@ -30,6 +34,11 @@ ID_RE = re.compile(ID_PATTERN)
 STATUS_VALUES = ("draft", "active", "inactive", "deprecated")
 UNICODE_NORMALIZATION_VALUES = ("none", "NFC", "NFKC")
 REGEX_FLAG_ORDER = ("ASCII", "IGNORECASE", "MULTILINE", "DOTALL", "VERBOSE")
+MAX_DESCRIPTION_LENGTH = 2_000
+MAX_PATTERN_VALUE_LENGTH = 10_000
+MAX_EVAL_REFS_PER_OBJECT = 1_000
+METADATA_WARNING_BYTES = 16 * 1024
+METADATA_ERROR_BYTES = 1024 * 1024
 
 
 def _is_json_array(_checker: Any, instance: Any) -> bool:
@@ -91,8 +100,8 @@ PATTERN_SCHEMA: dict[str, Any] = {
     "required": ["kind", "value", "description", "status", "priority", "metadata"],
     "properties": {
         "kind": {"type": "string", "enum": ["literal", "regex"]},
-        "value": {"type": "string", "minLength": 1},
-        "description": {"type": "string"},
+        "value": {"type": "string", "minLength": 1, "maxLength": MAX_PATTERN_VALUE_LENGTH},
+        "description": {"type": "string", "maxLength": MAX_DESCRIPTION_LENGTH},
         "status": {"type": "string", "enum": list(STATUS_VALUES)},
         "priority": {"type": "integer"},
         "regex_flags": REGEX_FLAGS_SCHEMA,
@@ -139,7 +148,7 @@ NAME_SCHEMA: dict[str, Any] = {
     "required": ["canonical", "description", "status", "patterns", "metadata"],
     "properties": {
         "canonical": {"type": "string"},
-        "description": {"type": "string"},
+        "description": {"type": "string", "maxLength": MAX_DESCRIPTION_LENGTH},
         "status": {"type": "string", "enum": list(STATUS_VALUES)},
         "patterns": {
             "type": "object",
@@ -157,7 +166,7 @@ ENTITY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["description", "status", "regex_flags", "names", "metadata"],
     "properties": {
-        "description": {"type": "string"},
+        "description": {"type": "string", "maxLength": MAX_DESCRIPTION_LENGTH},
         "status": {"type": "string", "enum": list(STATUS_VALUES)},
         "regex_flags": REGEX_FLAGS_SCHEMA,
         "names": {
@@ -196,7 +205,7 @@ BANK_SCHEMA: dict[str, Any] = {
         "schema_version": {"type": "string", "const": SCHEMA_VERSION},
         "id": {"type": "string", "pattern": ID_PATTERN},
         "name": {"type": "string"},
-        "description": {"type": "string"},
+        "description": {"type": "string", "maxLength": MAX_DESCRIPTION_LENGTH},
         "version": {"type": "string"},
         "status": {"type": "string", "enum": list(STATUS_VALUES)},
         "created_at": {"type": "string"},
@@ -223,6 +232,11 @@ __all__ = [
     "BANK_SCHEMA_VALIDATOR",
     "ID_PATTERN",
     "ID_RE",
+    "MAX_DESCRIPTION_LENGTH",
+    "MAX_EVAL_REFS_PER_OBJECT",
+    "MAX_PATTERN_VALUE_LENGTH",
+    "METADATA_ERROR_BYTES",
+    "METADATA_WARNING_BYTES",
     "REGEX_FLAG_ORDER",
     "SCHEMA_VERSION",
     "STATUS_VALUES",
@@ -453,12 +467,77 @@ def _iter_duplicate_flag_diagnostics(bank: Any) -> Iterable[Diagnostic]:
                     )
 
 
+def _metadata_size_diagnostic(path: str, size_bytes: int) -> Diagnostic | None:
+    if size_bytes > METADATA_ERROR_BYTES:
+        return diagnostic(
+            DIAGNOSTIC_ERROR,
+            METADATA_TOO_LARGE,
+            path,
+            f"Metadata exceeds the hard limit of {METADATA_ERROR_BYTES} serialized JSON bytes.",
+            metadata={"bytes": size_bytes, "limit": METADATA_ERROR_BYTES},
+        )
+    if size_bytes > METADATA_WARNING_BYTES:
+        return diagnostic(
+            DIAGNOSTIC_WARNING,
+            METADATA_LARGE,
+            path,
+            f"Metadata exceeds the review threshold of {METADATA_WARNING_BYTES} serialized JSON bytes.",
+            metadata={"bytes": size_bytes, "limit": METADATA_WARNING_BYTES},
+        )
+    return None
+
+
+def _iter_resource_limit_diagnostics(bank: Any) -> Iterable[Diagnostic]:
+    def visit(value: Any, path: list[Any]) -> Iterable[Diagnostic]:
+        if isinstance(value, Mapping):
+            eval_refs = value.get("eval_refs")
+            if isinstance(eval_refs, list) and len(eval_refs) > MAX_EVAL_REFS_PER_OBJECT:
+                yield diagnostic(
+                    DIAGNOSTIC_WARNING,
+                    EVAL_REFS_LARGE,
+                    _json_pointer([*path, "eval_refs"]),
+                    f"eval_refs contains more than {MAX_EVAL_REFS_PER_OBJECT} references on one object.",
+                    metadata={"count": len(eval_refs), "limit": MAX_EVAL_REFS_PER_OBJECT},
+                )
+
+            metadata = value.get("metadata")
+            if isinstance(metadata, Mapping):
+                try:
+                    payload = json.dumps(
+                        metadata,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    )
+                except (TypeError, ValueError):
+                    payload = None
+                if payload is not None:
+                    metadata_diagnostic = _metadata_size_diagnostic(
+                        _json_pointer([*path, "metadata"]),
+                        len(payload.encode("utf-8")),
+                    )
+                    if metadata_diagnostic is not None:
+                        yield metadata_diagnostic
+
+            for key, child in value.items():
+                if key == "metadata":
+                    continue
+                yield from visit(child, [*path, key])
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                yield from visit(child, [*path, index])
+
+    yield from visit(bank, [])
+
+
 def validate_bank_schema(bank: Any) -> dict[str, Any]:
     """Validate a bank object against the Milestone 1 JSON Schema layer."""
     diagnostics = [
         *_iter_schema_diagnostics(bank),
         *_iter_invalid_ids(bank),
         *_iter_duplicate_flag_diagnostics(bank),
+        *_iter_resource_limit_diagnostics(bank),
     ]
     diagnostics.sort(key=lambda item: (item["path"], item["severity"], item["code"], item["message"]))
     return {"valid": not has_errors(diagnostics), "diagnostics": diagnostics}

@@ -18,9 +18,12 @@ ENGINE_UNSUPPORTED = "engine.unsupported"
 EVAL_NEGATIVE_FAILED = "eval.negative_failed"
 EVAL_POSITIVE_FAILED = "eval.positive_failed"
 EVAL_RECORD_INVALID = "eval.record_invalid"
+EVAL_REFS_LARGE = "eval_refs.large"
 EVAL_REF_TOO_LARGE = "eval.ref_too_large"
 EVAL_REF_UNRESOLVED = "eval.ref_unresolved"
 EVAL_REF_UNSUPPORTED = "eval.ref_unsupported"
+METADATA_LARGE = "metadata.large"
+METADATA_TOO_LARGE = "metadata.too_large"
 PATCH_INVALID = "patch.invalid"
 REGEX_CAPTURE_CONFLICT = "regex.capture_conflict"
 REGEX_COMPILE_ERROR = "regex.compile_error"
@@ -46,11 +49,14 @@ __all__ = [
     "EVAL_NEGATIVE_FAILED",
     "EVAL_POSITIVE_FAILED",
     "EVAL_RECORD_INVALID",
+    "EVAL_REFS_LARGE",
     "EVAL_REF_TOO_LARGE",
     "EVAL_REF_UNRESOLVED",
     "EVAL_REF_UNSUPPORTED",
     "ID_INVALID",
     "JSON_PARSE",
+    "METADATA_LARGE",
+    "METADATA_TOO_LARGE",
     "PATCH_INVALID",
     "REGEX_CAPTURE_CONFLICT",
     "REGEX_COMPILE_ERROR",

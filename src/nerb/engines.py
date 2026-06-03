@@ -5,9 +5,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .bank import canonicalize_bank, hash_bank
+from .bank import _hash_canonical_bank, canonicalize_bank
 from .diagnostics import Diagnostic, has_errors
-from .records import MatchRecord, PatternIdentity
+from .records import MatchRecord, PatternIdentity, record_sort_key
 from .schema import STATUS_VALUES, validate_bank_schema
 
 DEFAULT_INCLUDE_STATUSES = ("active",)
@@ -103,6 +103,7 @@ class CompiledBank:
         records: list[MatchRecord] = []
         for matcher in self.matchers:
             records.extend(matcher.finditer(text))
+        records.sort(key=record_sort_key)
         return records
 
 
@@ -168,21 +169,16 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
     if resolved.engine != DEFAULT_ENGINE_NAME:
         raise ExtractionError("Extraction engine must be 'python_re' for this milestone.")
 
-    schema_result = validate_bank_schema(bank)
-    diagnostics = schema_result["diagnostics"]
-    if has_errors(diagnostics):
-        raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics)
-
-    from .validation import validate_bank
-
-    validation_result = validate_bank(bank, level="standard", engine=resolved.engine)
-    validation_diagnostics = validation_result["diagnostics"]
-    if has_errors(validation_diagnostics):
-        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", validation_diagnostics)
-
-    canonical_bank = canonicalize_bank(bank)
-    bank_hash = hash_bank(canonical_bank)
-    normalization = str(canonical_bank["unicode_normalization"])
+    try:
+        canonical_bank = canonicalize_bank(bank)
+        bank_hash = _hash_canonical_bank(canonical_bank)
+    except TypeError as exc:
+        schema_result = validate_bank_schema(bank)
+        diagnostics = schema_result["diagnostics"]
+        if has_errors(diagnostics):
+            raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics) from exc
+        raise
+    normalization = str(canonical_bank.get("unicode_normalization", "none"))
 
     from .literal_engine import LiteralMatcher
     from .python_re_engine import PythonReEngine
@@ -200,6 +196,18 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
     if cached is not None:
         _CACHE_HITS += 1
         return cached, True
+
+    schema_result = validate_bank_schema(bank)
+    diagnostics = schema_result["diagnostics"]
+    if has_errors(diagnostics):
+        raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics)
+
+    from .validation import validate_bank
+
+    validation_result = validate_bank(canonical_bank, level="standard", engine=resolved.engine)
+    validation_diagnostics = validation_result["diagnostics"]
+    if has_errors(validation_diagnostics):
+        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", validation_diagnostics)
 
     regex_patterns, literal_patterns = _eligible_patterns(canonical_bank, resolved.include_statuses)
     compiled = CompiledBank(
