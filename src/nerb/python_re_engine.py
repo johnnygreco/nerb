@@ -48,6 +48,7 @@ class PythonReEngine:
     def __init__(self, patterns: tuple[EnginePattern, ...], *, normalization: str) -> None:
         self.normalization = normalization
         self._patterns = patterns
+        self.pattern_count = len(patterns)
         self.entity_shards = self._compile_entity_shards(patterns)
 
     def finditer(self, text: str) -> list[MatchRecord]:

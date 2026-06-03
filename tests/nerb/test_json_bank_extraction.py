@@ -265,6 +265,15 @@ def test_extraction_rejects_runtime_invalid_banks(minimal_bank):
     assert any(diagnostic["code"] == "regex.matches_empty" for diagnostic in exc_info.value.diagnostics)
 
 
+def test_extraction_rejects_non_json_schema_invalid_banks_with_diagnostics(minimal_bank):
+    minimal_bank["metadata"]["bad"] = object()
+
+    with pytest.raises(ExtractionError, match="schema validation") as exc_info:
+        extract_text(minimal_bank, "Acme Corp")
+
+    assert any(diagnostic["path"] == "/metadata/bad" for diagnostic in exc_info.value.diagnostics)
+
+
 def test_extraction_option_validation_rejects_invalid_statuses_and_non_json_options(minimal_bank):
     with pytest.raises(ExtractionError, match="valid status strings"):
         extract_text(minimal_bank, "Acme Corp", options={"include_statuses": ["active", None]})
@@ -325,3 +334,21 @@ def test_compiled_bank_cache_key_dimensions_are_exposed(minimal_bank):
     assert with_status["engine"]["cache"]["key"]["include_statuses"] == ["active", "inactive"]
     assert with_options["engine"]["cache"]["key"]["engine_options"] == {"probe": "b"}
     assert with_normalization["engine"]["cache"]["key"]["normalization"] == "NFKC"
+
+
+def test_compiled_bank_cache_hit_skips_runtime_validation(monkeypatch, minimal_bank):
+    import nerb.validation as validation
+
+    clear_compiled_bank_cache()
+
+    first = extract_text(minimal_bank, "Acme Corp")
+
+    def fail_runtime_validation(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("runtime validation should not run for a compiled-bank cache hit")
+
+    monkeypatch.setattr(validation, "validate_bank", fail_runtime_validation)
+
+    second = extract_text(minimal_bank, "Acme Corp")
+
+    assert first["engine"]["cache"]["hit"] is False
+    assert second["engine"]["cache"]["hit"] is True

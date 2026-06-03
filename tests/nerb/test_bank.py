@@ -14,6 +14,7 @@ from nerb import (
     load_bank,
     validate_bank_schema,
 )
+from nerb.diagnostics import EVAL_REFS_LARGE, METADATA_LARGE, METADATA_TOO_LARGE
 
 
 @pytest.fixture
@@ -79,6 +80,28 @@ def test_metadata_must_be_json_compatible(minimal_bank):
     assert result["valid"] is False
     assert any(diagnostic["path"] == "/metadata/not_json" for diagnostic in result["diagnostics"])
     assert any(diagnostic["path"] == "/metadata/not_finite_json" for diagnostic in result["diagnostics"])
+
+
+def test_schema_resource_limits_report_hard_errors_and_warnings(minimal_bank):
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    minimal_bank["description"] = "x" * 2_001
+    minimal_bank["metadata"]["huge"] = "x" * (1024 * 1024)
+    pattern["value"] = "A" * 10_001
+    pattern["eval_refs"] = [f"eval_{index}.jsonl" for index in range(1_001)]
+    pattern["metadata"]["large"] = "x" * (16 * 1024)
+
+    result = validate_bank_schema(minimal_bank)
+    diagnostic_index = {(diagnostic["code"], diagnostic["path"]) for diagnostic in result["diagnostics"]}
+
+    assert result["valid"] is False
+    assert ("schema.maxLength", "/description") in diagnostic_index
+    assert ("schema.maxLength", "/entities/customer/names/acme_corp/patterns/primary/value") in diagnostic_index
+    assert (
+        EVAL_REFS_LARGE,
+        "/entities/customer/names/acme_corp/patterns/primary/eval_refs",
+    ) in diagnostic_index
+    assert (METADATA_LARGE, "/entities/customer/names/acme_corp/patterns/primary/metadata") in diagnostic_index
+    assert (METADATA_TOO_LARGE, "/metadata") in diagnostic_index
 
 
 def test_invalid_ids_produce_id_invalid_diagnostics(minimal_bank):
