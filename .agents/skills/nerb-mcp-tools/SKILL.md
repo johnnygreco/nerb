@@ -6,7 +6,7 @@ description: Use when implementing, testing, or documenting NERB Model Context P
 # NERB MCP Tools
 
 NERB exposes a local MCP server through `src/nerb/mcp_server.py` and the `nerb-mcp` console entry point on Python 3.10
-and newer. Core NERB remains Python 3.8-compatible; MCP support follows the official Python MCP SDK's floor.
+and newer. The current package targets Python 3.10 and newer, matching the official Python MCP SDK's floor.
 
 ## Surface
 

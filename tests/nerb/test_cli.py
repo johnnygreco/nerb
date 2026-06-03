@@ -25,7 +25,7 @@ from nerb import (
     extract_file as extract_json_file,
 )
 from nerb import (
-    extract_report as extract_json_report,
+    extract_report_file as extract_json_report_file,
 )
 from nerb import (
     extract_text as extract_json_text,
@@ -219,7 +219,7 @@ def test_json_bank_extraction_commands_match_helpers(tmp_path, test_data_path):
     clear_compiled_bank_cache()
     report_result = runner.invoke(app, ["extract-report", "--bank", str(bank_path), "--file", str(document_path)])
     clear_compiled_bank_cache()
-    expected_report = extract_json_report(bank, text)
+    expected_report = extract_json_report_file(bank, document_path)
 
     assert text_result.exit_code == 0
     assert file_result.exit_code == 0

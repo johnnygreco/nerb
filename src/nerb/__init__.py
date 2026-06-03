@@ -31,6 +31,7 @@ from .extraction import (
     extract_named_entity_records,
     extract_report,
     extract_report_batch,
+    extract_report_file,
     extract_text,
 )
 from .named_entities import NamedEntity, NamedEntityList
@@ -75,6 +76,7 @@ __all__ = [
     "extract_file",
     "extract_report",
     "extract_report_batch",
+    "extract_report_file",
     "extract_named_entities",
     "extract_named_entities_records",
     "extract_named_entity",

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from .bank import canonicalize_bank
@@ -12,7 +13,7 @@ from .extraction import _extract_prepared_batch, _prepare_batch_documents, extra
 from .records import MatchRecord, record_sort_key
 from .schema import REGEX_FLAG_ORDER, validate_bank_schema
 
-__all__ = ["extract_report", "extract_report_batch", "explain_match"]
+__all__ = ["extract_report", "extract_report_batch", "extract_report_file", "explain_match"]
 
 DEFAULT_OVERLAP_POLICY = "priority"
 DEFAULT_CONTEXT_CHARS = 80
@@ -49,6 +50,35 @@ def extract_report(
     extraction = extract_text(bank, text, options=options)
     canonical_bank = canonicalize_bank(bank)
     return _build_report(canonical_bank, text, extraction, report_options)
+
+
+def extract_report_file(
+    bank: Mapping[str, Any],
+    file_path: str | Path,
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a single-document extraction report for an explicit UTF-8 file."""
+    report_options = _resolve_report_options(options)
+    prepared_documents, combined_bytes = _prepare_batch_documents(
+        [{"document_id": "document_0", "file_path": str(file_path)}],
+        options=options,
+    )
+    batch = _extract_prepared_batch(bank, prepared_documents, combined_bytes=combined_bytes, options=options)
+    _document_id, _source, text = prepared_documents[0]
+    document_result = batch["documents"][0]
+    canonical_bank = canonicalize_bank(bank)
+    return _build_report(
+        canonical_bank,
+        text,
+        {
+            "bank": batch["bank"],
+            "engine": batch["engine"],
+            "source": document_result["source"],
+            "records": document_result["records"],
+        },
+        report_options,
+    )
 
 
 def extract_report_batch(

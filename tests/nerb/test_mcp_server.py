@@ -46,6 +46,9 @@ from nerb import (
     extract_report_batch as extract_report_batch_helper,
 )
 from nerb import (
+    extract_report_file as extract_report_file_helper,
+)
+from nerb import (
     extract_text as extract_text_helper,
 )
 from nerb import (
@@ -212,7 +215,7 @@ def test_json_bank_mcp_extraction_and_reports_match_helpers(tmp_path, test_data_
     clear_compiled_bank_cache()
     file_report_result = extract_report(bank_path=str(bank_path), file_path=str(document_path))
     clear_compiled_bank_cache()
-    expected_file_report = extract_report_helper(bank, text)
+    expected_file_report = extract_report_file_helper(bank, document_path)
     clear_compiled_bank_cache()
     report_batch_result = extract_report_batch(documents, bank=bank)
     clear_compiled_bank_cache()
@@ -300,11 +303,14 @@ def test_json_bank_mcp_invalid_bank_returns_diagnostics(tmp_path):
     invalid_bank_path.write_text(json.dumps(invalid_bank), encoding="utf-8")
 
     validation = validate_bank(bank=invalid_bank)
+    direct_extraction = extract_text("Acme Corp", bank=invalid_bank)
     extraction = extract_text("Acme Corp", bank_path=str(invalid_bank_path))
 
     assert validation["valid"] is False
+    assert direct_extraction["valid"] is False
     assert extraction["valid"] is False
     assert validation["diagnostics"][0]["code"].startswith("schema.")
+    assert direct_extraction["diagnostics"][0]["code"].startswith("schema.")
     assert extraction["diagnostics"][0]["code"].startswith("schema.")
 
 

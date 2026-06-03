@@ -274,6 +274,13 @@ def test_extraction_rejects_non_json_schema_invalid_banks_with_diagnostics(minim
     assert any(diagnostic["path"] == "/metadata/bad" for diagnostic in exc_info.value.diagnostics)
 
 
+def test_extraction_rejects_schema_invalid_banks_before_status_gate():
+    with pytest.raises(ExtractionError, match="schema validation") as exc_info:
+        extract_text({"schema_version": "nerb.bank.v1"}, "Acme Corp")
+
+    assert any(diagnostic["code"] == "schema.required" for diagnostic in exc_info.value.diagnostics)
+
+
 def test_extraction_option_validation_rejects_invalid_statuses_and_non_json_options(minimal_bank):
     with pytest.raises(ExtractionError, match="valid status strings"):
         extract_text(minimal_bank, "Acme Corp", options={"include_statuses": ["active", None]})
