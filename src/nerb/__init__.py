@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from .bank import BankError, BankLoadError, BankSchemaError, bank_stats, canonicalize_bank, hash_bank, load_bank
+from .benchmarks import benchmark_bank, regress_bank
 from .config import (
     DEFAULT_CONFIG_ENV_VAR,
     DEFAULT_CONFIG_FILENAME,
@@ -16,6 +17,7 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
+from .diff import diff_banks
 from .engines import clear_compiled_bank_cache, compiled_bank_cache_info
 from .evals import eval_bank
 from .extraction import (
@@ -51,6 +53,7 @@ __all__ = [
     "BankLoadError",
     "BankPatchError",
     "BankSchemaError",
+    "benchmark_bank",
     "ConfigError",
     "DEFAULT_CONFIG_ENV_VAR",
     "DEFAULT_CONFIG_FILENAME",
@@ -67,6 +70,7 @@ __all__ = [
     "canonicalize_bank",
     "clear_compiled_bank_cache",
     "compiled_bank_cache_info",
+    "diff_banks",
     "extract_batch",
     "extract_file",
     "extract_report",
@@ -85,6 +89,7 @@ __all__ = [
     "package_path",
     "repo_path",
     "remove_entity_pattern",
+    "regress_bank",
     "resolve_default_config_path",
     "save_config",
     "validate_bank_schema",
