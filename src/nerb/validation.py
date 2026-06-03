@@ -5,6 +5,7 @@ import signal
 import threading
 import time
 import unicodedata
+import warnings
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -558,8 +559,10 @@ def _composed_compile_diagnostics(
         ]
         shard = "|".join(alternatives)
         try:
-            re.compile(shard)
-        except re.error as exc:
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                re.compile(shard)
+        except (DeprecationWarning, re.error) as exc:
             diagnostics.append(
                 diagnostic(
                     DIAGNOSTIC_ERROR,
