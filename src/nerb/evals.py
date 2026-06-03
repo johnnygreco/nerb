@@ -637,9 +637,68 @@ def _match_diagnostics(match: Any, index: int, text: str | None) -> list[Diagnos
                 "Positive eval match entity and entity_id must agree when both are provided.",
             )
         )
-    if "captures" in match and not isinstance(match["captures"], Mapping):
-        diagnostics.append(_type_diagnostic(f"{path}/captures", "Positive eval match captures must be an object."))
+    if "captures" in match:
+        diagnostics.extend(_captures_diagnostics(match["captures"], path))
     return diagnostics
+
+
+def _captures_diagnostics(captures: Any, match_path: str) -> list[Diagnostic]:
+    if not isinstance(captures, Mapping):
+        return [_type_diagnostic(f"{match_path}/captures", "Positive eval match captures must be an object.")]
+
+    diagnostics: list[Diagnostic] = []
+    for capture_name, capture in captures.items():
+        capture_path = f"{match_path}/captures/{_json_pointer_part(str(capture_name))}"
+        if not isinstance(capture_name, str):
+            diagnostics.append(
+                _type_diagnostic(f"{match_path}/captures", "Positive eval capture names must be strings.")
+            )
+            continue
+        if not isinstance(capture, Mapping):
+            diagnostics.append(_type_diagnostic(capture_path, "Positive eval capture must be an object."))
+            continue
+
+        for field in sorted({"string", "start", "end"} - set(capture)):
+            diagnostics.append(_missing_diagnostic(f"{capture_path}/{field}"))
+        for field in sorted(set(capture) - {"string", "start", "end"}):
+            diagnostics.append(
+                diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    SCHEMA_ADDITIONAL_PROPERTY,
+                    f"{capture_path}/{field}",
+                    f"Additional eval capture property {field!r} is not allowed.",
+                )
+            )
+
+        if not isinstance(capture.get("string"), str):
+            diagnostics.append(
+                _type_diagnostic(f"{capture_path}/string", "Positive eval capture string must be a string.")
+            )
+        if not _is_non_negative_int(capture.get("start")):
+            diagnostics.append(
+                _type_diagnostic(f"{capture_path}/start", "Positive eval capture start must be a non-negative integer.")
+            )
+        if not _is_non_negative_int(capture.get("end")):
+            diagnostics.append(
+                _type_diagnostic(f"{capture_path}/end", "Positive eval capture end must be a non-negative integer.")
+            )
+        if _is_non_negative_int(capture.get("start")) and _is_non_negative_int(capture.get("end")):
+            start = cast(int, capture["start"])
+            end = cast(int, capture["end"])
+            if end < start:
+                diagnostics.append(
+                    diagnostic(
+                        DIAGNOSTIC_ERROR,
+                        EVAL_RECORD_INVALID,
+                        f"{capture_path}/end",
+                        "Positive eval capture end must be greater than or equal to start.",
+                    )
+                )
+    return diagnostics
+
+
+def _json_pointer_part(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
 
 
 def _is_non_negative_int(value: Any) -> bool:
@@ -781,11 +840,11 @@ def _normalize_expected_match(match: Mapping[str, Any], scope: EvalScope) -> dic
     expected.pop("entity", None)
     expected.pop("name", None)
 
-    if scope.entity_id is not None:
+    if scope.entity_id is not None and "entity_id" not in expected:
         expected["entity_id"] = scope.entity_id
-    if scope.name_id is not None:
+    if scope.name_id is not None and "name_id" not in expected:
         expected["name_id"] = scope.name_id
-    if scope.pattern_id is not None:
+    if scope.pattern_id is not None and "pattern_id" not in expected:
         expected["pattern_id"] = scope.pattern_id
     return expected
 

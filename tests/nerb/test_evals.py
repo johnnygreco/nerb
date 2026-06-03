@@ -201,6 +201,41 @@ def test_eval_bank_positive_failure_includes_repair_diagnostic_and_raw_details(t
     ]
 
 
+def test_eval_bank_scoped_positive_preserves_explicit_wrong_ids_as_failure(tmp_path, minimal_bank):
+    eval_ref = _write_jsonl(
+        tmp_path / "wrong_ids.jsonl",
+        [
+            _positive_record(
+                match={
+                    "entity_id": "vendor",
+                    "name_id": "wrong",
+                    "pattern_id": "wrong",
+                    "string": "Acme Corp",
+                    "start": 0,
+                    "end": 9,
+                }
+            )
+        ],
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"]["passed"] is False
+    assert result["summary"]["positive_failed"] == 1
+    assert result["failures"][0]["expected"] == [
+        {
+            "string": "Acme Corp",
+            "start": 0,
+            "end": 9,
+            "entity_id": "vendor",
+            "name_id": "wrong",
+            "pattern_id": "wrong",
+        }
+    ]
+
+
 def test_eval_bank_negative_failure_uses_scoped_actuals_and_diagnostic(tmp_path, minimal_bank):
     eval_ref = _write_jsonl(tmp_path / "negative_fail.jsonl", [_negative_record("Acme Corp")])
     minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["eval_refs"] = [eval_ref]
@@ -237,6 +272,43 @@ def test_eval_bank_invalid_jsonl_records_return_diagnostics(tmp_path, minimal_ba
     assert [failure["record"] for failure in result["failures"]] == [0, 1]
     assert result["failures"][0]["diagnostics"][0]["code"] == SCHEMA_ADDITIONAL_PROPERTY
     assert result["failures"][1]["diagnostics"][0]["code"] == JSON_PARSE
+
+
+def test_eval_bank_invalid_capture_records_return_schema_diagnostics(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "invalid_captures.jsonl"
+    eval_ref_path.write_text(
+        json.dumps(
+            {
+                "type": "positive",
+                "text": "Acme Corp",
+                "matches": [
+                    {
+                        "string": "Acme Corp",
+                        "start": 0,
+                        "end": 9,
+                        "captures": {"alias": "Acme Corp", "extra": {"string": "x", "start": 0, "end": 1, "bad": True}},
+                    }
+                ],
+                "metadata": {},
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["eval_refs"] = [
+        eval_ref_path.name
+    ]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"]["passed"] is False
+    diagnostics = result["failures"][0]["diagnostics"]
+    assert {diagnostic["code"] for diagnostic in diagnostics} == {"schema.type", "schema.additional_property"}
+    assert {diagnostic["path"] for diagnostic in diagnostics} == {
+        "/matches/0/captures/alias",
+        "/matches/0/captures/extra/bad",
+    }
 
 
 def test_eval_bank_relative_refs_require_base_path(minimal_bank):
