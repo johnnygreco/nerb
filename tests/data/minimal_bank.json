@@ -1,0 +1,43 @@
+{
+  "schema_version": "nerb.bank.v1",
+  "id": "company_entities",
+  "name": "Company Entities",
+  "description": "Known private entities for agent workflows.",
+  "version": "2026.06.03",
+  "status": "active",
+  "created_at": "2026-06-03T00:00:00Z",
+  "updated_at": "2026-06-03T00:00:00Z",
+  "unicode_normalization": "none",
+  "default_regex_flags": ["IGNORECASE"],
+  "entities": {
+    "customer": {
+      "description": "Customer organizations and accounts.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "acme_corp": {
+          "canonical": "Acme Corp",
+          "description": "Strategic customer account.",
+          "status": "active",
+          "patterns": {
+            "primary": {
+              "kind": "literal",
+              "value": "Acme Corp",
+              "description": "Exact Acme Corp alias.",
+              "status": "active",
+              "priority": 100,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {}
+            }
+          },
+          "metadata": {}
+        }
+      },
+      "metadata": {}
+    }
+  },
+  "metadata": {}
+}

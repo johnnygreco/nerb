@@ -4,7 +4,7 @@ import sys
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
+from typing import Any, NoReturn
 
 import typer
 import yaml
@@ -66,7 +66,7 @@ def _config_option() -> Any:
     )
 
 
-def _command_config_path(ctx: typer.Context, config: Optional[Path]) -> Path:
+def _command_config_path(ctx: typer.Context, config: Path | None) -> Path:
     if config is not None:
         return resolve_default_config_path(config)
 
@@ -104,9 +104,9 @@ def _save_command_config(config: PatternConfig, config_path: Path) -> None:
         _exit_error(f"Could not write config at {config_path}: {exc}")
 
 
-def _canonical_flag_names(flags: List[str]) -> List[str]:
-    flag_names: List[str] = []
-    seen: Set[str] = set()
+def _canonical_flag_names(flags: list[str]) -> list[str]:
+    flag_names: list[str] = []
+    seen: set[str] = set()
     for raw_value in flags:
         for raw_flag in raw_value.split(","):
             flag_name = raw_flag.strip()
@@ -120,14 +120,14 @@ def _canonical_flag_names(flags: List[str]) -> List[str]:
     return flag_names
 
 
-def _flag_config(entity: str, config_path: Path, flags: Optional[List[str]]) -> Optional[Union[str, List[str]]]:
+def _flag_config(entity: str, config_path: Path, flags: list[str] | None) -> str | list[str] | None:
     if not flags:
         return None
 
     flag_names = _canonical_flag_names(flags)
     if not flag_names:
         _exit_error(f"Invalid _flags for entity {entity!r} in {config_path}: Regex flag names must not be empty.")
-    flag_config: Union[str, List[str]] = flag_names[0] if len(flag_names) == 1 else flag_names
+    flag_config: str | list[str] = flag_names[0] if len(flag_names) == 1 else flag_names
     try:
         validate_regex_flags(flag_config)
     except ConfigError as exc:
@@ -138,7 +138,7 @@ def _flag_config(entity: str, config_path: Path, flags: Optional[List[str]]) -> 
 def _ensure_flag_update_allowed(
     config: PatternConfig,
     entity: str,
-    flag_config: Optional[Union[str, List[str]]],
+    flag_config: str | list[str] | None,
     *,
     force: bool,
     config_path: Path,
@@ -159,14 +159,12 @@ def _ensure_flag_update_allowed(
         _exit_error(message)
 
 
-def _with_entity_flags(
-    config: PatternConfig, entity: str, flag_config: Optional[Union[str, List[str]]]
-) -> PatternConfig:
+def _with_entity_flags(config: PatternConfig, entity: str, flag_config: str | list[str] | None) -> PatternConfig:
     if flag_config is None:
         return config
 
     updated_config = validate_pattern_config(config)
-    entity_config: Dict[str, Any] = {FLAGS_KEY: flag_config}
+    entity_config: dict[str, Any] = {FLAGS_KEY: flag_config}
     for name, pattern in updated_config[entity].items():
         if name != FLAGS_KEY:
             entity_config[name] = pattern
@@ -180,7 +178,7 @@ def _format_flags(flags: Any) -> str:
     return str(flags)
 
 
-def _echo_entity_listing(entity: str, entity_config: Dict[str, Any]) -> None:
+def _echo_entity_listing(entity: str, entity_config: dict[str, Any]) -> None:
     typer.echo(f"{entity}:")
     if FLAGS_KEY in entity_config:
         typer.echo(f"  {FLAGS_KEY}: {_format_flags(entity_config[FLAGS_KEY])}")
@@ -189,15 +187,15 @@ def _echo_entity_listing(entity: str, entity_config: Dict[str, Any]) -> None:
             typer.echo(f"  {name}")
 
 
-def _yaml_text(config: Dict[str, Any]) -> str:
+def _yaml_text(config: dict[str, Any]) -> str:
     return yaml.safe_dump(config, sort_keys=False, default_flow_style=False, allow_unicode=True).rstrip()
 
 
-def _command_config_explicit(ctx: typer.Context, config: Optional[Path]) -> bool:
+def _command_config_explicit(ctx: typer.Context, config: Path | None) -> bool:
     return config is not None or bool(ctx.obj and ctx.obj.get("config_explicit"))
 
 
-def _normalize_format_choice(output_format: str, choices: Set[str]) -> str:
+def _normalize_format_choice(output_format: str, choices: set[str]) -> str:
     normalized_format = output_format.lower()
     if normalized_format not in choices:
         formatted_choices = ", ".join(sorted(choices))
@@ -218,11 +216,11 @@ def _pattern_count(pattern_config: PatternConfig) -> int:
 
 
 def _resolve_extraction_arguments(
-    entity: Optional[str],
-    document: Optional[Path],
+    entity: str | None,
+    document: Path | None,
     *,
     all_entities: bool,
-) -> Tuple[Optional[str], Optional[Path]]:
+) -> tuple[str | None, Path | None]:
     if all_entities:
         if entity is not None and document is None:
             return None, Path(entity)
@@ -238,7 +236,7 @@ def _resolve_extraction_arguments(
     return entity, document
 
 
-def _read_extraction_text(document: Optional[Path], *, read_stdin: bool, text: Optional[str]) -> str:
+def _read_extraction_text(document: Path | None, *, read_stdin: bool, text: str | None) -> str:
     source_count = sum([document is not None, read_stdin, text is not None])
     if source_count != 1:
         _exit_error("Provide exactly one input source: DOCUMENT, --stdin, or --text.")
@@ -264,14 +262,14 @@ def _read_extraction_text(document: Optional[Path], *, read_stdin: bool, text: O
         _exit_error(f"Could not read document at {document}: {exc}")
 
 
-def _parse_pattern_definition(raw_value: str) -> Tuple[str, str]:
+def _parse_pattern_definition(raw_value: str) -> tuple[str, str]:
     name, separator, pattern = raw_value.partition("=")
     if not separator or not name.strip():
         _exit_error(f"Malformed --pattern value {raw_value!r}. Expected NAME=REGEX.")
     return name.strip(), pattern
 
 
-def _parse_detector_definition(raw_value: str) -> Tuple[str, str, str]:
+def _parse_detector_definition(raw_value: str) -> tuple[str, str, str]:
     detector_name, separator, pattern = raw_value.partition("=")
     entity, entity_separator, name = detector_name.partition(":")
     if not separator or not entity_separator or not entity.strip() or not name.strip():
@@ -289,11 +287,11 @@ def _add_inline_pattern(config: PatternConfig, entity: str, name: str, pattern: 
 def _load_extraction_config(
     ctx: typer.Context,
     config_path: Path,
-    config: Optional[Path],
+    config: Path | None,
     *,
-    inline_patterns: List[str],
-    inline_detectors: List[str],
-    selected_entity: Optional[str],
+    inline_patterns: list[str],
+    inline_detectors: list[str],
+    selected_entity: str | None,
 ) -> PatternConfig:
     if inline_patterns and selected_entity is None:
         _exit_error("--pattern requires ENTITY and cannot be used with --all.")
@@ -330,11 +328,11 @@ def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) 
 
 def _extract_records(
     pattern_config: PatternConfig,
-    selected_entity: Optional[str],
+    selected_entity: str | None,
     text: str,
     *,
     word_boundaries: bool,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     extractor = _compile_extractor(pattern_config, word_boundaries=word_boundaries)
 
     if selected_entity is None:
@@ -348,10 +346,10 @@ def _inline_detector_config(
     name: str,
     pattern: str,
     *,
-    flags: Optional[List[str]],
+    flags: list[str] | None,
     config_path: Path,
 ) -> PatternConfig:
-    entity_config: Dict[str, Any] = {}
+    entity_config: dict[str, Any] = {}
     flag_config = _flag_config(entity, config_path, flags)
     if flag_config is not None:
         entity_config[FLAGS_KEY] = flag_config
@@ -371,7 +369,7 @@ def _saved_detector_config(pattern_config: PatternConfig, entity: str, name: str
     if name == FLAGS_KEY or name not in entity_config:
         _exit_error(f"Pattern {name!r} does not exist for entity {entity!r} in {config_path}.")
 
-    selected_entity_config: Dict[str, Any] = {}
+    selected_entity_config: dict[str, Any] = {}
     if FLAGS_KEY in entity_config:
         selected_entity_config[FLAGS_KEY] = entity_config[FLAGS_KEY]
     selected_entity_config[name] = entity_config[name]
@@ -382,9 +380,9 @@ def _test_detector_config(
     config_path: Path,
     entity: str,
     name: str,
-    pattern: Optional[str],
+    pattern: str | None,
     *,
-    flags: Optional[List[str]],
+    flags: list[str] | None,
 ) -> PatternConfig:
     if pattern is not None:
         return _inline_detector_config(entity, name, pattern, flags=flags, config_path=config_path)
@@ -400,7 +398,7 @@ def _table_cell(value: Any) -> str:
     return str(value).replace("\n", "\\n").replace("\t", "\\t")
 
 
-def _format_records_table(records: List[Dict[str, Any]]) -> str:
+def _format_records_table(records: list[dict[str, Any]]) -> str:
     if not records:
         return "No matches."
 
@@ -414,7 +412,7 @@ def _format_records_table(records: List[Dict[str, Any]]) -> str:
     return f"{header}\n{separator}\n{body}"
 
 
-def _echo_records(records: List[Dict[str, Any]], output_format: str) -> None:
+def _echo_records(records: list[dict[str, Any]], output_format: str) -> None:
     normalized_format = _normalize_output_format(output_format)
     if normalized_format == "json":
         typer.echo(json.dumps(records, ensure_ascii=False))
@@ -428,12 +426,12 @@ def _echo_records(records: List[Dict[str, Any]], output_format: str) -> None:
     typer.echo(_format_records_table(records))
 
 
-def _compiled_regex_payload(entity: str, entity_config: Dict[str, Any], regex: Any) -> Dict[str, Any]:
+def _compiled_regex_payload(entity: str, entity_config: dict[str, Any], regex: Any) -> dict[str, Any]:
     groups = [
         {"name": group_name.replace("_", " "), "group": group_name, "index": index}
         for group_name, index in sorted(regex.groupindex.items(), key=lambda item: item[1])
     ]
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "entity": entity,
         "pattern": regex.pattern,
         "flags": int(regex.flags),
@@ -471,11 +469,11 @@ def _diagnostic(
     code: str,
     message: str,
     *,
-    entity: Optional[str] = None,
-    name: Optional[str] = None,
-    line: Optional[int] = None,
-) -> Dict[str, Any]:
-    diagnostic: Dict[str, Any] = {"level": level, "code": code, "message": message}
+    entity: str | None = None,
+    name: str | None = None,
+    line: int | None = None,
+) -> dict[str, Any]:
+    diagnostic: dict[str, Any] = {"level": level, "code": code, "message": message}
     if entity is not None:
         diagnostic["entity"] = entity
     if name is not None:
@@ -485,14 +483,14 @@ def _diagnostic(
     return diagnostic
 
 
-def _load_yaml_with_duplicate_diagnostics(config_path: Path) -> Tuple[Any, List[Dict[str, Any]], bool]:
-    diagnostics: List[Dict[str, Any]] = []
+def _load_yaml_with_duplicate_diagnostics(config_path: Path) -> tuple[Any, list[dict[str, Any]], bool]:
+    diagnostics: list[dict[str, Any]] = []
 
     class DuplicateKeyLoader(yaml.SafeLoader):
         pass
 
-    def construct_mapping(loader: Any, node: Any, deep: bool = False) -> Dict[Any, Any]:
-        mapping: Dict[Any, Any] = {}
+    def construct_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+        mapping: dict[Any, Any] = {}
         for key_node, value_node in node.value:
             key = loader.construct_object(key_node, deep=deep)
             try:
@@ -544,8 +542,8 @@ def _load_yaml_with_duplicate_diagnostics(config_path: Path) -> Tuple[Any, List[
         return None, diagnostics, False
 
 
-def _diagnose_suspicious_names(raw_config: Any) -> List[Dict[str, Any]]:
-    diagnostics: List[Dict[str, Any]] = []
+def _diagnose_suspicious_names(raw_config: Any) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
     if not isinstance(raw_config, dict):
         return diagnostics
 
@@ -563,8 +561,8 @@ def _diagnose_suspicious_names(raw_config: Any) -> List[Dict[str, Any]]:
         if not isinstance(entity, str) or not isinstance(entity_config, dict):
             continue
 
-        normalized_names: Dict[str, str] = {}
-        casefolded_names: Dict[str, str] = {}
+        normalized_names: dict[str, str] = {}
+        casefolded_names: dict[str, str] = {}
         for name in entity_config:
             if not isinstance(name, str) or name == FLAGS_KEY:
                 continue
@@ -613,8 +611,8 @@ def _diagnose_suspicious_names(raw_config: Any) -> List[Dict[str, Any]]:
     return diagnostics
 
 
-def _diagnose_compiled_entities(pattern_config: PatternConfig) -> List[Dict[str, Any]]:
-    diagnostics: List[Dict[str, Any]] = []
+def _diagnose_compiled_entities(pattern_config: PatternConfig) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
     for entity, entity_config in pattern_config.items():
         try:
             NERB({entity: entity_config})
@@ -632,9 +630,9 @@ def _diagnose_compiled_entities(pattern_config: PatternConfig) -> List[Dict[str,
 
 def _doctor_payload(
     config_path: Path,
-    pattern_config: Optional[PatternConfig],
-    diagnostics: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    pattern_config: PatternConfig | None,
+    diagnostics: list[dict[str, Any]],
+) -> dict[str, Any]:
     error_count = len([diagnostic for diagnostic in diagnostics if diagnostic["level"] == DIAGNOSTIC_ERROR])
     warning_count = len([diagnostic for diagnostic in diagnostics if diagnostic["level"] == DIAGNOSTIC_WARNING])
     summary_config = pattern_config or {}
@@ -651,7 +649,7 @@ def _doctor_payload(
     }
 
 
-def _format_doctor_text(payload: Dict[str, Any]) -> str:
+def _format_doctor_text(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
     lines = [f"Config doctor: {payload['config']}"]
     if payload["valid"]:
@@ -673,7 +671,7 @@ def _format_doctor_text(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _run_doctor(config_path: Path) -> Dict[str, Any]:
+def _run_doctor(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         _exit_error(f"Config file does not exist at {config_path}.")
 
@@ -681,7 +679,7 @@ def _run_doctor(config_path: Path) -> Dict[str, Any]:
     if raw_config_loaded:
         diagnostics.extend(_diagnose_suspicious_names(raw_config))
 
-    pattern_config: Optional[PatternConfig] = None
+    pattern_config: PatternConfig | None = None
     if raw_config_loaded:
         try:
             pattern_config = load_config(config_path)
@@ -711,14 +709,14 @@ def _run_doctor(config_path: Path) -> Dict[str, Any]:
 @app.callback()
 def callback(
     ctx: typer.Context,
-    version: Optional[bool] = typer.Option(
+    version: bool | None = typer.Option(
         None,
         "--version",
         callback=_version_callback,
         help="Show the installed package version and exit.",
         is_eager=True,
     ),
-    config: Optional[Path] = typer.Option(
+    config: Path | None = typer.Option(
         None,
         "--config",
         "-c",
@@ -732,17 +730,17 @@ def callback(
 @app.command("extract")
 def extract(
     ctx: typer.Context,
-    entity: Optional[str] = typer.Argument(None, help="Detector entity name, unless --all is used."),
-    document: Optional[Path] = typer.Argument(None, help="Document path to extract from."),
+    entity: str | None = typer.Argument(None, help="Detector entity name, unless --all is used."),
+    document: Path | None = typer.Argument(None, help="Document path to extract from."),
     all_entities: bool = typer.Option(False, "--all", help="Extract all configured detector entities."),
     read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
-    text: Optional[str] = typer.Option(None, "--text", help="Literal document text to extract from."),
-    inline_patterns: Optional[List[str]] = typer.Option(
+    text: str | None = typer.Option(None, "--text", help="Literal document text to extract from."),
+    inline_patterns: list[str] | None = typer.Option(
         None,
         "--pattern",
         help="Inline detector for ENTITY as NAME=REGEX. May be repeated.",
     ),
-    inline_detectors: Optional[List[str]] = typer.Option(
+    inline_detectors: list[str] | None = typer.Option(
         None,
         "--detector",
         help="Inline detector as ENTITY:NAME=REGEX. May be repeated.",
@@ -758,7 +756,7 @@ def extract(
         "--word-boundaries",
         help="Add regex word boundaries around configured detector patterns.",
     ),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Extract configured named entities from a document."""
     selected_entity, document_path = _resolve_extraction_arguments(entity, document, all_entities=all_entities)
@@ -781,11 +779,11 @@ def test_detector(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
-    pattern: Optional[str] = typer.Argument(None, help="Literal regex pattern. Omit to use a saved detector."),
-    document: Optional[Path] = typer.Option(None, "--document", "-d", help="Document path to test against."),
+    pattern: str | None = typer.Argument(None, help="Literal regex pattern. Omit to use a saved detector."),
+    document: Path | None = typer.Option(None, "--document", "-d", help="Document path to test against."),
     read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
-    text: Optional[str] = typer.Option(None, "--text", help="Literal document text to test against."),
-    flags: Optional[List[str]] = typer.Option(
+    text: str | None = typer.Option(None, "--text", help="Literal document text to test against."),
+    flags: list[str] | None = typer.Option(
         None,
         "--flag",
         help=f"Regex flag name for a literal PATTERN's {FLAGS_KEY}. May be repeated or comma-separated.",
@@ -801,7 +799,7 @@ def test_detector(
         "--word-boundaries",
         help="Add regex word boundaries around the detector pattern.",
     ),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Test one detector against literal text, standard input, or a document."""
     document_text = _read_extraction_text(document, read_stdin=read_stdin, text=text)
@@ -821,7 +819,7 @@ def compile_entity(
         "--word-boundaries",
         help="Add regex word boundaries before printing the compiled pattern.",
     ),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Print the compiled regex for one configured entity."""
     config_path = _command_config_path(ctx, config)
@@ -839,7 +837,7 @@ def compile_entity(
 def doctor_config(
     ctx: typer.Context,
     output_format: str = typer.Option("text", "--format", "-f", help="Output format: json or text."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Validate and diagnose detector config authoring issues."""
     config_path = _command_config_path(ctx, config)
@@ -858,7 +856,7 @@ def doctor_config(
 def init_config(
     ctx: typer.Context,
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing detector config."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Create an empty detector config file."""
     config_path = _command_config_path(ctx, config)
@@ -877,13 +875,13 @@ def add_pattern(
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
     pattern: str = typer.Argument(..., help="Regex pattern."),
-    flags: Optional[List[str]] = typer.Option(
+    flags: list[str] | None = typer.Option(
         None,
         "--flag",
         help=f"Regex flag name for this entity's {FLAGS_KEY}. May be repeated or comma-separated.",
     ),
     force: bool = typer.Option(False, "--force", "-f", help="Replace an existing entity/name pattern."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Add a detector pattern to the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -906,8 +904,8 @@ def add_pattern(
 @app.command("list")
 def list_patterns(
     ctx: typer.Context,
-    entity: Optional[str] = typer.Argument(None, help="Optional detector entity name."),
-    config: Optional[Path] = _config_option(),
+    entity: str | None = typer.Argument(None, help="Optional detector entity name."),
+    config: Path | None = _config_option(),
 ) -> None:
     """List detector patterns in the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -930,8 +928,8 @@ def list_patterns(
 def show_pattern(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
-    name: Optional[str] = typer.Argument(None, help="Optional pattern name."),
-    config: Optional[Path] = _config_option(),
+    name: str | None = typer.Argument(None, help="Optional pattern name."),
+    config: Path | None = _config_option(),
 ) -> None:
     """Show configured detector patterns for an entity."""
     config_path = _command_config_path(ctx, config)
@@ -947,7 +945,7 @@ def show_pattern(
     if name not in entity_config:
         _exit_error(f"Pattern {name!r} does not exist for entity {entity!r} in {config_path}.")
 
-    selected_entity_config: Dict[str, Any] = {}
+    selected_entity_config: dict[str, Any] = {}
     if FLAGS_KEY in entity_config and name != FLAGS_KEY:
         selected_entity_config[FLAGS_KEY] = entity_config[FLAGS_KEY]
     selected_entity_config[name] = entity_config[name]
@@ -959,7 +957,7 @@ def remove_pattern(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Remove a detector pattern from the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -976,7 +974,7 @@ def remove_pattern(
 @app.command("validate")
 def validate_config(
     ctx: typer.Context,
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Validate the configured detector file."""
     config_path = _command_config_path(ctx, config)
