@@ -23,8 +23,10 @@ from .extraction import (
     extract_named_entity_records,
 )
 from .named_entities import NamedEntity, NamedEntityList
+from .patches import BankPatchError, apply_bank_patches
 from .regex_builder import NERB
 from .schema import BANK_SCHEMA, ID_PATTERN, REGEX_FLAG_ORDER, SCHEMA_VERSION, validate_bank_schema
+from .validation import validate_bank
 
 __version__ = "0.0.5"
 
@@ -38,6 +40,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "BankError",
     "BankLoadError",
+    "BankPatchError",
     "BankSchemaError",
     "ConfigError",
     "DEFAULT_CONFIG_ENV_VAR",
@@ -49,6 +52,7 @@ __all__ = [
     "PatternConfig",
     "__version__",
     "add_entity_pattern",
+    "apply_bank_patches",
     "bank_stats",
     "canonicalize_bank",
     "extract_named_entities",
@@ -65,6 +69,7 @@ __all__ = [
     "resolve_default_config_path",
     "save_config",
     "validate_bank_schema",
+    "validate_bank",
     "validate_pattern_config",
     "validate_regex_flags",
 ]
