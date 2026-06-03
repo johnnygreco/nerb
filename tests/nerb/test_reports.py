@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from nerb import ExtractionError, explain_match, extract_report, extract_report_batch
+from nerb import ExtractionError, explain_match, extract_report, extract_report_batch, extract_report_file
 
 
 @pytest.fixture
@@ -99,6 +99,21 @@ def test_extract_report_shape_defaults_summary_explanation_and_context(minimal_b
         options={"include_pattern_values": False},
     )
     assert "pattern_value" not in hidden_value_report["resolved_records"][0]["explanation"]
+
+
+def test_extract_report_file_preserves_file_source_metadata(tmp_path, minimal_bank):
+    document_path = tmp_path / "email.txt"
+    document_path.write_text("Send Acme Corp now.", encoding="utf-8")
+
+    report = extract_report_file(minimal_bank, document_path, options={"context_chars": 5})
+
+    assert report["source"] == {
+        "type": "file",
+        "path": str(document_path),
+        "length": 19,
+        "bytes": 19,
+    }
+    assert report["resolved_records"][0]["context"] == {"before": "Send ", "match": "Acme Corp", "after": " now."}
 
 
 def test_priority_overlap_resolution_keeps_raw_records_and_resolves_by_priority(minimal_bank):

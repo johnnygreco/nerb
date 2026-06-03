@@ -22,6 +22,7 @@ __all__ = [
     "extract_file",
     "extract_report",
     "extract_report_batch",
+    "extract_report_file",
     "extract_named_entities",
     "extract_named_entities_records",
     "extract_named_entity",
@@ -90,8 +91,8 @@ def extract_text(bank: Mapping[str, Any], text: str, *, options: Mapping[str, An
 
     resolved = resolve_extraction_options(options)
     _ensure_text_limit(text, resolved.max_text_bytes)
-    _ensure_bank_status_extractable(bank, resolved.include_statuses)
     compiled, cache_hit = compile_bank(bank, options=options)
+    _ensure_bank_status_extractable(compiled.bank, resolved.include_statuses)
     records = _extract_records(compiled, text)
     return {
         "bank": _bank_metadata(compiled),
@@ -116,8 +117,8 @@ def extract_file(
 
     resolved = resolve_extraction_options(options)
     _ensure_text_limit(text, resolved.max_text_bytes)
-    _ensure_bank_status_extractable(bank, resolved.include_statuses)
     compiled, cache_hit = compile_bank(bank, options=options)
+    _ensure_bank_status_extractable(compiled.bank, resolved.include_statuses)
     records = _extract_records(compiled, text)
     return {
         "bank": _bank_metadata(compiled),
@@ -172,8 +173,8 @@ def _extract_prepared_batch(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     resolved = resolve_extraction_options(options)
-    _ensure_bank_status_extractable(bank, resolved.include_statuses)
     compiled, cache_hit = compile_bank(bank, options=options)
+    _ensure_bank_status_extractable(compiled.bank, resolved.include_statuses)
 
     document_results: list[dict[str, Any]] = []
     flat_records: list[MatchRecord] = []
@@ -225,6 +226,18 @@ def extract_report_batch(
     from .reports import extract_report_batch as _extract_report_batch
 
     return _extract_report_batch(bank, documents, options=options)
+
+
+def extract_report_file(
+    bank: Mapping[str, Any],
+    file_path: str | Path,
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a single-file extraction report."""
+    from .reports import extract_report_file as _extract_report_file
+
+    return _extract_report_file(bank, file_path, options=options)
 
 
 def explain_match(

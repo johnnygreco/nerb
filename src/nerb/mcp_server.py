@@ -62,6 +62,9 @@ from .extraction import (
     extract_report_batch as _json_extract_report_batch,
 )
 from .extraction import (
+    extract_report_file as _json_extract_report_file,
+)
+from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
@@ -71,8 +74,8 @@ from .validation import validate_bank as _validate_bank
 Transport = Literal["stdio", "sse", "streamable-http"]
 MCP_PYTHON_REQUIRES = (3, 10)
 MCP_UNAVAILABLE_MESSAGE = (
-    "NERB MCP support requires Python 3.10 or newer and the optional MCP SDK dependency. "
-    "Core NERB APIs and the `nerb` CLI remain available on Python 3.8."
+    "NERB MCP support requires Python 3.10 or newer and the MCP SDK dependency. "
+    "Install NERB with the current package metadata on Python 3.10 or newer."
 )
 
 
@@ -730,7 +733,15 @@ def extract_report(
     if bank_mapping is None:
         _raise_tool_error("extract_report requires a JSON bank object.")
 
-    document_text = _read_json_text_source(text, file_path)
+    if file_path is not None:
+        if text is not None:
+            _raise_tool_error("Provide exactly one text source: text or file_path.")
+        document_path = _ensure_explicit_file(file_path, "Document")
+        return _run_json_tool(
+            lambda: _json_extract_report_file(bank_mapping, document_path, options=_options_mapping(options))
+        )
+
+    document_text = _read_json_text_source(text, None)
     return _run_json_tool(lambda: _json_extract_report(bank_mapping, document_text, options=_options_mapping(options)))
 
 

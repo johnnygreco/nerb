@@ -53,6 +53,9 @@ from .extraction import (
     extract_report as _json_extract_report,
 )
 from .extraction import (
+    extract_report_file as _json_extract_report_file,
+)
+from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
@@ -1021,7 +1024,14 @@ def extract_json_bank_report(
     if bank is None:
         _exit_error(f"Could not load bank at {bank_path}.")
 
-    document_text = _read_json_bank_text_source(file_path, read_stdin=read_stdin, text=text)
+    if file_path is not None:
+        if read_stdin or text is not None:
+            _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
+        document_path = _ensure_explicit_file(file_path, "Document")
+        _echo_json(_run_json_helper(lambda: _json_extract_report_file(bank, document_path)))
+        return
+
+    document_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
     _echo_json(_run_json_helper(lambda: _json_extract_report(bank, document_text)))
 
 
