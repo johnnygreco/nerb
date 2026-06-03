@@ -134,6 +134,15 @@ def extract_batch(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Extract rich JSON-bank records from a bounded batch of text or file documents."""
+    prepared_documents, combined_bytes = _prepare_batch_documents(documents, options=options)
+    return _extract_prepared_batch(bank, prepared_documents, combined_bytes=combined_bytes, options=options)
+
+
+def _prepare_batch_documents(
+    documents: Sequence[Mapping[str, Any]],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> tuple[list[tuple[str, dict[str, Any], str]], int]:
     if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
         raise TypeError("extract_batch documents must be a sequence of document objects.")
 
@@ -152,6 +161,17 @@ def extract_batch(
     for _, _, text in prepared_documents:
         _ensure_text_limit(text, resolved.max_text_bytes)
 
+    return prepared_documents, combined_bytes
+
+
+def _extract_prepared_batch(
+    bank: Mapping[str, Any],
+    prepared_documents: Sequence[tuple[str, dict[str, Any], str]],
+    *,
+    combined_bytes: int,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    resolved = resolve_extraction_options(options)
     _ensure_bank_status_extractable(bank, resolved.include_statuses)
     compiled, cache_hit = compile_bank(bank, options=options)
 

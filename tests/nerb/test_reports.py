@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -314,6 +315,29 @@ def test_extract_report_batch_shape(minimal_bank):
     assert report["summary"]["documents_with_records"] == 1
     assert report["summary"]["documents_with_resolved_records"] == 1
     assert report["summary"]["entity_counts"] == {"customer": 1}
+
+
+def test_extract_report_batch_reuses_file_text_snapshot(monkeypatch, tmp_path, minimal_bank):
+    source_path = tmp_path / "source.txt"
+    source_path.write_text("unused", encoding="utf-8")
+    calls: list[Path] = []
+
+    def fake_read_text(path: Path, encoding: str | None = None) -> str:
+        del encoding
+        calls.append(path)
+        return "Acme Corp" if len(calls) == 1 else "ZZZZZZZZZ"
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    report = extract_report_batch(
+        minimal_bank,
+        [{"document_id": "file_doc", "file_path": source_path}],
+        options={"context_chars": 20},
+    )
+
+    assert calls == [source_path]
+    assert report["records"][0]["string"] == "Acme Corp"
+    assert report["resolved_records"][0]["context"]["match"] == "Acme Corp"
 
 
 def test_extract_report_options_are_validated(minimal_bank):

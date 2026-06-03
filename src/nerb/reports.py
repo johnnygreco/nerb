@@ -8,7 +8,7 @@ from typing import Any, cast
 from .bank import canonicalize_bank
 from .diagnostics import DIAGNOSTIC_WARNING, REPORT_EXPECTED_MISSING, diagnostic, has_errors
 from .engines import ExtractionError
-from .extraction import _prepare_batch_document, extract_batch, extract_text
+from .extraction import _extract_prepared_batch, _prepare_batch_documents, extract_text
 from .records import MatchRecord, record_sort_key
 from .schema import REGEX_FLAG_ORDER, validate_bank_schema
 
@@ -59,9 +59,9 @@ def extract_report_batch(
 ) -> dict[str, Any]:
     """Return reports for a bounded batch of text or file documents."""
     report_options = _resolve_report_options(options)
-    batch = extract_batch(bank, documents, options=options)
+    prepared_documents, combined_bytes = _prepare_batch_documents(documents, options=options)
+    batch = _extract_prepared_batch(bank, prepared_documents, combined_bytes=combined_bytes, options=options)
     canonical_bank = canonicalize_bank(bank)
-    prepared_documents = [_prepare_batch_document(index, document) for index, document in enumerate(documents)]
 
     document_reports: list[dict[str, Any]] = []
     flat_resolved_records: list[dict[str, Any]] = []
