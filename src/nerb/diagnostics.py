@@ -26,6 +26,7 @@ REGEX_MATCHES_EMPTY = "regex.matches_empty"
 REGEX_NORMALIZATION_COMPILE_ERROR = "regex.normalization_compile_error"
 REGEX_NORMALIZED_CHANGED = "regex.normalized_changed"
 REGEX_SHORT_UNBOUNDED = "regex.short_unbounded"
+REPORT_EXPECTED_MISSING = "report.expected_missing"
 
 Diagnostic = dict[str, Any]
 
@@ -49,6 +50,7 @@ __all__ = [
     "REGEX_NORMALIZATION_COMPILE_ERROR",
     "REGEX_NORMALIZED_CHANGED",
     "REGEX_SHORT_UNBOUNDED",
+    "REPORT_EXPECTED_MISSING",
     "SCHEMA_ADDITIONAL_PROPERTY",
     "SCHEMA_MIN_PROPERTIES",
     "SCHEMA_REQUIRED",
