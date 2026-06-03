@@ -103,11 +103,11 @@ def regress_bank(
 
     raw_options = options or {}
     benchmark_options = _resolve_benchmark_options(raw_options)
+    diff = diff_banks(old_bank, new_bank)
     old_canonical = canonicalize_bank(old_bank)
     new_canonical = canonicalize_bank(new_bank)
     benchmark_documents = _regression_benchmark_documents(old_canonical, new_canonical, raw_options, benchmark_options)
 
-    diff = diff_banks(old_canonical, new_canonical)
     old_eval = eval_bank(old_canonical, base_path=base_path, options=raw_options)
     new_eval = eval_bank(new_canonical, base_path=base_path, options=raw_options)
     old_benchmark = benchmark_bank(old_canonical, documents=benchmark_documents, options=raw_options)

@@ -117,3 +117,28 @@ def test_regress_bank_reports_diff_eval_benchmark_deltas_and_quality_gate(tmp_pa
         diagnostic["code"] == EVAL_POSITIVE_FAILED and diagnostic["metadata"]["bank"] == "new_bank"
         for diagnostic in result["diagnostics"]
     )
+
+
+def test_regress_bank_preserves_raw_diff_diagnostics(minimal_bank):
+    old_bank = copy.deepcopy(minimal_bank)
+    old_bank["default_regex_flags"] = ["IGNORECASE", "IGNORECASE"]
+
+    result = regress_bank(
+        old_bank,
+        minimal_bank,
+        options={"benchmark_iterations": 1, "stress_multiplier": 2},
+    )
+
+    assert result["diff"]["diagnostics"] == [
+        {
+            "severity": "warning",
+            "code": "flags.duplicate",
+            "path": "/default_regex_flags",
+            "message": "Duplicate regex flags will be removed during canonicalization: 'IGNORECASE'.",
+            "metadata": {"bank": "old_bank"},
+        }
+    ]
+    assert any(
+        diagnostic["code"] == "flags.duplicate" and diagnostic["metadata"]["bank"] == "old_bank"
+        for diagnostic in result["diagnostics"]
+    )
