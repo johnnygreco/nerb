@@ -505,16 +505,19 @@ def _capture_conflict_diagnostics(
     compiled_by_path: Mapping[str, re.Pattern[str]],
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
-    internal_group_names = {_internal_group_name(pattern) for pattern in patterns}
-    first_user_group_path: dict[str, str] = {}
-    duplicate_user_groups: defaultdict[str, list[str]] = defaultdict(list)
+    internal_group_names_by_entity: defaultdict[str, set[str]] = defaultdict(set)
+    for pattern in patterns:
+        internal_group_names_by_entity[pattern.entity_id].add(_internal_group_name(pattern))
+
+    first_user_group_path_by_entity: defaultdict[str, dict[str, str]] = defaultdict(dict)
+    duplicate_user_groups_by_entity: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
 
     for pattern in patterns:
         compiled = compiled_by_path.get(pattern.path)
         if compiled is None:
             continue
         for group_name in sorted(compiled.groupindex):
-            if group_name in internal_group_names:
+            if group_name in internal_group_names_by_entity[pattern.entity_id]:
                 diagnostics.append(
                     diagnostic(
                         DIAGNOSTIC_ERROR,
@@ -525,11 +528,12 @@ def _capture_conflict_diagnostics(
                         metadata={"group_name": group_name},
                     )
                 )
+            first_user_group_path = first_user_group_path_by_entity[pattern.entity_id]
             previous_path = first_user_group_path.setdefault(group_name, pattern.path)
             if previous_path != pattern.path:
-                duplicate_user_groups[group_name].append(pattern.path)
+                duplicate_user_groups_by_entity[(pattern.entity_id, group_name)].append(pattern.path)
 
-    for group_name, paths in sorted(duplicate_user_groups.items()):
+    for (entity_id, group_name), paths in sorted(duplicate_user_groups_by_entity.items()):
         for path in sorted(set(paths)):
             diagnostics.append(
                 diagnostic(
@@ -538,7 +542,7 @@ def _capture_conflict_diagnostics(
                     path,
                     f"User capture group {group_name!r} is duplicated within the composed entity shard.",
                     suggested_fix="Use unique capture group names within each entity.",
-                    metadata={"group_name": group_name},
+                    metadata={"entity_id": entity_id, "group_name": group_name},
                 )
             )
     return diagnostics

@@ -32,6 +32,24 @@ def _add_regex(minimal_bank: dict[str, Any], pattern_id: str, value: str) -> Non
     patterns[pattern_id] = _regex_pattern(value)
 
 
+def _add_entity_with_regex(bank: dict[str, Any], entity_id: str, name_id: str, pattern_value: str) -> None:
+    bank["entities"][entity_id] = {
+        "description": f"{entity_id} fixtures.",
+        "status": "active",
+        "regex_flags": [],
+        "names": {
+            name_id: {
+                "canonical": name_id.replace("_", " ").title(),
+                "description": "Runtime validation fixture.",
+                "status": "active",
+                "patterns": {"primary": _regex_pattern(pattern_value)},
+                "metadata": {},
+            }
+        },
+        "metadata": {},
+    }
+
+
 def _codes(result: dict[str, Any]) -> set[str]:
     return {diagnostic["code"] for diagnostic in result["diagnostics"]}
 
@@ -183,6 +201,18 @@ def test_python_re_composed_validation_reports_duplicate_user_capture_names(mini
 
     assert result["valid"] is False
     assert "regex.capture_conflict" in _codes(result)
+
+
+def test_python_re_capture_names_can_repeat_across_entity_shards(minimal_bank):
+    minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"] = _regex_pattern(
+        r"(?P<label>Acme)"
+    )
+    _add_entity_with_regex(minimal_bank, "vendor", "globex", r"(?P<label>Globex)")
+
+    result = validate_bank(minimal_bank)
+
+    assert result["valid"] is True
+    assert "regex.capture_conflict" not in _codes(result)
 
 
 def test_python_re_composed_validation_reports_internal_identity_capture_conflicts(minimal_bank):
