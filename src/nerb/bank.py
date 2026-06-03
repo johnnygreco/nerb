@@ -25,6 +25,7 @@ __all__ = [
     "canonicalize_bank",
     "hash_bank",
     "load_bank",
+    "read_bank_json",
 ]
 
 
@@ -44,12 +45,12 @@ class BankSchemaError(BankError):
     """Raised when a loaded bank does not satisfy the schema layer."""
 
 
-def load_bank(path: str | Path) -> dict[str, Any]:
-    """Load a JSON bank from an explicit file path and validate its schema shape."""
+def read_bank_json(path: str | Path) -> Any:
+    """Read JSON from an explicit bank file path without applying bank schema validation."""
     bank_path = Path(path).expanduser()
     try:
         with bank_path.open(encoding="utf-8") as file:
-            bank = json.load(file)
+            return json.load(file)
     except json.JSONDecodeError as exc:
         parse_diagnostic = diagnostic(
             DIAGNOSTIC_ERROR,
@@ -66,6 +67,12 @@ def load_bank(path: str | Path) -> dict[str, Any]:
             f"Could not read JSON bank {str(bank_path)!r}: {exc}.",
         )
         raise BankLoadError(f"Could not read JSON bank {str(bank_path)!r}.", [load_diagnostic]) from exc
+
+
+def load_bank(path: str | Path) -> dict[str, Any]:
+    """Load a JSON bank from an explicit file path and validate its schema shape."""
+    bank_path = Path(path).expanduser()
+    bank = read_bank_json(bank_path)
 
     if not isinstance(bank, dict):
         type_diagnostic = diagnostic(

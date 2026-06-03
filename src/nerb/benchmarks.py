@@ -108,8 +108,16 @@ def regress_bank(
     new_canonical = canonicalize_bank(new_bank)
     benchmark_documents = _regression_benchmark_documents(old_canonical, new_canonical, raw_options, benchmark_options)
 
-    old_eval = eval_bank(old_canonical, base_path=base_path, options=raw_options)
-    new_eval = eval_bank(new_canonical, base_path=base_path, options=raw_options)
+    old_eval = eval_bank(
+        old_canonical,
+        base_path=_regression_eval_base_path(base_path, raw_options, "old"),
+        options=raw_options,
+    )
+    new_eval = eval_bank(
+        new_canonical,
+        base_path=_regression_eval_base_path(base_path, raw_options, "new"),
+        options=raw_options,
+    )
     old_benchmark = benchmark_bank(old_canonical, documents=benchmark_documents, options=raw_options)
     new_benchmark = benchmark_bank(new_canonical, documents=benchmark_documents, options=raw_options)
     deltas = {
@@ -512,6 +520,22 @@ def _regression_benchmark_documents(
 ) -> dict[str, list[Mapping[str, Any]]]:
     documents = options.get("benchmark_documents", options.get("documents"))
     return _resolve_document_tiers([old_bank, new_bank], documents, benchmark_options)
+
+
+def _regression_eval_base_path(
+    default_base_path: str | Path | None,
+    options: Mapping[str, Any],
+    bank_label: str,
+) -> str | Path | None:
+    explicit_base_path = options.get(f"{bank_label}_base_path")
+    if explicit_base_path is not None:
+        return cast(str | Path, explicit_base_path)
+
+    bank_path = options.get(f"{bank_label}_bank_path")
+    if bank_path is not None:
+        return Path(cast(str | Path, bank_path)).expanduser().parent
+
+    return default_base_path
 
 
 def _quality_delta(old_eval: Mapping[str, Any], new_eval: Mapping[str, Any]) -> dict[str, Any]:

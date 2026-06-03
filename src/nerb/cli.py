@@ -1,6 +1,7 @@
 import json
 import re
 import sys
+from collections.abc import Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -12,6 +13,18 @@ from yaml.constructor import ConstructorError
 from yaml.resolver import BaseResolver
 
 from . import __version__
+from .bank import (
+    BankError,
+    BankLoadError,
+)
+from .bank import (
+    load_bank as _load_json_bank,
+)
+from .bank import (
+    read_bank_json as _read_bank_json,
+)
+from .benchmarks import benchmark_bank as _benchmark_bank
+from .benchmarks import regress_bank as _regress_bank
 from .config import (
     DEFAULT_CONFIG_ENV_VAR,
     FLAGS_KEY,
@@ -25,8 +38,26 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
-from .extraction import extract_named_entities_records, extract_named_entity_records
+from .diagnostics import JSON_PARSE
+from .diff import diff_banks as _diff_banks
+from .evals import eval_bank as _eval_bank
+from .extraction import (
+    ExtractionError,
+    extract_named_entities_records,
+    extract_named_entity_records,
+)
+from .extraction import (
+    extract_file as _json_extract_file,
+)
+from .extraction import (
+    extract_report as _json_extract_report,
+)
+from .extraction import (
+    extract_text as _json_extract_text,
+)
+from .patches import apply_bank_patches as _apply_bank_patches
 from .regex_builder import NERB
+from .validation import validate_bank as _validate_bank
 
 COMMAND_ERROR_EXIT_CODE = 1
 OUTPUT_FORMATS = {"json", "jsonl", "table"}
@@ -79,6 +110,155 @@ def _command_config_path(ctx: typer.Context, config: Path | None) -> Path:
 def _exit_error(message: str) -> NoReturn:
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
+
+
+def _echo_json(payload: Any) -> None:
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _diagnostic_payload(message: str, diagnostics: list[dict[str, Any]], *, path: Path | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"valid": False, "error": message, "diagnostics": diagnostics}
+    if path is not None:
+        payload["path"] = str(path)
+    return payload
+
+
+def _bank_load_error_is_json_parse(exc: BankLoadError) -> bool:
+    return any(diagnostic.get("code") == JSON_PARSE for diagnostic in exc.diagnostics)
+
+
+def _ensure_explicit_file(path: Path, label: str) -> Path:
+    resolved_path = path.expanduser()
+    if not resolved_path.exists():
+        _exit_error(f"{label} file does not exist at {resolved_path}.")
+    if not resolved_path.is_file():
+        _exit_error(f"{label} path is not a file: {resolved_path}.")
+    return resolved_path
+
+
+def _load_raw_bank_json_for_command(bank_path: Path) -> tuple[Any | None, Path, dict[str, Any] | None]:
+    path = _ensure_explicit_file(bank_path, "Bank")
+    try:
+        return _read_bank_json(path), path, None
+    except BankLoadError as exc:
+        if _bank_load_error_is_json_parse(exc):
+            return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        _exit_error(f"Could not read bank at {path}: {exc}")
+
+
+def _load_json_bank_for_command(bank_path: Path) -> tuple[Mapping[str, Any] | None, Path, dict[str, Any] | None]:
+    path = _ensure_explicit_file(bank_path, "Bank")
+    try:
+        return _load_json_bank(path), path, None
+    except BankLoadError as exc:
+        if _bank_load_error_is_json_parse(exc):
+            return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        _exit_error(f"Could not read bank at {path}: {exc}")
+    except BankError as exc:
+        return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+
+
+def _load_patch_json_for_command(patch_path: Path) -> Any:
+    path = _ensure_explicit_file(patch_path, "Patch")
+    try:
+        with path.open(encoding="utf-8") as file:
+            return json.load(file)
+    except json.JSONDecodeError as exc:
+        _exit_error(f"Could not parse JSON patch at {path}: {exc.msg} at line {exc.lineno}, column {exc.colno}.")
+    except OSError as exc:
+        _exit_error(f"Could not read patch at {path}: {exc}")
+
+
+def _coerce_patch_object(raw_patch: Mapping[Any, Any], label: str) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    for key, value in raw_patch.items():
+        if not isinstance(key, str):
+            _exit_error(f"{label} keys must be strings.")
+        patch[key] = value
+    return patch
+
+
+def _coerce_patch_sequence(raw_patch: Any) -> list[dict[str, Any]]:
+    if isinstance(raw_patch, Mapping):
+        return [_coerce_patch_object(raw_patch, "Patch JSON object")]
+
+    if not isinstance(raw_patch, Sequence) or isinstance(raw_patch, (str, bytes)):
+        _exit_error("Patch JSON must be an object or an array of objects.")
+
+    patches: list[dict[str, Any]] = []
+    for index, patch in enumerate(raw_patch):
+        if not isinstance(patch, Mapping):
+            _exit_error(f"Patch JSON item {index} must be an object.")
+        patches.append(_coerce_patch_object(patch, f"Patch JSON item {index}"))
+    return patches
+
+
+def _read_json_bank_text_source(
+    file_path: Path | None,
+    *,
+    read_stdin: bool,
+    text: str | None,
+) -> str:
+    source_count = sum([file_path is not None, read_stdin, text is not None])
+    if source_count != 1:
+        _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
+
+    if text is not None:
+        return text
+
+    if read_stdin:
+        return sys.stdin.read()
+
+    if file_path is None:
+        _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
+
+    path = _ensure_explicit_file(file_path, "Document")
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _exit_error(f"Could not read document at {path}: {exc}")
+
+
+def _invalid_bank_payloads_payload(payloads: dict[str, dict[str, Any] | None]) -> dict[str, Any] | None:
+    invalid_payloads = {label: payload for label, payload in payloads.items() if payload is not None}
+    if not invalid_payloads:
+        return None
+
+    diagnostics: list[dict[str, Any]] = []
+    for label, payload in invalid_payloads.items():
+        for item in payload["diagnostics"]:
+            diagnostic = dict(item)
+            metadata = dict(diagnostic.get("metadata", {}))
+            metadata["bank"] = label
+            diagnostic["metadata"] = metadata
+            diagnostics.append(diagnostic)
+
+    return {"valid": False, "banks": invalid_payloads, "diagnostics": diagnostics}
+
+
+def _non_mapping_bank_payload(raw_bank: Any, path: Path, label: str) -> dict[str, Any] | None:
+    if isinstance(raw_bank, Mapping):
+        return None
+
+    validation = _validate_bank(raw_bank)
+    return {
+        "valid": False,
+        "path": str(path),
+        "label": label,
+        "diagnostics": validation["diagnostics"],
+    }
+
+
+def _run_json_helper(action: Any) -> dict[str, Any]:
+    try:
+        return action()
+    except (ExtractionError, BankError) as exc:
+        diagnostics = getattr(exc, "diagnostics", [])
+        if diagnostics:
+            return _diagnostic_payload(str(exc), diagnostics)
+        _exit_error(str(exc))
+    except (TypeError, ValueError) as exc:
+        _exit_error(str(exc))
 
 
 def _load_command_config(config_path: Path, *, allow_missing: bool = False) -> PatternConfig:
@@ -725,6 +905,186 @@ def callback(
 ) -> None:
     """Build and manage named entity regex detector configs."""
     ctx.obj = {"config_path": resolve_default_config_path(config), "config_explicit": config is not None}
+
+
+@app.command("validate-bank")
+def validate_json_bank(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path to validate."),
+    level: str = typer.Option("standard", "--level", help="Validation level: basic, standard, or deep."),
+    engine: str = typer.Option("python_re", "--engine", help="Validation engine."),
+    strict: bool = typer.Option(False, "--strict", help="Promote strict validation warnings where supported."),
+) -> None:
+    """Validate a JSON bank and print the helper response as JSON."""
+    raw_bank, path, invalid_payload = _load_raw_bank_json_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+
+    payload = _run_json_helper(
+        lambda: _validate_bank(raw_bank, level=level, engine=engine, base_path=path.parent, strict=strict)
+    )
+    _echo_json(payload)
+
+
+@app.command("apply-patches")
+def apply_json_bank_patches(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path to patch."),
+    patch_path: Path = typer.Option(..., "--patch", help="JSON Patch file path."),
+    level: str = typer.Option("standard", "--level", help="Validation level after applying patches."),
+    engine: str = typer.Option("python_re", "--engine", help="Validation engine after applying patches."),
+) -> None:
+    """Apply JSON Patch operations to a JSON bank and print the validated candidate."""
+    bank, path, invalid_payload = _load_raw_bank_json_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {path}.")
+
+    patches = _coerce_patch_sequence(_load_patch_json_for_command(patch_path))
+    payload = _run_json_helper(
+        lambda: _apply_bank_patches(bank, patches, level=level, engine=engine, base_path=path.parent)
+    )
+    _echo_json(payload)
+
+
+@app.command("diff-banks")
+def diff_json_banks(
+    old_bank: Path = typer.Argument(..., help="Old JSON bank path."),
+    new_bank: Path = typer.Argument(..., help="New JSON bank path."),
+) -> None:
+    """Diff two JSON banks and print the helper response as JSON."""
+    old_raw, old_path, old_invalid = _load_raw_bank_json_for_command(old_bank)
+    new_raw, new_path, new_invalid = _load_raw_bank_json_for_command(new_bank)
+    invalid_payload = _invalid_bank_payloads_payload(
+        {
+            "old_bank": old_invalid or _non_mapping_bank_payload(old_raw, old_path, "old_bank"),
+            "new_bank": new_invalid or _non_mapping_bank_payload(new_raw, new_path, "new_bank"),
+        }
+    )
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if not isinstance(old_raw, Mapping) or not isinstance(new_raw, Mapping):
+        _exit_error("diff-banks requires JSON bank objects.")
+
+    _echo_json(_run_json_helper(lambda: _diff_banks(old_raw, new_raw)))
+
+
+@app.command("extract-text")
+def extract_json_bank_text(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    text: str | None = typer.Option(None, "--text", help="Literal document text to extract from."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+) -> None:
+    """Extract from one in-memory text source using a JSON bank."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    document_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
+    _echo_json(_run_json_helper(lambda: _json_extract_text(bank, document_text)))
+
+
+@app.command("extract-file")
+def extract_json_bank_file(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    file_path: Path = typer.Option(..., "--file", help="UTF-8 document file path."),
+) -> None:
+    """Extract from one explicit document file using a JSON bank."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    document_path = _ensure_explicit_file(file_path, "Document")
+    _echo_json(_run_json_helper(lambda: _json_extract_file(bank, document_path)))
+
+
+@app.command("extract-report")
+def extract_json_bank_report(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    file_path: Path | None = typer.Option(None, "--file", help="UTF-8 document file path."),
+    text: str | None = typer.Option(None, "--text", help="Literal document text to report on."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+) -> None:
+    """Build a single-document extraction report from a JSON bank."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    document_text = _read_json_bank_text_source(file_path, read_stdin=read_stdin, text=text)
+    _echo_json(_run_json_helper(lambda: _json_extract_report(bank, document_text)))
+
+
+@app.command("eval-bank")
+def eval_json_bank(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+) -> None:
+    """Evaluate a JSON bank against its explicit local eval refs."""
+    bank, path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {path}.")
+
+    _echo_json(_run_json_helper(lambda: _eval_bank(bank, base_path=path.parent)))
+
+
+@app.command("benchmark-bank")
+def benchmark_json_bank(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    benchmark_iterations: int | None = typer.Option(None, "--benchmark-iterations", help="Benchmark iterations."),
+    stress_multiplier: int | None = typer.Option(None, "--stress-multiplier", help="Benchmark stress multiplier."),
+) -> None:
+    """Benchmark JSON-bank compile and extraction throughput."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    options: dict[str, Any] = {}
+    if benchmark_iterations is not None:
+        options["benchmark_iterations"] = benchmark_iterations
+    if stress_multiplier is not None:
+        options["stress_multiplier"] = stress_multiplier
+    _echo_json(_run_json_helper(lambda: _benchmark_bank(bank, options=options or None)))
+
+
+@app.command("regress-bank")
+def regress_json_bank(
+    old_bank_path: Path = typer.Option(..., "--old-bank", help="Old JSON bank path."),
+    new_bank_path: Path = typer.Option(..., "--new-bank", help="New JSON bank path."),
+    benchmark_iterations: int | None = typer.Option(None, "--benchmark-iterations", help="Benchmark iterations."),
+    stress_multiplier: int | None = typer.Option(None, "--stress-multiplier", help="Benchmark stress multiplier."),
+) -> None:
+    """Run diff, eval, and benchmark regression checks for two JSON banks."""
+    old_bank, old_path, old_invalid = _load_json_bank_for_command(old_bank_path)
+    new_bank, new_path, new_invalid = _load_json_bank_for_command(new_bank_path)
+    invalid_payload = _invalid_bank_payloads_payload({"old_bank": old_invalid, "new_bank": new_invalid})
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if old_bank is None or new_bank is None:
+        _exit_error("Could not load both regression banks.")
+
+    options: dict[str, Any] = {"old_bank_path": str(old_path), "new_bank_path": str(new_path)}
+    if benchmark_iterations is not None:
+        options["benchmark_iterations"] = benchmark_iterations
+    if stress_multiplier is not None:
+        options["stress_multiplier"] = stress_multiplier
+    _echo_json(_run_json_helper(lambda: _regress_bank(old_bank, new_bank, options=options)))
 
 
 @app.command("extract")
