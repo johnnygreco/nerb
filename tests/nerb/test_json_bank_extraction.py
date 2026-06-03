@@ -175,6 +175,33 @@ def test_raw_extraction_preserves_overlaps_duplicates_and_ordering(minimal_bank)
     assert sort_keys == sorted(sort_keys)
 
 
+def test_regex_entity_shards_preserve_duplicate_same_start_matches(minimal_bank):
+    _set_customer_patterns(
+        minimal_bank,
+        {
+            "first_regex": _regex_pattern(r"\bAcme\b"),
+            "second_regex": _regex_pattern(r"\bAcme\b"),
+        },
+    )
+
+    result = extract_text(minimal_bank, "Acme")
+
+    assert [(record["pattern_id"], record["string"]) for record in result["records"]] == [
+        ("first_regex", "Acme"),
+        ("second_regex", "Acme"),
+    ]
+
+
+def test_regex_numeric_backreferences_are_preserved_under_internal_identity_wrapping(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"code": _regex_pattern(r"\b([A-Z]+)-\1\b")})
+
+    result = extract_text(minimal_bank, "Ship ABC-ABC today.")
+
+    assert result["records"][0]["string"] == "ABC-ABC"
+    assert result["records"][0]["start"] == 5
+    assert result["records"][0]["end"] == 12
+
+
 def test_extract_file_uses_file_source_metadata(tmp_path, minimal_bank):
     source_path = tmp_path / "source.txt"
     source_path.write_text("Acme Corp\n", encoding="utf-8")
@@ -200,6 +227,16 @@ def test_extract_batch_groups_documents_and_sorts_flat_records(minimal_bank):
     assert result["summary"] == {"document_count": 2, "record_count": 2, "documents_with_records": 2}
 
 
+def test_extract_batch_rejects_invalid_document_ids_and_generates_valid_default(minimal_bank):
+    with pytest.raises(ExtractionError, match="NERB ID syntax"):
+        extract_batch(minimal_bank, [{"document_id": "bad id!", "text": "Acme Corp"}])
+
+    result = extract_batch(minimal_bank, [{"text": "Acme Corp"}])
+
+    assert result["documents"][0]["document_id"] == "document_0"
+    assert result["records"][0]["document_id"] == "document_0"
+
+
 def test_extraction_limits_are_enforced(minimal_bank):
     with pytest.raises(ExtractionError, match="configured limit"):
         extract_text(minimal_bank, "Acme Corp", options={"max_text_bytes": 4})
@@ -217,6 +254,23 @@ def test_extraction_limits_are_enforced(minimal_bank):
             [{"document_id": "one", "text": "Acme Corp"}, {"document_id": "two", "text": "Acme Corp"}],
             options={"max_batch_text_bytes": 10},
         )
+
+
+def test_extraction_rejects_runtime_invalid_banks(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"empty": _regex_pattern("a*")})
+
+    with pytest.raises(ExtractionError, match="runtime validation") as exc_info:
+        extract_text(minimal_bank, "aaa")
+
+    assert any(diagnostic["code"] == "regex.matches_empty" for diagnostic in exc_info.value.diagnostics)
+
+
+def test_extraction_option_validation_rejects_invalid_statuses_and_non_json_options(minimal_bank):
+    with pytest.raises(ExtractionError, match="valid status strings"):
+        extract_text(minimal_bank, "Acme Corp", options={"include_statuses": ["active", None]})
+
+    with pytest.raises(ExtractionError, match="JSON-compatible"):
+        extract_text(minimal_bank, "Acme Corp", options={"engine_options": {"nan": float("nan")}})
 
 
 def test_status_filtering_defaults_to_active_chains_and_non_active_bank_errors(minimal_bank):

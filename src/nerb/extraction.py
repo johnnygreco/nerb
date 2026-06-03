@@ -14,6 +14,7 @@ from .engines import (
 )
 from .named_entities import NamedEntity, NamedEntityList
 from .records import MatchRecord, record_sort_key
+from .schema import ID_RE
 
 __all__ = [
     "ExtractionError",
@@ -232,9 +233,9 @@ def _prepare_batch_document(index: int, document: Mapping[str, Any]) -> tuple[st
     if not isinstance(document, Mapping):
         raise TypeError("Batch documents must be objects.")
 
-    document_id = document.get("document_id", document.get("id", str(index)))
-    if not isinstance(document_id, str) or not document_id:
-        raise ExtractionError("Batch document IDs must be non-empty strings.")
+    document_id = document.get("document_id", document.get("id", f"document_{index}"))
+    if not isinstance(document_id, str) or not ID_RE.fullmatch(document_id):
+        raise ExtractionError("Batch document IDs must use the NERB ID syntax.")
 
     has_text = "text" in document
     has_file_path = "file_path" in document

@@ -8,7 +8,7 @@ from typing import Any, Protocol
 from .bank import canonicalize_bank, hash_bank
 from .diagnostics import Diagnostic, has_errors
 from .records import MatchRecord, PatternIdentity
-from .schema import validate_bank_schema
+from .schema import STATUS_VALUES, validate_bank_schema
 
 DEFAULT_INCLUDE_STATUSES = ("active",)
 DEFAULT_ENGINE_NAME = "python_re"
@@ -127,9 +127,17 @@ def resolve_extraction_options(options: Mapping[str, Any] | None) -> ResolvedExt
     if not isinstance(include_statuses, Sequence) or isinstance(include_statuses, (str, bytes)):
         raise ExtractionError("Extraction option include_statuses must be a sequence of statuses.")
 
-    statuses = tuple(sorted({str(status) for status in include_statuses}))
-    if not statuses:
+    status_values = list(include_statuses)
+    if not status_values:
         raise ExtractionError("Extraction option include_statuses must not be empty.")
+    invalid_statuses = [
+        status for status in status_values if not isinstance(status, str) or status not in STATUS_VALUES
+    ]
+    if invalid_statuses:
+        raise ExtractionError(
+            f"Extraction option include_statuses must contain only valid status strings: {', '.join(STATUS_VALUES)}."
+        )
+    statuses = tuple(sorted(set(status_values)))
 
     engine = str(options.get("engine", DEFAULT_ENGINE_NAME))
     engine_options = options.get("engine_options", {})
@@ -164,6 +172,13 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
     diagnostics = schema_result["diagnostics"]
     if has_errors(diagnostics):
         raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics)
+
+    from .validation import validate_bank
+
+    validation_result = validate_bank(bank, level="standard", engine=resolved.engine)
+    validation_diagnostics = validation_result["diagnostics"]
+    if has_errors(validation_diagnostics):
+        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", validation_diagnostics)
 
     canonical_bank = canonicalize_bank(bank)
     bank_hash = hash_bank(canonical_bank)
@@ -218,7 +233,7 @@ def compiled_bank_cache_info() -> dict[str, Any]:
 
 def _canonical_options(options: Mapping[str, Any]) -> str:
     try:
-        return json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ExtractionError("Extraction option engine_options must be JSON-compatible.") from exc
 
