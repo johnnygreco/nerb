@@ -7,7 +7,29 @@ from importlib.metadata import version as package_version
 
 from typer.testing import CliRunner
 
-from nerb import NERB, extract_named_entities_records, extract_named_entity_records, load_config, save_config
+from nerb import (
+    NERB,
+    apply_bank_patches,
+    benchmark_bank,
+    clear_compiled_bank_cache,
+    diff_banks,
+    eval_bank,
+    extract_named_entities_records,
+    extract_named_entity_records,
+    load_config,
+    regress_bank,
+    save_config,
+    validate_bank,
+)
+from nerb import (
+    extract_file as extract_json_file,
+)
+from nerb import (
+    extract_report as extract_json_report,
+)
+from nerb import (
+    extract_text as extract_json_text,
+)
 from nerb.cli import app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
 
@@ -51,12 +73,42 @@ def _console_script_entry_points():
     return discovered_entry_points.get("console_scripts", [])
 
 
+def _load_json(path):
+    with open(path, encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _write_json(path, payload):
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    return path
+
+
 def test_help_shows_command_structure():
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0
     assert "Usage:" in result.output
-    for command_name in ["extract", "test", "compile", "doctor", "init", "add", "list", "show", "remove", "validate"]:
+    for command_name in [
+        "validate-bank",
+        "apply-patches",
+        "diff-banks",
+        "extract-text",
+        "extract-file",
+        "extract-report",
+        "eval-bank",
+        "benchmark-bank",
+        "regress-bank",
+        "extract",
+        "test",
+        "compile",
+        "doctor",
+        "init",
+        "add",
+        "list",
+        "show",
+        "remove",
+        "validate",
+    ]:
         assert command_name in result.output
     assert "--config" in result.output
     assert "--version" in result.output
@@ -81,6 +133,173 @@ def test_invalid_command_usage_returns_error():
     assert result.exit_code != 0
     assert "Missing argument" in result.output
     assert "ENTITY" in result.output
+
+
+def test_json_bank_validate_patch_diff_and_eval_commands_match_helpers(tmp_path, test_data_path):
+    bank_path = test_data_path / "minimal_bank.json"
+    bank = _load_json(bank_path)
+
+    validate_result = runner.invoke(app, ["validate-bank", "--bank", str(bank_path)])
+    assert validate_result.exit_code == 0
+    assert json.loads(validate_result.output) == validate_bank(bank, base_path=test_data_path)
+
+    patches = [
+        {
+            "op": "replace",
+            "path": "/entities/customer/names/acme_corp/patterns/primary/value",
+            "value": "Acme Corporation",
+        }
+    ]
+    patch_path = _write_json(tmp_path / "patches.json", patches)
+    apply_result = runner.invoke(app, ["apply-patches", "--bank", str(bank_path), "--patch", str(patch_path)])
+    assert apply_result.exit_code == 0
+    assert json.loads(apply_result.output) == apply_bank_patches(bank, patches, base_path=test_data_path)
+
+    new_bank = json.loads(json.dumps(bank))
+    new_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["value"] = "Acme Corporation"
+    new_bank_path = _write_json(tmp_path / "new_bank.json", new_bank)
+    diff_result = runner.invoke(app, ["diff-banks", str(bank_path), str(new_bank_path)])
+    assert diff_result.exit_code == 0
+    assert json.loads(diff_result.output) == diff_banks(bank, new_bank)
+
+    eval_ref_path = tmp_path / "acme.jsonl"
+    eval_ref_path.write_text(
+        json.dumps(
+            {
+                "type": "positive",
+                "text": "Acme Corp",
+                "matches": [{"string": "Acme Corp", "start": 0, "end": 9}],
+                "metadata": {},
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    eval_bank_payload = json.loads(json.dumps(bank))
+    eval_bank_payload["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["eval_refs"] = [
+        eval_ref_path.name
+    ]
+    eval_bank_path = _write_json(tmp_path / "eval_bank.json", eval_bank_payload)
+    eval_result = runner.invoke(app, ["eval-bank", "--bank", str(eval_bank_path)])
+    assert eval_result.exit_code == 0
+    assert json.loads(eval_result.output) == eval_bank(eval_bank_payload, base_path=tmp_path)
+
+
+def test_json_bank_extraction_commands_match_helpers(tmp_path, test_data_path):
+    bank_path = test_data_path / "minimal_bank.json"
+    bank = _load_json(bank_path)
+    text = "Send this to Acme Corp today."
+    document_path = tmp_path / "email.txt"
+    document_path.write_text(text, encoding="utf-8")
+
+    clear_compiled_bank_cache()
+    text_result = runner.invoke(app, ["extract-text", "--bank", str(bank_path), "--text", text])
+    clear_compiled_bank_cache()
+    expected_text = extract_json_text(bank, text)
+    clear_compiled_bank_cache()
+    file_result = runner.invoke(app, ["extract-file", "--bank", str(bank_path), "--file", str(document_path)])
+    clear_compiled_bank_cache()
+    expected_file = extract_json_file(bank, document_path)
+    clear_compiled_bank_cache()
+    report_result = runner.invoke(app, ["extract-report", "--bank", str(bank_path), "--file", str(document_path)])
+    clear_compiled_bank_cache()
+    expected_report = extract_json_report(bank, text)
+
+    assert text_result.exit_code == 0
+    assert file_result.exit_code == 0
+    assert report_result.exit_code == 0
+    assert json.loads(text_result.output) == expected_text
+    assert json.loads(file_result.output) == expected_file
+    assert json.loads(report_result.output) == expected_report
+
+
+def test_json_bank_cli_enforces_text_source_rules(tmp_path, test_data_path):
+    bank_path = test_data_path / "minimal_bank.json"
+    document_path = tmp_path / "email.txt"
+    document_path.write_text("Acme Corp", encoding="utf-8")
+
+    missing_source = runner.invoke(app, ["extract-text", "--bank", str(bank_path)])
+    duplicate_source = runner.invoke(
+        app,
+        ["extract-report", "--bank", str(bank_path), "--file", str(document_path), "--text", "Acme Corp"],
+    )
+
+    assert missing_source.exit_code == 1
+    assert duplicate_source.exit_code == 1
+    assert "Provide exactly one text source" in missing_source.output
+    assert "Provide exactly one text source" in duplicate_source.output
+
+
+def test_json_bank_cli_invalid_bank_returns_diagnostics(tmp_path):
+    invalid_bank_path = tmp_path / "invalid_bank.json"
+    invalid_bank_path.write_text('{"schema_version":"nerb.bank.v1"}', encoding="utf-8")
+
+    validate_result = runner.invoke(app, ["validate-bank", "--bank", str(invalid_bank_path)])
+    extract_result = runner.invoke(app, ["extract-text", "--bank", str(invalid_bank_path), "--text", "Acme Corp"])
+
+    assert validate_result.exit_code == 0
+    assert extract_result.exit_code == 0
+    assert json.loads(validate_result.output)["valid"] is False
+    assert json.loads(extract_result.output)["valid"] is False
+    assert json.loads(validate_result.output)["diagnostics"][0]["code"].startswith("schema.")
+
+
+def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_data_path):
+    bank = _load_json(test_data_path / "minimal_bank.json")
+    old_bank_path = _write_json(tmp_path / "old_bank.json", bank)
+    new_bank = json.loads(json.dumps(bank))
+    new_bank["version"] = "2026.06.04"
+    new_bank_path = _write_json(tmp_path / "new_bank.json", new_bank)
+
+    benchmark_result = runner.invoke(
+        app,
+        [
+            "benchmark-bank",
+            "--bank",
+            str(old_bank_path),
+            "--benchmark-iterations",
+            "1",
+            "--stress-multiplier",
+            "2",
+        ],
+    )
+    regress_result = runner.invoke(
+        app,
+        [
+            "regress-bank",
+            "--old-bank",
+            str(old_bank_path),
+            "--new-bank",
+            str(new_bank_path),
+            "--benchmark-iterations",
+            "1",
+            "--stress-multiplier",
+            "2",
+        ],
+    )
+
+    assert benchmark_result.exit_code == 0
+    benchmark_payload = json.loads(benchmark_result.output)
+    expected_projection = benchmark_bank(bank, options={"benchmark_iterations": 1, "stress_multiplier": 2})
+    assert benchmark_payload["bank"]["id"] == expected_projection["bank"]["id"]
+    assert benchmark_payload["options"] == expected_projection["options"]
+    assert benchmark_payload["summary"]["cache_hit_verified"] is True
+
+    assert regress_result.exit_code == 0
+    regress_payload = json.loads(regress_result.output)
+    expected_regression = regress_bank(
+        bank,
+        new_bank,
+        options={
+            "old_bank_path": str(old_bank_path),
+            "new_bank_path": str(new_bank_path),
+            "benchmark_iterations": 1,
+            "stress_multiplier": 2,
+        },
+    )
+    assert regress_payload["diff"] == expected_regression["diff"]
+    assert regress_payload["gates"]["passed"] == expected_regression["gates"]["passed"]
 
 
 def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):

@@ -2,12 +2,29 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import re
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
 
 from . import __version__
+from .bank import (
+    BankError,
+    BankLoadError,
+)
+from .bank import (
+    bank_stats as _json_bank_stats,
+)
+from .bank import (
+    load_bank as _load_json_bank,
+)
+from .bank import (
+    read_bank_json as _read_bank_json,
+)
+from .benchmarks import benchmark_bank as _benchmark_bank
+from .benchmarks import regress_bank as _regress_bank
 from .config import (
     FLAGS_KEY,
     ConfigError,
@@ -21,8 +38,35 @@ from .config import (
 from .config import (
     load_config as load_pattern_config,
 )
-from .extraction import extract_named_entities_records, extract_named_entity_records
+from .diagnostics import JSON_PARSE
+from .diff import diff_banks as _diff_banks
+from .evals import eval_bank as _eval_bank
+from .extraction import (
+    ExtractionError,
+    extract_named_entities_records,
+    extract_named_entity_records,
+)
+from .extraction import (
+    explain_match as _json_explain_match,
+)
+from .extraction import (
+    extract_batch as _json_extract_batch,
+)
+from .extraction import (
+    extract_file as _json_extract_file,
+)
+from .extraction import (
+    extract_report as _json_extract_report,
+)
+from .extraction import (
+    extract_report_batch as _json_extract_report_batch,
+)
+from .extraction import (
+    extract_text as _json_extract_text,
+)
+from .patches import apply_bank_patches as _apply_bank_patches
 from .regex_builder import NERB
+from .validation import validate_bank as _validate_bank
 
 Transport = Literal["stdio", "sse", "streamable-http"]
 MCP_PYTHON_REQUIRES = (3, 10)
@@ -67,6 +111,182 @@ mcp, _ToolError = _load_mcp_sdk()
 
 def _raise_tool_error(message: str) -> NoReturn:
     raise _ToolError(message)
+
+
+def _diagnostic_payload(message: str, diagnostics: list[dict[str, Any]], *, path: Path | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"valid": False, "error": message, "diagnostics": diagnostics}
+    if path is not None:
+        payload["path"] = str(path)
+    return payload
+
+
+def _bank_load_error_is_json_parse(exc: BankLoadError) -> bool:
+    return any(diagnostic.get("code") == JSON_PARSE for diagnostic in exc.diagnostics)
+
+
+def _ensure_explicit_file(path_value: str, label: str) -> Path:
+    if not path_value:
+        _raise_tool_error(f"{label.lower()}_path must be a non-empty string.")
+    path = Path(path_value).expanduser()
+    if not path.exists():
+        _raise_tool_error(f"{label} file does not exist at {path}.")
+    if not path.is_file():
+        _raise_tool_error(f"{label} path is not a file: {path}.")
+    return path
+
+
+def _load_raw_bank_json_for_tool(bank_path: str) -> tuple[Any | None, Path, dict[str, Any] | None]:
+    path = _ensure_explicit_file(bank_path, "Bank")
+    try:
+        return _read_bank_json(path), path, None
+    except BankLoadError as exc:
+        if _bank_load_error_is_json_parse(exc):
+            return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        _raise_tool_error(f"Could not read bank at {path}: {exc}")
+
+
+def _load_json_bank_for_tool(bank_path: str) -> tuple[Mapping[str, Any] | None, Path, dict[str, Any] | None]:
+    path = _ensure_explicit_file(bank_path, "Bank")
+    try:
+        return _load_json_bank(path), path, None
+    except BankLoadError as exc:
+        if _bank_load_error_is_json_parse(exc):
+            return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        _raise_tool_error(f"Could not read bank at {path}: {exc}")
+    except BankError as exc:
+        return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+
+
+def _resolve_bank_source(
+    bank: Any | None,
+    bank_path: str | None,
+    *,
+    base_path: str | None = None,
+    raw: bool = False,
+) -> tuple[Any | None, Path | None, Path | None, dict[str, Any] | None]:
+    has_bank = bank is not None
+    has_bank_path = bank_path is not None
+    if has_bank == has_bank_path:
+        _raise_tool_error("Provide exactly one bank source: bank or bank_path.")
+
+    if bank_path is not None:
+        loaded_bank, path, invalid_payload = (
+            _load_raw_bank_json_for_tool(bank_path) if raw else _load_json_bank_for_tool(bank_path)
+        )
+        return loaded_bank, path, path.parent, invalid_payload
+
+    resolved_base_path = Path(base_path).expanduser() if base_path is not None else None
+    return bank, None, resolved_base_path, None
+
+
+def _mapping_bank_or_payload(bank: Any, label: str) -> tuple[Mapping[str, Any] | None, dict[str, Any] | None]:
+    if isinstance(bank, Mapping):
+        return bank, None
+    validation = _validate_bank(bank)
+    return None, {"valid": False, "label": label, "diagnostics": validation["diagnostics"]}
+
+
+def _load_patch_json_for_tool(patch_path: str) -> Any:
+    path = _ensure_explicit_file(patch_path, "Patch")
+    try:
+        with path.open(encoding="utf-8") as file:
+            return json.load(file)
+    except json.JSONDecodeError as exc:
+        _raise_tool_error(f"Could not parse JSON patch at {path}: {exc.msg} at line {exc.lineno}, column {exc.colno}.")
+    except OSError as exc:
+        _raise_tool_error(f"Could not read patch at {path}: {exc}")
+
+
+def _coerce_patch_object(raw_patch: Mapping[Any, Any], label: str) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    for key, value in raw_patch.items():
+        if not isinstance(key, str):
+            _raise_tool_error(f"{label} keys must be strings.")
+        patch[key] = value
+    return patch
+
+
+def _resolve_patch_source(patches: Any | None, patch_path: str | None) -> list[dict[str, Any]]:
+    has_patches = patches is not None
+    has_patch_path = patch_path is not None
+    if has_patches == has_patch_path:
+        _raise_tool_error("Provide exactly one patch source: patches or patch_path.")
+
+    raw_patch = _load_patch_json_for_tool(patch_path) if patch_path is not None else patches
+    if isinstance(raw_patch, Mapping):
+        return [_coerce_patch_object(raw_patch, "Patch JSON object")]
+    if not isinstance(raw_patch, Sequence) or isinstance(raw_patch, (str, bytes)):
+        _raise_tool_error("Patch JSON must be an object or an array of objects.")
+
+    patch_operations: list[dict[str, Any]] = []
+    for index, patch in enumerate(raw_patch):
+        if not isinstance(patch, Mapping):
+            _raise_tool_error(f"Patch JSON item {index} must be an object.")
+        patch_operations.append(_coerce_patch_object(patch, f"Patch JSON item {index}"))
+    return patch_operations
+
+
+def _read_json_text_source(text: str | None, file_path: str | None) -> str:
+    source_count = sum([text is not None, file_path is not None])
+    if source_count != 1:
+        _raise_tool_error("Provide exactly one text source: text or file_path.")
+
+    if text is not None:
+        return text
+
+    if file_path is None:
+        _raise_tool_error("Provide exactly one text source: text or file_path.")
+
+    path = _ensure_explicit_file(file_path, "Document")
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _raise_tool_error(f"Could not read document at {path}: {exc}")
+
+
+def _document_sequence(documents: Any) -> Sequence[Mapping[str, Any]]:
+    if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
+        _raise_tool_error("documents must be an array of explicit document objects.")
+    if not all(isinstance(document, Mapping) for document in documents):
+        _raise_tool_error("documents must be an array of explicit document objects.")
+    return cast(Sequence[Mapping[str, Any]], documents)
+
+
+def _options_mapping(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    if options is None:
+        return {}
+    if not isinstance(options, Mapping):
+        _raise_tool_error("options must be an object.")
+    return dict(options)
+
+
+def _invalid_bank_payloads_payload(payloads: Mapping[str, dict[str, Any] | None]) -> dict[str, Any] | None:
+    invalid_payloads = {label: payload for label, payload in payloads.items() if payload is not None}
+    if not invalid_payloads:
+        return None
+
+    diagnostics: list[dict[str, Any]] = []
+    for label, payload in invalid_payloads.items():
+        for item in payload["diagnostics"]:
+            diagnostic = dict(item)
+            metadata = dict(diagnostic.get("metadata", {}))
+            metadata["bank"] = label
+            diagnostic["metadata"] = metadata
+            diagnostics.append(diagnostic)
+
+    return {"valid": False, "banks": invalid_payloads, "diagnostics": diagnostics}
+
+
+def _run_json_tool(action: Any) -> dict[str, Any]:
+    try:
+        return action()
+    except (ExtractionError, BankError) as exc:
+        diagnostics = getattr(exc, "diagnostics", [])
+        if diagnostics:
+            return _diagnostic_payload(str(exc), diagnostics)
+        _raise_tool_error(str(exc))
+    except (TypeError, ValueError) as exc:
+        _raise_tool_error(str(exc))
 
 
 def _tool_config_path(config_path: str) -> Path:
@@ -322,6 +542,341 @@ def extract_inline(
         "records": records,
         "record_count": len(records),
     }
+
+
+@mcp.tool()
+def validate_bank(
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    level: str = "standard",
+    engine: str = "python_re",
+    base_path: str | None = None,
+    strict: bool = False,
+) -> dict[str, Any]:
+    """Validate a JSON bank from a direct object or explicit bank_path."""
+    bank_value, _path, resolved_base_path, invalid_payload = _resolve_bank_source(
+        bank,
+        bank_path,
+        base_path=base_path,
+        raw=True,
+    )
+    if invalid_payload is not None:
+        return invalid_payload
+
+    return _run_json_tool(
+        lambda: _validate_bank(
+            bank_value,
+            level=level,
+            engine=engine,
+            base_path=resolved_base_path,
+            strict=strict,
+        )
+    )
+
+
+@mcp.tool()
+def apply_bank_patches(
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    patches: Any | None = None,
+    patch_path: str | None = None,
+    level: str = "standard",
+    engine: str = "python_re",
+    base_path: str | None = None,
+) -> dict[str, Any]:
+    """Apply explicit JSON Patch operations to a JSON bank and validate the candidate."""
+    bank_value, _path, resolved_base_path, invalid_payload = _resolve_bank_source(
+        bank,
+        bank_path,
+        base_path=base_path,
+        raw=True,
+    )
+    if invalid_payload is not None:
+        return invalid_payload
+
+    patch_operations = _resolve_patch_source(patches, patch_path)
+    return _run_json_tool(
+        lambda: _apply_bank_patches(
+            bank_value,
+            patch_operations,
+            level=level,
+            engine=engine,
+            base_path=resolved_base_path,
+        )
+    )
+
+
+@mcp.tool()
+def diff_banks(
+    old_bank: Any | None = None,
+    new_bank: Any | None = None,
+    old_bank_path: str | None = None,
+    new_bank_path: str | None = None,
+) -> dict[str, Any]:
+    """Diff two JSON banks from direct objects or explicit bank paths."""
+    old_value, _old_path, _old_base_path, old_invalid = _resolve_bank_source(old_bank, old_bank_path, raw=True)
+    new_value, _new_path, _new_base_path, new_invalid = _resolve_bank_source(new_bank, new_bank_path, raw=True)
+    old_mapping, old_mapping_invalid = _mapping_bank_or_payload(old_value, "old_bank")
+    new_mapping, new_mapping_invalid = _mapping_bank_or_payload(new_value, "new_bank")
+    invalid_payload = _invalid_bank_payloads_payload(
+        {"old_bank": old_invalid or old_mapping_invalid, "new_bank": new_invalid or new_mapping_invalid}
+    )
+    if invalid_payload is not None:
+        return invalid_payload
+    if old_mapping is None or new_mapping is None:
+        _raise_tool_error("diff_banks requires JSON bank objects.")
+
+    return _run_json_tool(lambda: _diff_banks(old_mapping, new_mapping))
+
+
+@mcp.tool()
+def bank_stats(
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    include_engine: bool = False,
+    engine: str = "python_re",
+) -> dict[str, Any]:
+    """Return JSON-bank structural counts without compiling patterns."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path, raw=True)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("bank_stats requires a JSON bank object.")
+
+    return _run_json_tool(lambda: _json_bank_stats(bank_mapping, include_engine=include_engine, engine=engine))
+
+
+@mcp.tool()
+def extract_text(
+    text: str,
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract JSON-bank records from a single in-memory text document."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("extract_text requires a JSON bank object.")
+
+    return _run_json_tool(lambda: _json_extract_text(bank_mapping, text, options=_options_mapping(options)))
+
+
+@mcp.tool()
+def extract_file(
+    file_path: str,
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract JSON-bank records from one explicit UTF-8 document file."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("extract_file requires a JSON bank object.")
+
+    document_path = _ensure_explicit_file(file_path, "Document")
+    return _run_json_tool(lambda: _json_extract_file(bank_mapping, document_path, options=_options_mapping(options)))
+
+
+@mcp.tool()
+def extract_batch(
+    documents: Any,
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract JSON-bank records from explicit document objects only."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("extract_batch requires a JSON bank object.")
+
+    return _run_json_tool(
+        lambda: _json_extract_batch(bank_mapping, _document_sequence(documents), options=_options_mapping(options))
+    )
+
+
+@mcp.tool()
+def extract_report(
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    text: str | None = None,
+    file_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a single-document extraction report from text or an explicit file_path."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("extract_report requires a JSON bank object.")
+
+    document_text = _read_json_text_source(text, file_path)
+    return _run_json_tool(lambda: _json_extract_report(bank_mapping, document_text, options=_options_mapping(options)))
+
+
+@mcp.tool()
+def extract_report_batch(
+    documents: Any,
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return extraction reports for explicit document objects only."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("extract_report_batch requires a JSON bank object.")
+
+    return _run_json_tool(
+        lambda: _json_extract_report_batch(
+            bank_mapping,
+            _document_sequence(documents),
+            options=_options_mapping(options),
+        )
+    )
+
+
+@mcp.tool()
+def eval_bank(
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    base_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Evaluate a JSON bank against its explicit local eval_refs."""
+    bank_value, _path, resolved_base_path, invalid_payload = _resolve_bank_source(
+        bank,
+        bank_path,
+        base_path=base_path,
+    )
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("eval_bank requires a JSON bank object.")
+
+    return _run_json_tool(
+        lambda: _eval_bank(bank_mapping, base_path=resolved_base_path, options=_options_mapping(options))
+    )
+
+
+@mcp.tool()
+def benchmark_bank(
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    documents: Any | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Benchmark JSON-bank compile and extraction throughput."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("benchmark_bank requires a JSON bank object.")
+
+    return _run_json_tool(lambda: _benchmark_bank(bank_mapping, documents=documents, options=_options_mapping(options)))
+
+
+@mcp.tool()
+def explain_match(
+    entity_id: str,
+    name_id: str,
+    pattern_id: str,
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Explain one configured JSON-bank pattern without scanning text."""
+    bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_payload is not None:
+        return invalid_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("explain_match requires a JSON bank object.")
+
+    return _run_json_tool(
+        lambda: _json_explain_match(
+            bank_mapping,
+            entity_id,
+            name_id,
+            pattern_id,
+            options=_options_mapping(options),
+        )
+    )
+
+
+@mcp.tool()
+def regress_bank(
+    old_bank: Any | None = None,
+    new_bank: Any | None = None,
+    old_bank_path: str | None = None,
+    new_bank_path: str | None = None,
+    base_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Run diff, eval, and benchmark regression checks for two JSON banks."""
+    old_value, old_path, old_base_path, old_invalid = _resolve_bank_source(
+        old_bank,
+        old_bank_path,
+        base_path=base_path,
+    )
+    new_value, new_path, new_base_path, new_invalid = _resolve_bank_source(
+        new_bank,
+        new_bank_path,
+        base_path=base_path,
+    )
+    old_mapping, old_mapping_invalid = _mapping_bank_or_payload(old_value, "old_bank")
+    new_mapping, new_mapping_invalid = _mapping_bank_or_payload(new_value, "new_bank")
+    invalid_payload = _invalid_bank_payloads_payload(
+        {"old_bank": old_invalid or old_mapping_invalid, "new_bank": new_invalid or new_mapping_invalid}
+    )
+    if invalid_payload is not None:
+        return invalid_payload
+    if old_mapping is None or new_mapping is None:
+        _raise_tool_error("regress_bank requires JSON bank objects.")
+
+    regression_options = _options_mapping(options)
+    if old_path is not None:
+        regression_options["old_bank_path"] = str(old_path)
+    elif old_base_path is not None:
+        regression_options["old_base_path"] = str(old_base_path)
+    if new_path is not None:
+        regression_options["new_bank_path"] = str(new_path)
+    elif new_base_path is not None:
+        regression_options["new_base_path"] = str(new_base_path)
+
+    return _run_json_tool(lambda: _regress_bank(old_mapping, new_mapping, options=regression_options))
 
 
 def main(argv: list[str] | None = None) -> None:
