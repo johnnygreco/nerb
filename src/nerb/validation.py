@@ -82,6 +82,13 @@ def _diagnostic_sort_key(item: Diagnostic) -> tuple[str, str, str, str]:
     )
 
 
+def _safe_hash_bank(bank: Mapping[str, Any]) -> str | None:
+    try:
+        return hash_bank(bank)
+    except TypeError:
+        return None
+
+
 def _error_or_warning(strict: bool) -> str:
     return DIAGNOSTIC_ERROR if strict else DIAGNOSTIC_WARNING
 
@@ -700,7 +707,7 @@ def validate_bank(
         return {
             "valid": False,
             "bank": candidate_bank,
-            "hash": hash_bank(candidate_bank) if isinstance(candidate_bank, Mapping) else None,
+            "hash": _safe_hash_bank(candidate_bank) if isinstance(candidate_bank, Mapping) else None,
             "diagnostics": diagnostics,
             "stats": stats,
             "engine_compatibility": {"engine": engine, "compatible": False},

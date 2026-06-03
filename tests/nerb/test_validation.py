@@ -89,6 +89,16 @@ def test_basic_validation_reports_standalone_regex_compile_errors(minimal_bank):
     assert "regex.compile_error" in _codes(result)
 
 
+def test_validate_bank_returns_schema_diagnostics_for_non_json_compatible_bank(minimal_bank):
+    minimal_bank["metadata"]["bad"] = object()
+
+    result = validate_bank(minimal_bank)
+
+    assert result["valid"] is False
+    assert result["hash"] is None
+    assert any(diagnostic["path"] == "/metadata/bad" for diagnostic in result["diagnostics"])
+
+
 def test_validation_reports_regexes_that_match_empty_strings(minimal_bank):
     _add_regex(minimal_bank, "empty", r"a*")
 
