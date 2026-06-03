@@ -934,7 +934,7 @@ def apply_json_bank_patches(
     engine: str = typer.Option("python_re", "--engine", help="Validation engine after applying patches."),
 ) -> None:
     """Apply JSON Patch operations to a JSON bank and print the validated candidate."""
-    bank, path, invalid_payload = _load_json_bank_for_command(bank_path)
+    bank, path, invalid_payload = _load_raw_bank_json_for_command(bank_path)
     if invalid_payload is not None:
         _echo_json(invalid_payload)
         return

@@ -186,6 +186,21 @@ def test_json_bank_validate_patch_diff_and_eval_commands_match_helpers(tmp_path,
     assert json.loads(eval_result.output) == eval_bank(eval_bank_payload, base_path=tmp_path)
 
 
+def test_json_bank_apply_patches_command_allows_repairing_invalid_bank(tmp_path, test_data_path):
+    bank = _load_json(test_data_path / "minimal_bank.json")
+    invalid_bank = json.loads(json.dumps(bank))
+    del invalid_bank["description"]
+    patches = [{"op": "add", "path": "/description", "value": "Restored bank description."}]
+    bank_path = _write_json(tmp_path / "invalid_bank.json", invalid_bank)
+    patch_path = _write_json(tmp_path / "patches.json", patches)
+
+    result = runner.invoke(app, ["apply-patches", "--bank", str(bank_path), "--patch", str(patch_path)])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == apply_bank_patches(invalid_bank, patches, base_path=tmp_path)
+    assert json.loads(result.output)["valid"] is True
+
+
 def test_json_bank_extraction_commands_match_helpers(tmp_path, test_data_path):
     bank_path = test_data_path / "minimal_bank.json"
     bank = _load_json(bank_path)
