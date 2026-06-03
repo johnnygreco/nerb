@@ -1,0 +1,3 @@
+{"type":"positive","text":"Send this to Acme Corp.","matches":[{"string":"Acme Corp","start":13,"end":22}],"metadata":{"case":"fixture_positive"}}
+{"type":"negative","text":"The acme of performance was impressive.","reason":"Common-word false positive guard.","metadata":{}}
+{"type":"provenance","source_type":"crm","observed_at":"2026-06-03T00:00:00Z","evidence":"Fixture eval record for Acme Corp.","metadata":{}}

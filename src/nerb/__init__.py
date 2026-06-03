@@ -17,6 +17,7 @@ from .config import (
     validate_regex_flags,
 )
 from .engines import clear_compiled_bank_cache, compiled_bank_cache_info
+from .evals import eval_bank
 from .extraction import (
     ExtractionError,
     explain_match,
@@ -75,6 +76,7 @@ __all__ = [
     "extract_named_entity",
     "extract_named_entity_records",
     "extract_text",
+    "eval_bank",
     "explain_match",
     "hash_bank",
     "load_bank",
