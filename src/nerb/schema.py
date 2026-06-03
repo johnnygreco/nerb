@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
+from jsonschema.validators import extend
 
 from .diagnostics import (
     DIAGNOSTIC_ERROR,
@@ -28,14 +30,52 @@ STATUS_VALUES = ("draft", "active", "inactive", "deprecated")
 UNICODE_NORMALIZATION_VALUES = ("none", "NFC", "NFKC")
 REGEX_FLAG_ORDER = ("ASCII", "IGNORECASE", "MULTILINE", "DOTALL", "VERBOSE")
 
+
+def _is_json_array(_checker: Any, instance: Any) -> bool:
+    return isinstance(instance, list)
+
+
+def _is_json_integer(_checker: Any, instance: Any) -> bool:
+    return isinstance(instance, int) and not isinstance(instance, bool)
+
+
+def _is_json_number(_checker: Any, instance: Any) -> bool:
+    return isinstance(instance, (int, float)) and not isinstance(instance, bool) and math.isfinite(instance)
+
+
+def _is_json_object(_checker: Any, instance: Any) -> bool:
+    return isinstance(instance, dict)
+
+
+JSON_TYPE_CHECKER = Draft202012Validator.TYPE_CHECKER.redefine_many(
+    {
+        "array": _is_json_array,
+        "integer": _is_json_integer,
+        "number": _is_json_number,
+        "object": _is_json_object,
+    }
+)
+BankSchemaValidator = extend(Draft202012Validator, type_checker=JSON_TYPE_CHECKER)
+
 EVAL_REFS_SCHEMA: dict[str, Any] = {
     "type": "array",
     "items": {"type": "string", "minLength": 1},
 }
 
+JSON_VALUE_SCHEMA: dict[str, Any] = {
+    "anyOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "number"},
+        {"type": "string"},
+        {"type": "array", "items": {"$ref": "#/$defs/json_value"}},
+        {"type": "object", "additionalProperties": {"$ref": "#/$defs/json_value"}},
+    ],
+}
+
 METADATA_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "additionalProperties": True,
+    "additionalProperties": {"$ref": "#/$defs/json_value"},
 }
 
 REGEX_FLAGS_SCHEMA: dict[str, Any] = {
@@ -135,6 +175,7 @@ BANK_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://nerb.dev/schemas/bank.v1.schema.json",
     "title": "NERB Bank",
+    "$defs": {"json_value": JSON_VALUE_SCHEMA},
     "type": "object",
     "required": [
         "schema_version",
@@ -173,7 +214,7 @@ BANK_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-BANK_SCHEMA_VALIDATOR = Draft202012Validator(BANK_SCHEMA)
+BANK_SCHEMA_VALIDATOR = BankSchemaValidator(BANK_SCHEMA)
 Draft202012Validator.check_schema(BANK_SCHEMA)
 
 __all__ = [
@@ -195,6 +236,12 @@ def _json_pointer(parts: Iterable[Any]) -> str:
 
 
 def _additional_properties(error: ValidationError) -> list[str]:
+    if isinstance(error.instance, Mapping) and isinstance(error.schema, Mapping):
+        allowed_properties = set(error.schema.get("properties", {}))
+        if allowed_properties:
+            return sorted(
+                str(property_name) for property_name in error.instance if property_name not in allowed_properties
+            )
     return re.findall(r"'([^']+)'", error.message)
 
 
@@ -233,6 +280,16 @@ def _schema_diagnostic(error: ValidationError) -> Diagnostic:
     return diagnostic(DIAGNOSTIC_ERROR, code, path, error.message)
 
 
+def _additional_property_diagnostic(error: ValidationError, property_name: str) -> Diagnostic:
+    path = _json_pointer([*error.path, property_name])
+    return diagnostic(
+        DIAGNOSTIC_ERROR,
+        SCHEMA_ADDITIONAL_PROPERTY,
+        path,
+        f"Additional property {property_name!r} is not allowed.",
+    )
+
+
 def _schema_sort_key(error: ValidationError) -> tuple[str, str, str]:
     return (_diagnostic_path(error), _diagnostic_code(error), error.message)
 
@@ -244,6 +301,13 @@ def _iter_schema_diagnostics(bank: Any) -> list[Diagnostic]:
             continue
         if error.validator == "pattern" and list(error.path) == ["id"]:
             continue
+        if error.validator == "additionalProperties":
+            properties = _additional_properties(error)
+            if properties:
+                diagnostics.extend(
+                    _additional_property_diagnostic(error, property_name) for property_name in properties
+                )
+                continue
         diagnostics.append(_schema_diagnostic(error))
     return diagnostics
 

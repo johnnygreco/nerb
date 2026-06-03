@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 
 import pytest
 
@@ -52,6 +53,32 @@ def test_unknown_fields_are_rejected_outside_metadata(minimal_bank):
         (diagnostic["code"], diagnostic["path"]) for diagnostic in result["diagnostics"]
     }
     assert all(diagnostic["path"] != "/metadata/arbitrary" for diagnostic in result["diagnostics"])
+
+
+def test_multiple_unknown_fields_get_field_level_paths(minimal_bank):
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["unexpected_one"] = "nope"
+    pattern["unexpected_two"] = "also nope"
+
+    result = validate_bank_schema(minimal_bank)
+
+    assert result["valid"] is False
+    assert {
+        ("schema.additional_property", "/entities/customer/names/acme_corp/patterns/primary/unexpected_one"),
+        ("schema.additional_property", "/entities/customer/names/acme_corp/patterns/primary/unexpected_two"),
+    }.issubset({(diagnostic["code"], diagnostic["path"]) for diagnostic in result["diagnostics"]})
+
+
+def test_metadata_must_be_json_compatible(minimal_bank):
+    minimal_bank["metadata"]["json_ok"] = {"nested": ["json", 1, 1.5, True, None]}
+    minimal_bank["metadata"]["not_json"] = object()
+    minimal_bank["metadata"]["not_finite_json"] = math.nan
+
+    result = validate_bank_schema(minimal_bank)
+
+    assert result["valid"] is False
+    assert any(diagnostic["path"] == "/metadata/not_json" for diagnostic in result["diagnostics"])
+    assert any(diagnostic["path"] == "/metadata/not_finite_json" for diagnostic in result["diagnostics"])
 
 
 def test_invalid_ids_produce_id_invalid_diagnostics(minimal_bank):
