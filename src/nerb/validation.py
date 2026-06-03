@@ -500,6 +500,17 @@ def _internal_group_name(pattern: RegexPattern) -> str:
     return f"nerb__{pattern.entity_id}__{pattern.name_id}__{pattern.pattern_id}"
 
 
+def _generated_group_prefix(pattern: RegexPattern) -> str:
+    return f"nerb_ug__{pattern.entity_id}__{pattern.name_id}__{pattern.pattern_id}__"
+
+
+def _rewritten_scoped_pattern(pattern: RegexPattern) -> str:
+    from .python_re_engine import _rewrite_numeric_backrefs
+
+    rewritten, _ = _rewrite_numeric_backrefs(pattern.value, _generated_group_prefix(pattern))
+    return _scoped_pattern(rewritten, pattern.flags)
+
+
 def _capture_conflict_diagnostics(
     patterns: Sequence[RegexPattern],
     compiled_by_path: Mapping[str, re.Pattern[str]],
@@ -564,11 +575,12 @@ def _composed_compile_diagnostics(
     for entity_id, shard_patterns in sorted(entity_patterns.items()):
         if not shard_patterns:
             continue
+
         alternatives = [
-            f"(?P<{_internal_group_name(pattern)}>{_scoped_pattern(pattern.value, pattern.flags)})"
+            (f"(?:(?=(?:{_rewritten_scoped_pattern(pattern)})(?P<{_internal_group_name(pattern)}>))|)")
             for pattern in shard_patterns
         ]
-        shard = "|".join(alternatives)
+        shard = "".join(alternatives)
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("error", DeprecationWarning)

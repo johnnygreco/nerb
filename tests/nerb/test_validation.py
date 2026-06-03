@@ -215,6 +215,17 @@ def test_python_re_capture_names_can_repeat_across_entity_shards(minimal_bank):
     assert "regex.capture_conflict" not in _codes(result)
 
 
+def test_python_re_composed_validation_allows_numeric_backreferences(minimal_bank):
+    patterns = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]
+    patterns.clear()
+    patterns["code"] = _regex_pattern(r"\b([A-Z]+)-\1\b")
+
+    result = validate_bank(minimal_bank)
+
+    assert result["valid"] is True
+    assert "regex.compose_compile_error" not in _codes(result)
+
+
 def test_python_re_composed_validation_reports_internal_identity_capture_conflicts(minimal_bank):
     minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"] = _regex_pattern(
         r"(?P<nerb__customer__acme_corp__primary>Acme)"

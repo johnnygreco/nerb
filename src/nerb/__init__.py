@@ -16,11 +16,16 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
+from .engines import clear_compiled_bank_cache, compiled_bank_cache_info
 from .extraction import (
+    ExtractionError,
+    extract_batch,
+    extract_file,
     extract_named_entities,
     extract_named_entities_records,
     extract_named_entity,
     extract_named_entity_records,
+    extract_text,
 )
 from .named_entities import NamedEntity, NamedEntityList
 from .patches import BankPatchError, apply_bank_patches
@@ -50,15 +55,21 @@ __all__ = [
     "NamedEntity",
     "NamedEntityList",
     "PatternConfig",
+    "ExtractionError",
     "__version__",
     "add_entity_pattern",
     "apply_bank_patches",
     "bank_stats",
     "canonicalize_bank",
+    "clear_compiled_bank_cache",
+    "compiled_bank_cache_info",
+    "extract_batch",
+    "extract_file",
     "extract_named_entities",
     "extract_named_entities_records",
     "extract_named_entity",
     "extract_named_entity_records",
+    "extract_text",
     "hash_bank",
     "load_bank",
     "load_config",
