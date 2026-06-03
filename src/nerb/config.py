@@ -7,7 +7,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 # Third-party
 import yaml
@@ -32,7 +32,7 @@ DEFAULT_CONFIG_ENV_VAR = "NERB_CONFIG_PATH"
 DEFAULT_CONFIG_FILENAME = "detectors.yaml"
 FLAGS_KEY = "_flags"
 
-PatternConfig = Dict[str, Dict[str, Any]]
+PatternConfig = dict[str, dict[str, Any]]
 
 
 class ConfigError(ValueError):
