@@ -145,8 +145,8 @@ benchmark = benchmark_bank(bank, options={"benchmark_iterations": 1})
 ```
 
 Other public helpers include `bank_stats`, `canonicalize_bank`, `hash_bank`, `validate_bank_schema`,
-`extract_file`, `extract_batch`, `extract_report_file`, `extract_report_batch`, `explain_match`, and
-`compiled_bank_cache_info`.
+`benchmark_fixture_profiles`, `make_benchmark_fixture_profile`, `extract_file`, `extract_batch`,
+`extract_report_file`, `extract_report_batch`, `explain_match`, and `compiled_bank_cache_info`.
 
 The current Python regex-builder API is still present until the Rust-backed `Bank` API replaces it:
 

@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from nerb import benchmark_bank, regress_bank
-from nerb.benchmarks import make_synthetic_bank
+from nerb import benchmark_bank, benchmark_fixture_profiles, make_benchmark_fixture_profile, regress_bank
+from nerb.benchmarks import BENCHMARK_PROFILE_IDS, make_synthetic_bank
 from nerb.diagnostics import EVAL_POSITIVE_FAILED
 
 
@@ -62,10 +62,66 @@ def test_benchmark_bank_reports_cache_compile_and_deterministic_tier_counts(mini
     assert first["compile"]["cache"]["cold_hit"] is False
     assert first["compile"]["cache"]["warm_hit"] is True
     assert first["summary"]["cache_hit_verified"] is True
+    assert first["stages"]["compile_cache"]["cache_hit_verified"] is True
+    assert first["stages"]["input_parse"] == {
+        "available": False,
+        "seconds": None,
+        "note": "benchmark_bank receives an already-loaded bank object.",
+    }
     assert set(first["tiers"]) == {"baseline", "target", "stress"}
     assert all(tier["record_count_stable"] is True for tier in first["tiers"].values())
+    assert all(
+        set(tier["stages"]) == {"document_prepare_seconds", "scan_project_sort_seconds"}
+        for tier in first["tiers"].values()
+    )
     assert first["bank"]["profile"]["profile"] == "mostly_literal"
     assert _benchmark_projection(first) == _benchmark_projection(second)
+
+
+def test_benchmark_fixture_profiles_manifest_is_json_compatible_and_explicit():
+    manifest = benchmark_fixture_profiles()
+
+    assert json.loads(json.dumps(manifest, allow_nan=False)) == manifest
+    assert tuple(manifest["profile_ids"]) == BENCHMARK_PROFILE_IDS
+    assert set(manifest["profiles"]) == set(BENCHMARK_PROFILE_IDS)
+    assert manifest["gate"] == {
+        "stage": "smoke",
+        "thresholds_configured": False,
+        "threshold_status": "deferred_until_native_engine_modes",
+        "required_profiles": list(BENCHMARK_PROFILE_IDS),
+        "required_tiers": ["baseline", "target", "stress"],
+        "required_result_sections": ["bank", "engine", "options", "stages", "compile", "tiers", "summary"],
+    }
+    assert manifest["profiles"]["adversarial_smoke"]["workload"] == "adversarial_smoke"
+
+
+@pytest.mark.parametrize("profile_id", BENCHMARK_PROFILE_IDS)
+def test_benchmark_fixture_profile_runs_with_stable_smoke_shape(profile_id):
+    fixture = make_benchmark_fixture_profile(profile_id)
+
+    assert json.loads(json.dumps(fixture, allow_nan=False)) == fixture
+    assert fixture["id"] == profile_id
+    assert set(fixture["documents"]) == {"baseline", "target", "stress"}
+    assert fixture["options"]["benchmark_profile_id"] == profile_id
+
+    result = benchmark_bank(fixture["bank"], documents=fixture["documents"], options=fixture["options"])
+
+    assert json.loads(json.dumps(result, allow_nan=False)) == result
+    assert result["options"]["benchmark_profile_id"] == profile_id
+    assert result["summary"]["benchmark_profile_id"] == profile_id
+    assert set(result["stages"]) == {
+        "input_parse",
+        "canonicalize",
+        "validation",
+        "document_tier_resolution",
+        "compile_cache",
+        "document_prepare",
+        "scan_project_sort",
+    }
+    assert result["stages"]["compile_cache"]["cache_hit_verified"] is True
+    assert set(result["stages"]["document_prepare"]["seconds_by_tier"]) == {"baseline", "target", "stress"}
+    assert set(result["stages"]["scan_project_sort"]["seconds_by_tier"]) == {"baseline", "target", "stress"}
+    assert all(tier["record_count_stable"] is True for tier in result["tiers"].values())
 
 
 def test_benchmark_bank_profiles_mixed_literal_regex_workload(minimal_bank):

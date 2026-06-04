@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from .bank import BankError, BankLoadError, BankSchemaError, bank_stats, canonicalize_bank, hash_bank, load_bank
-from .benchmarks import benchmark_bank, regress_bank
+from .benchmarks import benchmark_bank, benchmark_fixture_profiles, make_benchmark_fixture_profile, regress_bank
 from .config import (
     DEFAULT_CONFIG_ENV_VAR,
     DEFAULT_CONFIG_FILENAME,
@@ -55,6 +55,7 @@ __all__ = [
     "BankPatchError",
     "BankSchemaError",
     "benchmark_bank",
+    "benchmark_fixture_profiles",
     "ConfigError",
     "DEFAULT_CONFIG_ENV_VAR",
     "DEFAULT_CONFIG_FILENAME",
@@ -88,6 +89,7 @@ __all__ = [
     "load_bank",
     "load_config",
     "load_yaml_config",
+    "make_benchmark_fixture_profile",
     "package_path",
     "repo_path",
     "remove_entity_pattern",
