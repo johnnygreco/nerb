@@ -55,7 +55,9 @@ make build
 
 - During the Rust engine migration, treat the Rust-backed `Bank` API as the target. Do not add shims for current Python regex-builder callers unless an active issue explicitly requires one.
 - Put shared behavior in `config.py`, `extraction.py`, `named_entities.py`, or `regex_builder.py`; have CLI and future MCP code call those helpers instead of reimplementing parsing, validation, or serialization.
-- Keep output records JSON-compatible with stable fields: `entity`, `name`, `string`, `start`, and `end`.
+- Current Python oracle records keep JSON-compatible fields: `entity`, `name`, `string`, `start`, and `end`.
+  New Rust-backed `Bank` scan records follow the explicit Rust record contract in
+  `docs/decisions/0001-rust-engine-semantics.md`.
 - Maintain deterministic behavior. Extraction across all entities sorts by start offset, end offset, entity, name, and matched string.
 - Keep user-facing CLI behavior covered with `typer.testing.CliRunner` tests in `tests/nerb/test_cli.py`.
 - Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.

@@ -6,8 +6,7 @@ description: Use when changing NERB extraction behavior, serialized output recor
 # NERB Extraction Surfaces
 
 Use this skill for extraction behavior and output formats. During the Rust engine migration, treat the Rust-backed `Bank`
-surface and explicit record contracts as the target; current Python output can be a test oracle, not a surface to
-a target surface.
+surface and explicit record contracts as the target; current Python output can be a test oracle, not the target surface.
 
 ## Files
 
