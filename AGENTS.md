@@ -58,7 +58,8 @@ make build
 - Current Python oracle records keep JSON-compatible fields: `entity`, `name`, `string`, `start`, and `end`.
   New Rust-backed `Bank` scan records follow the explicit Rust record contract in
   `docs/decisions/0001-rust-engine-semantics.md`.
-- Maintain deterministic behavior. Extraction across all entities sorts by start offset, end offset, entity, name, and matched string.
+- Maintain deterministic behavior. Current Python oracle extraction sorts by start offset, end offset, entity, name,
+  and matched string; Rust-backed `Bank` scan ordering follows `docs/decisions/0001-rust-engine-semantics.md`.
 - Keep user-facing CLI behavior covered with `typer.testing.CliRunner` tests in `tests/nerb/test_cli.py`.
 - Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
