@@ -5,7 +5,7 @@ use crate::ids::{bank_hash, entity_stable_id, pattern_stable_id};
 use regex_syntax::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CANONICAL_SCHEMA: u32 = 1;
 const ENGINE_NAME: &str = "rust-regex-meta";
@@ -182,6 +182,7 @@ fn canonicalize_jsonl_rows(value: Value) -> Result<CanonicalBank> {
         }
     };
     let mut candidates = Vec::new();
+    let mut next_priority_by_entity: HashMap<String, i64> = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
         let path = format!("/{index}");
         let object = as_object(row, &path)?;
@@ -203,7 +204,10 @@ fn canonicalize_jsonl_rows(value: Value) -> Result<CanonicalBank> {
             .unwrap_or_else(|| canonical_name.clone());
         let regex = required_string(object, "regex", &path)?;
         let flags = parse_flags_value(object.get("flags"), &format!("{path}/flags"))?;
-        let priority = optional_i64(object, "priority", &path)?;
+        let source_priority = next_priority_by_entity.entry(entity.clone()).or_insert(0);
+        let default_priority = *source_priority;
+        *source_priority += 1;
+        let priority = Some(optional_i64(object, "priority", &path)?.unwrap_or(default_priority));
         candidates.push(PatternCandidate {
             entity,
             canonical_name,
@@ -400,6 +404,7 @@ fn canonicalize_current_json_bank(object: &Map<String, Value>) -> Result<Canonic
                 let candidate = candidate_from_current_pattern(
                     entity_id,
                     &canonical_name,
+                    pattern_id,
                     pattern,
                     &pattern_path,
                     &default_flags,
@@ -415,6 +420,7 @@ fn canonicalize_current_json_bank(object: &Map<String, Value>) -> Result<Canonic
 fn candidate_from_current_pattern(
     entity_id: &str,
     canonical_name: &str,
+    pattern_id: &str,
     pattern: &Map<String, Value>,
     path: &str,
     default_flags: &[String],
@@ -443,11 +449,18 @@ fn candidate_from_current_pattern(
     let priority = Some(required_i64(pattern, "priority", path)?);
     let flags = match kind.as_str() {
         "regex" => {
-            let pattern_flags =
-                parse_flags_value(pattern.get("regex_flags"), &format!("{path}/regex_flags"))?;
+            reject_present(pattern, "case_sensitive", path, "regex patterns")?;
+            reject_present(pattern, "normalize_whitespace", path, "regex patterns")?;
+            reject_present(pattern, "left_boundary", path, "regex patterns")?;
+            reject_present(pattern, "right_boundary", path, "regex patterns")?;
+            let pattern_flags = parse_flags_value(
+                Some(required_value(pattern, "regex_flags", path)?),
+                &format!("{path}/regex_flags"),
+            )?;
             merge_flags(&[default_flags.to_vec(), entity_flags.to_vec(), pattern_flags])?
         }
         "literal" => {
+            reject_present(pattern, "regex_flags", path, "literal patterns")?;
             let case_sensitive = required_bool(pattern, "case_sensitive", path)?;
             let mut literal_flags = Vec::new();
             if !case_sensitive {
@@ -467,16 +480,21 @@ fn candidate_from_current_pattern(
         "literal" => literal_regex(
             &value,
             required_bool(pattern, "normalize_whitespace", path)?,
-            optional_boundary(pattern, "left_boundary", path)?.as_deref(),
-            optional_boundary(pattern, "right_boundary", path)?.as_deref(),
+            &required_boundary(pattern, "left_boundary", path)?,
+            &required_boundary(pattern, "right_boundary", path)?,
         )?,
+        _ => unreachable!("kind is validated above"),
+    };
+    let surface_name = match kind.as_str() {
+        "literal" => required_string(pattern, "value", path)?,
+        "regex" => pattern_id.to_string(),
         _ => unreachable!("kind is validated above"),
     };
 
     Ok(PatternCandidate {
         entity: entity_id.to_string(),
         canonical_name: canonical_name.to_string(),
-        surface_name: canonical_name.to_string(),
+        surface_name,
         regex,
         flags,
         priority,
@@ -486,14 +504,14 @@ fn candidate_from_current_pattern(
 fn literal_regex(
     value: &str,
     normalize_whitespace: bool,
-    left: Option<&str>,
-    right: Option<&str>,
+    left: &str,
+    right: &str,
 ) -> Result<String> {
     let mut escaped = regex_syntax::escape(value);
     if normalize_whitespace {
-        escaped = escaped.split_whitespace().collect::<Vec<_>>().join(r"\s+");
+        escaped = normalize_literal_whitespace(value);
     }
-    let left_boundary = match left.unwrap_or("none") {
+    let left_boundary = match left {
         "none" => "",
         "word" => r"\b",
         other => {
@@ -503,7 +521,7 @@ fn literal_regex(
             ))
         }
     };
-    let right_boundary = match right.unwrap_or("none") {
+    let right_boundary = match right {
         "none" => "",
         "word" => r"\b",
         other => {
@@ -518,6 +536,31 @@ fn literal_regex(
     } else {
         Ok(format!("{left_boundary}(?:{escaped}){right_boundary}"))
     }
+}
+
+fn normalize_literal_whitespace(value: &str) -> String {
+    let mut regex = String::new();
+    let mut literal_run = String::new();
+    let mut in_whitespace = false;
+    for char in value.chars() {
+        if char.is_whitespace() {
+            if !literal_run.is_empty() {
+                regex.push_str(&regex_syntax::escape(&literal_run));
+                literal_run.clear();
+            }
+            if !in_whitespace {
+                regex.push_str(r"\s+");
+                in_whitespace = true;
+            }
+        } else {
+            in_whitespace = false;
+            literal_run.push(char);
+        }
+    }
+    if !literal_run.is_empty() {
+        regex.push_str(&regex_syntax::escape(&literal_run));
+    }
+    regex
 }
 
 #[derive(Clone, Debug)]
@@ -679,8 +722,6 @@ fn validate_and_normalize_canonical_bank(bank: &mut CanonicalBank) -> Result<()>
             "canonical bank must define at least one entity",
         ));
     }
-    bank.entities
-        .sort_by(|left, right| left.name.cmp(&right.name));
     let mut candidates = Vec::new();
     for entity in &bank.entities {
         validate_non_empty(&entity.name, "/entities/name", "entity names")?;
@@ -850,6 +891,16 @@ fn reject_unknown(object: &Map<String, Value>, path: &str, allowed: &[&str]) -> 
     Ok(())
 }
 
+fn reject_present(object: &Map<String, Value>, key: &str, path: &str, context: &str) -> Result<()> {
+    if object.contains_key(key) {
+        return Err(validation(
+            field_path(path, key),
+            format!("field {key:?} is not allowed for {context}"),
+        ));
+    }
+    Ok(())
+}
+
 fn required_value<'a>(object: &'a Map<String, Value>, key: &str, path: &str) -> Result<&'a Value> {
     object.get(key).ok_or_else(|| {
         validation(
@@ -918,15 +969,13 @@ fn optional_i64(object: &Map<String, Value>, key: &str, path: &str) -> Result<Op
     }
 }
 
-fn optional_boundary(object: &Map<String, Value>, key: &str, path: &str) -> Result<Option<String>> {
-    let boundary = optional_string(object, key, path)?;
-    if let Some(boundary) = &boundary {
-        if boundary != "none" && boundary != "word" {
-            return Err(validation(
-                field_path(path, key),
-                format!("field {key:?} must be \"none\" or \"word\""),
-            ));
-        }
+fn required_boundary(object: &Map<String, Value>, key: &str, path: &str) -> Result<String> {
+    let boundary = required_string(object, key, path)?;
+    if boundary != "none" && boundary != "word" {
+        return Err(validation(
+            field_path(path, key),
+            format!("field {key:?} must be \"none\" or \"word\""),
+        ));
     }
     Ok(boundary)
 }
@@ -981,6 +1030,30 @@ fn field_path(path: &str, key: &str) -> String {
 mod tests {
     use super::*;
 
+    fn current_bank_source_with_pattern(pattern: Value) -> Vec<u8> {
+        serde_json::json!({
+            "schema_version": "nerb.bank.v1",
+            "id": "company_entities",
+            "unicode_normalization": "none",
+            "default_regex_flags": [],
+            "entities": {
+                "customer": {
+                    "regex_flags": [],
+                    "names": {
+                        "acme_corp": {
+                            "canonical": "Acme Corp",
+                            "patterns": {
+                                "primary": pattern,
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     #[test]
     fn yaml_detector_map_canonicalizes_flags_and_ids() {
         let bank = NativeBank::from_source_bytes(
@@ -1032,6 +1105,47 @@ GENRE:
         let error = NativeBank::from_source_bytes(source, Some("jsonl"), None).unwrap_err();
 
         assert!(error.to_string().contains("duplicate logical detector"));
+    }
+
+    #[test]
+    fn current_json_bank_rejects_kind_specific_pattern_fields() {
+        let literal_with_regex_flags = current_bank_source_with_pattern(serde_json::json!({
+            "kind": "literal",
+            "value": "Acme Corp",
+            "priority": 0,
+            "case_sensitive": false,
+            "normalize_whitespace": true,
+            "left_boundary": "word",
+            "right_boundary": "word",
+            "regex_flags": [],
+        }));
+        let error = NativeBank::from_source_bytes(&literal_with_regex_flags, Some("json"), None)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not allowed for literal patterns"));
+
+        let regex_missing_flags = current_bank_source_with_pattern(serde_json::json!({
+            "kind": "regex",
+            "value": "Acme",
+            "priority": 0,
+        }));
+        let error =
+            NativeBank::from_source_bytes(&regex_missing_flags, Some("json"), None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("missing required field \"regex_flags\""));
+
+        let regex_with_literal_field = current_bank_source_with_pattern(serde_json::json!({
+            "kind": "regex",
+            "value": "Acme",
+            "priority": 0,
+            "regex_flags": [],
+            "case_sensitive": false,
+        }));
+        let error = NativeBank::from_source_bytes(&regex_with_literal_field, Some("json"), None)
+            .unwrap_err();
+        assert!(error.to_string().contains("not allowed for regex patterns"));
     }
 
     #[test]

@@ -38,7 +38,9 @@ JSONL is the structured bulk-review form. Each non-empty line is one detector ro
 
 The existing JSON-bank object shape is accepted as a source input so current authoring helpers can feed the Rust
 canonicalizer. Rust maps bank-level, entity-level, and pattern-level flags into canonical per-pattern flags. Literal
-patterns are escaped into regex syntax, and `word` boundaries become explicit boundary wrappers.
+patterns are escaped into regex syntax, and `word` boundaries become explicit boundary wrappers. For current JSON-bank
+inputs, literal pattern `value` becomes the canonical `surface_name`; regex patterns use the source `pattern_id` as the
+surface label until a later projection surface introduces richer regex alias metadata.
 
 ## Canonical JSON
 
@@ -74,8 +76,8 @@ Canonical JSON is an engine artifact, not the hand-authored format:
 ```
 
 Entity arrays are ordered by entity name. Patterns are ordered by priority, canonical name, surface name, regex, and flags.
-Map-style detector sources assign default priorities after deterministic key ordering; JSONL rows may provide explicit
-priorities.
+Map-style detector sources assign default priorities after deterministic key ordering. JSONL rows default priority from
+source row order within each entity unless a row provides an explicit `priority`.
 
 Stable IDs are assigned by Rust. `from_canonical_json_bytes` rejects canonical JSON whose stable IDs do not match the
 deterministic IDs for the logical detector fields.
@@ -107,6 +109,7 @@ Rust canonicalization fails clearly on invalid inputs. Example messages include:
 
 ```text
 bank validation error at /0/unexpected: unknown field "unexpected"
+could not parse json source: duplicate key "Alpha" at /CODE
 bank validation error at /flags: unsupported regex flag "UNICODE"; supported flags are ASCII, IGNORECASE, MULTILINE, DOTALL, VERBOSE
 bank validation error at /regex: unsupported Rust regex syntax for detector "CODE"/"Alpha": ...
 bank validation error at /entities/CODE/patterns: duplicate logical detector for entity "CODE", canonical_name "Alpha", surface_name "A"
@@ -114,6 +117,13 @@ bank validation error at /entities/CODE/patterns: duplicate logical detector for
 
 Exact duplicate logical detectors are rejected. Detectors with the same regex remain distinct when their entity,
 canonical name, or surface name differs, because attribution is part of the detector identity.
+
+Source parsing rejects duplicate object keys before canonicalization, caps source bytes and JSONL line/row counts before
+full canonicalization, and rejects excessive nesting depth.
+
+YAML support currently uses the `serde_yaml` parser, which is deprecated upstream and pulls `unsafe-libyaml`. The parser
+is isolated to source-bank canonicalization and remains in scope because YAML authoring is part of the Rust engine plan;
+it should be revisited before release hardening or any dependency-deny policy.
 
 ## Deferred Fields
 

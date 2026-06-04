@@ -62,6 +62,45 @@ def test_native_bank_canonicalizes_current_json_bank_flags_and_literal_boundarie
     assert pattern["flags"] == ["IGNORECASE"]
 
 
+def test_native_bank_preserves_current_json_literal_surface_and_whitespace(engine, test_data_path):
+    source = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
+    pattern = source["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["value"] = " Acme   Corp "
+    pattern["left_boundary"] = "none"
+    pattern["right_boundary"] = "none"
+
+    canonical_pattern = _canonical(engine.Bank.from_source_bytes(json.dumps(source).encode(), format_hint="json"))[
+        "entities"
+    ][0]["patterns"][0]
+
+    assert canonical_pattern["canonical_name"] == "Acme Corp"
+    assert canonical_pattern["surface_name"] == " Acme   Corp "
+    assert canonical_pattern["regex"] == r"\s+Acme\s+Corp\s+"
+
+
+def test_native_bank_uses_current_json_regex_pattern_id_as_surface(engine, test_data_path):
+    source = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
+    source["entities"]["customer"]["names"]["acme_corp"]["patterns"] = {
+        "ticker_alias": {
+            "kind": "regex",
+            "value": r"ACME-\d+",
+            "description": "Regex Acme alias.",
+            "status": "active",
+            "priority": 7,
+            "regex_flags": [],
+            "metadata": {},
+        }
+    }
+
+    pattern = _canonical(engine.Bank.from_source_bytes(json.dumps(source).encode(), format_hint="json"))["entities"][0][
+        "patterns"
+    ][0]
+
+    assert pattern["canonical_name"] == "Acme Corp"
+    assert pattern["surface_name"] == "ticker_alias"
+    assert pattern["regex"] == r"ACME-\d+"
+
+
 def test_native_bank_accepts_jsonl_and_preserves_distinct_same_regex_detectors(engine):
     source = b"""
 {"entity":"CODE","canonical_name":"Alpha","surface_name":"A","regex":"A"}
@@ -74,6 +113,29 @@ def test_native_bank_accepts_jsonl_and_preserves_distinct_same_regex_detectors(e
     assert len(patterns) == 2
     assert {pattern["canonical_name"] for pattern in patterns} == {"Alpha", "Beta"}
     assert patterns[0]["stable_id"] != patterns[1]["stable_id"]
+
+
+def test_native_bank_preserves_jsonl_source_order_as_default_priority(engine):
+    source = b"""
+{"entity":"CODE","canonical_name":"Zulu","surface_name":"Z","regex":"Z"}
+{"entity":"CODE","canonical_name":"Alpha","surface_name":"A","regex":"A"}
+"""
+
+    patterns = _canonical(engine.Bank.from_source_bytes(source, format_hint="jsonl"))["entities"][0]["patterns"]
+
+    assert [(pattern["canonical_name"], pattern["priority"]) for pattern in patterns] == [
+        ("Zulu", 0),
+        ("Alpha", 1),
+    ]
+
+
+def test_native_bank_auto_detects_single_row_jsonl(engine):
+    source = b'{"entity":"CODE","canonical_name":"Alpha","surface_name":"A","regex":"A"}'
+
+    canonical = _canonical(engine.Bank.from_source_bytes(source))
+
+    assert canonical["entities"][0]["name"] == "CODE"
+    assert canonical["entities"][0]["patterns"][0]["canonical_name"] == "Alpha"
 
 
 def test_native_bank_rejects_exact_duplicate_logical_detectors(engine):
@@ -98,6 +160,46 @@ def test_native_bank_rejects_unknown_fields_and_unsupported_flags(engine):
             b'{"entity":"CODE","canonical_name":"Alpha","regex":"A","flags":["UNICODE"]}',
             format_hint="jsonl",
         )
+
+
+def test_native_bank_rejects_duplicate_source_keys(engine):
+    with pytest.raises(ValueError, match="duplicate key"):
+        engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A","Alpha":"B"}}', format_hint="json")
+
+    with pytest.raises(ValueError, match="duplicate key"):
+        engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A","Alpha":"B"}}')
+
+    with pytest.raises(ValueError, match="duplicate key"):
+        engine.Bank.from_source_bytes(
+            b'{"entity":"CODE","canonical_name":"Alpha","regex":"A","regex":"B"}',
+            format_hint="jsonl",
+        )
+
+
+def test_native_bank_rejects_kind_specific_current_json_bank_fields(engine, test_data_path):
+    bank = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
+    pattern = bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["regex_flags"] = []
+
+    with pytest.raises(ValueError, match="not allowed for literal patterns"):
+        engine.Bank.from_source_bytes(json.dumps(bank).encode(), format_hint="json")
+
+    bank = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
+    bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"] = {
+        "kind": "regex",
+        "value": "Acme",
+        "description": "Regex Acme.",
+        "status": "active",
+        "priority": 0,
+        "metadata": {},
+    }
+    with pytest.raises(ValueError, match='/regex_flags: missing required field "regex_flags"'):
+        engine.Bank.from_source_bytes(json.dumps(bank).encode(), format_hint="json")
+
+    bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["regex_flags"] = []
+    bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["case_sensitive"] = False
+    with pytest.raises(ValueError, match="not allowed for regex patterns"):
+        engine.Bank.from_source_bytes(json.dumps(bank).encode(), format_hint="json")
 
 
 def test_native_bank_rejects_invalid_current_bank_ids_and_resource_limit_violations(engine, test_data_path):
@@ -138,6 +240,13 @@ def test_native_canonical_json_round_trips_and_validates_stable_ids(engine):
     broken["entities"][0]["patterns"][0]["stable_id"] = "pattern:not-valid"
     with pytest.raises(ValueError, match="invalid pattern stable_id"):
         engine.Bank.from_canonical_json_bytes(json.dumps(broken).encode())
+
+    reversed_entities = _canonical(
+        engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"},"ARTIST":{"Beta":"B"}}', format_hint="json")
+    )
+    reversed_entities["entities"] = list(reversed(reversed_entities["entities"]))
+    with pytest.raises(ValueError, match="canonical order"):
+        engine.Bank.from_canonical_json_bytes(json.dumps(reversed_entities).encode())
 
 
 def test_native_bank_hash_is_stable_across_input_key_order_and_semantic_options(engine):
