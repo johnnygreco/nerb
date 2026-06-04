@@ -78,6 +78,21 @@ def test_native_bank_preserves_current_json_literal_surface_and_whitespace(engin
     assert canonical_pattern["regex"] == r"\s+Acme\s+Corp\s+"
 
 
+def test_native_bank_preserves_literal_surface_newlines(engine, test_data_path):
+    source = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
+    pattern = source["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["value"] = "Acme\nCorp"
+    pattern["left_boundary"] = "none"
+    pattern["right_boundary"] = "none"
+
+    canonical_pattern = _canonical(engine.Bank.from_source_bytes(json.dumps(source).encode(), format_hint="json"))[
+        "entities"
+    ][0]["patterns"][0]
+
+    assert canonical_pattern["surface_name"] == "Acme\nCorp"
+    assert canonical_pattern["regex"] == r"Acme\s+Corp"
+
+
 def test_native_bank_uses_current_json_regex_pattern_id_as_surface(engine, test_data_path):
     source = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
     source["entities"]["customer"]["names"]["acme_corp"]["patterns"] = {
@@ -99,6 +114,28 @@ def test_native_bank_uses_current_json_regex_pattern_id_as_surface(engine, test_
     assert pattern["canonical_name"] == "Acme Corp"
     assert pattern["surface_name"] == "ticker_alias"
     assert pattern["regex"] == r"ACME-\d+"
+
+
+def test_native_bank_accepts_multiline_verbose_regex(engine, test_data_path):
+    source = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
+    source["entities"]["customer"]["names"]["acme_corp"]["patterns"] = {
+        "verbose_alias": {
+            "kind": "regex",
+            "value": "(?x) Acme \n Corp",
+            "description": "Verbose regex Acme alias.",
+            "status": "active",
+            "priority": 7,
+            "regex_flags": ["VERBOSE"],
+            "metadata": {},
+        }
+    }
+
+    pattern = _canonical(engine.Bank.from_source_bytes(json.dumps(source).encode(), format_hint="json"))["entities"][0][
+        "patterns"
+    ][0]
+
+    assert pattern["surface_name"] == "verbose_alias"
+    assert pattern["regex"] == "(?x) Acme \n Corp"
 
 
 def test_native_bank_accepts_jsonl_and_preserves_distinct_same_regex_detectors(engine):
@@ -138,12 +175,42 @@ def test_native_bank_auto_detects_single_row_jsonl(engine):
     assert canonical["entities"][0]["patterns"][0]["canonical_name"] == "Alpha"
 
 
+def test_native_bank_auto_detects_json_shaped_yaml_detector_maps(engine):
+    canonical = _canonical(engine.Bank.from_source_bytes(b"{CODE: {Alpha: A}}"))
+
+    assert canonical["entities"][0]["name"] == "CODE"
+    assert canonical["entities"][0]["patterns"][0]["canonical_name"] == "Alpha"
+    assert canonical["entities"][0]["patterns"][0]["regex"] == "A"
+
+
 def test_native_bank_rejects_reserved_compact_detector_map_entity_names(engine):
     with pytest.raises(ValueError, match="reserved entity names"):
         engine.Bank.from_source_bytes(b'{"schema":{"Alpha":"A"}}', format_hint="json")
 
     with pytest.raises(ValueError, match="reserved entity names"):
         engine.Bank.from_source_bytes(b'{"schema_version":{"Alpha":"A"}}', format_hint="json")
+
+    with pytest.raises(ValueError, match="reserved entity names"):
+        engine.Bank.from_source_bytes(
+            b'{"schema":{"Alpha":"A"},"defaults":{"Beta":"B"},"entities":{"Gamma":"G"}}',
+            format_hint="json",
+        )
+
+
+def test_native_bank_routes_marker_values_to_specific_bank_validators(engine):
+    with pytest.raises(ValueError, match='/entities: missing required field "entities"'):
+        engine.Bank.from_source_bytes(
+            b'{"schema_version":"nerb.bank.v1","id":"company_entities",'
+            b'"unicode_normalization":"none","default_regex_flags":[]}',
+            format_hint="json",
+        )
+
+    with pytest.raises(ValueError, match="/entities: canonical bank must define at least one entity"):
+        engine.Bank.from_source_bytes(
+            b'{"schema":1,"defaults":{"engine":"rust-regex-meta","unicode":true,'
+            b'"case_insensitive":false,"word_boundaries":false,"normalization":"none"},"entities":[]}',
+            format_hint="json",
+        )
 
 
 def test_native_bank_rejects_exact_duplicate_logical_detectors(engine):
@@ -197,6 +264,29 @@ def test_native_bank_rejects_duplicate_compile_option_keys(engine):
             format_hint="json",
             compile_options_json='{"match_mode":"entity_independent","match_mode":"all_overlaps"}',
         )
+
+
+def test_native_bank_validates_and_defaults_compile_options(engine):
+    source = b'{"CODE":{"Alpha":"A"}}'
+    default_bank = engine.Bank.from_source_bytes(source, format_hint="json")
+    empty_options_bank = engine.Bank.from_source_bytes(source, format_hint="json", compile_options_json="{}")
+    overlap_bank = engine.Bank.from_source_bytes(
+        source,
+        format_hint="json",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+
+    assert default_bank.metadata()["compile_options"] == {"match_mode": "entity_independent"}
+    assert empty_options_bank.metadata()["compile_options"] == {"match_mode": "entity_independent"}
+    assert default_bank.metadata()["bank_hash"] == empty_options_bank.metadata()["bank_hash"]
+    assert overlap_bank.metadata()["compile_options"] == {"match_mode": "all_overlaps"}
+    assert default_bank.metadata()["bank_hash"] != overlap_bank.metadata()["bank_hash"]
+
+    with pytest.raises(ValueError, match="unknown field"):
+        engine.Bank.from_source_bytes(source, format_hint="json", compile_options_json='{"unknown":true}')
+
+    with pytest.raises(ValueError, match="unknown variant"):
+        engine.Bank.from_source_bytes(source, format_hint="json", compile_options_json='{"match_mode":"bogus"}')
 
 
 def test_native_bank_rejects_kind_specific_current_json_bank_fields(engine, test_data_path):

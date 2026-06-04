@@ -50,15 +50,12 @@ pub fn parse_source_auto(bytes: &[u8]) -> Result<(Value, SourceFormat)> {
             }
             return Ok((value, SourceFormat::Json));
         }
-        Err(error) => {
+        Err(_error) => {
             if looks_like_jsonl(bytes) {
                 match parse_jsonl(bytes) {
                     Ok(value) => return Ok((value, SourceFormat::Jsonl)),
                     Err(jsonl_error) => return Err(jsonl_error),
                 }
-            }
-            if starts_like_json(bytes) {
-                return Err(error);
             }
         }
     }
@@ -156,16 +153,6 @@ fn looks_like_jsonl(bytes: &[u8]) -> bool {
         return false;
     };
     first.trim_start().starts_with('{') && non_empty.next().is_some()
-}
-
-fn starts_like_json(bytes: &[u8]) -> bool {
-    matches!(
-        bytes
-            .iter()
-            .copied()
-            .find(|byte| !byte.is_ascii_whitespace()),
-        Some(b'{') | Some(b'[')
-    )
 }
 
 fn enforce_source_size(bytes: &[u8], format: &'static str) -> Result<()> {

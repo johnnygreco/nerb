@@ -87,12 +87,15 @@ deterministic IDs for the logical detector fields.
 
 ## Bank Hash
 
-`metadata()["bank_hash"]` is a `sha256:` hash over the canonical bank plus semantic compile options. The default compile
-options are parsed with the same duplicate-key rejection as source JSON. The default compile options are:
+`metadata()["bank_hash"]` is a `sha256:` hash over the canonical bank plus effective semantic compile options. Compile
+options are parsed with the same duplicate-key rejection as source JSON, unknown keys are rejected, and omitted keys are
+filled with defaults. The default compile options are:
 
 ```json
 {"match_mode":"entity_independent"}
 ```
+
+Supported `match_mode` values are `entity_independent`, `all_overlaps`, and `global_leftmost`.
 
 Changing semantic options changes the hash:
 

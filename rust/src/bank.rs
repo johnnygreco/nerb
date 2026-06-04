@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CANONICAL_SCHEMA: u32 = 1;
 const ENGINE_NAME: &str = "rust-regex-meta";
-const DEFAULT_MATCH_MODE: &str = "entity_independent";
 const MAX_ENTITIES: usize = 10_000;
 const MAX_PATTERNS: usize = 100_000;
 const MAX_PATTERNS_PER_ENTITY: usize = 50_000;
@@ -59,6 +58,33 @@ pub struct NativeBank {
     canonical_json: Vec<u8>,
     bank_hash: String,
     compile_options: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CompileOptions {
+    #[serde(default = "default_match_mode")]
+    match_mode: MatchMode,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            match_mode: default_match_mode(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MatchMode {
+    EntityIndependent,
+    AllOverlaps,
+    GlobalLeftmost,
+}
+
+fn default_match_mode() -> MatchMode {
+    MatchMode::EntityIndependent
 }
 
 impl NativeBank {
@@ -139,19 +165,24 @@ impl NativeBank {
 }
 
 pub fn parse_compile_options(compile_options_json: Option<&str>) -> Result<Value> {
-    match compile_options_json {
-        None => Ok(serde_json::json!({"match_mode": DEFAULT_MATCH_MODE})),
+    let options = match compile_options_json {
+        None => CompileOptions::default(),
         Some(raw) => {
             let value = parse_source_value(raw.as_bytes(), SourceFormat::Json)?;
-            match value {
-                Value::Object(_) => Ok(crate::ids::canonicalize_json_value(&value)),
-                _ => Err(validation(
+            if !value.is_object() {
+                return Err(validation(
                     "/compile_options",
                     "compile options must be a JSON object because they are part of the semantic bank hash",
-                )),
+                ));
             }
+            serde_json::from_value::<CompileOptions>(value).map_err(|error| BankError::Parse {
+                format: "compile_options_json",
+                message: error.to_string(),
+            })?
         }
-    }
+    };
+    let value = serde_json::to_value(options).expect("compile options must serialize");
+    Ok(crate::ids::canonicalize_json_value(&value))
 }
 
 fn canonicalize_source_value(value: Value, source_format: SourceFormat) -> Result<CanonicalBank> {
@@ -174,17 +205,13 @@ fn canonicalize_source_value(value: Value, source_format: SourceFormat) -> Resul
 }
 
 fn is_canonical_json_object(object: &Map<String, Value>) -> bool {
-    object.contains_key("schema")
-        && object.contains_key("defaults")
-        && object.contains_key("entities")
+    matches!(object.get("schema"), Some(Value::Number(_)))
+        && matches!(object.get("defaults"), Some(Value::Object(_)))
+        && matches!(object.get("entities"), Some(Value::Array(_)))
 }
 
 fn is_current_json_bank_object(object: &Map<String, Value>) -> bool {
-    object.contains_key("schema_version")
-        && object.contains_key("id")
-        && object.contains_key("unicode_normalization")
-        && object.contains_key("default_regex_flags")
-        && object.contains_key("entities")
+    matches!(object.get("schema_version"), Some(Value::String(_)))
 }
 
 fn canonicalize_jsonl_rows(value: Value) -> Result<CanonicalBank> {
@@ -806,8 +833,8 @@ fn validate_candidate(candidate: &PatternCandidate, defaults: &CanonicalDefaults
         "/canonical_name",
         "canonical names",
     )?;
-    validate_non_empty(&candidate.surface_name, "/surface_name", "surface names")?;
-    validate_non_empty(&candidate.regex, "/regex", "regex patterns")?;
+    validate_text_field(&candidate.surface_name, "/surface_name", "surface names")?;
+    validate_text_field(&candidate.regex, "/regex", "regex patterns")?;
     if candidate.regex.len() > MAX_PATTERN_BYTES {
         return Err(validation(
             "/regex",
@@ -1007,6 +1034,22 @@ fn validate_non_empty(value: &str, path: &str, label: &str) -> Result<()> {
         return Err(validation(
             path,
             format!("{label} cannot contain control separators"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_text_field(value: &str, path: &str, label: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(validation(
+            path,
+            format!("{label} must be non-empty strings"),
+        ));
+    }
+    if value.contains('\0') {
+        return Err(validation(
+            path,
+            format!("{label} cannot contain NUL bytes"),
         ));
     }
     Ok(())
