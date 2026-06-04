@@ -148,6 +148,10 @@ Other public helpers include `bank_stats`, `canonicalize_bank`, `hash_bank`, `va
 `benchmark_fixture_profiles`, `make_benchmark_fixture_profile`, `extract_file`, `extract_batch`,
 `extract_report_file`, `extract_report_batch`, `explain_match`, and `compiled_bank_cache_info`.
 
+The Rust engine migration is underway. Native source-bank canonicalization is documented in
+[`docs/rust-engine-canonicalization.md`](docs/rust-engine-canonicalization.md); the current Python `NERB` API remains only
+until the Rust-backed `Bank` surface replaces it.
+
 The current Python regex-builder API is still present until the Rust-backed `Bank` API replaces it:
 
 ```python
