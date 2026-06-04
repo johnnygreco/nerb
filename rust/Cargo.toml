@@ -1,0 +1,14 @@
+[package]
+name = "nerb_engine"
+version = "0.0.5"
+edition = "2021"
+description = "Native Rust engine skeleton for NERB"
+license = "MIT"
+repository = "https://github.com/johnnygreco/nerb"
+
+[lib]
+name = "nerb_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["extension-module"] }

@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
 
 [project]
 name = "nerb"
@@ -24,18 +24,23 @@ nerb-mcp = "nerb.mcp_server:main"
 
 [project.optional-dependencies]
 tests = ["mypy>=1.14,<1.15", "pytest>=7.0"]
-dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "setuptools>=61", "ty>=0.0.39"]
+dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "ty>=0.0.39"]
 
 [dependency-groups]
-dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "setuptools>=61", "ty>=0.0.39"]
+dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "ty>=0.0.39"]
 
 [project.urls]
 Homepage = "https://github.com/johnnygreco/nerb"
 Repository = "https://github.com/johnnygreco/nerb"
 Issues = "https://github.com/johnnygreco/nerb/issues"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.maturin]
+bindings = "pyo3"
+manifest-path = "rust/Cargo.toml"
+module-name = "nerb._engine"
+python-source = "src"
+profile = "release"
+strip = true
 
 [tool.ruff]
 line-length = 120
