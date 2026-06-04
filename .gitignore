@@ -130,3 +130,6 @@ dmypy.json
 
 .idea/
 .vscode/
+
+# agent notes and plans
+agent-scratchpads/
