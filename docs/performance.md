@@ -45,6 +45,50 @@ projection, memory, and match-amplification numbers. Later full gates should use
 add thresholds such as cold compile ceilings, target bytes/records per second, memory caps, and all-overlaps
 amplification limits.
 
+Run one smoke profile with:
+
+```shell
+uv run python - <<'PY'
+import json
+from nerb import benchmark_bank, make_benchmark_fixture_profile
+
+fixture = make_benchmark_fixture_profile("adversarial_smoke")
+result = benchmark_bank(fixture["bank"], documents=fixture["documents"], options=fixture["options"])
+summary = {
+    "profile": fixture["id"],
+    "gate": fixture["gate"],
+    "sections": sorted(result),
+    "compile_cache": result["stages"]["compile_cache"],
+    "record_count_stable": {name: tier["record_count_stable"] for name, tier in result["tiers"].items()},
+}
+print(json.dumps(summary, indent=2, sort_keys=True))
+PY
+```
+
+Trimmed output shape:
+
+```json
+{
+  "compile_cache": {
+    "cache_hit_verified": true,
+    "exclusive": false,
+    "includes": ["canonicalize", "schema_validation", "runtime_validation", "cache_lookup", "matcher_compile"]
+  },
+  "gate": {
+    "requires_cache_hit_verified": true,
+    "requires_stable_record_counts": true,
+    "thresholds_configured": false
+  },
+  "profile": "adversarial_smoke",
+  "record_count_stable": {
+    "baseline": true,
+    "stress": true,
+    "target": true
+  },
+  "sections": ["bank", "compile", "diagnostics", "engine", "options", "stages", "summary", "tiers"]
+}
+```
+
 ## Benchmark Commands
 
 Target exact-literal bank:

@@ -368,6 +368,8 @@ def _smoke_gate_manifest() -> dict[str, Any]:
         "required_profiles": list(BENCHMARK_PROFILE_IDS),
         "required_tiers": list(BENCHMARK_TIERS),
         "required_result_sections": ["bank", "engine", "options", "stages", "compile", "tiers", "summary"],
+        "requires_cache_hit_verified": True,
+        "requires_stable_record_counts": True,
     }
 
 
@@ -905,6 +907,15 @@ def _benchmark_stages(
         "validation": {"seconds": _seconds(validation_seconds)},
         "document_tier_resolution": {"seconds": _seconds(document_resolution_seconds)},
         "compile_cache": {
+            "exclusive": False,
+            "includes": [
+                "canonicalize",
+                "schema_validation",
+                "runtime_validation",
+                "cache_lookup",
+                "matcher_compile",
+            ],
+            "note": "Current compile_bank timing is inclusive; do not sum it with sibling stage timings.",
             "cold_seconds": compile_report["cold_seconds"],
             "warm_cache_lookup_seconds": compile_report["warm_cache_lookup_seconds"],
             "cache_hit_verified": compile_report["cache"]["cold_hit"] is False

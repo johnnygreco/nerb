@@ -11,6 +11,49 @@ from nerb import benchmark_bank, benchmark_fixture_profiles, make_benchmark_fixt
 from nerb.benchmarks import BENCHMARK_PROFILE_IDS, make_synthetic_bank
 from nerb.diagnostics import EVAL_POSITIVE_FAILED
 
+EXPECTED_BENCHMARK_PROFILES = {
+    "small": {
+        "workload": "small_bank",
+        "active_totals": {"entities": 2, "names": 4, "patterns": 8},
+        "by_kind": {"literal": 4, "regex": 4},
+        "bank_profile": "mixed",
+        "target_documents": ["target_literal", "target_regex", "target_mixed"],
+        "record_counts": {"baseline": 1, "target": 16, "stress": 16},
+    },
+    "literal_heavy": {
+        "workload": "realistic_literal_heavy",
+        "active_totals": {"entities": 6, "names": 24, "patterns": 72},
+        "by_kind": {"literal": 72, "regex": 0},
+        "bank_profile": "mostly_literal",
+        "target_documents": ["target_literal", "target_regex", "target_mixed"],
+        "record_counts": {"baseline": 1, "target": 24, "stress": 24},
+    },
+    "regex_heavy": {
+        "workload": "regex_heavy",
+        "active_totals": {"entities": 4, "names": 12, "patterns": 36},
+        "by_kind": {"literal": 0, "regex": 36},
+        "bank_profile": "mostly_regex",
+        "target_documents": ["target_literal", "target_regex", "target_mixed"],
+        "record_counts": {"baseline": 1, "target": 16, "stress": 16},
+    },
+    "mixed": {
+        "workload": "mixed_literal_regex",
+        "active_totals": {"entities": 4, "names": 16, "patterns": 64},
+        "by_kind": {"literal": 32, "regex": 32},
+        "bank_profile": "mixed",
+        "target_documents": ["target_literal", "target_regex", "target_mixed"],
+        "record_counts": {"baseline": 1, "target": 24, "stress": 24},
+    },
+    "adversarial_smoke": {
+        "workload": "adversarial_smoke",
+        "active_totals": {"entities": 3, "names": 5, "patterns": 8},
+        "by_kind": {"literal": 4, "regex": 4},
+        "bank_profile": "mixed",
+        "target_documents": ["adversarial_dense_hits", "adversarial_near_miss", "adversarial_mixed"],
+        "record_counts": {"baseline": 7, "target": 76, "stress": 76},
+    },
+}
+
 
 @pytest.fixture
 def minimal_bank(test_data_path) -> dict[str, Any]:
@@ -63,11 +106,17 @@ def test_benchmark_bank_reports_cache_compile_and_deterministic_tier_counts(mini
     assert first["compile"]["cache"]["warm_hit"] is True
     assert first["summary"]["cache_hit_verified"] is True
     assert first["stages"]["compile_cache"]["cache_hit_verified"] is True
-    assert first["stages"]["input_parse"] == {
-        "available": False,
-        "seconds": None,
-        "note": "benchmark_bank receives an already-loaded bank object.",
-    }
+    assert first["stages"]["compile_cache"]["exclusive"] is False
+    assert first["stages"]["compile_cache"]["includes"] == [
+        "canonicalize",
+        "schema_validation",
+        "runtime_validation",
+        "cache_lookup",
+        "matcher_compile",
+    ]
+    assert first["stages"]["input_parse"]["available"] is False
+    assert first["stages"]["input_parse"]["seconds"] is None
+    assert first["stages"]["input_parse"]["note"]
     assert set(first["tiers"]) == {"baseline", "target", "stress"}
     assert all(tier["record_count_stable"] is True for tier in first["tiers"].values())
     assert all(
@@ -91,6 +140,8 @@ def test_benchmark_fixture_profiles_manifest_is_json_compatible_and_explicit():
         "required_profiles": list(BENCHMARK_PROFILE_IDS),
         "required_tiers": ["baseline", "target", "stress"],
         "required_result_sections": ["bank", "engine", "options", "stages", "compile", "tiers", "summary"],
+        "requires_cache_hit_verified": True,
+        "requires_stable_record_counts": True,
     }
     assert manifest["profiles"]["adversarial_smoke"]["workload"] == "adversarial_smoke"
 
@@ -98,9 +149,12 @@ def test_benchmark_fixture_profiles_manifest_is_json_compatible_and_explicit():
 @pytest.mark.parametrize("profile_id", BENCHMARK_PROFILE_IDS)
 def test_benchmark_fixture_profile_runs_with_stable_smoke_shape(profile_id):
     fixture = make_benchmark_fixture_profile(profile_id)
+    expected = EXPECTED_BENCHMARK_PROFILES[profile_id]
 
     assert json.loads(json.dumps(fixture, allow_nan=False)) == fixture
+    assert make_benchmark_fixture_profile(profile_id) == fixture
     assert fixture["id"] == profile_id
+    assert fixture["workload"] == expected["workload"]
     assert set(fixture["documents"]) == {"baseline", "target", "stress"}
     assert fixture["options"]["benchmark_profile_id"] == profile_id
 
@@ -109,6 +163,15 @@ def test_benchmark_fixture_profile_runs_with_stable_smoke_shape(profile_id):
     assert json.loads(json.dumps(result, allow_nan=False)) == result
     assert result["options"]["benchmark_profile_id"] == profile_id
     assert result["summary"]["benchmark_profile_id"] == profile_id
+    assert result["bank"]["stats"]["active_totals"] == expected["active_totals"]
+    assert result["bank"]["stats"]["by_kind"] == expected["by_kind"]
+    assert result["bank"]["profile"]["profile"] == expected["bank_profile"]
+    assert [document["document_id"] for document in result["tiers"]["target"]["documents"]] == expected[
+        "target_documents"
+    ]
+    assert {tier: result["tiers"][tier]["record_count"] for tier in ("baseline", "target", "stress")} == expected[
+        "record_counts"
+    ]
     assert set(result["stages"]) == {
         "input_parse",
         "canonicalize",
@@ -119,6 +182,7 @@ def test_benchmark_fixture_profile_runs_with_stable_smoke_shape(profile_id):
         "scan_project_sort",
     }
     assert result["stages"]["compile_cache"]["cache_hit_verified"] is True
+    assert result["stages"]["compile_cache"]["exclusive"] is False
     assert set(result["stages"]["document_prepare"]["seconds_by_tier"]) == {"baseline", "target", "stress"}
     assert set(result["stages"]["scan_project_sort"]["seconds_by_tier"]) == {"baseline", "target", "stress"}
     assert all(tier["record_count_stable"] is True for tier in result["tiers"].values())
