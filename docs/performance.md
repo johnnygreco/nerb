@@ -20,6 +20,75 @@ Recorded on 2026-06-03 in the local agent workspace:
 - Literal and regex records are sorted by the stable record key before returning from compiled extraction.
 - Shards are immutable after construction and can be parallelized later without changing output shape.
 
+## Rust Engine Smoke Profiles
+
+Slice 2 adds deterministic smoke profiles through `benchmark_fixture_profiles()` and
+`make_benchmark_fixture_profile(profile_id)`. These profiles are fixture scaffolding for the Rust engine migration, not
+final performance thresholds. Each profile emits JSON-compatible benchmark results with separate stage metadata for
+input parsing availability, canonicalization, validation, compile/cache lookup, document preparation, and combined
+scan/project/sort work.
+
+Current smoke profiles:
+
+| Profile | Workload | Purpose |
+| --- | --- | --- |
+| `small` | tiny mixed bank | Cheapest structural signal for benchmark output shape. |
+| `literal_heavy` | alias-heavy literal bank | Models curated exact-name banks and entity shard fan-out. |
+| `regex_heavy` | regex-dominant bank | Keeps regex validation and shard scan costs visible. |
+| `mixed` | balanced literal/regex bank | Exercises both matcher families in one fixture. |
+| `adversarial_smoke` | dense-hit and near-miss text | Exercises overlap, alternation, dense records, and near misses safely. |
+
+The smoke gate currently requires all five profiles, the `baseline`/`target`/`stress` tiers, stable record counts across
+iterations, cache-hit verification, and the expected JSON sections. It intentionally does not enforce wall-clock
+thresholds yet. Full gates are deferred until native Rust modes exist and can report mode-specific compile, scan,
+projection, memory, and match-amplification numbers. Later full gates should use larger real or synthetic banks and may
+add thresholds such as cold compile ceilings, target bytes/records per second, memory caps, and all-overlaps
+amplification limits.
+
+Run one smoke profile with:
+
+```shell
+uv run python - <<'PY'
+import json
+from nerb import benchmark_bank, make_benchmark_fixture_profile
+
+fixture = make_benchmark_fixture_profile("adversarial_smoke")
+result = benchmark_bank(fixture["bank"], documents=fixture["documents"], options=fixture["options"])
+summary = {
+    "profile": fixture["id"],
+    "gate": fixture["gate"],
+    "sections": sorted(result),
+    "compile_cache": result["stages"]["compile_cache"],
+    "record_count_stable": {name: tier["record_count_stable"] for name, tier in result["tiers"].items()},
+}
+print(json.dumps(summary, indent=2, sort_keys=True))
+PY
+```
+
+Trimmed output shape:
+
+```json
+{
+  "compile_cache": {
+    "cache_hit_verified": true,
+    "exclusive": false,
+    "includes": ["canonicalize", "schema_validation", "runtime_validation", "cache_lookup", "matcher_compile"]
+  },
+  "gate": {
+    "requires_cache_hit_verified": true,
+    "requires_stable_record_counts": true,
+    "thresholds_configured": false
+  },
+  "profile": "adversarial_smoke",
+  "record_count_stable": {
+    "baseline": true,
+    "stress": true,
+    "target": true
+  },
+  "sections": ["bank", "compile", "diagnostics", "engine", "options", "stages", "summary", "tiers"]
+}
+```
+
 ## Benchmark Commands
 
 Target exact-literal bank:

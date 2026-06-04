@@ -22,12 +22,23 @@ from .extraction import _prepare_batch_documents
 from .records import record_sort_key
 from .validation import VALIDATION_LEVELS, validate_bank
 
-__all__ = ["benchmark_bank", "make_synthetic_bank", "regress_bank"]
+__all__ = [
+    "BENCHMARK_PROFILE_IDS",
+    "benchmark_bank",
+    "benchmark_fixture_profiles",
+    "make_benchmark_fixture_profile",
+    "make_synthetic_bank",
+    "regress_bank",
+]
 
 DEFAULT_BENCHMARK_ITERATIONS = 3
 DEFAULT_STRESS_MULTIPLIER = 8
 DEFAULT_MAX_PATTERN_EXAMPLES = 12
 BENCHMARK_TIERS = ("baseline", "target", "stress")
+BENCHMARK_PROFILE_IDS = ("small", "literal_heavy", "regex_heavy", "mixed", "adversarial_smoke")
+BENCHMARK_PROFILE_SCHEMA_VERSION = "nerb.benchmark_profile.v1"
+BENCHMARK_PROFILE_MANIFEST_SCHEMA_VERSION = "nerb.benchmark_profiles.v1"
+BENCHMARK_SMOKE_SUITE_ID = "rust_engine_smoke"
 SYNTHETIC_BANK_TIMESTAMP = "2026-06-03T00:00:00Z"
 
 
@@ -37,6 +48,7 @@ class BenchmarkOptions:
     stress_multiplier: int
     max_pattern_examples: int
     validation_level: str
+    profile_id: str | None
 
 
 def make_synthetic_bank(
@@ -117,6 +129,49 @@ def make_synthetic_bank(
     }
 
 
+def benchmark_fixture_profiles() -> dict[str, Any]:
+    """Return the deterministic Rust-engine smoke benchmark profile manifest."""
+    return {
+        "schema_version": BENCHMARK_PROFILE_MANIFEST_SCHEMA_VERSION,
+        "suite": BENCHMARK_SMOKE_SUITE_ID,
+        "stage": "smoke",
+        "profile_ids": list(BENCHMARK_PROFILE_IDS),
+        "profiles": {profile_id: _benchmark_profile_manifest(profile_id) for profile_id in BENCHMARK_PROFILE_IDS},
+        "gate": _smoke_gate_manifest(),
+    }
+
+
+def make_benchmark_fixture_profile(profile_id: str) -> dict[str, Any]:
+    """Create one deterministic benchmark smoke fixture profile."""
+    if profile_id not in BENCHMARK_PROFILE_IDS:
+        raise ExtractionError(
+            f"Benchmark fixture profile must be one of {', '.join(BENCHMARK_PROFILE_IDS)}.",
+        )
+
+    manifest = _benchmark_profile_manifest(profile_id)
+    options = _benchmark_profile_options(profile_id)
+    benchmark_options = _resolve_benchmark_options(options)
+    bank = _benchmark_profile_bank(profile_id)
+    documents = (
+        _adversarial_document_tiers(benchmark_options)
+        if profile_id == "adversarial_smoke"
+        else _synthetic_document_tiers([bank], benchmark_options)
+    )
+
+    return {
+        "schema_version": BENCHMARK_PROFILE_SCHEMA_VERSION,
+        "suite": BENCHMARK_SMOKE_SUITE_ID,
+        "id": profile_id,
+        "description": manifest["description"],
+        "workload": manifest["workload"],
+        "tags": list(manifest["tags"]),
+        "bank": bank,
+        "documents": documents,
+        "options": options,
+        "gate": manifest["gate"],
+    }
+
+
 def benchmark_bank(
     bank: Mapping[str, Any],
     *,
@@ -129,12 +184,20 @@ def benchmark_bank(
 
     raw_options = options or {}
     benchmark_options = _resolve_benchmark_options(raw_options)
+
+    canonical_start = time.perf_counter()
     canonical_bank = canonicalize_bank(bank)
+    canonical_seconds = time.perf_counter() - canonical_start
+
+    validation_start = time.perf_counter()
     validation = validate_bank(canonical_bank, level=benchmark_options.validation_level)
+    validation_seconds = time.perf_counter() - validation_start
     if not validation["valid"]:
         raise ExtractionError("Bank failed validation and cannot be benchmarked.", validation["diagnostics"])
 
+    document_start = time.perf_counter()
     document_tiers = _resolve_document_tiers([canonical_bank], documents, benchmark_options)
+    document_resolution_seconds = time.perf_counter() - document_start
     compile_report, compiled = _measure_compile(canonical_bank, raw_options)
     tiers = {
         tier: _measure_tier(compiled, document_tiers[tier], raw_options, benchmark_options) for tier in BENCHMARK_TIERS
@@ -162,7 +225,15 @@ def benchmark_bank(
             "stress_multiplier": benchmark_options.stress_multiplier,
             "max_pattern_examples": benchmark_options.max_pattern_examples,
             "validation_level": benchmark_options.validation_level,
+            "benchmark_profile_id": benchmark_options.profile_id,
         },
+        "stages": _benchmark_stages(
+            canonical_seconds=canonical_seconds,
+            validation_seconds=validation_seconds,
+            document_resolution_seconds=document_resolution_seconds,
+            compile_report=compile_report,
+            tiers=tiers,
+        ),
         "compile": compile_report,
         "tiers": tiers,
         "summary": _benchmark_summary(tiers, compile_report, profile, benchmark_options),
@@ -220,6 +291,9 @@ def _resolve_benchmark_options(options: Mapping[str, Any]) -> BenchmarkOptions:
     validation_level = str(options.get("benchmark_validation_level", options.get("validation_level", "standard")))
     if validation_level not in VALIDATION_LEVELS:
         raise ExtractionError(f"Benchmark validation_level must be one of {', '.join(VALIDATION_LEVELS)}.")
+    raw_profile_id = options.get("benchmark_profile_id")
+    if raw_profile_id is not None and not isinstance(raw_profile_id, str):
+        raise ExtractionError("Benchmark option benchmark_profile_id must be a string.")
     return BenchmarkOptions(
         iterations=_positive_int_option(
             options,
@@ -229,6 +303,7 @@ def _resolve_benchmark_options(options: Mapping[str, Any]) -> BenchmarkOptions:
         stress_multiplier=_positive_int_option(options, "stress_multiplier", DEFAULT_STRESS_MULTIPLIER),
         max_pattern_examples=_positive_int_option(options, "max_pattern_examples", DEFAULT_MAX_PATTERN_EXAMPLES),
         validation_level=validation_level,
+        profile_id=raw_profile_id,
     )
 
 
@@ -242,6 +317,224 @@ def _positive_int_option(options: Mapping[str, Any], key: str, default: int) -> 
 def _ensure_positive_int(value: int, name: str) -> None:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ExtractionError(f"Synthetic bank {name} must be a positive integer.")
+
+
+def _benchmark_profile_manifest(profile_id: str) -> dict[str, Any]:
+    specs = {
+        "small": {
+            "description": "Tiny mixed bank used as the cheapest benchmark smoke signal.",
+            "workload": "small_bank",
+            "tags": ["small", "literal", "regex", "ci_smoke"],
+            "bank_shape": {"name_count": 4, "patterns_per_name": 2, "entity_count": 2, "literal_ratio": 0.5},
+        },
+        "literal_heavy": {
+            "description": "Literal-dominant bank that models curated alias-heavy detector banks.",
+            "workload": "realistic_literal_heavy",
+            "tags": ["literal_heavy", "entity_shards", "ci_smoke"],
+            "bank_shape": {"name_count": 24, "patterns_per_name": 3, "entity_count": 6, "literal_ratio": 1.0},
+        },
+        "regex_heavy": {
+            "description": "Regex-dominant bank that keeps Python and future Rust regex shard costs visible.",
+            "workload": "regex_heavy",
+            "tags": ["regex_heavy", "runtime_validation", "ci_smoke"],
+            "bank_shape": {"name_count": 12, "patterns_per_name": 3, "entity_count": 4, "literal_ratio": 0.0},
+        },
+        "mixed": {
+            "description": "Balanced literal/regex bank for smoke coverage of both matcher families.",
+            "workload": "mixed_literal_regex",
+            "tags": ["mixed", "literal", "regex", "ci_smoke"],
+            "bank_shape": {"name_count": 16, "patterns_per_name": 4, "entity_count": 4, "literal_ratio": 0.5},
+        },
+        "adversarial_smoke": {
+            "description": (
+                "Safe dense-hit and near-miss workload for overlap, alternation, and regex projection costs."
+            ),
+            "workload": "adversarial_smoke",
+            "tags": ["dense_hits", "overlap", "alternation", "near_miss", "ci_smoke"],
+            "bank_shape": {"name_count": 5, "pattern_count": 8, "entity_count": 3, "literal_ratio": 0.5},
+        },
+    }
+    spec = dict(specs[profile_id])
+    spec["id"] = profile_id
+    spec["gate"] = _smoke_gate_manifest()
+    return spec
+
+
+def _smoke_gate_manifest() -> dict[str, Any]:
+    return {
+        "stage": "smoke",
+        "thresholds_configured": False,
+        "threshold_status": "deferred_until_native_engine_modes",
+        "required_profiles": list(BENCHMARK_PROFILE_IDS),
+        "required_tiers": list(BENCHMARK_TIERS),
+        "required_result_sections": ["bank", "engine", "options", "stages", "compile", "tiers", "summary"],
+        "requires_cache_hit_verified": True,
+        "requires_stable_record_counts": True,
+    }
+
+
+def _benchmark_profile_options(profile_id: str) -> dict[str, Any]:
+    options = {
+        "benchmark_iterations": 1,
+        "stress_multiplier": 2,
+        "max_pattern_examples": 8,
+        "benchmark_profile_id": profile_id,
+    }
+    if profile_id in {"literal_heavy", "mixed"}:
+        options["max_pattern_examples"] = 12
+    return options
+
+
+def _benchmark_profile_bank(profile_id: str) -> dict[str, Any]:
+    if profile_id == "adversarial_smoke":
+        return _adversarial_smoke_bank()
+
+    shape = _benchmark_profile_manifest(profile_id)["bank_shape"]
+    return make_synthetic_bank(
+        name_count=int(shape["name_count"]),
+        patterns_per_name=int(shape["patterns_per_name"]),
+        entity_count=int(shape["entity_count"]),
+        literal_ratio=float(shape["literal_ratio"]),
+        bank_id=f"benchmark_{profile_id}",
+    )
+
+
+def _adversarial_smoke_bank() -> dict[str, Any]:
+    return {
+        "schema_version": "nerb.bank.v1",
+        "id": "benchmark_adversarial_smoke",
+        "name": "Benchmark Adversarial Smoke Bank",
+        "description": "Safe dense-hit and near-miss smoke fixture for Rust engine benchmark scaffolding.",
+        "version": "2026.06.04",
+        "status": "active",
+        "created_at": SYNTHETIC_BANK_TIMESTAMP,
+        "updated_at": SYNTHETIC_BANK_TIMESTAMP,
+        "unicode_normalization": "none",
+        "default_regex_flags": [],
+        "entities": {
+            "person": {
+                "description": "Overlapping person-like detector examples.",
+                "status": "active",
+                "regex_flags": [],
+                "names": {
+                    "sam": {
+                        "canonical": "Sam",
+                        "description": "Short overlapping name.",
+                        "status": "active",
+                        "patterns": {
+                            "literal": _profile_literal_pattern("Sam", priority=100),
+                            "alternation": _profile_regex_pattern(
+                                r"\b(?:Sam|Samuel|Samwise)\b",
+                                benchmark_text="Samwise",
+                                priority=80,
+                            ),
+                        },
+                        "metadata": {},
+                    },
+                    "samwise": {
+                        "canonical": "Samwise",
+                        "description": "Longer overlapping name.",
+                        "status": "active",
+                        "patterns": {"literal": _profile_literal_pattern("Samwise", priority=90)},
+                        "metadata": {},
+                    },
+                },
+                "metadata": {},
+            },
+            "project": {
+                "description": "Project-like names that overlap person detector surfaces.",
+                "status": "active",
+                "regex_flags": [],
+                "names": {
+                    "samba": {
+                        "canonical": "Samba",
+                        "description": "Project name with person-prefix overlap.",
+                        "status": "active",
+                        "patterns": {
+                            "literal": _profile_literal_pattern("Samba", priority=100),
+                            "release": _profile_regex_pattern(
+                                r"\bSamba\s+(?:Alpha|Beta|Gamma)\b",
+                                benchmark_text="Samba Alpha",
+                                priority=70,
+                            ),
+                        },
+                        "metadata": {},
+                    }
+                },
+                "metadata": {},
+            },
+            "token": {
+                "description": "Dense token-shaped regex examples.",
+                "status": "active",
+                "regex_flags": [],
+                "names": {
+                    "nerb_engine": {
+                        "canonical": "NERB Engine",
+                        "description": "Repeated engine token.",
+                        "status": "active",
+                        "patterns": {
+                            "engine_literal": _profile_literal_pattern("NERB Engine", priority=100),
+                            "engine_regex": _profile_regex_pattern(
+                                r"\bNERB(?:[-\s]?Engine){1,2}\b",
+                                benchmark_text="NERB Engine",
+                                priority=60,
+                            ),
+                        },
+                        "metadata": {},
+                    },
+                    "uppercase_identifier": {
+                        "canonical": "Uppercase Identifier",
+                        "description": "Bounded identifier regex.",
+                        "status": "active",
+                        "patterns": {
+                            "identifier": _profile_regex_pattern(
+                                r"\b[A-Z][A-Z0-9_]{2,12}\b",
+                                benchmark_text="NERB_2026",
+                                priority=50,
+                            )
+                        },
+                        "metadata": {},
+                    },
+                },
+                "metadata": {},
+            },
+        },
+        "metadata": {"benchmark_profile_id": "adversarial_smoke"},
+    }
+
+
+def _profile_literal_pattern(value: str, *, priority: int) -> dict[str, Any]:
+    pattern = _synthetic_literal_pattern(value)
+    pattern["description"] = "Benchmark fixture literal pattern."
+    pattern["priority"] = priority
+    return pattern
+
+
+def _profile_regex_pattern(value: str, *, benchmark_text: str, priority: int) -> dict[str, Any]:
+    return {
+        "kind": "regex",
+        "value": value,
+        "description": "Benchmark fixture regex pattern.",
+        "status": "active",
+        "priority": priority,
+        "regex_flags": [],
+        "metadata": {"benchmark_text": benchmark_text},
+    }
+
+
+def _adversarial_document_tiers(options: BenchmarkOptions) -> dict[str, list[Mapping[str, Any]]]:
+    target_dense = "Sam Samba Samwise NERB Engine NERB_2026 Samba Alpha " * 2
+    target_near_miss = "Sambal SAMWISE nerb-engine NERB-EngineX NERB_2026X " * 2
+    mixed = f"{target_dense} {target_near_miss}".strip()
+    return {
+        "baseline": [{"document_id": "adversarial_baseline", "text": "Sam Samba NERB Engine"}],
+        "target": [
+            {"document_id": "adversarial_dense_hits", "text": target_dense.strip()},
+            {"document_id": "adversarial_near_miss", "text": target_near_miss.strip()},
+            {"document_id": "adversarial_mixed", "text": mixed},
+        ],
+        "stress": [{"document_id": "adversarial_stress", "text": " ".join([mixed] * options.stress_multiplier)}],
+    }
 
 
 def _synthetic_literal_pattern(value: str) -> dict[str, Any]:
@@ -506,7 +799,9 @@ def _measure_tier(
     extraction_options: Mapping[str, Any],
     benchmark_options: BenchmarkOptions,
 ) -> dict[str, Any]:
+    prepare_start = time.perf_counter()
     prepared_documents, combined_bytes = _prepare_batch_documents(documents, options=extraction_options)
+    prepare_seconds = time.perf_counter() - prepare_start
     document_summaries: list[dict[str, Any]] = []
     run_record_counts: list[int] = []
 
@@ -549,6 +844,10 @@ def _measure_tier(
         "record_count_stable": len(set(run_record_counts)) <= 1,
         "documents": document_summaries,
         "warm_extraction_seconds": _seconds(elapsed_seconds),
+        "stages": {
+            "document_prepare_seconds": _seconds(prepare_seconds),
+            "scan_project_sort_seconds": _seconds(elapsed_seconds),
+        },
         "throughput": {
             "documents_per_second": _rate(total_documents, elapsed_seconds),
             "bytes_per_second": _rate(total_bytes, elapsed_seconds),
@@ -588,6 +887,51 @@ def _bank_profile(bank: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _benchmark_stages(
+    *,
+    canonical_seconds: float,
+    validation_seconds: float,
+    document_resolution_seconds: float,
+    compile_report: Mapping[str, Any],
+    tiers: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    tier_scan_seconds = {tier: tiers[tier]["warm_extraction_seconds"] for tier in BENCHMARK_TIERS}
+    tier_prepare_seconds = {tier: tiers[tier]["stages"]["document_prepare_seconds"] for tier in BENCHMARK_TIERS}
+    return {
+        "input_parse": {
+            "available": False,
+            "seconds": None,
+            "note": "benchmark_bank receives an already-loaded bank object.",
+        },
+        "canonicalize": {"seconds": _seconds(canonical_seconds)},
+        "validation": {"seconds": _seconds(validation_seconds)},
+        "document_tier_resolution": {"seconds": _seconds(document_resolution_seconds)},
+        "compile_cache": {
+            "exclusive": False,
+            "includes": [
+                "canonicalize",
+                "schema_validation",
+                "runtime_validation",
+                "cache_lookup",
+                "matcher_compile",
+            ],
+            "note": "Current compile_bank timing is inclusive; do not sum it with sibling stage timings.",
+            "cold_seconds": compile_report["cold_seconds"],
+            "warm_cache_lookup_seconds": compile_report["warm_cache_lookup_seconds"],
+            "cache_hit_verified": compile_report["cache"]["cold_hit"] is False
+            and compile_report["cache"]["warm_hit"] is True,
+        },
+        "document_prepare": {
+            "seconds_by_tier": tier_prepare_seconds,
+            "total_seconds": _seconds(sum(float(value) for value in tier_prepare_seconds.values())),
+        },
+        "scan_project_sort": {
+            "seconds_by_tier": tier_scan_seconds,
+            "total_seconds": _seconds(sum(float(value) for value in tier_scan_seconds.values())),
+        },
+    }
+
+
 def _matcher_profiles(compiled: CompiledBank) -> list[dict[str, Any]]:
     profiles: list[dict[str, Any]] = []
     for matcher in compiled.matchers:
@@ -620,6 +964,7 @@ def _benchmark_summary(
         "document_count": sum(int(tier["document_count"]) for tier in tiers.values()),
         "record_count": sum(int(tier["record_count"]) for tier in tiers.values()),
         "extraction_iterations": options.iterations,
+        "benchmark_profile_id": options.profile_id,
         "cache_hit_verified": compile_report["cache"]["cold_hit"] is False
         and compile_report["cache"]["warm_hit"] is True,
         "profile": profile["profile"],
