@@ -76,27 +76,39 @@ impl NativeEngine {
         })?;
 
         buffer.clear();
-        for shard in &self.shards {
-            for raw_match in shard.regex.find_iter(haystack) {
-                let local_index = raw_match.pattern().as_usize();
-                let Some(&detector_index) = shard.local_to_detector.get(local_index) else {
-                    return Err(validation(
-                        format!("/engine/shards/{}/local_to_detector", shard.entity),
-                        format!(
-                            "regex engine returned local pattern index {local_index} outside detector map"
-                        ),
-                    ));
-                };
-                buffer.push(RawMatch::new(
-                    detector_index,
-                    raw_match.start() as u64,
-                    raw_match.end() as u64,
-                )?)?;
-            }
+        let result = scan_entity_independent(&self.shards, haystack, buffer);
+        if result.is_err() {
+            buffer.clear();
         }
-        buffer.sort();
-        Ok(())
+        result
     }
+}
+
+fn scan_entity_independent(
+    shards: &[MatcherShard],
+    haystack: &[u8],
+    buffer: &mut NativeMatchBuffer,
+) -> Result<()> {
+    for shard in shards {
+        for raw_match in shard.regex.find_iter(haystack) {
+            let local_index = raw_match.pattern().as_usize();
+            let Some(&detector_index) = shard.local_to_detector.get(local_index) else {
+                return Err(validation(
+                    format!("/engine/shards/{}/local_to_detector", shard.entity),
+                    format!(
+                        "regex engine returned local pattern index {local_index} outside detector map"
+                    ),
+                ));
+            };
+            buffer.push(RawMatch::new(
+                detector_index,
+                raw_match.start() as u64,
+                raw_match.end() as u64,
+            )?)?;
+        }
+    }
+    buffer.sort();
+    Ok(())
 }
 
 fn detector_metadata(canonical: &CanonicalBank) -> Result<Vec<DetectorMetadata>> {

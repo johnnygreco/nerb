@@ -557,6 +557,7 @@ fn candidate_from_current_pattern(
             required_bool(pattern, "normalize_whitespace", path)?,
             &required_boundary(pattern, "left_boundary", path)?,
             &required_boundary(pattern, "right_boundary", path)?,
+            flags.iter().any(|flag| flag == "VERBOSE"),
         )?,
         _ => unreachable!("kind is validated above"),
     };
@@ -581,11 +582,13 @@ fn literal_regex(
     normalize_whitespace: bool,
     left: &str,
     right: &str,
+    verbose_safe: bool,
 ) -> Result<String> {
-    let mut escaped = regex_syntax::escape(value);
-    if normalize_whitespace {
-        escaped = normalize_literal_whitespace(value);
-    }
+    let escaped = if normalize_whitespace {
+        normalize_literal_whitespace(value, verbose_safe)
+    } else {
+        escape_literal_run(value, verbose_safe)
+    };
     let left_boundary = match left {
         "none" => "",
         "word" => r"\b",
@@ -613,14 +616,14 @@ fn literal_regex(
     }
 }
 
-fn normalize_literal_whitespace(value: &str) -> String {
+fn normalize_literal_whitespace(value: &str, verbose_safe: bool) -> String {
     let mut regex = String::new();
     let mut literal_run = String::new();
     let mut in_whitespace = false;
     for char in value.chars() {
         if char.is_whitespace() {
             if !literal_run.is_empty() {
-                regex.push_str(&regex_syntax::escape(&literal_run));
+                regex.push_str(&escape_literal_run(&literal_run, verbose_safe));
                 literal_run.clear();
             }
             if !in_whitespace {
@@ -633,9 +636,25 @@ fn normalize_literal_whitespace(value: &str) -> String {
         }
     }
     if !literal_run.is_empty() {
-        regex.push_str(&regex_syntax::escape(&literal_run));
+        regex.push_str(&escape_literal_run(&literal_run, verbose_safe));
     }
     regex
+}
+
+fn escape_literal_run(value: &str, verbose_safe: bool) -> String {
+    if !verbose_safe {
+        return regex_syntax::escape(value);
+    }
+
+    let mut escaped = String::new();
+    for char in value.chars() {
+        if char.is_whitespace() || char == '#' {
+            escaped.push_str(&format!(r"\x{{{:X}}}", char as u32));
+        } else {
+            escaped.push_str(&regex_syntax::escape(&char.to_string()));
+        }
+    }
+    escaped
 }
 
 #[derive(Clone, Debug)]

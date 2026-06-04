@@ -213,3 +213,18 @@ def test_native_verbose_flag_supports_trailing_comments(engine):
     raw = bank.scan_bytes(b"A")
 
     assert [raw[index] for index in range(len(raw))] == [(0, 0, 1)]
+
+
+def test_native_current_json_literal_preserves_whitespace_and_hash_under_verbose_flag(engine, test_data_path):
+    source = json.loads((test_data_path / "minimal_bank.json").read_text(encoding="utf-8"))
+    source["default_regex_flags"] = ["VERBOSE"]
+    pattern = source["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["value"] = "Acme Corp #1"
+    pattern["normalize_whitespace"] = False
+    pattern["left_boundary"] = "none"
+    pattern["right_boundary"] = "none"
+
+    bank = engine.Bank.from_source_bytes(json.dumps(source).encode(), format_hint="json")
+    raw = bank.scan_bytes(b"Acme Corp #1 AcmeCorp1")
+
+    assert [raw[index] for index in range(len(raw))] == [(0, 0, 12)]

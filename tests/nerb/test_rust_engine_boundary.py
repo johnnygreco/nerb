@@ -120,15 +120,15 @@ def test_native_match_buffer_rejects_oversized_raw_match_sequences_before_item_a
 
 def test_native_scan_bytes_returns_sorted_raw_matches_and_reuses_output_buffer(engine):
     bank = engine.Bank.from_source_bytes(
-        b'{"PERSON":{"Sam":"Sam"},"PROJECT":{"Samba":"Samba"}}',
+        b'{"A_LATE":{"late":"late"},"B_EARLY":{"early":"early"}}',
         format_hint="json",
     )
     buffer = engine.MatchBuffer()
 
-    returned = bank.scan_bytes(b"Samba ships", out=buffer)
+    returned = bank.scan_bytes(b"early then late", out=buffer)
 
     assert returned is buffer
-    assert [buffer[index] for index in range(len(buffer))] == [(0, 0, 3), (1, 0, 5)]
+    assert [buffer[index] for index in range(len(buffer))] == [(1, 0, 5), (0, 11, 15)]
 
 
 def test_native_scan_bytes_out_preserves_reserved_capacity(engine):
@@ -141,6 +141,17 @@ def test_native_scan_bytes_out_preserves_reserved_capacity(engine):
     assert returned is buffer
     assert buffer.capacity() >= before
     assert [buffer[index] for index in range(len(buffer))] == [(0, 0, 5)]
+
+
+def test_native_scan_bytes_out_clears_partial_matches_after_scan_error(engine):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"A":"A"}}', format_hint="json")
+    buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+
+    with pytest.raises(MemoryError, match="exceeds pre-scan limit"):
+        bank.scan_bytes(b"A" * 1_000_001, out=buffer)
+
+    assert len(buffer) == 0
+    assert buffer.capacity() >= 1
 
 
 def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
