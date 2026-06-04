@@ -1,7 +1,9 @@
+use crate::engine::{DetectorMetadata, NativeEngine};
 use crate::error::{validation, BankError, Result};
 use crate::flags::{canonicalize_flag_names, merge_flags, parse_flags_value};
 use crate::formats::{parse_source_auto, parse_source_value, SourceFormat};
 use crate::ids::{bank_hash, entity_stable_id, pattern_stable_id};
+use crate::match_buffer::NativeMatchBuffer;
 use regex_syntax::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -58,9 +60,10 @@ pub struct NativeBank {
     canonical_json: Vec<u8>,
     bank_hash: String,
     compile_options: Value,
+    engine: NativeEngine,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CompileOptions {
     #[serde(default = "default_match_mode")]
@@ -75,9 +78,9 @@ impl Default for CompileOptions {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum MatchMode {
+pub(crate) enum MatchMode {
     EntityIndependent,
     AllOverlaps,
     GlobalLeftmost,
@@ -85,6 +88,16 @@ enum MatchMode {
 
 fn default_match_mode() -> MatchMode {
     MatchMode::EntityIndependent
+}
+
+impl MatchMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::EntityIndependent => "entity_independent",
+            Self::AllOverlaps => "all_overlaps",
+            Self::GlobalLeftmost => "global_leftmost",
+        }
+    }
 }
 
 impl NativeBank {
@@ -138,6 +151,18 @@ impl NativeBank {
         &self.compile_options
     }
 
+    pub fn detectors(&self) -> &[DetectorMetadata] {
+        self.engine.detectors()
+    }
+
+    pub fn scan_bytes(&self, haystack: &[u8]) -> Result<NativeMatchBuffer> {
+        self.engine.scan_bytes(haystack)
+    }
+
+    pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
+        self.engine.scan_bytes_into(haystack, buffer)
+    }
+
     fn from_canonical_value(value: Value, compile_options_json: Option<&str>) -> Result<Self> {
         let canonical =
             serde_json::from_value::<CanonicalBank>(value).map_err(|error| BankError::Parse {
@@ -152,19 +177,22 @@ impl NativeBank {
         compile_options_json: Option<&str>,
     ) -> Result<Self> {
         validate_and_normalize_canonical_bank(&mut canonical)?;
-        let compile_options = parse_compile_options(compile_options_json)?;
+        let compile_options = parse_compile_options_struct(compile_options_json)?;
+        let compile_options_value = compile_options_value(&compile_options);
         let canonical_json = serde_json::to_vec(&canonical).expect("canonical bank must serialize");
-        let bank_hash = bank_hash(&canonical, &compile_options);
+        let bank_hash = bank_hash(&canonical, &compile_options_value);
+        let engine = NativeEngine::compile(&canonical, compile_options.match_mode)?;
         Ok(Self {
             canonical,
             canonical_json,
             bank_hash,
-            compile_options,
+            compile_options: compile_options_value,
+            engine,
         })
     }
 }
 
-pub fn parse_compile_options(compile_options_json: Option<&str>) -> Result<Value> {
+fn parse_compile_options_struct(compile_options_json: Option<&str>) -> Result<CompileOptions> {
     let options = match compile_options_json {
         None => CompileOptions::default(),
         Some(raw) => {
@@ -181,8 +209,12 @@ pub fn parse_compile_options(compile_options_json: Option<&str>) -> Result<Value
             })?
         }
     };
+    Ok(options)
+}
+
+fn compile_options_value(options: &CompileOptions) -> Value {
     let value = serde_json::to_value(options).expect("compile options must serialize");
-    Ok(crate::ids::canonicalize_json_value(&value))
+    crate::ids::canonicalize_json_value(&value)
 }
 
 fn canonicalize_source_value(value: Value, source_format: SourceFormat) -> Result<CanonicalBank> {
@@ -525,6 +557,7 @@ fn candidate_from_current_pattern(
             required_bool(pattern, "normalize_whitespace", path)?,
             &required_boundary(pattern, "left_boundary", path)?,
             &required_boundary(pattern, "right_boundary", path)?,
+            flags.iter().any(|flag| flag == "VERBOSE"),
         )?,
         _ => unreachable!("kind is validated above"),
     };
@@ -549,11 +582,13 @@ fn literal_regex(
     normalize_whitespace: bool,
     left: &str,
     right: &str,
+    verbose_safe: bool,
 ) -> Result<String> {
-    let mut escaped = regex_syntax::escape(value);
-    if normalize_whitespace {
-        escaped = normalize_literal_whitespace(value);
-    }
+    let escaped = if normalize_whitespace {
+        normalize_literal_whitespace(value, verbose_safe)
+    } else {
+        escape_literal_run(value, verbose_safe)
+    };
     let left_boundary = match left {
         "none" => "",
         "word" => r"\b",
@@ -581,14 +616,14 @@ fn literal_regex(
     }
 }
 
-fn normalize_literal_whitespace(value: &str) -> String {
+fn normalize_literal_whitespace(value: &str, verbose_safe: bool) -> String {
     let mut regex = String::new();
     let mut literal_run = String::new();
     let mut in_whitespace = false;
     for char in value.chars() {
         if char.is_whitespace() {
             if !literal_run.is_empty() {
-                regex.push_str(&regex_syntax::escape(&literal_run));
+                regex.push_str(&escape_literal_run(&literal_run, verbose_safe));
                 literal_run.clear();
             }
             if !in_whitespace {
@@ -601,9 +636,25 @@ fn normalize_literal_whitespace(value: &str) -> String {
         }
     }
     if !literal_run.is_empty() {
-        regex.push_str(&regex_syntax::escape(&literal_run));
+        regex.push_str(&escape_literal_run(&literal_run, verbose_safe));
     }
     regex
+}
+
+fn escape_literal_run(value: &str, verbose_safe: bool) -> String {
+    if !verbose_safe {
+        return regex_syntax::escape(value);
+    }
+
+    let mut escaped = String::new();
+    for char in value.chars() {
+        if char.is_whitespace() || char == '#' {
+            escaped.push_str(&format!(r"\x{{{:X}}}", char as u32));
+        } else {
+            escaped.push_str(&regex_syntax::escape(&char.to_string()));
+        }
+    }
+    escaped
 }
 
 #[derive(Clone, Debug)]

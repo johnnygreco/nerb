@@ -82,10 +82,21 @@ impl NativeMatchBuffer {
         })?;
         validate_capacity(requested)?;
         if self.matches.len() == self.matches.capacity() {
-            try_reserve_exact(&mut self.matches, 1)?;
+            let additional = next_growth(self.matches.capacity(), requested)?;
+            try_reserve_exact(&mut self.matches, additional)?;
         }
         self.matches.push(raw_match);
         Ok(())
+    }
+
+    pub fn sort(&mut self) {
+        self.matches.sort_by_key(|raw_match| {
+            (
+                raw_match.start_byte,
+                raw_match.end_byte,
+                raw_match.detector_index,
+            )
+        });
     }
 
     pub fn get(&self, index: usize) -> Option<RawMatch> {
@@ -110,6 +121,19 @@ fn try_reserve_exact(matches: &mut Vec<RawMatch>, additional: usize) -> Result<(
         memory(
             "/match_buffer",
             format!("could not reserve match buffer capacity: {error}"),
+        )
+    })
+}
+
+fn next_growth(current_capacity: usize, requested: usize) -> Result<usize> {
+    let doubled = current_capacity.saturating_mul(2).max(1);
+    let target = doubled
+        .max(requested)
+        .min(MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY);
+    target.checked_sub(current_capacity).ok_or_else(|| {
+        memory(
+            "/match_buffer",
+            "requested match buffer capacity overflowed usize",
         )
     })
 }
@@ -160,5 +184,34 @@ mod tests {
         let error = buffer.push(RawMatch::new(0, 0, 0).unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("exceeds pre-scan limit"));
+    }
+
+    #[test]
+    fn match_buffer_sorts_by_offsets_and_detector_index() {
+        let mut buffer = NativeMatchBuffer::new();
+        buffer.push(RawMatch::new(2, 5, 6).unwrap()).unwrap();
+        buffer.push(RawMatch::new(1, 0, 5).unwrap()).unwrap();
+        buffer.push(RawMatch::new(0, 0, 3).unwrap()).unwrap();
+        buffer.push(RawMatch::new(3, 0, 3).unwrap()).unwrap();
+
+        buffer.sort();
+
+        assert_eq!(
+            (0..buffer.len())
+                .map(|index| buffer.get(index).unwrap().as_tuple())
+                .collect::<Vec<_>>(),
+            [(0, 0, 3), (3, 0, 3), (1, 0, 5), (2, 5, 6)]
+        );
+    }
+
+    #[test]
+    fn match_buffer_push_grows_amortized_within_pre_scan_limit() {
+        let mut buffer = NativeMatchBuffer::new();
+        buffer.push(RawMatch::new(0, 0, 0).unwrap()).unwrap();
+        let first_capacity = buffer.capacity();
+        buffer.push(RawMatch::new(0, 1, 1).unwrap()).unwrap();
+
+        assert!(first_capacity >= 1);
+        assert!(buffer.capacity() >= 2);
     }
 }
