@@ -1,6 +1,6 @@
 use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PySequence, PySequenceMethods};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 mod bank;
@@ -11,7 +11,7 @@ mod ids;
 mod match_buffer;
 
 use bank::NativeBank;
-use match_buffer::NativeMatchBuffer;
+use match_buffer::{NativeMatchBuffer, RawMatch};
 
 fn ffi_boundary<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(operation)) {
@@ -158,11 +158,17 @@ impl PyMatchBuffer {
     }
 
     #[staticmethod]
-    fn from_raw_matches(raw_matches: Vec<(u32, u64, u64)>) -> PyResult<Self> {
+    fn from_raw_matches(raw_matches: &Bound<'_, PyAny>) -> PyResult<Self> {
         ffi_boundary(|| {
-            Ok(Self {
-                inner: NativeMatchBuffer::from_raw_matches(&raw_matches)?,
-            })
+            let sequence = raw_matches.cast::<PySequence>()?;
+            let len = sequence.len()?;
+            let mut buffer = NativeMatchBuffer::with_capacity(len)?;
+            for index in 0..len {
+                let item = sequence.get_item(index)?;
+                let (detector_index, start_byte, end_byte): (u32, u64, u64) = item.extract()?;
+                buffer.push(RawMatch::new(detector_index, start_byte, end_byte)?)?;
+            }
+            Ok(Self { inner: buffer })
         })
     }
 

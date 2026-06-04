@@ -60,11 +60,11 @@ assert raw[0] == (7, 10, 15)
 raw.clear()
 ```
 
-`from_raw_matches` exists to test the boundary before scans land. The scanner slice will fill `MatchBuffer` from Rust.
-Public record projection remains outside the scan loop.
+`from_raw_matches` accepts a sized Python sequence and exists to test the boundary before scans land. The scanner slice
+will fill `MatchBuffer` from Rust. Public record projection remains outside the scan loop.
 
-Before scanning exists, Python-created buffers are capped at 1,000,000 raw matches and use fallible Rust allocation paths.
-The scanner slice may revisit this limit once dense-hit memory gates are measured.
+Before scanning exists, Python-created buffers are capped at 1,000,000 requested raw matches and use fallible Rust
+allocation paths. The scanner slice may revisit this logical limit once dense-hit memory gates are measured.
 
 ## Scan Stubs
 

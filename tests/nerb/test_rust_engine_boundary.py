@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from collections.abc import Sequence
 
 import pytest
 
@@ -85,6 +86,18 @@ def test_native_match_buffer_rejects_oversized_capacity_requests(engine):
     buffer = engine.MatchBuffer()
     with pytest.raises(MemoryError, match="exceeds pre-scan limit"):
         buffer.reserve(1_000_001)
+
+
+def test_native_match_buffer_rejects_oversized_raw_match_sequences_before_item_access(engine):
+    class OversizedRawMatches(Sequence):
+        def __len__(self):
+            return 1_000_001
+
+        def __getitem__(self, index):
+            raise AssertionError("oversized raw match sequence should be rejected before item access")
+
+    with pytest.raises(MemoryError, match="exceeds pre-scan limit"):
+        engine.MatchBuffer.from_raw_matches(OversizedRawMatches())
 
 
 def test_native_scan_methods_are_boundary_stubs_without_record_projection(engine):
