@@ -68,6 +68,14 @@ def test_load_config_rejects_invalid_detector_name(tmp_path):
         load_config(config_path)
 
 
+def test_load_config_rejects_detector_names_that_compile_to_same_group(tmp_path):
+    config_path = tmp_path / "entities.yaml"
+    config_path.write_text("ARTIST:\n  Pink Floyd: 'Pink\\sFloyd'\n  Pink_Floyd: 'Pink_Floyd'\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="both compile to regex group 'Pink_Floyd'"):
+        load_config(config_path)
+
+
 def test_add_entity_pattern_returns_updated_copy():
     config = {"ARTIST": {"Coheed": r"Coheed(?:\sand\sCambria)?"}}
 
@@ -100,6 +108,13 @@ def test_add_entity_pattern_rejects_invalid_pattern_name_and_regex():
 
     with pytest.raises(ConfigError, match="not a valid regex pattern"):
         add_entity_pattern(config, "ARTIST", "Rush", "(")
+
+
+def test_add_entity_pattern_rejects_detector_names_that_compile_to_same_group():
+    config = {"ARTIST": {"Pink Floyd": r"Pink\sFloyd"}}
+
+    with pytest.raises(ConfigError, match="both compile to regex group 'Pink_Floyd'"):
+        add_entity_pattern(config, "ARTIST", "Pink_Floyd", "Pink_Floyd")
 
 
 def test_remove_entity_pattern_returns_updated_copy():

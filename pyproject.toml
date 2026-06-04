@@ -9,9 +9,11 @@ description = "Named Entity Regex Builder (NERB): Streamlining named capture gro
 readme = "README.md"
 authors = [{ name = "Johnny Greco" }]
 license = { file = "LICENSE" }
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.27,<2 ; python_version >= '3.10'",
+    "jsonpatch>=1.33",
+    "jsonschema>=4.23",
+    "mcp>=1.27,<2",
     "PyYAML>=6.0",
     "typer>=0.12",
 ]
@@ -37,14 +39,14 @@ where = ["src"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py38"
+target-version = "py310"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 strict_optional = true
 ignore_missing_imports = true
 disallow_untyped_defs = false

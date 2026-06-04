@@ -58,7 +58,7 @@ make build
 - Keep output records JSON-compatible with stable fields: `entity`, `name`, `string`, `start`, and `end`.
 - Maintain deterministic behavior. Extraction across all entities sorts by start offset, end offset, entity, name, and matched string.
 - Keep user-facing CLI behavior covered with `typer.testing.CliRunner` tests in `tests/nerb/test_cli.py`.
-- Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.8 and 3.13.
+- Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
 
 ## MCP Server

@@ -7,7 +7,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 # Third-party
 import yaml
@@ -32,7 +32,7 @@ DEFAULT_CONFIG_ENV_VAR = "NERB_CONFIG_PATH"
 DEFAULT_CONFIG_FILENAME = "detectors.yaml"
 FLAGS_KEY = "_flags"
 
-PatternConfig = Dict[str, Dict[str, Any]]
+PatternConfig = dict[str, dict[str, Any]]
 
 
 class ConfigError(ValueError):
@@ -193,6 +193,7 @@ def validate_pattern_config(config: Any) -> PatternConfig:
         raw_flags = entity_config.get(FLAGS_KEY, 0)
         regex_flags = validate_regex_flags(raw_flags)
         validated_entity: dict[str, Any] = {}
+        group_names: dict[str, str] = {}
         pattern_count = 0
         for name, pattern in entity_config.items():
             if not isinstance(name, str) or not name:
@@ -205,7 +206,13 @@ def validate_pattern_config(config: Any) -> PatternConfig:
             if not isinstance(pattern, str):
                 raise ConfigError(f"Pattern {name!r} for entity {entity!r} must be a regex string.")
 
-            _validate_detector_name(entity, name)
+            group_name = _validate_detector_name(entity, name)
+            previous_name = group_names.setdefault(group_name, name)
+            if previous_name != name:
+                raise ConfigError(
+                    f"Pattern names {previous_name!r} and {name!r} for entity {entity!r} both compile to "
+                    f"regex group {group_name!r}."
+                )
             _validate_regex_pattern(entity, name, pattern, regex_flags)
             validated_entity[name] = pattern
             pattern_count += 1

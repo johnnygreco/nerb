@@ -3,26 +3,18 @@
 [![CI](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml/badge.svg)](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](https://github.com/johnnygreco/nerb/blob/main/LICENSE)
 
-NERB extracts named entities with regex detector configs. The command line is the primary interface: create and check
-detector configs, extract records from text or documents, and test detector patterns before saving them. The Python API
-is still available for applications that need compiled regex objects directly.
+NERB builds, validates, extracts, reports, evaluates, diffs, and benchmarks named-entity regex banks. The current
+agent-first surface uses JSON banks and returns JSON-compatible facts for local tools, CI gates, and MCP clients. The
+older YAML detector-config workflow is still available for simple regex extraction and authoring.
 
 ## Installation
 
-Install or upgrade the released package:
-
 ```shell
 pip install --upgrade nerb
-```
-
-After installing a release that includes CLI support, verify the command:
-
-```shell
 nerb --help
 ```
 
-The `nerb` CLI and `nerb-mcp` entry points are part of the next release containing these docs. If that release is not
-available on PyPI yet, run the CLI through a source checkout:
+From a source checkout:
 
 ```shell
 git clone https://github.com/johnnygreco/nerb.git
@@ -31,155 +23,132 @@ uv sync --all-extras
 uv run nerb --help
 ```
 
-You can also install from source:
+The current package targets Python 3.10 and newer. The `nerb-mcp` entry point also requires Python 3.10 or newer because
+it uses the official MCP SDK.
 
-```shell
-pip install "git+https://github.com/johnnygreco/nerb.git"
-nerb --help
+## JSON Banks
+
+A JSON bank is the agent-first format. It stores entities, canonical names, pattern metadata, statuses, eval references,
+and literal or regex pattern settings in one validated object.
+
+```json
+{
+  "schema_version": "nerb.bank.v1",
+  "id": "company_entities",
+  "name": "Company Entities",
+  "description": "Known private entities for agent workflows.",
+  "version": "2026.06.03",
+  "status": "active",
+  "created_at": "2026-06-03T00:00:00Z",
+  "updated_at": "2026-06-03T00:00:00Z",
+  "unicode_normalization": "none",
+  "default_regex_flags": ["IGNORECASE"],
+  "entities": {
+    "customer": {
+      "description": "Customer organizations and accounts.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "acme_corp": {
+          "canonical": "Acme Corp",
+          "description": "Strategic customer account.",
+          "status": "active",
+          "patterns": {
+            "primary": {
+              "kind": "literal",
+              "value": "Acme Corp",
+              "description": "Exact Acme Corp alias.",
+              "status": "active",
+              "priority": 100,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {}
+            }
+          },
+          "metadata": {}
+        }
+      },
+      "metadata": {}
+    }
+  },
+  "metadata": {}
+}
 ```
-
-The command examples below use `nerb`. From a source checkout before the CLI release is published, use `uv run nerb`
-instead.
-
-## Detector Configs
-
-A detector config is YAML. Top-level keys are entity names, and each entity maps detector names to regex patterns.
-`_flags` is reserved for regex flags on an entity.
-
-```yaml
-ARTIST:
-  Pink Floyd: 'Pink\sFloyd'
-  The Who: '[Tt]he\sWho'
-
-GENRE:
-  _flags: IGNORECASE
-  Rock: '(?:progressive\s)?rock'
-```
-
-NERB resolves the config path in this order:
-
-1. explicit `--config`
-2. `NERB_CONFIG_PATH`
-3. the platform user config path, such as `~/Library/Application Support/nerb/detectors.yaml` on macOS,
-   `$XDG_CONFIG_HOME/nerb/detectors.yaml` or `~/.config/nerb/detectors.yaml` on Linux, and
-   `%APPDATA%\nerb\detectors.yaml` on Windows
 
 ## CLI Quickstart
 
-Use the default config path:
+JSON-bank commands emit JSON matching the Python helper response shape.
 
 ```shell
-nerb init
-nerb add ARTIST "Pink Floyd" 'Pink\sFloyd'
-nerb add GENRE Rock rock --flag IGNORECASE
-nerb extract --all --text "Pink Floyd played progressive rock." --format json
+nerb validate-bank --bank company.json
+nerb extract-text --bank company.json --text "Send this to Acme Corp today."
+nerb extract-file --bank company.json --file email.txt
+nerb extract-report --bank company.json --file email.txt
+nerb eval-bank --bank company.json
+nerb benchmark-bank --bank company.json
 ```
 
-Output:
+Extraction records include stable core fields (`entity`, `name`, `string`, `start`, `end`) plus JSON-bank IDs, pattern
+kind, and captures:
 
 ```json
-[{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}, {"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34}]
+{
+  "entity": "customer",
+  "entity_id": "customer",
+  "name": "Acme Corp",
+  "name_id": "acme_corp",
+  "pattern_id": "primary",
+  "pattern_kind": "literal",
+  "string": "Acme Corp",
+  "start": 13,
+  "end": 22,
+  "captures": {}
+}
 ```
 
-Use an explicit config file when you want project-local detectors:
+Agent repair and promotion workflows use the same helper surfaces:
 
 ```shell
-nerb init --config ./detectors.yaml
-nerb add ARTIST "Pink Floyd" 'Pink\sFloyd' --config ./detectors.yaml
-nerb extract ARTIST --text "Pink Floyd played progressive rock." --config ./detectors.yaml --format json
+nerb apply-patches --bank company.json --patch patches.json
+nerb diff-banks old-company.json new-company.json
+nerb regress-bank --old-bank old-company.json --new-bank new-company.json
 ```
 
-Use the checked-in example config from this repository:
-
-```shell
-nerb validate --config examples/music_entities.yaml
-nerb extract ARTIST examples/prog_rock_wiki.txt --config examples/music_entities.yaml --format json
-```
-
-`extract` accepts exactly one input source: a document path, `--text`, or `--stdin`. Use `ENTITY` for one entity or
-`--all` for every entity in the config.
-
-## Inline Extraction
-
-For one-shot extraction, pass detectors directly on the command line. This does not require a saved config on a clean
-install.
-
-```shell
-nerb extract CITY --text "San Francisco hosts PyCon." --pattern 'San Francisco=San\sFrancisco' --format json
-```
-
-Output:
-
-```json
-[{"entity": "CITY", "name": "San Francisco", "string": "San Francisco", "start": 0, "end": 13}]
-```
-
-Use `--detector ENTITY:NAME=REGEX` when extracting all inline entities:
-
-```shell
-nerb extract --all --text "San Francisco hosts PyCon." \
-  --detector 'CITY:San Francisco=San\sFrancisco' \
-  --detector 'EVENT:PyCon=PyCon' \
-  --format jsonl
-```
-
-Output:
-
-```jsonl
-{"entity": "CITY", "name": "San Francisco", "string": "San Francisco", "start": 0, "end": 13}
-{"entity": "EVENT", "name": "PyCon", "string": "PyCon", "start": 20, "end": 25}
-```
-
-## Authoring Commands
-
-Use these commands while building and debugging detector configs:
-
-```shell
-nerb test ARTIST "Pink Floyd" 'Pink\sFloyd' --text "Pink Floyd played progressive rock."
-nerb test ARTIST "Pink Floyd" --config examples/music_entities.yaml --document examples/prog_rock_wiki.txt --format json
-nerb compile ARTIST --config examples/music_entities.yaml
-nerb doctor --config examples/music_entities.yaml
-nerb doctor --config examples/music_entities.yaml --format json
-```
-
-`test` checks a literal pattern or a saved detector against text. `compile` prints the final named-capture regex for an
-entity. `doctor` validates YAML, detector names, regex compilation, duplicate compiled group names, and other authoring
-issues. `init`, `add`, `list`, `show`, `remove`, and `validate` cover the basic config lifecycle.
-
-## Output Formats
-
-Extraction commands support `--format table`, `--format json`, and `--format jsonl`. Table output is the default for
-humans. JSON and JSONL return records with stable fields: `entity`, `name`, `string`, `start`, and `end`.
-
-JSON:
-
-```json
-[{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}]
-```
-
-JSONL:
-
-```jsonl
-{"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
-{"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34}
-```
-
-## Examples
-
-The `examples/` directory contains a detector config, a sample document, a short Python API script, and an examples
-README. From a source checkout:
-
-```shell
-uv run nerb validate --config examples/music_entities.yaml
-uv run nerb extract ARTIST examples/prog_rock_wiki.txt --config examples/music_entities.yaml --format json
-uv run python examples/prog_wiki.py
-```
-
-After installing a release that includes the CLI, use `nerb` instead of `uv run nerb`.
+`apply-patches` applies RFC 6902 JSON Patch operations before validation, so a patch can repair an invalid bank and
+return the validated candidate plus diagnostics.
 
 ## Python API
 
-Use the Python API when you need compiled regex objects or want extraction inside another Python program:
+Use the JSON-bank helpers when building agent or service integrations:
+
+```python
+from nerb import (
+    apply_bank_patches,
+    benchmark_bank,
+    diff_banks,
+    eval_bank,
+    extract_report,
+    extract_text,
+    load_bank,
+    regress_bank,
+    validate_bank,
+)
+
+bank = load_bank("company.json")
+
+validation = validate_bank(bank)
+extraction = extract_text(bank, "Send this to Acme Corp today.")
+report = extract_report(bank, "Send this to Acme Corp today.")
+benchmark = benchmark_bank(bank, options={"benchmark_iterations": 1})
+```
+
+Other public helpers include `bank_stats`, `canonicalize_bank`, `hash_bank`, `validate_bank_schema`,
+`extract_file`, `extract_batch`, `extract_report_file`, `extract_report_batch`, `explain_match`, and
+`compiled_bank_cache_info`.
+
+The legacy Python API remains available for YAML detector configs and compiled regex objects:
 
 ```python
 from pathlib import Path
@@ -190,18 +159,29 @@ config_path = Path("examples/music_entities.yaml")
 document = Path("examples/prog_rock_wiki.txt").read_text(encoding="utf-8")
 
 extractor = NERB(config_path, add_word_boundaries=True)
-artist_records = extractor.extract_named_entity("ARTIST", document).to_records()
-all_records = extractor.extract_named_entities(document).to_records()
-
-print(artist_records[0])
-print(len(all_records))
+records = extractor.extract_named_entities(document).to_records()
 ```
 
-Compiled entity regexes are also available as attributes, such as `extractor.ARTIST`.
+Compiled entity regexes are still exposed as attributes such as `extractor.ARTIST`.
+
+## Eval And Regression
+
+Eval references are local JSONL files attached at the bank, entity, name, or pattern level through `eval_refs`. Positive
+records assert exact expected matches, negative records assert that scoped extraction returns no matches, and provenance
+records are counted without affecting pass/fail.
+
+`regress_bank` runs:
+
+```text
+diff_banks -> eval old/new -> benchmark old/new -> quality and performance deltas
+```
+
+Regression output is machine-readable for external promotion gates. NERB does not own publishing, approval, signing,
+scheduling, deployment, or disk cache behavior.
 
 ## MCP Server
 
-NERB includes a local stdio MCP server on Python 3.10 and newer:
+Run the local stdio MCP server from the repo:
 
 ```shell
 uv run nerb-mcp
@@ -221,8 +201,72 @@ Minimal MCP client config:
 }
 ```
 
-MCP tools require explicit `config_path` values for config reads and writes. See `AGENTS.md` and
-`.agents/skills/nerb-mcp-tools/SKILL.md` for the local agent workflow details.
+JSON-bank MCP tools:
+
+```text
+validate_bank
+apply_bank_patches
+diff_banks
+bank_stats
+extract_text
+extract_file
+extract_batch
+extract_report
+extract_report_batch
+eval_bank
+benchmark_bank
+explain_match
+regress_bank
+```
+
+MCP tools accept explicit bank objects or explicit bank paths, depending on the tool. File reads are limited to explicit
+bank, document, patch, and eval paths.
+
+## YAML Detector Configs
+
+The YAML detector-config workflow is useful for simple regex extraction and authoring.
+
+```yaml
+ARTIST:
+  Pink Floyd: 'Pink\sFloyd'
+  The Who: '[Tt]he\sWho'
+
+GENRE:
+  _flags: IGNORECASE
+  Rock: '(?:progressive\s)?rock'
+```
+
+Config path resolution:
+
+1. explicit `--config`
+2. `NERB_CONFIG_PATH`
+3. the platform user config path
+
+Common commands:
+
+```shell
+nerb init --config detectors.yaml
+nerb add ARTIST "Pink Floyd" 'Pink\sFloyd' --config detectors.yaml
+nerb extract ARTIST examples/prog_rock_wiki.txt --config detectors.yaml --format json
+nerb extract --all --text "Pink Floyd played progressive rock." \
+  --detector 'ARTIST:Pink Floyd=Pink\sFloyd' \
+  --detector 'GENRE:Rock=rock' \
+  --format json
+nerb test ARTIST "Pink Floyd" 'Pink\sFloyd' --text "Pink Floyd played progressive rock."
+nerb compile ARTIST --config detectors.yaml
+nerb doctor --config detectors.yaml --format json
+```
+
+YAML extraction supports `--format table`, `--format json`, and `--format jsonl`. JSON and JSONL records use
+`entity`, `name`, `string`, `start`, and `end`.
+
+## Performance
+
+NERB compiles one Python `re` shard per entity for regex patterns, uses separate literal shards for literal patterns,
+caches compiled banks in process by canonical bank hash and extraction options, and keeps disk cache deferred for V1.
+
+See [docs/performance.md](docs/performance.md) for target/stress benchmark commands and recorded results. The V1 review
+keeps PCRE2 optional and does not add a binary literal-matcher dependency.
 
 ## Development
 

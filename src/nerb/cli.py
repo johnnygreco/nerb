@@ -1,10 +1,11 @@
 import json
 import re
 import sys
+from collections.abc import Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any, Dict, List, NoReturn, Optional, Set, Tuple, Union
+from typing import Any, NoReturn
 
 import typer
 import yaml
@@ -12,6 +13,18 @@ from yaml.constructor import ConstructorError
 from yaml.resolver import BaseResolver
 
 from . import __version__
+from .bank import (
+    BankError,
+    BankLoadError,
+)
+from .bank import (
+    load_bank as _load_json_bank,
+)
+from .bank import (
+    read_bank_json as _read_bank_json,
+)
+from .benchmarks import benchmark_bank as _benchmark_bank
+from .benchmarks import regress_bank as _regress_bank
 from .config import (
     DEFAULT_CONFIG_ENV_VAR,
     FLAGS_KEY,
@@ -25,8 +38,29 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
-from .extraction import extract_named_entities_records, extract_named_entity_records
+from .diagnostics import JSON_PARSE
+from .diff import diff_banks as _diff_banks
+from .evals import eval_bank as _eval_bank
+from .extraction import (
+    ExtractionError,
+    extract_named_entities_records,
+    extract_named_entity_records,
+)
+from .extraction import (
+    extract_file as _json_extract_file,
+)
+from .extraction import (
+    extract_report as _json_extract_report,
+)
+from .extraction import (
+    extract_report_file as _json_extract_report_file,
+)
+from .extraction import (
+    extract_text as _json_extract_text,
+)
+from .patches import apply_bank_patches as _apply_bank_patches
 from .regex_builder import NERB
+from .validation import validate_bank as _validate_bank
 
 COMMAND_ERROR_EXIT_CODE = 1
 OUTPUT_FORMATS = {"json", "jsonl", "table"}
@@ -66,7 +100,7 @@ def _config_option() -> Any:
     )
 
 
-def _command_config_path(ctx: typer.Context, config: Optional[Path]) -> Path:
+def _command_config_path(ctx: typer.Context, config: Path | None) -> Path:
     if config is not None:
         return resolve_default_config_path(config)
 
@@ -79,6 +113,155 @@ def _command_config_path(ctx: typer.Context, config: Optional[Path]) -> Path:
 def _exit_error(message: str) -> NoReturn:
     typer.echo(f"Error: {message}", err=True)
     raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
+
+
+def _echo_json(payload: Any) -> None:
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+def _diagnostic_payload(message: str, diagnostics: list[dict[str, Any]], *, path: Path | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {"valid": False, "error": message, "diagnostics": diagnostics}
+    if path is not None:
+        payload["path"] = str(path)
+    return payload
+
+
+def _bank_load_error_is_json_parse(exc: BankLoadError) -> bool:
+    return any(diagnostic.get("code") == JSON_PARSE for diagnostic in exc.diagnostics)
+
+
+def _ensure_explicit_file(path: Path, label: str) -> Path:
+    resolved_path = path.expanduser()
+    if not resolved_path.exists():
+        _exit_error(f"{label} file does not exist at {resolved_path}.")
+    if not resolved_path.is_file():
+        _exit_error(f"{label} path is not a file: {resolved_path}.")
+    return resolved_path
+
+
+def _load_raw_bank_json_for_command(bank_path: Path) -> tuple[Any | None, Path, dict[str, Any] | None]:
+    path = _ensure_explicit_file(bank_path, "Bank")
+    try:
+        return _read_bank_json(path), path, None
+    except BankLoadError as exc:
+        if _bank_load_error_is_json_parse(exc):
+            return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        _exit_error(f"Could not read bank at {path}: {exc}")
+
+
+def _load_json_bank_for_command(bank_path: Path) -> tuple[Mapping[str, Any] | None, Path, dict[str, Any] | None]:
+    path = _ensure_explicit_file(bank_path, "Bank")
+    try:
+        return _load_json_bank(path), path, None
+    except BankLoadError as exc:
+        if _bank_load_error_is_json_parse(exc):
+            return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        _exit_error(f"Could not read bank at {path}: {exc}")
+    except BankError as exc:
+        return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+
+
+def _load_patch_json_for_command(patch_path: Path) -> Any:
+    path = _ensure_explicit_file(patch_path, "Patch")
+    try:
+        with path.open(encoding="utf-8") as file:
+            return json.load(file)
+    except json.JSONDecodeError as exc:
+        _exit_error(f"Could not parse JSON patch at {path}: {exc.msg} at line {exc.lineno}, column {exc.colno}.")
+    except OSError as exc:
+        _exit_error(f"Could not read patch at {path}: {exc}")
+
+
+def _coerce_patch_object(raw_patch: Mapping[Any, Any], label: str) -> dict[str, Any]:
+    patch: dict[str, Any] = {}
+    for key, value in raw_patch.items():
+        if not isinstance(key, str):
+            _exit_error(f"{label} keys must be strings.")
+        patch[key] = value
+    return patch
+
+
+def _coerce_patch_sequence(raw_patch: Any) -> list[dict[str, Any]]:
+    if isinstance(raw_patch, Mapping):
+        return [_coerce_patch_object(raw_patch, "Patch JSON object")]
+
+    if not isinstance(raw_patch, Sequence) or isinstance(raw_patch, (str, bytes)):
+        _exit_error("Patch JSON must be an object or an array of objects.")
+
+    patches: list[dict[str, Any]] = []
+    for index, patch in enumerate(raw_patch):
+        if not isinstance(patch, Mapping):
+            _exit_error(f"Patch JSON item {index} must be an object.")
+        patches.append(_coerce_patch_object(patch, f"Patch JSON item {index}"))
+    return patches
+
+
+def _read_json_bank_text_source(
+    file_path: Path | None,
+    *,
+    read_stdin: bool,
+    text: str | None,
+) -> str:
+    source_count = sum([file_path is not None, read_stdin, text is not None])
+    if source_count != 1:
+        _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
+
+    if text is not None:
+        return text
+
+    if read_stdin:
+        return sys.stdin.read()
+
+    if file_path is None:
+        _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
+
+    path = _ensure_explicit_file(file_path, "Document")
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        _exit_error(f"Could not read document at {path}: {exc}")
+
+
+def _invalid_bank_payloads_payload(payloads: dict[str, dict[str, Any] | None]) -> dict[str, Any] | None:
+    invalid_payloads = {label: payload for label, payload in payloads.items() if payload is not None}
+    if not invalid_payloads:
+        return None
+
+    diagnostics: list[dict[str, Any]] = []
+    for label, payload in invalid_payloads.items():
+        for item in payload["diagnostics"]:
+            diagnostic = dict(item)
+            metadata = dict(diagnostic.get("metadata", {}))
+            metadata["bank"] = label
+            diagnostic["metadata"] = metadata
+            diagnostics.append(diagnostic)
+
+    return {"valid": False, "banks": invalid_payloads, "diagnostics": diagnostics}
+
+
+def _non_mapping_bank_payload(raw_bank: Any, path: Path, label: str) -> dict[str, Any] | None:
+    if isinstance(raw_bank, Mapping):
+        return None
+
+    validation = _validate_bank(raw_bank)
+    return {
+        "valid": False,
+        "path": str(path),
+        "label": label,
+        "diagnostics": validation["diagnostics"],
+    }
+
+
+def _run_json_helper(action: Any) -> dict[str, Any]:
+    try:
+        return action()
+    except (ExtractionError, BankError) as exc:
+        diagnostics = getattr(exc, "diagnostics", [])
+        if diagnostics:
+            return _diagnostic_payload(str(exc), diagnostics)
+        _exit_error(str(exc))
+    except (TypeError, ValueError) as exc:
+        _exit_error(str(exc))
 
 
 def _load_command_config(config_path: Path, *, allow_missing: bool = False) -> PatternConfig:
@@ -104,9 +287,9 @@ def _save_command_config(config: PatternConfig, config_path: Path) -> None:
         _exit_error(f"Could not write config at {config_path}: {exc}")
 
 
-def _canonical_flag_names(flags: List[str]) -> List[str]:
-    flag_names: List[str] = []
-    seen: Set[str] = set()
+def _canonical_flag_names(flags: list[str]) -> list[str]:
+    flag_names: list[str] = []
+    seen: set[str] = set()
     for raw_value in flags:
         for raw_flag in raw_value.split(","):
             flag_name = raw_flag.strip()
@@ -120,14 +303,14 @@ def _canonical_flag_names(flags: List[str]) -> List[str]:
     return flag_names
 
 
-def _flag_config(entity: str, config_path: Path, flags: Optional[List[str]]) -> Optional[Union[str, List[str]]]:
+def _flag_config(entity: str, config_path: Path, flags: list[str] | None) -> str | list[str] | None:
     if not flags:
         return None
 
     flag_names = _canonical_flag_names(flags)
     if not flag_names:
         _exit_error(f"Invalid _flags for entity {entity!r} in {config_path}: Regex flag names must not be empty.")
-    flag_config: Union[str, List[str]] = flag_names[0] if len(flag_names) == 1 else flag_names
+    flag_config: str | list[str] = flag_names[0] if len(flag_names) == 1 else flag_names
     try:
         validate_regex_flags(flag_config)
     except ConfigError as exc:
@@ -138,7 +321,7 @@ def _flag_config(entity: str, config_path: Path, flags: Optional[List[str]]) -> 
 def _ensure_flag_update_allowed(
     config: PatternConfig,
     entity: str,
-    flag_config: Optional[Union[str, List[str]]],
+    flag_config: str | list[str] | None,
     *,
     force: bool,
     config_path: Path,
@@ -159,14 +342,12 @@ def _ensure_flag_update_allowed(
         _exit_error(message)
 
 
-def _with_entity_flags(
-    config: PatternConfig, entity: str, flag_config: Optional[Union[str, List[str]]]
-) -> PatternConfig:
+def _with_entity_flags(config: PatternConfig, entity: str, flag_config: str | list[str] | None) -> PatternConfig:
     if flag_config is None:
         return config
 
     updated_config = validate_pattern_config(config)
-    entity_config: Dict[str, Any] = {FLAGS_KEY: flag_config}
+    entity_config: dict[str, Any] = {FLAGS_KEY: flag_config}
     for name, pattern in updated_config[entity].items():
         if name != FLAGS_KEY:
             entity_config[name] = pattern
@@ -180,7 +361,7 @@ def _format_flags(flags: Any) -> str:
     return str(flags)
 
 
-def _echo_entity_listing(entity: str, entity_config: Dict[str, Any]) -> None:
+def _echo_entity_listing(entity: str, entity_config: dict[str, Any]) -> None:
     typer.echo(f"{entity}:")
     if FLAGS_KEY in entity_config:
         typer.echo(f"  {FLAGS_KEY}: {_format_flags(entity_config[FLAGS_KEY])}")
@@ -189,15 +370,15 @@ def _echo_entity_listing(entity: str, entity_config: Dict[str, Any]) -> None:
             typer.echo(f"  {name}")
 
 
-def _yaml_text(config: Dict[str, Any]) -> str:
+def _yaml_text(config: dict[str, Any]) -> str:
     return yaml.safe_dump(config, sort_keys=False, default_flow_style=False, allow_unicode=True).rstrip()
 
 
-def _command_config_explicit(ctx: typer.Context, config: Optional[Path]) -> bool:
+def _command_config_explicit(ctx: typer.Context, config: Path | None) -> bool:
     return config is not None or bool(ctx.obj and ctx.obj.get("config_explicit"))
 
 
-def _normalize_format_choice(output_format: str, choices: Set[str]) -> str:
+def _normalize_format_choice(output_format: str, choices: set[str]) -> str:
     normalized_format = output_format.lower()
     if normalized_format not in choices:
         formatted_choices = ", ".join(sorted(choices))
@@ -218,11 +399,11 @@ def _pattern_count(pattern_config: PatternConfig) -> int:
 
 
 def _resolve_extraction_arguments(
-    entity: Optional[str],
-    document: Optional[Path],
+    entity: str | None,
+    document: Path | None,
     *,
     all_entities: bool,
-) -> Tuple[Optional[str], Optional[Path]]:
+) -> tuple[str | None, Path | None]:
     if all_entities:
         if entity is not None and document is None:
             return None, Path(entity)
@@ -238,7 +419,7 @@ def _resolve_extraction_arguments(
     return entity, document
 
 
-def _read_extraction_text(document: Optional[Path], *, read_stdin: bool, text: Optional[str]) -> str:
+def _read_extraction_text(document: Path | None, *, read_stdin: bool, text: str | None) -> str:
     source_count = sum([document is not None, read_stdin, text is not None])
     if source_count != 1:
         _exit_error("Provide exactly one input source: DOCUMENT, --stdin, or --text.")
@@ -264,14 +445,14 @@ def _read_extraction_text(document: Optional[Path], *, read_stdin: bool, text: O
         _exit_error(f"Could not read document at {document}: {exc}")
 
 
-def _parse_pattern_definition(raw_value: str) -> Tuple[str, str]:
+def _parse_pattern_definition(raw_value: str) -> tuple[str, str]:
     name, separator, pattern = raw_value.partition("=")
     if not separator or not name.strip():
         _exit_error(f"Malformed --pattern value {raw_value!r}. Expected NAME=REGEX.")
     return name.strip(), pattern
 
 
-def _parse_detector_definition(raw_value: str) -> Tuple[str, str, str]:
+def _parse_detector_definition(raw_value: str) -> tuple[str, str, str]:
     detector_name, separator, pattern = raw_value.partition("=")
     entity, entity_separator, name = detector_name.partition(":")
     if not separator or not entity_separator or not entity.strip() or not name.strip():
@@ -289,11 +470,11 @@ def _add_inline_pattern(config: PatternConfig, entity: str, name: str, pattern: 
 def _load_extraction_config(
     ctx: typer.Context,
     config_path: Path,
-    config: Optional[Path],
+    config: Path | None,
     *,
-    inline_patterns: List[str],
-    inline_detectors: List[str],
-    selected_entity: Optional[str],
+    inline_patterns: list[str],
+    inline_detectors: list[str],
+    selected_entity: str | None,
 ) -> PatternConfig:
     if inline_patterns and selected_entity is None:
         _exit_error("--pattern requires ENTITY and cannot be used with --all.")
@@ -330,11 +511,11 @@ def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) 
 
 def _extract_records(
     pattern_config: PatternConfig,
-    selected_entity: Optional[str],
+    selected_entity: str | None,
     text: str,
     *,
     word_boundaries: bool,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     extractor = _compile_extractor(pattern_config, word_boundaries=word_boundaries)
 
     if selected_entity is None:
@@ -348,10 +529,10 @@ def _inline_detector_config(
     name: str,
     pattern: str,
     *,
-    flags: Optional[List[str]],
+    flags: list[str] | None,
     config_path: Path,
 ) -> PatternConfig:
-    entity_config: Dict[str, Any] = {}
+    entity_config: dict[str, Any] = {}
     flag_config = _flag_config(entity, config_path, flags)
     if flag_config is not None:
         entity_config[FLAGS_KEY] = flag_config
@@ -371,7 +552,7 @@ def _saved_detector_config(pattern_config: PatternConfig, entity: str, name: str
     if name == FLAGS_KEY or name not in entity_config:
         _exit_error(f"Pattern {name!r} does not exist for entity {entity!r} in {config_path}.")
 
-    selected_entity_config: Dict[str, Any] = {}
+    selected_entity_config: dict[str, Any] = {}
     if FLAGS_KEY in entity_config:
         selected_entity_config[FLAGS_KEY] = entity_config[FLAGS_KEY]
     selected_entity_config[name] = entity_config[name]
@@ -382,9 +563,9 @@ def _test_detector_config(
     config_path: Path,
     entity: str,
     name: str,
-    pattern: Optional[str],
+    pattern: str | None,
     *,
-    flags: Optional[List[str]],
+    flags: list[str] | None,
 ) -> PatternConfig:
     if pattern is not None:
         return _inline_detector_config(entity, name, pattern, flags=flags, config_path=config_path)
@@ -400,7 +581,7 @@ def _table_cell(value: Any) -> str:
     return str(value).replace("\n", "\\n").replace("\t", "\\t")
 
 
-def _format_records_table(records: List[Dict[str, Any]]) -> str:
+def _format_records_table(records: list[dict[str, Any]]) -> str:
     if not records:
         return "No matches."
 
@@ -414,7 +595,7 @@ def _format_records_table(records: List[Dict[str, Any]]) -> str:
     return f"{header}\n{separator}\n{body}"
 
 
-def _echo_records(records: List[Dict[str, Any]], output_format: str) -> None:
+def _echo_records(records: list[dict[str, Any]], output_format: str) -> None:
     normalized_format = _normalize_output_format(output_format)
     if normalized_format == "json":
         typer.echo(json.dumps(records, ensure_ascii=False))
@@ -428,12 +609,12 @@ def _echo_records(records: List[Dict[str, Any]], output_format: str) -> None:
     typer.echo(_format_records_table(records))
 
 
-def _compiled_regex_payload(entity: str, entity_config: Dict[str, Any], regex: Any) -> Dict[str, Any]:
+def _compiled_regex_payload(entity: str, entity_config: dict[str, Any], regex: Any) -> dict[str, Any]:
     groups = [
         {"name": group_name.replace("_", " "), "group": group_name, "index": index}
         for group_name, index in sorted(regex.groupindex.items(), key=lambda item: item[1])
     ]
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "entity": entity,
         "pattern": regex.pattern,
         "flags": int(regex.flags),
@@ -471,11 +652,11 @@ def _diagnostic(
     code: str,
     message: str,
     *,
-    entity: Optional[str] = None,
-    name: Optional[str] = None,
-    line: Optional[int] = None,
-) -> Dict[str, Any]:
-    diagnostic: Dict[str, Any] = {"level": level, "code": code, "message": message}
+    entity: str | None = None,
+    name: str | None = None,
+    line: int | None = None,
+) -> dict[str, Any]:
+    diagnostic: dict[str, Any] = {"level": level, "code": code, "message": message}
     if entity is not None:
         diagnostic["entity"] = entity
     if name is not None:
@@ -485,14 +666,14 @@ def _diagnostic(
     return diagnostic
 
 
-def _load_yaml_with_duplicate_diagnostics(config_path: Path) -> Tuple[Any, List[Dict[str, Any]], bool]:
-    diagnostics: List[Dict[str, Any]] = []
+def _load_yaml_with_duplicate_diagnostics(config_path: Path) -> tuple[Any, list[dict[str, Any]], bool]:
+    diagnostics: list[dict[str, Any]] = []
 
     class DuplicateKeyLoader(yaml.SafeLoader):
         pass
 
-    def construct_mapping(loader: Any, node: Any, deep: bool = False) -> Dict[Any, Any]:
-        mapping: Dict[Any, Any] = {}
+    def construct_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+        mapping: dict[Any, Any] = {}
         for key_node, value_node in node.value:
             key = loader.construct_object(key_node, deep=deep)
             try:
@@ -544,8 +725,8 @@ def _load_yaml_with_duplicate_diagnostics(config_path: Path) -> Tuple[Any, List[
         return None, diagnostics, False
 
 
-def _diagnose_suspicious_names(raw_config: Any) -> List[Dict[str, Any]]:
-    diagnostics: List[Dict[str, Any]] = []
+def _diagnose_suspicious_names(raw_config: Any) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
     if not isinstance(raw_config, dict):
         return diagnostics
 
@@ -563,8 +744,8 @@ def _diagnose_suspicious_names(raw_config: Any) -> List[Dict[str, Any]]:
         if not isinstance(entity, str) or not isinstance(entity_config, dict):
             continue
 
-        normalized_names: Dict[str, str] = {}
-        casefolded_names: Dict[str, str] = {}
+        normalized_names: dict[str, str] = {}
+        casefolded_names: dict[str, str] = {}
         for name in entity_config:
             if not isinstance(name, str) or name == FLAGS_KEY:
                 continue
@@ -613,8 +794,8 @@ def _diagnose_suspicious_names(raw_config: Any) -> List[Dict[str, Any]]:
     return diagnostics
 
 
-def _diagnose_compiled_entities(pattern_config: PatternConfig) -> List[Dict[str, Any]]:
-    diagnostics: List[Dict[str, Any]] = []
+def _diagnose_compiled_entities(pattern_config: PatternConfig) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
     for entity, entity_config in pattern_config.items():
         try:
             NERB({entity: entity_config})
@@ -632,9 +813,9 @@ def _diagnose_compiled_entities(pattern_config: PatternConfig) -> List[Dict[str,
 
 def _doctor_payload(
     config_path: Path,
-    pattern_config: Optional[PatternConfig],
-    diagnostics: List[Dict[str, Any]],
-) -> Dict[str, Any]:
+    pattern_config: PatternConfig | None,
+    diagnostics: list[dict[str, Any]],
+) -> dict[str, Any]:
     error_count = len([diagnostic for diagnostic in diagnostics if diagnostic["level"] == DIAGNOSTIC_ERROR])
     warning_count = len([diagnostic for diagnostic in diagnostics if diagnostic["level"] == DIAGNOSTIC_WARNING])
     summary_config = pattern_config or {}
@@ -651,7 +832,7 @@ def _doctor_payload(
     }
 
 
-def _format_doctor_text(payload: Dict[str, Any]) -> str:
+def _format_doctor_text(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
     lines = [f"Config doctor: {payload['config']}"]
     if payload["valid"]:
@@ -673,7 +854,7 @@ def _format_doctor_text(payload: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _run_doctor(config_path: Path) -> Dict[str, Any]:
+def _run_doctor(config_path: Path) -> dict[str, Any]:
     if not config_path.exists():
         _exit_error(f"Config file does not exist at {config_path}.")
 
@@ -681,7 +862,7 @@ def _run_doctor(config_path: Path) -> Dict[str, Any]:
     if raw_config_loaded:
         diagnostics.extend(_diagnose_suspicious_names(raw_config))
 
-    pattern_config: Optional[PatternConfig] = None
+    pattern_config: PatternConfig | None = None
     if raw_config_loaded:
         try:
             pattern_config = load_config(config_path)
@@ -711,14 +892,14 @@ def _run_doctor(config_path: Path) -> Dict[str, Any]:
 @app.callback()
 def callback(
     ctx: typer.Context,
-    version: Optional[bool] = typer.Option(
+    version: bool | None = typer.Option(
         None,
         "--version",
         callback=_version_callback,
         help="Show the installed package version and exit.",
         is_eager=True,
     ),
-    config: Optional[Path] = typer.Option(
+    config: Path | None = typer.Option(
         None,
         "--config",
         "-c",
@@ -729,20 +910,207 @@ def callback(
     ctx.obj = {"config_path": resolve_default_config_path(config), "config_explicit": config is not None}
 
 
+@app.command("validate-bank")
+def validate_json_bank(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path to validate."),
+    level: str = typer.Option("standard", "--level", help="Validation level: basic, standard, or deep."),
+    engine: str = typer.Option("python_re", "--engine", help="Validation engine."),
+    strict: bool = typer.Option(False, "--strict", help="Promote strict validation warnings where supported."),
+) -> None:
+    """Validate a JSON bank and print the helper response as JSON."""
+    raw_bank, path, invalid_payload = _load_raw_bank_json_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+
+    payload = _run_json_helper(
+        lambda: _validate_bank(raw_bank, level=level, engine=engine, base_path=path.parent, strict=strict)
+    )
+    _echo_json(payload)
+
+
+@app.command("apply-patches")
+def apply_json_bank_patches(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path to patch."),
+    patch_path: Path = typer.Option(..., "--patch", help="JSON Patch file path."),
+    level: str = typer.Option("standard", "--level", help="Validation level after applying patches."),
+    engine: str = typer.Option("python_re", "--engine", help="Validation engine after applying patches."),
+) -> None:
+    """Apply JSON Patch operations to a JSON bank and print the validated candidate."""
+    bank, path, invalid_payload = _load_raw_bank_json_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {path}.")
+
+    patches = _coerce_patch_sequence(_load_patch_json_for_command(patch_path))
+    payload = _run_json_helper(
+        lambda: _apply_bank_patches(bank, patches, level=level, engine=engine, base_path=path.parent)
+    )
+    _echo_json(payload)
+
+
+@app.command("diff-banks")
+def diff_json_banks(
+    old_bank: Path = typer.Argument(..., help="Old JSON bank path."),
+    new_bank: Path = typer.Argument(..., help="New JSON bank path."),
+) -> None:
+    """Diff two JSON banks and print the helper response as JSON."""
+    old_raw, old_path, old_invalid = _load_raw_bank_json_for_command(old_bank)
+    new_raw, new_path, new_invalid = _load_raw_bank_json_for_command(new_bank)
+    invalid_payload = _invalid_bank_payloads_payload(
+        {
+            "old_bank": old_invalid or _non_mapping_bank_payload(old_raw, old_path, "old_bank"),
+            "new_bank": new_invalid or _non_mapping_bank_payload(new_raw, new_path, "new_bank"),
+        }
+    )
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if not isinstance(old_raw, Mapping) or not isinstance(new_raw, Mapping):
+        _exit_error("diff-banks requires JSON bank objects.")
+
+    _echo_json(_run_json_helper(lambda: _diff_banks(old_raw, new_raw)))
+
+
+@app.command("extract-text")
+def extract_json_bank_text(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    text: str | None = typer.Option(None, "--text", help="Literal document text to extract from."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+) -> None:
+    """Extract from one in-memory text source using a JSON bank."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    document_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
+    _echo_json(_run_json_helper(lambda: _json_extract_text(bank, document_text)))
+
+
+@app.command("extract-file")
+def extract_json_bank_file(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    file_path: Path = typer.Option(..., "--file", help="UTF-8 document file path."),
+) -> None:
+    """Extract from one explicit document file using a JSON bank."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    document_path = _ensure_explicit_file(file_path, "Document")
+    _echo_json(_run_json_helper(lambda: _json_extract_file(bank, document_path)))
+
+
+@app.command("extract-report")
+def extract_json_bank_report(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    file_path: Path | None = typer.Option(None, "--file", help="UTF-8 document file path."),
+    text: str | None = typer.Option(None, "--text", help="Literal document text to report on."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+) -> None:
+    """Build a single-document extraction report from a JSON bank."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    if file_path is not None:
+        if read_stdin or text is not None:
+            _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
+        document_path = _ensure_explicit_file(file_path, "Document")
+        _echo_json(_run_json_helper(lambda: _json_extract_report_file(bank, document_path)))
+        return
+
+    document_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
+    _echo_json(_run_json_helper(lambda: _json_extract_report(bank, document_text)))
+
+
+@app.command("eval-bank")
+def eval_json_bank(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+) -> None:
+    """Evaluate a JSON bank against its explicit local eval refs."""
+    bank, path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {path}.")
+
+    _echo_json(_run_json_helper(lambda: _eval_bank(bank, base_path=path.parent)))
+
+
+@app.command("benchmark-bank")
+def benchmark_json_bank(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    benchmark_iterations: int | None = typer.Option(None, "--benchmark-iterations", help="Benchmark iterations."),
+    stress_multiplier: int | None = typer.Option(None, "--stress-multiplier", help="Benchmark stress multiplier."),
+) -> None:
+    """Benchmark JSON-bank compile and extraction throughput."""
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+
+    options: dict[str, Any] = {}
+    if benchmark_iterations is not None:
+        options["benchmark_iterations"] = benchmark_iterations
+    if stress_multiplier is not None:
+        options["stress_multiplier"] = stress_multiplier
+    _echo_json(_run_json_helper(lambda: _benchmark_bank(bank, options=options or None)))
+
+
+@app.command("regress-bank")
+def regress_json_bank(
+    old_bank_path: Path = typer.Option(..., "--old-bank", help="Old JSON bank path."),
+    new_bank_path: Path = typer.Option(..., "--new-bank", help="New JSON bank path."),
+    benchmark_iterations: int | None = typer.Option(None, "--benchmark-iterations", help="Benchmark iterations."),
+    stress_multiplier: int | None = typer.Option(None, "--stress-multiplier", help="Benchmark stress multiplier."),
+) -> None:
+    """Run diff, eval, and benchmark regression checks for two JSON banks."""
+    old_bank, old_path, old_invalid = _load_json_bank_for_command(old_bank_path)
+    new_bank, new_path, new_invalid = _load_json_bank_for_command(new_bank_path)
+    invalid_payload = _invalid_bank_payloads_payload({"old_bank": old_invalid, "new_bank": new_invalid})
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if old_bank is None or new_bank is None:
+        _exit_error("Could not load both regression banks.")
+
+    options: dict[str, Any] = {"old_bank_path": str(old_path), "new_bank_path": str(new_path)}
+    if benchmark_iterations is not None:
+        options["benchmark_iterations"] = benchmark_iterations
+    if stress_multiplier is not None:
+        options["stress_multiplier"] = stress_multiplier
+    _echo_json(_run_json_helper(lambda: _regress_bank(old_bank, new_bank, options=options)))
+
+
 @app.command("extract")
 def extract(
     ctx: typer.Context,
-    entity: Optional[str] = typer.Argument(None, help="Detector entity name, unless --all is used."),
-    document: Optional[Path] = typer.Argument(None, help="Document path to extract from."),
+    entity: str | None = typer.Argument(None, help="Detector entity name, unless --all is used."),
+    document: Path | None = typer.Argument(None, help="Document path to extract from."),
     all_entities: bool = typer.Option(False, "--all", help="Extract all configured detector entities."),
     read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
-    text: Optional[str] = typer.Option(None, "--text", help="Literal document text to extract from."),
-    inline_patterns: Optional[List[str]] = typer.Option(
+    text: str | None = typer.Option(None, "--text", help="Literal document text to extract from."),
+    inline_patterns: list[str] | None = typer.Option(
         None,
         "--pattern",
         help="Inline detector for ENTITY as NAME=REGEX. May be repeated.",
     ),
-    inline_detectors: Optional[List[str]] = typer.Option(
+    inline_detectors: list[str] | None = typer.Option(
         None,
         "--detector",
         help="Inline detector as ENTITY:NAME=REGEX. May be repeated.",
@@ -758,7 +1126,7 @@ def extract(
         "--word-boundaries",
         help="Add regex word boundaries around configured detector patterns.",
     ),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Extract configured named entities from a document."""
     selected_entity, document_path = _resolve_extraction_arguments(entity, document, all_entities=all_entities)
@@ -781,11 +1149,11 @@ def test_detector(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
-    pattern: Optional[str] = typer.Argument(None, help="Literal regex pattern. Omit to use a saved detector."),
-    document: Optional[Path] = typer.Option(None, "--document", "-d", help="Document path to test against."),
+    pattern: str | None = typer.Argument(None, help="Literal regex pattern. Omit to use a saved detector."),
+    document: Path | None = typer.Option(None, "--document", "-d", help="Document path to test against."),
     read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
-    text: Optional[str] = typer.Option(None, "--text", help="Literal document text to test against."),
-    flags: Optional[List[str]] = typer.Option(
+    text: str | None = typer.Option(None, "--text", help="Literal document text to test against."),
+    flags: list[str] | None = typer.Option(
         None,
         "--flag",
         help=f"Regex flag name for a literal PATTERN's {FLAGS_KEY}. May be repeated or comma-separated.",
@@ -801,7 +1169,7 @@ def test_detector(
         "--word-boundaries",
         help="Add regex word boundaries around the detector pattern.",
     ),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Test one detector against literal text, standard input, or a document."""
     document_text = _read_extraction_text(document, read_stdin=read_stdin, text=text)
@@ -821,7 +1189,7 @@ def compile_entity(
         "--word-boundaries",
         help="Add regex word boundaries before printing the compiled pattern.",
     ),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Print the compiled regex for one configured entity."""
     config_path = _command_config_path(ctx, config)
@@ -839,7 +1207,7 @@ def compile_entity(
 def doctor_config(
     ctx: typer.Context,
     output_format: str = typer.Option("text", "--format", "-f", help="Output format: json or text."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Validate and diagnose detector config authoring issues."""
     config_path = _command_config_path(ctx, config)
@@ -858,7 +1226,7 @@ def doctor_config(
 def init_config(
     ctx: typer.Context,
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing detector config."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Create an empty detector config file."""
     config_path = _command_config_path(ctx, config)
@@ -877,13 +1245,13 @@ def add_pattern(
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
     pattern: str = typer.Argument(..., help="Regex pattern."),
-    flags: Optional[List[str]] = typer.Option(
+    flags: list[str] | None = typer.Option(
         None,
         "--flag",
         help=f"Regex flag name for this entity's {FLAGS_KEY}. May be repeated or comma-separated.",
     ),
     force: bool = typer.Option(False, "--force", "-f", help="Replace an existing entity/name pattern."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Add a detector pattern to the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -906,8 +1274,8 @@ def add_pattern(
 @app.command("list")
 def list_patterns(
     ctx: typer.Context,
-    entity: Optional[str] = typer.Argument(None, help="Optional detector entity name."),
-    config: Optional[Path] = _config_option(),
+    entity: str | None = typer.Argument(None, help="Optional detector entity name."),
+    config: Path | None = _config_option(),
 ) -> None:
     """List detector patterns in the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -930,8 +1298,8 @@ def list_patterns(
 def show_pattern(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
-    name: Optional[str] = typer.Argument(None, help="Optional pattern name."),
-    config: Optional[Path] = _config_option(),
+    name: str | None = typer.Argument(None, help="Optional pattern name."),
+    config: Path | None = _config_option(),
 ) -> None:
     """Show configured detector patterns for an entity."""
     config_path = _command_config_path(ctx, config)
@@ -947,7 +1315,7 @@ def show_pattern(
     if name not in entity_config:
         _exit_error(f"Pattern {name!r} does not exist for entity {entity!r} in {config_path}.")
 
-    selected_entity_config: Dict[str, Any] = {}
+    selected_entity_config: dict[str, Any] = {}
     if FLAGS_KEY in entity_config and name != FLAGS_KEY:
         selected_entity_config[FLAGS_KEY] = entity_config[FLAGS_KEY]
     selected_entity_config[name] = entity_config[name]
@@ -959,7 +1327,7 @@ def remove_pattern(
     ctx: typer.Context,
     entity: str = typer.Argument(..., help="Detector entity name."),
     name: str = typer.Argument(..., help="Pattern name."),
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Remove a detector pattern from the configured detector file."""
     config_path = _command_config_path(ctx, config)
@@ -976,7 +1344,7 @@ def remove_pattern(
 @app.command("validate")
 def validate_config(
     ctx: typer.Context,
-    config: Optional[Path] = _config_option(),
+    config: Path | None = _config_option(),
 ) -> None:
     """Validate the configured detector file."""
     config_path = _command_config_path(ctx, config)
