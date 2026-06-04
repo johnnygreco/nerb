@@ -151,7 +151,7 @@ impl PyMatchBuffer {
                 inner: if capacity == 0 {
                     NativeMatchBuffer::new()
                 } else {
-                    NativeMatchBuffer::with_capacity(capacity)
+                    NativeMatchBuffer::with_capacity(capacity)?
                 },
             })
         })
@@ -187,7 +187,7 @@ impl PyMatchBuffer {
 
     fn reserve(&mut self, additional: usize) -> PyResult<()> {
         ffi_boundary(|| {
-            self.inner.reserve(additional);
+            self.inner.reserve(additional)?;
             Ok(())
         })
     }

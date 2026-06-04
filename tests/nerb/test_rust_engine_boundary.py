@@ -78,6 +78,15 @@ def test_native_match_buffer_rejects_invalid_raw_spans(engine):
         engine.MatchBuffer.from_raw_matches([(1, 9, 8)])
 
 
+def test_native_match_buffer_rejects_oversized_capacity_requests(engine):
+    with pytest.raises(MemoryError, match="exceeds pre-scan limit"):
+        engine.MatchBuffer(capacity=1_000_001)
+
+    buffer = engine.MatchBuffer()
+    with pytest.raises(MemoryError, match="exceeds pre-scan limit"):
+        buffer.reserve(1_000_001)
+
+
 def test_native_scan_methods_are_boundary_stubs_without_record_projection(engine):
     bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
     buffer = engine.MatchBuffer()

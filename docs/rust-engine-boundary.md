@@ -63,6 +63,9 @@ raw.clear()
 `from_raw_matches` exists to test the boundary before scans land. The scanner slice will fill `MatchBuffer` from Rust.
 Public record projection remains outside the scan loop.
 
+Before scanning exists, Python-created buffers are capped at 1,000,000 raw matches and use fallible Rust allocation paths.
+The scanner slice may revisit this limit once dense-hit memory gates are measured.
+
 ## Scan Stubs
 
 `Bank.scan_bytes` and `Bank.scan_path` are exported only as boundary stubs in this slice. They raise

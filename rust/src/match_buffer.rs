@@ -1,4 +1,6 @@
-use crate::error::{validation, Result};
+use crate::error::{memory, validation, Result};
+
+const MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawMatch {
@@ -37,14 +39,15 @@ impl NativeMatchBuffer {
         Self::default()
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            matches: Vec::with_capacity(capacity),
-        }
+    pub fn with_capacity(capacity: usize) -> Result<Self> {
+        validate_capacity(capacity)?;
+        let mut matches = Vec::new();
+        try_reserve(&mut matches, capacity)?;
+        Ok(Self { matches })
     }
 
     pub fn from_raw_matches(raw_matches: &[(u32, u64, u64)]) -> Result<Self> {
-        let mut buffer = Self::with_capacity(raw_matches.len());
+        let mut buffer = Self::with_capacity(raw_matches.len())?;
         for (detector_index, start_byte, end_byte) in raw_matches {
             buffer.push(RawMatch::new(*detector_index, *start_byte, *end_byte)?);
         }
@@ -67,8 +70,15 @@ impl NativeMatchBuffer {
         self.matches.clear();
     }
 
-    pub fn reserve(&mut self, additional: usize) {
-        self.matches.reserve(additional);
+    pub fn reserve(&mut self, additional: usize) -> Result<()> {
+        let requested = self.matches.len().checked_add(additional).ok_or_else(|| {
+            memory(
+                "/match_buffer",
+                "requested match buffer capacity overflowed usize",
+            )
+        })?;
+        validate_capacity(requested)?;
+        try_reserve(&mut self.matches, additional)
     }
 
     pub fn push(&mut self, raw_match: RawMatch) {
@@ -80,13 +90,34 @@ impl NativeMatchBuffer {
     }
 }
 
+fn validate_capacity(capacity: usize) -> Result<()> {
+    if capacity > MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY {
+        return Err(memory(
+            "/match_buffer",
+            format!(
+                "requested match buffer capacity {capacity} exceeds pre-scan limit {MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn try_reserve(matches: &mut Vec<RawMatch>, additional: usize) -> Result<()> {
+    matches.try_reserve(additional).map_err(|error| {
+        memory(
+            "/match_buffer",
+            format!("could not reserve match buffer capacity: {error}"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn match_buffer_stores_and_clears_raw_matches() {
-        let mut buffer = NativeMatchBuffer::with_capacity(4);
+        let mut buffer = NativeMatchBuffer::with_capacity(4).unwrap();
         buffer.push(RawMatch::new(7, 10, 12).unwrap());
 
         assert_eq!(buffer.len(), 1);
@@ -104,5 +135,13 @@ mod tests {
         let error = RawMatch::new(1, 5, 4).unwrap_err();
 
         assert!(error.to_string().contains("before start_byte"));
+    }
+
+    #[test]
+    fn match_buffer_rejects_oversized_capacity() {
+        let error =
+            NativeMatchBuffer::with_capacity(MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY + 1).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds pre-scan limit"));
     }
 }
