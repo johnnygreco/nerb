@@ -183,6 +183,20 @@ def test_native_bank_auto_detects_json_shaped_yaml_detector_maps(engine):
     assert canonical["entities"][0]["patterns"][0]["regex"] == "A"
 
 
+def test_native_bank_auto_detects_multiline_json_shaped_yaml_detector_maps(engine):
+    canonical = _canonical(engine.Bank.from_source_bytes(b"{CODE: {Alpha: A},\n GENRE: {Jazz: jazz}}\n"))
+
+    assert [entity["name"] for entity in canonical["entities"]] == ["CODE", "GENRE"]
+
+
+def test_native_bank_does_not_misroute_json_detector_maps_that_resemble_jsonl_rows(engine):
+    source = b'{"entity":{"Alpha":"A"},"canonical_name":{"Beta":"B"},"regex":{"Gamma":"G"}}'
+
+    canonical = _canonical(engine.Bank.from_source_bytes(source))
+
+    assert [entity["name"] for entity in canonical["entities"]] == ["canonical_name", "entity", "regex"]
+
+
 def test_native_bank_rejects_reserved_compact_detector_map_entity_names(engine):
     with pytest.raises(ValueError, match="reserved entity names"):
         engine.Bank.from_source_bytes(b'{"schema":{"Alpha":"A"}}', format_hint="json")

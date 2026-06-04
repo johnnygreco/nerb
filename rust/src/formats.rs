@@ -54,7 +54,12 @@ pub fn parse_source_auto(bytes: &[u8]) -> Result<(Value, SourceFormat)> {
             if looks_like_jsonl(bytes) {
                 match parse_jsonl(bytes) {
                     Ok(value) => return Ok((value, SourceFormat::Jsonl)),
-                    Err(jsonl_error) => return Err(jsonl_error),
+                    Err(jsonl_error) => {
+                        if let Ok(value) = parse_yaml(bytes) {
+                            return Ok((value, SourceFormat::Yaml));
+                        }
+                        return Err(jsonl_error);
+                    }
                 }
             }
         }
@@ -66,9 +71,9 @@ pub fn parse_source_auto(bytes: &[u8]) -> Result<(Value, SourceFormat)> {
 fn is_jsonl_row_object(value: &Value) -> bool {
     match value {
         Value::Object(object) => {
-            object.contains_key("entity")
-                && object.contains_key("canonical_name")
-                && object.contains_key("regex")
+            matches!(object.get("entity"), Some(Value::String(_)))
+                && matches!(object.get("canonical_name"), Some(Value::String(_)))
+                && matches!(object.get("regex"), Some(Value::String(_)))
         }
         _ => false,
     }
