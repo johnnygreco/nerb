@@ -41,11 +41,14 @@ jobs:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
-      - name: Build distributions
-        run: uv build --clear
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Verify distributions
-        run: uv run --no-project --with twine twine check --strict dist/*
+      - name: Build source distribution
+        run: uv build --sdist --clear
+
+      - name: Verify source distribution
+        run: uv run --no-project --with twine twine check --strict dist/*.tar.gz
 
       - name: Publish distributions
         uses: pypa/gh-action-pypi-publish@release/v1

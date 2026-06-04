@@ -2,7 +2,7 @@ UV ?= uv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help sync format lint type test check build clean publish-test publish
+.PHONY: help sync format lint type test check build build-sdist clean publish-test publish
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "Available targets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -31,8 +31,14 @@ build: ## Build and validate source and wheel distributions.
 	$(UV) build --clear
 	$(UV) run --no-project --with twine twine check --strict dist/*
 
+build-sdist: ## Build and validate the source distribution for publishing.
+	$(UV) build --sdist --clear
+	$(UV) run --no-project --with twine twine check --strict dist/*.tar.gz
+
 clean: ## Remove local build outputs and tool caches.
 	rm -rf build dist .eggs *.egg-info src/*.egg-info
+	rm -rf rust/target
+	rm -f src/nerb/_engine*.so src/nerb/_engine*.pyd
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage .coverage.* htmlcov
 	find . \( -path ./.git -o -path ./.venv \) -prune -o -type d -name __pycache__ -exec rm -rf {} +
 	find . \( -path ./.git -o -path ./.venv \) -prune -o -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
@@ -44,8 +50,8 @@ publish-test: ## Manually publish to TestPyPI with uv credentials; requires CONF
 		exit 1; \
 	fi
 	rm -rf dist
-	$(MAKE) build
-	$(UV) publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple/ dist/*.tar.gz dist/*.whl
+	$(MAKE) build-sdist
+	$(UV) publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple/ dist/*.tar.gz
 
 publish: ## Manually publish to PyPI with uv credentials; prefer the Publish workflow; requires CONFIRM=yes.
 	@if [ "$(CONFIRM)" != "yes" ]; then \
@@ -54,5 +60,5 @@ publish: ## Manually publish to PyPI with uv credentials; prefer the Publish wor
 		exit 1; \
 	fi
 	rm -rf dist
-	$(MAKE) build
-	$(UV) publish --check-url https://pypi.org/simple/ dist/*.tar.gz dist/*.whl
+	$(MAKE) build-sdist
+	$(UV) publish --check-url https://pypi.org/simple/ dist/*.tar.gz

@@ -449,7 +449,6 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "setuptools" },
     { name = "ty" },
 ]
 tests = [
@@ -462,7 +461,6 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "setuptools" },
     { name = "ty" },
 ]
 
@@ -477,7 +475,6 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'tests'", specifier = ">=7.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.14" },
-    { name = "setuptools", marker = "extra == 'dev'", specifier = ">=61" },
     { name = "ty", marker = "extra == 'dev'", specifier = ">=0.0.39" },
     { name = "typer", specifier = ">=0.12" },
 ]
@@ -488,7 +485,6 @@ dev = [
     { name = "mypy", specifier = ">=1.14,<1.15" },
     { name = "pytest", specifier = ">=7.0" },
     { name = "ruff", specifier = ">=0.15.14" },
-    { name = "setuptools", specifier = ">=61" },
     { name = "ty", specifier = ">=0.0.39" },
 ]
 
@@ -984,15 +980,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/36/38/012bf76752e1f89ed50b77b99532d90f3a3e287bc7918e1fc0948ac866ac/ruff-0.15.14-py3-none-win32.whl", hash = "sha256:6d0c1ad2a0ab718d39b6d8fd2217981ce4d625cd96a720095f798fb47d8b13e6", size = 10805548, upload-time = "2026-05-21T14:34:33.453Z" },
     { url = "https://files.pythonhosted.org/packages/d1/b7/4ea2c170f10ad760fff2a5250beb18897719dc8b52b53a24cddbb9dd3f19/ruff-0.15.14-py3-none-win_amd64.whl", hash = "sha256:802342981e056db3851a7836e5b070f8f15f67d4a685ae2a6160939d364b2902", size = 11939523, upload-time = "2026-05-21T14:34:18.077Z" },
     { url = "https://files.pythonhosted.org/packages/62/d5/bc97ff895ec35cf3925d4bd60f3b39d822f377a446906ec9bcc87405e59b/ruff-0.15.14-py3-none-win_arm64.whl", hash = "sha256:ff47b90a9ef6a40c9e2f3b479c1fb78531adf055b94c1eba0a7ba04b31951826", size = 11208607, upload-time = "2026-05-21T14:34:26.525Z" },
-]
-
-[[package]]
-name = "setuptools"
-version = "82.0.1"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/4f/db/cfac1baf10650ab4d1c111714410d2fbb77ac5a616db26775db562c8fab2/setuptools-82.0.1.tar.gz", hash = "sha256:7d872682c5d01cfde07da7bccc7b65469d3dca203318515ada1de5eda35efbf9", size = 1152316, upload-time = "2026-03-09T12:47:17.221Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/9d/76/f789f7a86709c6b087c5a2f52f911838cad707cc613162401badc665acfe/setuptools-82.0.1-py3-none-any.whl", hash = "sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb", size = 1006223, upload-time = "2026-03-09T12:47:15.026Z" },
 ]
 
 [[package]]
