@@ -3,6 +3,8 @@ use crate::error::{validation, Result};
 use crate::match_buffer::{NativeMatchBuffer, RawMatch};
 use regex_automata::meta::Regex;
 use regex_automata::{MatchKind, PatternID};
+use regex_syntax::hir::Hir;
+use regex_syntax::ParserBuilder;
 
 const ENTITY_INDEPENDENT_NFA_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -50,6 +52,12 @@ impl NativeEngine {
     }
 
     pub fn scan_bytes(&self, haystack: &[u8]) -> Result<NativeMatchBuffer> {
+        let mut buffer = NativeMatchBuffer::new();
+        self.scan_bytes_into(haystack, &mut buffer)?;
+        Ok(buffer)
+    }
+
+    pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
         if self.match_mode != MatchMode::EntityIndependent {
             return Err(validation(
                 "/compile_options/match_mode",
@@ -67,7 +75,7 @@ impl NativeEngine {
             )
         })?;
 
-        let mut buffer = NativeMatchBuffer::new();
+        buffer.clear();
         for shard in &self.shards {
             for raw_match in shard.regex.find_iter(haystack) {
                 let local_index = raw_match.pattern().as_usize();
@@ -87,7 +95,7 @@ impl NativeEngine {
             }
         }
         buffer.sort();
-        Ok(buffer)
+        Ok(())
     }
 }
 
@@ -120,8 +128,13 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
     for entity in &canonical.entities {
         let mut patterns = Vec::with_capacity(entity.patterns.len());
         let mut local_to_detector = Vec::with_capacity(entity.patterns.len());
-        for pattern in &entity.patterns {
-            patterns.push(pattern_with_flags(&pattern.regex, &pattern.flags));
+        for (pattern_index, pattern) in entity.patterns.iter().enumerate() {
+            patterns.push(parse_pattern_with_flags(
+                &entity.name,
+                pattern_index,
+                &pattern.regex,
+                &pattern.flags,
+            )?);
             local_to_detector.push(next_detector_index);
             next_detector_index = next_detector_index.checked_add(1).ok_or_else(|| {
                 validation(
@@ -141,7 +154,7 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
                     .dfa_size_limit(Some(ENTITY_INDEPENDENT_DFA_SIZE_LIMIT))
                     .dfa_state_limit(Some(ENTITY_INDEPENDENT_DFA_STATE_LIMIT)),
             )
-            .build_many(&patterns)
+            .build_many_from_hir(&patterns)
             .map_err(|error| {
                 let path = match error.pattern() {
                     Some(pattern_id) => pattern_path(&entity.name, pattern_id),
@@ -169,19 +182,46 @@ fn pattern_path(entity_name: &str, pattern_id: PatternID) -> String {
     format!("/entities/{entity_name}/patterns/{}", pattern_id.as_usize())
 }
 
-fn pattern_with_flags(regex: &str, flags: &[String]) -> String {
-    let mut pattern = regex.to_string();
-    for flag in flags.iter().rev() {
-        pattern = match flag.as_str() {
-            "ASCII" => format!("(?-u:{pattern})"),
-            "DOTALL" => format!("(?s:{pattern})"),
-            "IGNORECASE" => format!("(?i:{pattern})"),
-            "MULTILINE" => format!("(?m:{pattern})"),
-            "VERBOSE" => format!("(?x:{pattern})"),
-            _ => pattern,
-        };
+fn parse_pattern_with_flags(
+    entity_name: &str,
+    pattern_index: usize,
+    regex: &str,
+    flags: &[String],
+) -> Result<Hir> {
+    let mut parser = ParserBuilder::new();
+    for flag in flags {
+        match flag.as_str() {
+            "ASCII" => {
+                return Err(validation(
+                    pattern_path_by_index(entity_name, pattern_index),
+                    "ASCII regex flag is not supported by the UTF-8 native scan path yet",
+                ))
+            }
+            "DOTALL" => {
+                parser.dot_matches_new_line(true);
+            }
+            "IGNORECASE" => {
+                parser.case_insensitive(true);
+            }
+            "MULTILINE" => {
+                parser.multi_line(true);
+            }
+            "VERBOSE" => {
+                parser.ignore_whitespace(true);
+            }
+            _ => {}
+        }
     }
-    pattern
+    parser.build().parse(regex).map_err(|error| {
+        validation(
+            pattern_path_by_index(entity_name, pattern_index),
+            format!("unsupported Rust regex syntax for native scanner: {error}"),
+        )
+    })
+}
+
+fn pattern_path_by_index(entity_name: &str, pattern_index: usize) -> String {
+    format!("/entities/{entity_name}/patterns/{pattern_index}")
 }
 
 #[cfg(test)]

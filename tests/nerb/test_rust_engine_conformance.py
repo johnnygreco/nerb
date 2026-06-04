@@ -32,6 +32,8 @@ def test_python_oracle_projects_to_planned_rust_record_schema(case):
 
 
 def _native_source_for_case(case):
+    if case.case_id == "entity_flag_ascii":
+        pytest.skip("ASCII flag lowering for UTF-8-safe native scanning is deferred beyond #51")
     rows = []
     for entity, patterns in case.pattern_config.items():
         flags = patterns.get("_flags", [])
@@ -183,3 +185,31 @@ def test_native_bank_rejects_unsupported_or_compile_bomb_regex_profile_fixtures(
 
     with pytest.raises(ValueError):
         engine.Bank.from_source_bytes(json.dumps(row).encode(), format_hint="jsonl")
+
+
+def test_native_bank_rejects_ascii_flag_until_utf8_safe_lowering_lands(engine):
+    row = {
+        "entity": "CODE",
+        "canonical_name": "ASCII dot",
+        "surface_name": "ASCII dot",
+        "regex": ".",
+        "flags": ["ASCII"],
+    }
+
+    with pytest.raises(ValueError, match="ASCII regex flag is not supported"):
+        engine.Bank.from_source_bytes(json.dumps(row).encode(), format_hint="jsonl")
+
+
+def test_native_verbose_flag_supports_trailing_comments(engine):
+    row = {
+        "entity": "CODE",
+        "canonical_name": "Verbose",
+        "surface_name": "Verbose",
+        "regex": "A # trailing comment",
+        "flags": ["VERBOSE"],
+    }
+
+    bank = engine.Bank.from_source_bytes(json.dumps(row).encode(), format_hint="jsonl")
+    raw = bank.scan_bytes(b"A")
+
+    assert [raw[index] for index in range(len(raw))] == [(0, 0, 1)]

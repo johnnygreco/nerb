@@ -86,6 +86,10 @@ index, and optionally fills a caller-provided `MatchBuffer`.
 Matcher construction applies bounded `regex-automata` NFA, one-pass, hybrid-cache, and DFA limits. Unsupported syntax and
 compile-bomb shapes fail during bank construction with `ValueError`.
 
+`IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE` are applied through per-pattern syntax configuration. The `ASCII` flag
+is rejected in this slice because lowering it correctly for a UTF-8 text scanner requires a narrower rewrite than
+byte-mode `(?-u:...)`; that migration remains explicit future work.
+
 ```python
 bank = _engine.Bank.from_source_bytes(b'{"PERSON":{"Sam":"Sam"},"PROJECT":{"Samba":"Samba"}}')
 raw = bank.scan_bytes(b"Samba ships")

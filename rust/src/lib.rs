@@ -124,14 +124,20 @@ impl PyBank {
         haystack: &[u8],
         out: Option<Py<PyMatchBuffer>>,
     ) -> PyResult<Py<PyMatchBuffer>> {
-        ffi_boundary(|| {
-            let buffer = py.detach(|| self.inner.scan_bytes(haystack))?;
-            match out {
-                Some(out) => {
-                    out.bind(py).borrow_mut().inner = buffer;
-                    Ok(out)
-                }
-                None => Py::new(py, PyMatchBuffer { inner: buffer }),
+        ffi_boundary(|| match out {
+            Some(out) => {
+                let mut buffer = {
+                    let mut borrowed = out.bind(py).borrow_mut();
+                    std::mem::take(&mut borrowed.inner)
+                };
+                let scan_result = py.detach(|| self.inner.scan_bytes_into(haystack, &mut buffer));
+                out.bind(py).borrow_mut().inner = buffer;
+                scan_result?;
+                Ok(out)
+            }
+            None => {
+                let buffer = py.detach(|| self.inner.scan_bytes(haystack))?;
+                Py::new(py, PyMatchBuffer { inner: buffer })
             }
         })
     }

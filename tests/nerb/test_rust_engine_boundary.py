@@ -131,6 +131,18 @@ def test_native_scan_bytes_returns_sorted_raw_matches_and_reuses_output_buffer(e
     assert [buffer[index] for index in range(len(buffer))] == [(0, 0, 3), (1, 0, 5)]
 
 
+def test_native_scan_bytes_out_preserves_reserved_capacity(engine):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"Alpha"}}', format_hint="json")
+    buffer = engine.MatchBuffer(capacity=32)
+    before = buffer.capacity()
+
+    returned = bank.scan_bytes(b"Alpha", out=buffer)
+
+    assert returned is buffer
+    assert buffer.capacity() >= before
+    assert [buffer[index] for index in range(len(buffer))] == [(0, 0, 5)]
+
+
 def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
     bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
 

@@ -159,6 +159,10 @@ impl NativeBank {
         self.engine.scan_bytes(haystack)
     }
 
+    pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
+        self.engine.scan_bytes_into(haystack, buffer)
+    }
+
     fn from_canonical_value(value: Value, compile_options_json: Option<&str>) -> Result<Self> {
         let canonical =
             serde_json::from_value::<CanonicalBank>(value).map_err(|error| BankError::Parse {
