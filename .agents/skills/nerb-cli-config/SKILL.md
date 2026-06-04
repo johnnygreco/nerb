@@ -7,6 +7,12 @@ description: Use when adding or changing NERB CLI detector config commands, conf
 
 Use this skill for config-focused CLI work. Keep CLI behavior thin and put reusable rules in `src/nerb/config.py`.
 
+## Rust Engine Plan Precedence
+
+When working on tracker #45 or `agent-scratchpads/rust-engine-plan.md`, that plan and the active implementation issue
+override current-surface guidance in this skill. Do not add preservation shims or constrain the Rust-backed target unless
+the active issue explicitly requires it.
+
 ## Files
 
 - `src/nerb/cli.py`: Typer app and command output.

@@ -4,7 +4,7 @@ This guide is for coding agents working in NERB. Keep changes small, verify them
 
 ## Project Layout
 
-- `src/nerb/regex_builder.py`: `NERB`, compiled regex construction, and legacy Python API methods.
+- `src/nerb/regex_builder.py`: `NERB`, compiled regex construction, and current Python regex-builder methods.
 - `src/nerb/config.py`: detector config loading, validation, default path resolution, and atomic YAML saves.
 - `src/nerb/extraction.py`: reusable extraction helpers and record serialization helpers.
 - `src/nerb/named_entities.py`: `NamedEntity` and `NamedEntityList` public data structures.
@@ -53,10 +53,13 @@ make build
 
 ## Development Rules
 
-- Preserve the Python API while making CLI and MCP surfaces first-class. Keep `NERB`, `NamedEntity`, `NamedEntityList`, config helpers, extraction helpers, and exports in `src/nerb/__init__.py` stable unless a task explicitly requires a breaking change.
+- During the Rust engine migration, treat the Rust-backed `Bank` API as the target. Do not add shims for current Python regex-builder callers unless an active issue explicitly requires one.
 - Put shared behavior in `config.py`, `extraction.py`, `named_entities.py`, or `regex_builder.py`; have CLI and future MCP code call those helpers instead of reimplementing parsing, validation, or serialization.
-- Keep output records JSON-compatible with stable fields: `entity`, `name`, `string`, `start`, and `end`.
-- Maintain deterministic behavior. Extraction across all entities sorts by start offset, end offset, entity, name, and matched string.
+- Current Python oracle records keep JSON-compatible fields: `entity`, `name`, `string`, `start`, and `end`.
+  New Rust-backed `Bank` scan records follow the explicit Rust record contract in
+  `docs/decisions/0001-rust-engine-semantics.md`.
+- Maintain deterministic behavior. Current Python oracle extraction sorts by start offset, end offset, entity, name,
+  and matched string; Rust-backed `Bank` scan ordering follows `docs/decisions/0001-rust-engine-semantics.md`.
 - Keep user-facing CLI behavior covered with `typer.testing.CliRunner` tests in `tests/nerb/test_cli.py`.
 - Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
@@ -101,6 +104,6 @@ document `file_path`. `extract_inline` uses provided detector definitions and do
 Use these when the task matches:
 
 - `.agents/skills/nerb-cli-config/SKILL.md`: CLI commands and detector config behavior.
-- `.agents/skills/nerb-extraction-surfaces/SKILL.md`: extraction behavior, records, and public API compatibility.
+- `.agents/skills/nerb-extraction-surfaces/SKILL.md`: extraction behavior, records, and public extraction surfaces.
 - `.agents/skills/nerb-mcp-tools/SKILL.md`: MCP tool implementation and launch/test workflow.
 - `.agents/skills/nerb-release-publishing/SKILL.md`: release, build, and publishing workflow changes.

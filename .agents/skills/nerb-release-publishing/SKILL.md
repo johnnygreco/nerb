@@ -7,6 +7,12 @@ description: Use when changing NERB release, build, versioning, PyPI publishing,
 
 Use this skill for release workflow changes. Prefer the trusted-publishing GitHub Actions flow documented in `docs/releasing.md`.
 
+## Rust Engine Plan Precedence
+
+When working on tracker #45 or `agent-scratchpads/rust-engine-plan.md`, that plan and the active implementation issue
+override current release/build guidance in this skill. Prefer the Rust/PyO3 packaging direction from the active issue
+over preserving older pure-Python packaging behavior.
+
 ## Files
 
 - `docs/releasing.md`: canonical release process.

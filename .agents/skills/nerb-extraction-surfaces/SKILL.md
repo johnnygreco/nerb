@@ -5,7 +5,14 @@ description: Use when changing NERB extraction behavior, serialized output recor
 
 # NERB Extraction Surfaces
 
-Use this skill for extraction behavior and output formats. Preserve the Python API while making CLI and MCP outputs first-class wrappers around shared helpers.
+Use this skill for extraction behavior and output formats. During the Rust engine migration, treat the Rust-backed `Bank`
+surface and explicit record contracts as the target; current Python output can be a test oracle, not the target surface.
+
+## Rust Engine Plan Precedence
+
+When working on tracker #45 or `agent-scratchpads/rust-engine-plan.md`, that plan and the active implementation issue
+override current-surface guidance in this skill. Use the current Python behavior as an oracle only where the active issue
+asks for differential checks.
 
 ## Files
 
@@ -15,7 +22,7 @@ Use this skill for extraction behavior and output formats. Preserve the Python A
 - `src/nerb/__init__.py`: public exports.
 - `tests/nerb/test_extraction.py`: extraction ordering and records.
 
-## Stable Behavior
+## Current Python Behavior
 
 - `NERB(pattern_config, add_word_boundaries=False)` accepts a path/string YAML config or an in-memory config dict.
 - Entity regexes remain accessible as attributes such as `nerb.ARTIST`.
@@ -26,11 +33,11 @@ Use this skill for extraction behavior and output formats. Preserve the Python A
 
 ## Implementation Guidance
 
-- Add new serialization formats by adapting `NamedEntityList.to_records()` output rather than changing the record fields.
-- Keep CLI and MCP extraction commands thin: load/build a `NERB`, call `extract_named_entity` or `extract_named_entities`, then serialize records.
+- Use the current Python behavior as an oracle only when an active issue calls for differential checks.
+- Keep CLI and MCP extraction commands thin: load/build the active engine surface, call the shared extraction helper, then serialize records.
 - Export new public helpers from `src/nerb/__init__.py` only when they are intended as Python API.
 - Keep fixture parity between Python API, future CLI extraction, and future MCP tools.
-- Do not change `NamedEntity` field names or `NamedEntityList` behavior without explicit compatibility work.
+- Do not add shims for current Python regex-builder callers unless an active issue explicitly requires one.
 
 ## Acceptance Checks
 

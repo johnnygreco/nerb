@@ -148,7 +148,7 @@ Other public helpers include `bank_stats`, `canonicalize_bank`, `hash_bank`, `va
 `extract_file`, `extract_batch`, `extract_report_file`, `extract_report_batch`, `explain_match`, and
 `compiled_bank_cache_info`.
 
-The legacy Python API remains available for YAML detector configs and compiled regex objects:
+The current Python regex-builder API is still present until the Rust-backed `Bank` API replaces it:
 
 ```python
 from pathlib import Path
@@ -162,7 +162,7 @@ extractor = NERB(config_path, add_word_boundaries=True)
 records = extractor.extract_named_entities(document).to_records()
 ```
 
-Compiled entity regexes are still exposed as attributes such as `extractor.ARTIST`.
+Compiled entity regexes are exposed today as attributes such as `extractor.ARTIST`.
 
 ## Eval And Regression
 

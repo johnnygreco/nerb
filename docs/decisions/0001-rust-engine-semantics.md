@@ -11,12 +11,12 @@ Implementation issue: <https://github.com/johnnygreco/nerb/issues/46>
 ## Context
 
 The Rust engine migration changes NERB from the current Python `re` regex builder into a package with Python as the
-authoring/control plane and Rust as the matching data plane. Backward compatibility is not a constraint for this
-migration, but silent semantic drift is unacceptable. Every planned engine mode must either satisfy this record or be
-documented as a deliberate divergence.
+authoring/control plane and Rust as the matching data plane. This is a planned breaking migration: the Rust engine
+behavior is the target, and the current Python object model does not constrain the design. Silent semantic drift is
+unacceptable. Every planned engine mode must either satisfy this record or be documented as a deliberate divergence.
 
 Current Python surfaces expose useful differential oracles. These oracles help identify and name semantic changes; they
-are not compatibility targets.
+do not define the target surface.
 
 - Current `NERB` extraction returns `entity`, `name`, `string`, `start`, and `end` records with Python string offsets.
 - JSON-bank extraction returns richer pattern identity, but still reports offsets over Python strings.
@@ -56,7 +56,7 @@ records will keep the two concepts separate once Rust canonicalization exists.
 
 Current `NERB` loses information when detector names contain underscores because spaces are converted to underscores for
 Python capture groups and then underscores are converted back to spaces on extraction. The Rust engine must not inherit
-that limitation. The Slice 0 fixtures mark this as a known Python-oracle divergence instead of a behavior to preserve.
+that limitation. The Slice 0 fixtures mark this as a known Python-oracle divergence instead of behavior to carry forward.
 
 ### Overlap Contract
 
