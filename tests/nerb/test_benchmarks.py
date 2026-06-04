@@ -131,6 +131,7 @@ def test_benchmark_fixture_profiles_manifest_is_json_compatible_and_explicit():
     manifest = benchmark_fixture_profiles()
 
     assert json.loads(json.dumps(manifest, allow_nan=False)) == manifest
+    assert tuple(BENCHMARK_PROFILE_IDS) == tuple(EXPECTED_BENCHMARK_PROFILES)
     assert tuple(manifest["profile_ids"]) == BENCHMARK_PROFILE_IDS
     assert set(manifest["profiles"]) == set(BENCHMARK_PROFILE_IDS)
     assert manifest["gate"] == {
@@ -146,7 +147,7 @@ def test_benchmark_fixture_profiles_manifest_is_json_compatible_and_explicit():
     assert manifest["profiles"]["adversarial_smoke"]["workload"] == "adversarial_smoke"
 
 
-@pytest.mark.parametrize("profile_id", BENCHMARK_PROFILE_IDS)
+@pytest.mark.parametrize("profile_id", EXPECTED_BENCHMARK_PROFILES)
 def test_benchmark_fixture_profile_runs_with_stable_smoke_shape(profile_id):
     fixture = make_benchmark_fixture_profile(profile_id)
     expected = EXPECTED_BENCHMARK_PROFILES[profile_id]
