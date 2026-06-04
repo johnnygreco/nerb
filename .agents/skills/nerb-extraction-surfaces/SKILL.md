@@ -8,6 +8,12 @@ description: Use when changing NERB extraction behavior, serialized output recor
 Use this skill for extraction behavior and output formats. During the Rust engine migration, treat the Rust-backed `Bank`
 surface and explicit record contracts as the target; current Python output can be a test oracle, not the target surface.
 
+## Rust Engine Plan Precedence
+
+When working on tracker #45 or `agent-scratchpads/rust-engine-plan.md`, that plan and the active implementation issue
+override current-surface guidance in this skill. Use the current Python behavior as an oracle only where the active issue
+asks for differential checks.
+
 ## Files
 
 - `src/nerb/regex_builder.py`: `NERB`, compiled regex attributes, and instance extraction methods.

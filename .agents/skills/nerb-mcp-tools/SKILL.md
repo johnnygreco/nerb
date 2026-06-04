@@ -8,6 +8,12 @@ description: Use when implementing, testing, or documenting NERB Model Context P
 NERB exposes a local MCP server through `src/nerb/mcp_server.py` and the `nerb-mcp` console entry point on Python 3.10
 and newer. The current package targets Python 3.10 and newer, matching the official Python MCP SDK's floor.
 
+## Rust Engine Plan Precedence
+
+When working on tracker #45 or `agent-scratchpads/rust-engine-plan.md`, that plan and the active implementation issue
+override current MCP/Python helper guidance in this skill. New Rust-backed MCP extraction records follow the explicit
+Rust record contract instead of the current Python oracle shape unless the active issue says otherwise.
+
 ## Surface
 
 MCP tools wrap the same helpers used by the Python API and CLI:
@@ -16,7 +22,7 @@ MCP tools wrap the same helpers used by the Python API and CLI:
 - add, update, remove, and list detector patterns through config helpers
 - extract one entity or all entities through `src/nerb/extraction.py`
 - support one-shot inline extraction without requiring a saved config
-- return JSON-compatible data with `entity`, `name`, `string`, `start`, and `end`
+- current Python oracle extraction returns JSON-compatible data with `entity`, `name`, `string`, `start`, and `end`
 
 Avoid broad filesystem access. Tools read only explicit config/document paths or provided text, and writes go through
 explicit config paths. On Python versions unsupported by the MCP SDK, `nerb-mcp` exits with a clear compatibility error.
