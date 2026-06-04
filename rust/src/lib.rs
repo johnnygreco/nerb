@@ -1,9 +1,10 @@
 use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRuntimeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PySequence, PySequenceMethods};
+use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 mod bank;
+mod engine;
 mod error;
 mod flags;
 mod formats;
@@ -99,6 +100,19 @@ impl PyBank {
             let compile_options = json.call_method1("loads", (compile_options_json,))?;
             metadata.set_item("compile_options", compile_options)?;
 
+            let detectors = PyList::empty(py);
+            for detector in self.inner.detectors() {
+                let item = PyDict::new(py);
+                item.set_item("detector_index", detector.detector_index)?;
+                item.set_item("entity", &detector.entity)?;
+                item.set_item("canonical_name", &detector.canonical_name)?;
+                item.set_item("surface_name", &detector.surface_name)?;
+                item.set_item("stable_id", &detector.stable_id)?;
+                item.set_item("priority", detector.priority)?;
+                detectors.append(item)?;
+            }
+            metadata.set_item("detectors", detectors)?;
+
             Ok(metadata)
         })
     }
@@ -108,14 +122,17 @@ impl PyBank {
         &self,
         py: Python<'_>,
         haystack: &[u8],
-        out: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<PyMatchBuffer> {
+        out: Option<Py<PyMatchBuffer>>,
+    ) -> PyResult<Py<PyMatchBuffer>> {
         ffi_boundary(|| {
-            let _ = (haystack, out);
-            py.detach(|| ());
-            Err(PyNotImplementedError::new_err(
-                "Bank.scan_bytes is reserved for the Rust matching slice and is not implemented yet",
-            ))
+            let buffer = py.detach(|| self.inner.scan_bytes(haystack))?;
+            match out {
+                Some(out) => {
+                    out.bind(py).borrow_mut().inner = buffer;
+                    Ok(out)
+                }
+                None => Py::new(py, PyMatchBuffer { inner: buffer }),
+            }
         })
     }
 

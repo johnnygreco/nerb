@@ -1,7 +1,9 @@
+use crate::engine::{DetectorMetadata, NativeEngine};
 use crate::error::{validation, BankError, Result};
 use crate::flags::{canonicalize_flag_names, merge_flags, parse_flags_value};
 use crate::formats::{parse_source_auto, parse_source_value, SourceFormat};
 use crate::ids::{bank_hash, entity_stable_id, pattern_stable_id};
+use crate::match_buffer::NativeMatchBuffer;
 use regex_syntax::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -58,9 +60,10 @@ pub struct NativeBank {
     canonical_json: Vec<u8>,
     bank_hash: String,
     compile_options: Value,
+    engine: NativeEngine,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct CompileOptions {
     #[serde(default = "default_match_mode")]
@@ -75,9 +78,9 @@ impl Default for CompileOptions {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum MatchMode {
+pub(crate) enum MatchMode {
     EntityIndependent,
     AllOverlaps,
     GlobalLeftmost,
@@ -85,6 +88,16 @@ enum MatchMode {
 
 fn default_match_mode() -> MatchMode {
     MatchMode::EntityIndependent
+}
+
+impl MatchMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::EntityIndependent => "entity_independent",
+            Self::AllOverlaps => "all_overlaps",
+            Self::GlobalLeftmost => "global_leftmost",
+        }
+    }
 }
 
 impl NativeBank {
@@ -138,6 +151,14 @@ impl NativeBank {
         &self.compile_options
     }
 
+    pub fn detectors(&self) -> &[DetectorMetadata] {
+        self.engine.detectors()
+    }
+
+    pub fn scan_bytes(&self, haystack: &[u8]) -> Result<NativeMatchBuffer> {
+        self.engine.scan_bytes(haystack)
+    }
+
     fn from_canonical_value(value: Value, compile_options_json: Option<&str>) -> Result<Self> {
         let canonical =
             serde_json::from_value::<CanonicalBank>(value).map_err(|error| BankError::Parse {
@@ -152,19 +173,22 @@ impl NativeBank {
         compile_options_json: Option<&str>,
     ) -> Result<Self> {
         validate_and_normalize_canonical_bank(&mut canonical)?;
-        let compile_options = parse_compile_options(compile_options_json)?;
+        let compile_options = parse_compile_options_struct(compile_options_json)?;
+        let compile_options_value = compile_options_value(&compile_options);
         let canonical_json = serde_json::to_vec(&canonical).expect("canonical bank must serialize");
-        let bank_hash = bank_hash(&canonical, &compile_options);
+        let bank_hash = bank_hash(&canonical, &compile_options_value);
+        let engine = NativeEngine::compile(&canonical, compile_options.match_mode)?;
         Ok(Self {
             canonical,
             canonical_json,
             bank_hash,
-            compile_options,
+            compile_options: compile_options_value,
+            engine,
         })
     }
 }
 
-pub fn parse_compile_options(compile_options_json: Option<&str>) -> Result<Value> {
+fn parse_compile_options_struct(compile_options_json: Option<&str>) -> Result<CompileOptions> {
     let options = match compile_options_json {
         None => CompileOptions::default(),
         Some(raw) => {
@@ -181,8 +205,12 @@ pub fn parse_compile_options(compile_options_json: Option<&str>) -> Result<Value
             })?
         }
     };
+    Ok(options)
+}
+
+fn compile_options_value(options: &CompileOptions) -> Value {
     let value = serde_json::to_value(options).expect("compile options must serialize");
-    Ok(crate::ids::canonicalize_json_value(&value))
+    crate::ids::canonicalize_json_value(&value)
 }
 
 fn canonicalize_source_value(value: Value, source_format: SourceFormat) -> Result<CanonicalBank> {

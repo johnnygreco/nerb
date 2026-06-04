@@ -1,7 +1,7 @@
 # Rust Engine PyO3 Boundary
 
-Issue #50 exposes the non-scanning native boundary that later matching slices will use. The native module is still
-`nerb._engine`; the public Python wrapper in `nerb.engine.Bank` is deferred.
+Issues #50 and #51 expose the native boundary and first Rust scanning path. The native module is still `nerb._engine`;
+the public Python wrapper in `nerb.engine.Bank` is deferred.
 
 ## Bank Constructors
 
@@ -33,7 +33,17 @@ assert round_tripped.metadata()["bank_hash"] == bank.metadata()["bank_hash"]
   },
   "compile_options": {
     "match_mode": "entity_independent"
-  }
+  },
+  "detectors": [
+    {
+      "detector_index": 0,
+      "entity": "CODE",
+      "canonical_name": "Alpha",
+      "surface_name": "Alpha",
+      "stable_id": "pattern:sha256:...",
+      "priority": 0
+    }
+  ]
 }
 ```
 
@@ -60,20 +70,33 @@ assert raw[0] == (7, 10, 15)
 raw.clear()
 ```
 
-`from_raw_matches` accepts a sized Python sequence and exists to test the boundary before scans land. The scanner slice
-will fill `MatchBuffer` from Rust. Public record projection remains outside the scan loop.
+`from_raw_matches` accepts a sized Python sequence and exists to test the boundary. `Bank.scan_bytes` fills
+`MatchBuffer` from Rust. Public record projection remains outside the scan loop.
 
-Before scanning exists, Python-created buffers are capped at 1,000,000 requested raw matches and use fallible Rust
-allocation paths. The scanner slice may revisit this logical limit once dense-hit memory gates are measured.
+Python-created buffers and Rust scanner appends are capped at 1,000,000 requested raw matches and use fallible Rust
+allocation paths. Later dense-hit measurement may revisit this logical limit.
 
-## Scan Stubs
+## Scanning
 
-`Bank.scan_bytes` and `Bank.scan_path` are exported only as boundary stubs in this slice. They raise
-`NotImplementedError` and do not allocate Python match records. Issue #51 will attach `regex-automata` matching to these
-methods and use PyO3's GIL-detach path around the Rust scan.
+`Bank.scan_bytes` implements the initial `entity_independent` mode: one `regex-automata` meta matcher per entity with
+leftmost-first semantics inside each entity and cross-entity overlap preserved. It validates UTF-8 input, releases the
+GIL during the Rust scan, returns raw `(detector_index, start_byte, end_byte)` matches sorted by byte offsets and detector
+index, and optionally fills a caller-provided `MatchBuffer`.
+
+Matcher construction applies bounded `regex-automata` NFA, one-pass, hybrid-cache, and DFA limits. Unsupported syntax and
+compile-bomb shapes fail during bank construction with `ValueError`.
+
+```python
+bank = _engine.Bank.from_source_bytes(b'{"PERSON":{"Sam":"Sam"},"PROJECT":{"Samba":"Samba"}}')
+raw = bank.scan_bytes(b"Samba ships")
+assert [raw[i] for i in range(len(raw))] == [(0, 0, 3), (1, 0, 5)]
+```
+
+`Bank.scan_path` remains a boundary stub in this slice. It raises `NotImplementedError` and does not allocate Python
+match records. All-overlaps and global-leftmost modes remain future work.
 
 ## Error Boundary
 
 Native validation and parse failures are translated to `ValueError`. Buffer indexing failures are `IndexError`, scan
-stubs are `NotImplementedError`, and panic-safe wrappers translate an unexpected Rust panic into `RuntimeError` instead
-of unwinding through Python.
+future scan stubs are `NotImplementedError`, native allocation failures are `MemoryError`, and panic-safe wrappers
+translate an unexpected Rust panic into `RuntimeError` instead of unwinding through Python.

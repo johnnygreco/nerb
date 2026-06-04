@@ -88,6 +88,16 @@ impl NativeMatchBuffer {
         Ok(())
     }
 
+    pub fn sort(&mut self) {
+        self.matches.sort_by_key(|raw_match| {
+            (
+                raw_match.start_byte,
+                raw_match.end_byte,
+                raw_match.detector_index,
+            )
+        });
+    }
+
     pub fn get(&self, index: usize) -> Option<RawMatch> {
         self.matches.get(index).copied()
     }
@@ -160,5 +170,23 @@ mod tests {
         let error = buffer.push(RawMatch::new(0, 0, 0).unwrap()).unwrap_err();
 
         assert!(error.to_string().contains("exceeds pre-scan limit"));
+    }
+
+    #[test]
+    fn match_buffer_sorts_by_offsets_and_detector_index() {
+        let mut buffer = NativeMatchBuffer::new();
+        buffer.push(RawMatch::new(2, 5, 6).unwrap()).unwrap();
+        buffer.push(RawMatch::new(1, 0, 5).unwrap()).unwrap();
+        buffer.push(RawMatch::new(0, 0, 3).unwrap()).unwrap();
+        buffer.push(RawMatch::new(3, 0, 3).unwrap()).unwrap();
+
+        buffer.sort();
+
+        assert_eq!(
+            (0..buffer.len())
+                .map(|index| buffer.get(index).unwrap().as_tuple())
+                .collect::<Vec<_>>(),
+            [(0, 0, 3), (3, 0, 3), (1, 0, 5), (2, 5, 6)]
+        );
     }
 }

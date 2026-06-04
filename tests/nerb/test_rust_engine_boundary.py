@@ -27,6 +27,24 @@ def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
     assert metadata["entity_count"] == 2
     assert metadata["pattern_count"] == 2
     assert metadata["compile_options"] == {"match_mode": "all_overlaps"}
+    assert metadata["detectors"] == [
+        {
+            "detector_index": 0,
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "stable_id": canonical["entities"][0]["patterns"][0]["stable_id"],
+            "priority": 0,
+        },
+        {
+            "detector_index": 1,
+            "entity": "CODE",
+            "canonical_name": "Alpha",
+            "surface_name": "Alpha",
+            "stable_id": canonical["entities"][1]["patterns"][0]["stable_id"],
+            "priority": 0,
+        },
+    ]
     assert metadata["bank_hash"].startswith("sha256:")
 
     round_tripped = engine.Bank.from_canonical_json_bytes(bank.to_canonical_json_bytes())
@@ -100,12 +118,37 @@ def test_native_match_buffer_rejects_oversized_raw_match_sequences_before_item_a
         engine.MatchBuffer.from_raw_matches(OversizedRawMatches())
 
 
-def test_native_scan_methods_are_boundary_stubs_without_record_projection(engine):
-    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
+def test_native_scan_bytes_returns_sorted_raw_matches_and_reuses_output_buffer(engine):
+    bank = engine.Bank.from_source_bytes(
+        b'{"PERSON":{"Sam":"Sam"},"PROJECT":{"Samba":"Samba"}}',
+        format_hint="json",
+    )
     buffer = engine.MatchBuffer()
 
-    with pytest.raises(NotImplementedError, match="not implemented yet"):
-        bank.scan_bytes(b"Alpha", out=buffer)
+    returned = bank.scan_bytes(b"Samba ships", out=buffer)
+
+    assert returned is buffer
+    assert [buffer[index] for index in range(len(buffer))] == [(0, 0, 3), (1, 0, 5)]
+
+
+def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
+
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        bank.scan_bytes(b"\xff")
+
+    future_mode = engine.Bank.from_source_bytes(
+        b'{"CODE":{"Alpha":"A"}}',
+        format_hint="json",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+    with pytest.raises(ValueError, match="entity_independent"):
+        future_mode.scan_bytes(b"Alpha")
+
+
+def test_native_scan_path_remains_boundary_stub_without_record_projection(engine):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
+    buffer = engine.MatchBuffer()
 
     with pytest.raises(NotImplementedError, match="not implemented yet"):
         bank.scan_path("document.txt", out=buffer)
