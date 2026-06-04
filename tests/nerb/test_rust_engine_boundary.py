@@ -160,6 +160,13 @@ def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
     with pytest.raises(ValueError, match="valid UTF-8"):
         bank.scan_bytes(b"\xff")
 
+    invalid_utf8_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        bank.scan_bytes(b"\xff", out=invalid_utf8_buffer)
+
+    assert len(invalid_utf8_buffer) == 0
+    assert invalid_utf8_buffer.capacity() >= 1
+
     future_mode = engine.Bank.from_source_bytes(
         b'{"CODE":{"Alpha":"A"}}',
         format_hint="json",
@@ -167,6 +174,13 @@ def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
     )
     with pytest.raises(ValueError, match="entity_independent"):
         future_mode.scan_bytes(b"Alpha")
+
+    future_mode_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+    with pytest.raises(ValueError, match="entity_independent"):
+        future_mode.scan_bytes(b"Alpha", out=future_mode_buffer)
+
+    assert len(future_mode_buffer) == 0
+    assert future_mode_buffer.capacity() >= 1
 
 
 def test_native_scan_path_remains_boundary_stub_without_record_projection(engine):

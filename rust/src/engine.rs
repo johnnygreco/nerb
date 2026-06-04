@@ -58,6 +58,7 @@ impl NativeEngine {
     }
 
     pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
+        buffer.clear();
         if self.match_mode != MatchMode::EntityIndependent {
             return Err(validation(
                 "/compile_options/match_mode",
@@ -75,7 +76,6 @@ impl NativeEngine {
             )
         })?;
 
-        buffer.clear();
         let result = scan_entity_independent(&self.shards, haystack, buffer);
         if result.is_err() {
             buffer.clear();
