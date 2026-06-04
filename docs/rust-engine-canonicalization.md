@@ -29,6 +29,9 @@ GENRE:
   Jazz: '(?:smooth\s)?jazz'
 ```
 
+Compact detector-map entity names cannot be `schema` or `schema_version`; those names are reserved for canonical JSON and
+current JSON-bank source disambiguation.
+
 JSONL is the structured bulk-review form. Each non-empty line is one detector row:
 
 ```jsonl
@@ -85,7 +88,7 @@ deterministic IDs for the logical detector fields.
 ## Bank Hash
 
 `metadata()["bank_hash"]` is a `sha256:` hash over the canonical bank plus semantic compile options. The default compile
-options are:
+options are parsed with the same duplicate-key rejection as source JSON. The default compile options are:
 
 ```json
 {"match_mode":"entity_independent"}

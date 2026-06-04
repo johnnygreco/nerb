@@ -138,6 +138,14 @@ def test_native_bank_auto_detects_single_row_jsonl(engine):
     assert canonical["entities"][0]["patterns"][0]["canonical_name"] == "Alpha"
 
 
+def test_native_bank_rejects_reserved_compact_detector_map_entity_names(engine):
+    with pytest.raises(ValueError, match="reserved entity names"):
+        engine.Bank.from_source_bytes(b'{"schema":{"Alpha":"A"}}', format_hint="json")
+
+    with pytest.raises(ValueError, match="reserved entity names"):
+        engine.Bank.from_source_bytes(b'{"schema_version":{"Alpha":"A"}}', format_hint="json")
+
+
 def test_native_bank_rejects_exact_duplicate_logical_detectors(engine):
     source = b"""
 {"entity":"CODE","canonical_name":"Alpha","surface_name":"A","regex":"A"}
@@ -173,6 +181,21 @@ def test_native_bank_rejects_duplicate_source_keys(engine):
         engine.Bank.from_source_bytes(
             b'{"entity":"CODE","canonical_name":"Alpha","regex":"A","regex":"B"}',
             format_hint="jsonl",
+        )
+
+    with pytest.raises(ValueError, match="line 1: duplicate key"):
+        engine.Bank.from_source_bytes(
+            b'{"entity":"CODE","canonical_name":"Alpha","regex":"A","regex":"B"}\n'
+            b'{"entity":"CODE","canonical_name":"Beta","regex":"B"}'
+        )
+
+
+def test_native_bank_rejects_duplicate_compile_option_keys(engine):
+    with pytest.raises(ValueError, match="duplicate key"):
+        engine.Bank.from_source_bytes(
+            b'{"CODE":{"Alpha":"A"}}',
+            format_hint="json",
+            compile_options_json='{"match_mode":"entity_independent","match_mode":"all_overlaps"}',
         )
 
 

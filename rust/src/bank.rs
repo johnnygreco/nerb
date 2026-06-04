@@ -78,7 +78,7 @@ impl NativeBank {
         }
 
         match &value {
-            Value::Object(object) if object.contains_key("schema") => {
+            Value::Object(object) if is_canonical_json_object(object) => {
                 Self::from_canonical_value(value, compile_options_json)
             }
             _ => {
@@ -142,10 +142,7 @@ pub fn parse_compile_options(compile_options_json: Option<&str>) -> Result<Value
     match compile_options_json {
         None => Ok(serde_json::json!({"match_mode": DEFAULT_MATCH_MODE})),
         Some(raw) => {
-            let value = serde_json::from_str::<Value>(raw).map_err(|error| BankError::Parse {
-                format: "compile_options_json",
-                message: error.to_string(),
-            })?;
+            let value = parse_source_value(raw.as_bytes(), SourceFormat::Json)?;
             match value {
                 Value::Object(_) => Ok(crate::ids::canonicalize_json_value(&value)),
                 _ => Err(validation(
@@ -162,13 +159,32 @@ fn canonicalize_source_value(value: Value, source_format: SourceFormat) -> Resul
         SourceFormat::Jsonl => canonicalize_jsonl_rows(value),
         SourceFormat::Json | SourceFormat::Yaml | SourceFormat::CanonicalJson => {
             let object = as_object(&value, "")?;
-            if object.contains_key("schema_version") {
+            if is_current_json_bank_object(object) {
                 canonicalize_current_json_bank(object)
+            } else if object.contains_key("schema") || object.contains_key("schema_version") {
+                Err(validation(
+                    "",
+                    "compact detector maps cannot use reserved entity names \"schema\" or \"schema_version\"",
+                ))
             } else {
                 canonicalize_detector_map(object)
             }
         }
     }
+}
+
+fn is_canonical_json_object(object: &Map<String, Value>) -> bool {
+    object.contains_key("schema")
+        && object.contains_key("defaults")
+        && object.contains_key("entities")
+}
+
+fn is_current_json_bank_object(object: &Map<String, Value>) -> bool {
+    object.contains_key("schema_version")
+        && object.contains_key("id")
+        && object.contains_key("unicode_normalization")
+        && object.contains_key("default_regex_flags")
+        && object.contains_key("entities")
 }
 
 fn canonicalize_jsonl_rows(value: Value) -> Result<CanonicalBank> {

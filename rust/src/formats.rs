@@ -52,8 +52,9 @@ pub fn parse_source_auto(bytes: &[u8]) -> Result<(Value, SourceFormat)> {
         }
         Err(error) => {
             if looks_like_jsonl(bytes) {
-                if let Ok(value) = parse_jsonl(bytes) {
-                    return Ok((value, SourceFormat::Jsonl));
+                match parse_jsonl(bytes) {
+                    Ok(value) => return Ok((value, SourceFormat::Jsonl)),
+                    Err(jsonl_error) => return Err(jsonl_error),
                 }
             }
             if starts_like_json(bytes) {
