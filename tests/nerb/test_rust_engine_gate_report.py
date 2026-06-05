@@ -130,6 +130,33 @@ def test_mode_pass_criteria_fail_on_reconstruction_tuple_mismatch():
     assert all(criteria.values()) is False
 
 
+def test_entity_cardinality_sweep_fails_when_routine_case_fails(monkeypatch):
+    gate_report = _load_gate_report_module()
+
+    def dense_case(entity_count: int, _iterations: int) -> dict[str, Any]:
+        return {
+            "entity_count": entity_count,
+            "passed": True,
+            "entity_independent": _measurement(seconds=0.001),
+        }
+
+    def routine_case(entity_count: int, _iterations: int, target_bytes: int) -> dict[str, Any]:
+        return {
+            "entity_count": entity_count,
+            "document_bytes": target_bytes,
+            "passed": entity_count != 32,
+            "entity_independent": _measurement(seconds=0.001),
+        }
+
+    monkeypatch.setattr(gate_report, "_entity_cardinality_case", dense_case)
+    monkeypatch.setattr(gate_report, "_entity_cardinality_routine_case", routine_case)
+
+    sweep = gate_report._entity_cardinality_sweep(iterations=1, target_bytes=10_000)
+
+    assert sweep["routine_size_cases"][-1]["passed"] is False
+    assert sweep["passed"] is False
+
+
 def test_memory_report_from_child_fails_when_isolated_probe_exceeds_budget():
     gate_report = _load_gate_report_module()
 

@@ -90,12 +90,13 @@ nerb eval-bank --bank company.json
 nerb benchmark-bank --bank company.json
 ```
 
-Extraction records include stable core fields (`entity`, `name`, `string`, `start`, `end`) plus JSON-bank IDs, pattern
-kind, and captures:
+Extraction records include the Rust-backed scan fields plus JSON-bank source IDs, pattern kind, and captures:
 
 ```json
 {
   "entity": "customer",
+  "canonical_name": "Acme Corp",
+  "surface_name": "Acme Corp",
   "entity_id": "customer",
   "name": "Acme Corp",
   "name_id": "acme_corp",
@@ -104,6 +105,7 @@ kind, and captures:
   "string": "Acme Corp",
   "start": 13,
   "end": 22,
+  "offset_unit": "byte",
   "captures": {}
 }
 ```

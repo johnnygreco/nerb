@@ -4,10 +4,11 @@ This guide is for coding agents working in NERB. Keep changes small, verify them
 
 ## Project Layout
 
-- `src/nerb/regex_builder.py`: `NERB`, compiled regex construction, and current Python regex-builder methods.
+- `src/nerb/engine.py`: high-level Python wrapper around the native Rust `Bank` API and process-local bank cache.
+- `src/nerb/engines.py`: JSON-bank extraction adapter that validates, filters, compiles, and enriches Rust scan records.
 - `src/nerb/config.py`: detector config loading, validation, default path resolution, and atomic YAML saves.
-- `src/nerb/extraction.py`: reusable extraction helpers and record serialization helpers.
-- `src/nerb/named_entities.py`: `NamedEntity` and `NamedEntityList` public data structures.
+- `src/nerb/extraction.py`: reusable JSON-bank extraction helpers and response metadata.
+- `src/nerb/records.py`: shared extraction record typing and deterministic sort keys.
 - `src/nerb/cli.py`: Typer CLI for config commands.
 - `tests/nerb/`: unit tests for the public API, CLI behavior, config validation, and extraction output.
 - `examples/`: README example inputs.
@@ -54,12 +55,14 @@ make build
 ## Development Rules
 
 - During the Rust engine migration, treat the Rust-backed `Bank` API as the target. Do not add shims for current Python regex-builder callers unless an active issue explicitly requires one.
-- Put shared behavior in `config.py`, `extraction.py`, `named_entities.py`, or `regex_builder.py`; have CLI and future MCP code call those helpers instead of reimplementing parsing, validation, or serialization.
-- Current Python oracle records keep JSON-compatible fields: `entity`, `name`, `string`, `start`, and `end`.
-  New Rust-backed `Bank` scan records follow the explicit Rust record contract in
-  `docs/decisions/0001-rust-engine-semantics.md`.
-- Maintain deterministic behavior. Current Python oracle extraction sorts by start offset, end offset, entity, name,
-  and matched string; Rust-backed `Bank` scan ordering follows `docs/decisions/0001-rust-engine-semantics.md`.
+- Put shared behavior in `config.py`, `engine.py`, `engines.py`, `extraction.py`, `records.py`, or the existing bank/report
+  helpers; have CLI and MCP code call those helpers instead of reimplementing parsing, validation, scanning, or
+  serialization.
+- Rust-backed `Bank` scan records follow the explicit Rust record contract in
+  `docs/decisions/0001-rust-engine-semantics.md`; JSON-bank extraction enriches those records with source IDs and pattern
+  metadata.
+- Maintain deterministic behavior. Rust-backed `Bank` scan ordering follows
+  `docs/decisions/0001-rust-engine-semantics.md`, and JSON-bank extraction uses the shared record sort key.
 - Keep user-facing CLI behavior covered with `typer.testing.CliRunner` tests in `tests/nerb/test_cli.py`.
 - Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
@@ -96,7 +99,7 @@ document `file_path`. `extract_inline` uses provided detector definitions and do
 - `NERB_CONFIG_PATH` overrides the platform default config path; explicit `--config` or function arguments take precedence.
 - Empty top-level configs are valid, but every non-empty entity must have at least one pattern.
 - `_flags` is reserved for regex flags and cannot be used as a detector pattern name.
-- Pattern names are converted from spaces to underscores for regex group names; invalid group names must fail validation.
+- Detector names are preserved as Rust-backed canonical names; they are not constrained by Python regex group-name rules.
 - MCP support uses the official Python MCP SDK, which currently requires Python 3.10 or newer.
 
 ## Reusable Skills

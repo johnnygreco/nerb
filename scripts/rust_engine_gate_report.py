@@ -603,7 +603,11 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
         },
         "dense_cases": cases,
         "routine_size_cases": routine_cases,
-        "passed": all(case["passed"] for case in cases) and all(performance_criteria.values()),
+        "passed": (
+            all(case["passed"] for case in cases)
+            and all(case["passed"] for case in routine_cases)
+            and all(performance_criteria.values())
+        ),
     }
 
 

@@ -333,7 +333,7 @@ def _priority_resolution_key(bank: Mapping[str, Any], record: MatchRecord) -> tu
         priority = 0
     length = int(record["end"]) - int(record["start"])
     return (
-        -priority,
+        priority,
         -length,
         int(record["start"]),
         str(record["entity_id"]),
@@ -368,11 +368,27 @@ def _grouped_counts(records: Sequence[Mapping[str, Any]]) -> dict[str, dict[str,
 def _context_snippet(text: str, record: Mapping[str, Any], context_chars: int) -> dict[str, str]:
     start = int(record["start"])
     end = int(record["end"])
+    if record.get("offset_unit") == "byte":
+        byte_to_char = _byte_to_char_offset_map(text)
+        try:
+            start = byte_to_char[start]
+            end = byte_to_char[end]
+        except KeyError as exc:
+            raise ExtractionError("Report record byte offsets do not align to UTF-8 character boundaries.") from exc
     return {
         "before": text[max(0, start - context_chars) : start],
         "match": text[start:end],
         "after": text[end : end + context_chars],
     }
+
+
+def _byte_to_char_offset_map(text: str) -> dict[int, int]:
+    byte_to_char = {0: 0}
+    byte_offset = 0
+    for char_offset, character in enumerate(text, start=1):
+        byte_offset += len(character.encode("utf-8"))
+        byte_to_char[byte_offset] = char_offset
+    return byte_to_char
 
 
 def _compact_explanation(bank: Mapping[str, Any], record: Mapping[str, Any], options: ReportOptions) -> dict[str, Any]:

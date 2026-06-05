@@ -1,8 +1,8 @@
 # Rust Engine Canonicalization
 
-Issue #49 introduces Rust-owned source-bank canonicalization for the engine migration. This layer parses source bytes,
-validates the supported source schema, assigns deterministic stable IDs, emits canonical JSON, and computes the bank hash.
-It does not implement matching yet.
+Issue #49 introduced Rust-owned source-bank canonicalization for the engine migration. The current Rust-backed `Bank`
+layer parses source bytes, validates the supported source schema, assigns deterministic stable IDs, emits canonical JSON,
+computes the bank hash, compiles detector indexes, scans UTF-8 text, and projects public records.
 
 The current Rust entry point is the native module:
 

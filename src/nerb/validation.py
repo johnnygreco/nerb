@@ -542,6 +542,7 @@ def _runtime_validation(
     engine: str,
     base_path: str | Path | None,
     strict: bool,
+    check_engine_compile: bool,
 ) -> tuple[list[Diagnostic], dict[str, Any]]:
     diagnostics: list[Diagnostic] = []
     engine_compatibility: dict[str, Any] = {
@@ -602,7 +603,8 @@ def _runtime_validation(
             diagnostics.extend(_static_risk_diagnostics(pattern, strict=strict))
             diagnostics.extend(_runtime_probe_diagnostics(pattern, compiled, level=level, strict=strict))
 
-    diagnostics.extend(_rust_engine_diagnostics(bank))
+    if check_engine_compile:
+        diagnostics.extend(_rust_engine_diagnostics(bank))
 
     engine_compatibility["compatible"] = not has_errors(diagnostics)
     return diagnostics, engine_compatibility
@@ -615,6 +617,7 @@ def validate_bank(
     engine: str = VALIDATION_ENGINE,
     base_path: str | Path | None = None,
     strict: bool = False,
+    check_engine_compile: bool = True,
 ) -> dict[str, Any]:
     """Validate a JSON bank with schema checks plus bounded runtime regex diagnostics."""
     if level not in VALIDATION_LEVELS:
@@ -646,6 +649,7 @@ def validate_bank(
         engine=engine,
         base_path=base_path,
         strict=strict,
+        check_engine_compile=check_engine_compile,
     )
     diagnostics.extend(runtime_diagnostics)
     diagnostics.sort(key=_diagnostic_sort_key)

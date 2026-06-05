@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from .bank import canonicalize_bank, hash_bank
-from .diagnostics import Diagnostic, has_errors
+from .diagnostics import DIAGNOSTIC_ERROR, Diagnostic, diagnostic, has_errors
 from .engine import Bank
 from .records import MatchRecord, record_sort_key
 from .schema import STATUS_VALUES, validate_bank_schema
@@ -111,11 +111,19 @@ def resolve_extraction_options(options: Mapping[str, Any] | None) -> ResolvedExt
     engine_options = options.get("engine_options", {})
     if not isinstance(engine_options, Mapping):
         raise ExtractionError("Extraction option engine_options must be an object.")
+    engine_options_dict = dict(engine_options)
+    match_mode = engine_options_dict.get("match_mode")
+    if match_mode is not None:
+        if match_mode != "entity_independent":
+            raise ExtractionError(
+                f"Public JSON-bank extraction only supports match_mode 'entity_independent'; got {match_mode!r}."
+            )
+        del engine_options_dict["match_mode"]
 
     return ResolvedExtractionOptions(
         include_statuses=statuses,
         engine=engine,
-        engine_options=dict(engine_options),
+        engine_options=engine_options_dict,
         max_text_bytes=_positive_int_option(options, "max_text_bytes", DEFAULT_MAX_TEXT_BYTES),
         max_batch_documents=_positive_int_option(options, "max_batch_documents", DEFAULT_MAX_BATCH_DOCUMENTS),
         max_batch_text_bytes=_positive_int_option(options, "max_batch_text_bytes", DEFAULT_MAX_BATCH_TEXT_BYTES),
@@ -141,13 +149,6 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
             f"{list(resolved.include_statuses)!r}."
         )
 
-    from .validation import validate_bank
-
-    validation_result = validate_bank(canonical_bank, level="standard", engine=resolved.engine)
-    validation_diagnostics = validation_result["diagnostics"]
-    if has_errors(validation_diagnostics):
-        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", validation_diagnostics)
-
     extractable_bank = _filter_extractable_bank(canonical_bank, resolved.include_statuses)
     if extractable_bank is None:
         compiled = CompiledBank(
@@ -165,6 +166,18 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
         )
         return compiled, False
 
+    from .validation import validate_bank
+
+    validation_result = validate_bank(
+        extractable_bank,
+        level="standard",
+        engine=resolved.engine,
+        check_engine_compile=False,
+    )
+    validation_diagnostics = validation_result["diagnostics"]
+    if has_errors(validation_diagnostics):
+        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", validation_diagnostics)
+
     compile_options_json = _canonical_options(resolved.engine_options)
     try:
         native_bank = Bank.from_source_bytes(
@@ -173,7 +186,16 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
             compile_options_json=compile_options_json,
         )
     except ValueError as exc:
-        raise ExtractionError(f"Bank failed Rust engine validation and cannot be extracted: {exc}.") from exc
+        diagnostics = [
+            diagnostic(
+                DIAGNOSTIC_ERROR,
+                "engine.compile_error",
+                "",
+                f"Rust engine failed to compile the bank: {exc}.",
+            )
+        ]
+        message = f"Bank failed Rust engine validation and cannot be extracted: {exc}."
+        raise ExtractionError(message, diagnostics) from exc
 
     cache_metadata = native_bank.cache_metadata()
     cache_key = cache_metadata.get("key") if isinstance(cache_metadata, Mapping) else None
@@ -294,13 +316,21 @@ def _json_bank_detector_index(bank: Mapping[str, Any]) -> dict[tuple[str, str, s
                 pattern_map = cast(Mapping[str, Any], pattern)
                 pattern_kind = str(pattern_map.get("kind", ""))
                 surface_name = str(pattern_map.get("value")) if pattern_kind == "literal" else pattern_id
-                index[(entity_id, canonical_name, surface_name)] = _DetectorIdentity(
+                key = (entity_id, canonical_name, surface_name)
+                identity = _DetectorIdentity(
                     entity_id=entity_id,
                     name_id=name_id,
                     pattern_id=pattern_id,
                     pattern_kind=pattern_kind,
                     canonical_name=canonical_name,
                 )
+                previous_identity = index.get(key)
+                if previous_identity is not None and previous_identity != identity:
+                    raise ExtractionError(
+                        "JSON-bank detector metadata is ambiguous for Rust engine record projection: "
+                        f"{entity_id}/{canonical_name}/{surface_name} maps to multiple source detectors."
+                    )
+                index[key] = identity
 
     return index
 

@@ -60,6 +60,14 @@ def test_load_config_rejects_invalid_regex_pattern(tmp_path):
         load_config(config_path)
 
 
+def test_load_config_rejects_regexes_outside_rust_profile(tmp_path):
+    config_path = tmp_path / "entities.yaml"
+    config_path.write_text("ARTIST:\n  Code: '([A-Z]+)-" + r"\1" + "'\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="not compatible with the Rust engine"):
+        load_config(config_path)
+
+
 def test_load_config_accepts_detector_names_that_are_not_regex_group_names(tmp_path):
     config_path = tmp_path / "entities.yaml"
     config_path.write_text("ARTIST:\n  AC/DC: 'AC/DC'\n", encoding="utf-8")

@@ -208,6 +208,14 @@ def validate_pattern_config(config: Any) -> PatternConfig:
 
         validated_config[entity] = validated_entity
 
+    if validated_config:
+        try:
+            from .engine import Bank
+
+            Bank.from_config(validated_config, use_cache=False)
+        except ValueError as exc:
+            raise ConfigError(f"Detector config is not compatible with the Rust engine: {exc}.") from exc
+
     return validated_config
 
 
