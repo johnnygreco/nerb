@@ -151,7 +151,8 @@ Other public helpers include `Bank`, `bank_stats`, `bank_cache_info`, `canonical
 The Rust engine migration is underway. Native source-bank canonicalization is documented in
 [`docs/rust-engine-canonicalization.md`](docs/rust-engine-canonicalization.md), and the current native PyO3 boundary plus
 `entity_independent` `scan_bytes` path are documented in
-[`docs/rust-engine-boundary.md`](docs/rust-engine-boundary.md). The current Python `NERB` API remains only until the
+[`docs/rust-engine-boundary.md`](docs/rust-engine-boundary.md). Rust engine gate evidence is recorded in
+[`docs/rust-engine-gates.md`](docs/rust-engine-gates.md). The current Python `NERB` API remains only until the
 Rust-backed `Bank` surface replaces it.
 
 The current Python regex-builder API is still present until the Rust-backed `Bank` API replaces it:

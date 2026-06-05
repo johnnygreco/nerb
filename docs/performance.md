@@ -1,5 +1,8 @@
 # V1 Performance Scale Review
 
+Rust engine conformance, benchmark, dense-memory, mode-strategy, and distribution gate evidence for the migration is
+recorded in [`rust-engine-gates.md`](rust-engine-gates.md).
+
 Recorded on 2026-06-03 in the local agent workspace:
 
 - Python: `Python 3.14.4`
