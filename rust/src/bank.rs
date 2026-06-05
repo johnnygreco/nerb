@@ -98,6 +98,36 @@ impl MatchMode {
             Self::GlobalLeftmost => "global_leftmost",
         }
     }
+
+    pub(crate) fn status(self) -> &'static str {
+        match self {
+            Self::EntityIndependent => "production_default",
+            Self::AllOverlaps => "internal_prototype",
+            Self::GlobalLeftmost => "internal_benchmark_only",
+        }
+    }
+
+    pub(crate) fn production_default(self) -> bool {
+        self == Self::EntityIndependent
+    }
+
+    pub(crate) fn internal_only(self) -> bool {
+        self != Self::EntityIndependent
+    }
+
+    pub(crate) fn semantic_notes(self) -> &'static str {
+        match self {
+            Self::EntityIndependent => {
+                "reports cross-entity overlap with leftmost-first matching within each entity"
+            }
+            Self::AllOverlaps => {
+                "reports raw cross-entity, within-entity, and within-pattern overlaps for prototype measurement"
+            }
+            Self::GlobalLeftmost => {
+                "collapses cross-entity overlap to one leftmost-first winner per region and is not semantically equivalent to the production default"
+            }
+        }
+    }
 }
 
 impl NativeBank {
@@ -149,6 +179,10 @@ impl NativeBank {
 
     pub fn compile_options(&self) -> &Value {
         &self.compile_options
+    }
+
+    pub fn match_mode(&self) -> MatchMode {
+        self.engine.match_mode()
     }
 
     pub fn detectors(&self) -> &[DetectorMetadata] {
