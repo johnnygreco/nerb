@@ -68,3 +68,98 @@ def test_public_bank_from_config_word_boundaries_are_rust_canonicalized():
     assert plain.metadata()["bank_hash"] != bounded.metadata()["bank_hash"]
     assert round_tripped.metadata()["bank_hash"] == bounded.metadata()["bank_hash"]
     assert [record["start"] for record in bounded.scan_text("art article art")] == [0, 12]
+
+
+def test_public_bank_cache_reuses_compiled_banks_and_reports_key_dimensions():
+    nerb.clear_bank_cache()
+
+    first = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}})
+    second = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}})
+    bounded = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}}, word_boundaries=True)
+
+    first_cache = first.cache_metadata()
+    second_cache = second.cache_metadata()
+    bounded_cache = bounded.cache_metadata()
+    key = first_cache["key"]
+
+    assert first_cache["enabled"] is True
+    assert first_cache["hit"] is False
+    assert second_cache["hit"] is True
+    assert second_cache["key"] == key
+    assert bounded_cache["hit"] is False
+    assert bounded_cache["key"]["bank_hash"] != key["bank_hash"]
+    assert key["bank_hash"] == first.metadata()["bank_hash"]
+    assert key["schema_version"] == first.metadata()["schema"]
+    assert key["semantic_version"] == nerb.__version__
+    assert key["engine_name"] == "nerb_engine"
+    assert key["engine_version"] == nerb.__version__
+    assert key["canonical_engine"] == first.metadata()["defaults"]["engine"]
+    assert key["compile_options"] == {"match_mode": "entity_independent"}
+    assert isinstance(key["target_triple"], str) and key["target_triple"]
+    assert isinstance(key["platform"], str) and key["platform"]
+    assert key["pointer_width"] in {32, 64}
+    assert key["endian"] in {"little", "big"}
+    assert nerb.bank_cache_info()["hits"] == 1
+    assert nerb.bank_cache_info()["misses"] == 2
+    assert nerb.bank_cache_info()["size"] == 2
+
+
+def test_public_bank_cache_can_be_bypassed():
+    nerb.clear_bank_cache()
+
+    bank = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}}, use_cache=False)
+
+    assert bank.cache_metadata() == {"enabled": False, "hit": False, "key": None}
+    assert nerb.bank_cache_info() == {"size": 0, "source_key_count": 0, "hits": 0, "misses": 0, "keys": []}
+
+
+def test_public_bank_compile_options_reject_duplicate_keys_like_native_engine():
+    duplicate_match_mode = '{"match_mode":"all_overlaps","match_mode":"entity_independent"}'
+    duplicate_word_boundaries = '{"word_boundaries":false,"word_boundaries":true}'
+    canonical = nerb.Bank.from_config({"CODE": {"A": "A"}}).to_canonical_json_bytes()
+
+    with pytest.raises(ValueError, match="duplicate key 'match_mode'"):
+        nerb.Bank.from_source_bytes(
+            b'{"CODE":{"A":"A"}}',
+            format_hint="json",
+            compile_options_json=duplicate_match_mode,
+            use_cache=False,
+        )
+
+    with pytest.raises(ValueError, match="duplicate key 'match_mode'"):
+        nerb.Bank.from_canonical_json_bytes(canonical, compile_options_json=duplicate_match_mode)
+
+    with pytest.raises(ValueError, match="duplicate key 'word_boundaries'"):
+        nerb.Bank.from_config(
+            {"CODE": {"A": "A"}},
+            compile_options_json=duplicate_word_boundaries,
+            word_boundaries=True,
+        )
+
+
+def test_public_bank_compile_options_reject_non_finite_constants():
+    with pytest.raises(ValueError, match="non-finite value NaN"):
+        nerb.Bank.from_source_bytes(
+            b'{"CODE":{"A":"A"}}',
+            format_hint="json",
+            compile_options_json='{"match_mode":NaN}',
+        )
+
+
+@pytest.mark.parametrize("raw_options", ['{"word_boundaries":"bad"}', '{"word_boundaries":{}}'])
+def test_public_bank_config_word_boundary_option_must_be_boolean_before_override(raw_options):
+    with pytest.raises(ValueError, match='field "word_boundaries" must be a boolean'):
+        nerb.Bank.from_config(
+            {"CODE": {"A": "A"}},
+            compile_options_json=raw_options,
+            word_boundaries=True,
+        )
+
+
+def test_public_bank_config_word_boundary_option_rejects_non_finite_before_override():
+    with pytest.raises(ValueError, match="non-finite value"):
+        nerb.Bank.from_config(
+            {"CODE": {"A": "A"}},
+            compile_options_json='{"word_boundaries":1e999}',
+            word_boundaries=True,
+        )
