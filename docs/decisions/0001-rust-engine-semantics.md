@@ -77,8 +77,20 @@ collected.
 ### Non-Default Modes
 
 `all_overlaps` has a different semantic contract. It reports cross-entity overlap, within-entity overlap, and all
-matching alternation branches unless a post-filter reconstructs leftmost-first behavior. It must remain a measured
-prototype until its raw semantics, post-filter cost, and dense-hit match amplification are documented.
+matching spans for each detector pattern unless a reconstruction step restores leftmost-first behavior. It does not
+preserve branch identity inside one regex; attribution remains at the NERB detector index. Slice 6 showed that a
+span-only raw-candidate post-filter is not sufficient to prove exact reconstruction: `MatchKind::All` can expose the
+shorter span of one detector such as `Sam` from `Samwise|Sam`, while leftmost-first semantics choose `Samwise` when that
+branch appears first. The prototype therefore keeps raw `all_overlaps` output separate from an exact reconstruction
+measurement path that reruns the entity-independent shards after measuring raw overlap scan cost. It must remain a
+measured prototype until raw semantics, reconstruction cost, and dense-hit match amplification justify a mode strategy
+change.
+
+The Slice 6 lower-level DFA prototype rejects Unicode word-boundary assertions such as `\b`. `regex-automata` hybrid DFA
+support for Unicode boundaries is heuristic and can quit on valid non-ASCII UTF-8, which is not an acceptable runtime
+failure mode for NERB text scans. Raw `all_overlaps` can still use explicit ASCII word-boundary syntax such as
+`(?-u:\b)`, while Unicode boundary semantics stay on the `entity_independent` path unless a later issue adds a measured
+fallback.
 
 `global_leftmost` is an internal throughput baseline only. It collapses cross-entity overlap and must not become the
 default extraction behavior without a separate product decision.

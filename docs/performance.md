@@ -89,6 +89,141 @@ Trimmed output shape:
 }
 ```
 
+## Slice 6 All-Overlaps Probe
+
+Slice 6 adds a native `all_overlaps` prototype with `regex-automata` lower-level hybrid DFAs. The probe below uses a
+dense one-entity prefix bank with 32 detectors (`A{32}` down to `A`) over a 512-byte `A...A` document. Source order
+prefers the longest detector, so the production `entity_independent` contract emits 16 non-overlapping leftmost matches.
+Raw `all_overlaps` emits every overlapping detector span and amplifies the same scan to 15,888 raw matches.
+
+Recorded on 2026-06-04 with the editable native extension rebuilt by:
+
+```shell
+maturin develop --skip-install
+```
+
+Probe command:
+
+```shell
+python - <<'PY'
+from __future__ import annotations
+
+import json
+import statistics
+import time
+from nerb import _engine
+
+pattern_count = 32
+doc_bytes = 512
+iterations = 25
+source_lines = []
+for index in range(pattern_count, 0, -1):
+    token = "A" * index
+    source_lines.append(
+        json.dumps(
+            {
+                "entity": "DENSE",
+                "canonical_name": f"A{index}",
+                "surface_name": f"A{index}",
+                "regex": token,
+                "priority": pattern_count - index,
+            },
+            separators=(",", ":"),
+        )
+    )
+source = ("\n".join(source_lines) + "\n").encode()
+haystack = b"A" * doc_bytes
+
+
+def measure(label, func):
+    counts = []
+    seconds = []
+    for _ in range(iterations):
+        start = time.perf_counter()
+        buffer = func()
+        seconds.append(time.perf_counter() - start)
+        counts.append(len(buffer))
+    return {
+        "label": label,
+        "count": counts[0],
+        "count_stable": len(set(counts)) == 1,
+        "median_seconds": round(statistics.median(seconds), 6),
+        "min_seconds": round(min(seconds), 6),
+    }
+
+
+default_bank = _engine.Bank.from_source_bytes(source, format_hint="jsonl")
+overlap_bank = _engine.Bank.from_source_bytes(
+    source,
+    format_hint="jsonl",
+    compile_options_json='{"match_mode":"all_overlaps"}',
+)
+entity = measure("entity_independent", lambda: default_bank.scan_bytes(haystack))
+raw = measure("all_overlaps_raw", lambda: overlap_bank.scan_bytes(haystack))
+reconstructed = measure(
+    "all_overlaps_raw_plus_exact_leftmost_reconstruction",
+    lambda: overlap_bank.scan_bytes_leftmost_from_all_overlaps(haystack),
+)
+summary = {
+    "bank": {"entities": 1, "patterns": pattern_count, "pattern_lengths": [1, pattern_count]},
+    "document_bytes": doc_bytes,
+    "iterations": iterations,
+    "measurements": [entity, raw, reconstructed],
+    "raw_to_entity_count_ratio": round(raw["count"] / entity["count"], 3),
+    "raw_to_reconstructed_count_ratio": round(raw["count"] / reconstructed["count"], 3),
+}
+print(json.dumps(summary, indent=2, sort_keys=True))
+PY
+```
+
+Output:
+
+```json
+{
+  "bank": {
+    "entities": 1,
+    "pattern_lengths": [1, 32],
+    "patterns": 32
+  },
+  "document_bytes": 512,
+  "iterations": 25,
+  "measurements": [
+    {
+      "count": 16,
+      "count_stable": true,
+      "label": "entity_independent",
+      "median_seconds": 0.000005,
+      "min_seconds": 0.000005
+    },
+    {
+      "count": 15888,
+      "count_stable": true,
+      "label": "all_overlaps_raw",
+      "median_seconds": 0.001666,
+      "min_seconds": 0.001513
+    },
+    {
+      "count": 16,
+      "count_stable": true,
+      "label": "all_overlaps_raw_plus_exact_leftmost_reconstruction",
+      "median_seconds": 0.001735,
+      "min_seconds": 0.001637
+    }
+  ],
+  "raw_to_entity_count_ratio": 993.0,
+  "raw_to_reconstructed_count_ratio": 993.0
+}
+```
+
+Interpretation: raw `all_overlaps` is feasible on the smoke fixture, but dense overlap can multiply materialized matches
+by three orders of magnitude. Exact leftmost reconstruction currently measures raw overlap cost and then reruns the
+entity-independent shards; the incremental median cost in this probe was about 0.000069 seconds after the raw scan, but
+the important finding is semantic: raw candidates alone do not preserve enough ordered-alternation information to prove
+leftmost-first conformance. The reconstruction measurement is exact only when the raw overlapping scan fits the current
+`MatchBuffer` pre-scan capacity cap. The Slice 6 raw prototype also rejects Unicode word-boundary assertions; explicit
+ASCII word boundaries are available, and Unicode boundary behavior remains covered by `entity_independent` unless a later
+issue adds a measured fallback.
+
 ## Benchmark Commands
 
 Target exact-literal bank:

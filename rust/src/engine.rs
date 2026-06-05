@@ -1,8 +1,10 @@
 use crate::bank::{CanonicalBank, MatchMode};
 use crate::error::{validation, Result};
 use crate::match_buffer::{NativeMatchBuffer, RawMatch};
+use regex_automata::hybrid::dfa::{Cache as HybridCache, OverlappingState, DFA as HybridDfa};
 use regex_automata::meta::Regex;
-use regex_automata::{MatchKind, PatternID};
+use regex_automata::nfa::thompson::{self, WhichCaptures};
+use regex_automata::{Anchored, Input, MatchKind, PatternID};
 use regex_syntax::hir::Hir;
 use regex_syntax::ParserBuilder;
 
@@ -17,6 +19,7 @@ pub struct NativeEngine {
     match_mode: MatchMode,
     detectors: Vec<DetectorMetadata>,
     shards: Vec<MatcherShard>,
+    all_overlaps: Option<AllOverlapsMatcher>,
 }
 
 #[derive(Clone, Debug)]
@@ -36,14 +39,27 @@ struct MatcherShard {
     local_to_detector: Vec<u32>,
 }
 
+#[derive(Clone, Debug)]
+struct AllOverlapsMatcher {
+    forward: HybridDfa,
+    reverse: HybridDfa,
+    local_to_detector: Vec<u32>,
+}
+
 impl NativeEngine {
     pub fn compile(canonical: &CanonicalBank, match_mode: MatchMode) -> Result<Self> {
         let detectors = detector_metadata(canonical)?;
         let shards = compile_entity_independent(canonical)?;
+        let all_overlaps = if match_mode == MatchMode::AllOverlaps {
+            Some(compile_all_overlaps(canonical)?)
+        } else {
+            None
+        };
         Ok(Self {
             match_mode,
             detectors,
             shards,
+            all_overlaps,
         })
     }
 
@@ -59,16 +75,6 @@ impl NativeEngine {
 
     pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
         buffer.clear();
-        if self.match_mode != MatchMode::EntityIndependent {
-            return Err(validation(
-                "/compile_options/match_mode",
-                format!(
-                    "Bank.scan_bytes currently supports match_mode {:?} only; got {:?}",
-                    MatchMode::EntityIndependent.as_str(),
-                    self.match_mode.as_str()
-                ),
-            ));
-        }
         std::str::from_utf8(haystack).map_err(|error| {
             validation(
                 "/scan_bytes/haystack",
@@ -76,7 +82,64 @@ impl NativeEngine {
             )
         })?;
 
-        let result = scan_entity_independent(&self.shards, haystack, buffer);
+        let result = match self.match_mode {
+            MatchMode::EntityIndependent => scan_entity_independent(&self.shards, haystack, buffer),
+            MatchMode::AllOverlaps => scan_all_overlaps(
+                self.all_overlaps
+                    .as_ref()
+                    .expect("all_overlaps matcher must exist for all_overlaps mode"),
+                haystack,
+                buffer,
+            ),
+            MatchMode::GlobalLeftmost => Err(validation(
+                "/compile_options/match_mode",
+                "Bank.scan_bytes does not implement global_leftmost yet",
+            )),
+        };
+        if result.is_err() {
+            buffer.clear();
+        }
+        result
+    }
+
+    pub fn scan_bytes_leftmost_from_all_overlaps(
+        &self,
+        haystack: &[u8],
+        buffer: &mut NativeMatchBuffer,
+    ) -> Result<()> {
+        buffer.clear();
+        if self.match_mode != MatchMode::AllOverlaps {
+            return Err(validation(
+                "/compile_options/match_mode",
+                format!(
+                    "Bank.scan_bytes_leftmost_from_all_overlaps requires match_mode {:?}; got {:?}",
+                    MatchMode::AllOverlaps.as_str(),
+                    self.match_mode.as_str()
+                ),
+            ));
+        }
+        std::str::from_utf8(haystack).map_err(|error| {
+            validation(
+                "/scan_bytes/haystack",
+                format!("Bank.scan_bytes_leftmost_from_all_overlaps requires valid UTF-8 input: {error}"),
+            )
+        })?;
+
+        let mut raw = NativeMatchBuffer::new();
+        let result = scan_all_overlaps(
+            self.all_overlaps
+                .as_ref()
+                .expect("all_overlaps matcher must exist for all_overlaps mode"),
+            haystack,
+            &mut raw,
+        )
+        .and_then(|()| {
+            // MatchKind::All can lose ordered-alternation information inside one
+            // detector, so exact leftmost reconstruction currently reuses the
+            // entity-independent shards after measuring raw overlap scan cost.
+            buffer.clear();
+            scan_entity_independent(&self.shards, haystack, buffer)
+        });
         if result.is_err() {
             buffer.clear();
         }
@@ -111,6 +174,77 @@ fn scan_entity_independent(
     Ok(())
 }
 
+fn scan_all_overlaps(
+    matcher: &AllOverlapsMatcher,
+    haystack: &[u8],
+    buffer: &mut NativeMatchBuffer,
+) -> Result<()> {
+    buffer.clear();
+    let input = Input::new(haystack);
+    let mut forward_cache = HybridCache::new(&matcher.forward);
+    let mut reverse_cache = HybridCache::new(&matcher.reverse);
+    let mut state = OverlappingState::start();
+    loop {
+        matcher
+            .forward
+            .try_search_overlapping_fwd(&mut forward_cache, &input, &mut state)
+            .map_err(|error| {
+                validation(
+                    "/engine/all_overlaps/forward",
+                    format!("all_overlaps forward search failed: {error}"),
+                )
+            })?;
+        let Some(end) = state.get_match() else {
+            break;
+        };
+        let local_index = end.pattern().as_usize();
+        let Some(&detector_index) = matcher.local_to_detector.get(local_index) else {
+            return Err(validation(
+                "/engine/all_overlaps/local_to_detector",
+                format!(
+                    "regex engine returned local pattern index {local_index} outside detector map"
+                ),
+            ));
+        };
+
+        let reverse_input = input
+            .clone()
+            .range(input.start()..end.offset())
+            .anchored(Anchored::Pattern(end.pattern()))
+            .earliest(false);
+        let mut reverse_state = OverlappingState::start();
+        let mut recovered_start = false;
+        loop {
+            matcher
+                .reverse
+                .try_search_overlapping_rev(&mut reverse_cache, &reverse_input, &mut reverse_state)
+                .map_err(|error| {
+                    validation(
+                        "/engine/all_overlaps/reverse",
+                        format!("all_overlaps reverse search failed: {error}"),
+                    )
+                })?;
+            let Some(start) = reverse_state.get_match() else {
+                break;
+            };
+            recovered_start = true;
+            buffer.push(RawMatch::new(
+                detector_index,
+                start.offset() as u64,
+                end.offset() as u64,
+            )?)?;
+        }
+        if !recovered_start {
+            return Err(validation(
+                "/engine/all_overlaps/reverse",
+                "all_overlaps reverse search failed to recover a match start",
+            ));
+        }
+    }
+    buffer.sort();
+    Ok(())
+}
+
 fn detector_metadata(canonical: &CanonicalBank) -> Result<Vec<DetectorMetadata>> {
     let mut detectors = Vec::new();
     for entity in &canonical.entities {
@@ -132,6 +266,100 @@ fn detector_metadata(canonical: &CanonicalBank) -> Result<Vec<DetectorMetadata>>
         }
     }
     Ok(detectors)
+}
+
+fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher> {
+    let mut patterns = Vec::new();
+    let mut local_to_detector = Vec::new();
+    let mut next_detector_index = 0u32;
+    for entity in &canonical.entities {
+        for (pattern_index, pattern) in entity.patterns.iter().enumerate() {
+            let hir = parse_pattern_with_flags(
+                &entity.name,
+                pattern_index,
+                &pattern.regex,
+                &pattern.flags,
+            )?;
+            if hir.properties().look_set().contains_word_unicode() {
+                return Err(validation(
+                    pattern_path_by_index(&entity.name, pattern_index),
+                    "Unicode word-boundary assertions are not supported by the all_overlaps prototype; use explicit ASCII word boundaries such as (?-u:\\b) or the entity_independent mode",
+                ));
+            }
+            patterns.push(hir);
+            local_to_detector.push(next_detector_index);
+            next_detector_index = next_detector_index.checked_add(1).ok_or_else(|| {
+                validation(
+                    "/entities",
+                    "detector count exceeds u32::MAX and cannot be represented in raw matches",
+                )
+            })?;
+        }
+    }
+
+    let forward_nfa = thompson::Compiler::new()
+        .configure(
+            thompson::Config::new()
+                .which_captures(WhichCaptures::None)
+                .nfa_size_limit(Some(ENTITY_INDEPENDENT_NFA_SIZE_LIMIT)),
+        )
+        .build_many_from_hir(&patterns)
+        .map_err(|error| {
+            validation(
+                "/entities",
+                format!("could not compile all_overlaps forward NFA: {error}"),
+            )
+        })?;
+    let reverse_nfa = thompson::Compiler::new()
+        .configure(
+            thompson::Config::new()
+                .reverse(true)
+                .which_captures(WhichCaptures::None)
+                .nfa_size_limit(Some(ENTITY_INDEPENDENT_NFA_SIZE_LIMIT)),
+        )
+        .build_many_from_hir(&patterns)
+        .map_err(|error| {
+            validation(
+                "/entities",
+                format!("could not compile all_overlaps reverse NFA: {error}"),
+            )
+        })?;
+
+    let forward = HybridDfa::builder()
+        .configure(
+            HybridDfa::config()
+                .match_kind(MatchKind::All)
+                .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),
+        )
+        .build_from_nfa(forward_nfa)
+        .map_err(|error| {
+            validation(
+                "/entities",
+                format!("could not compile all_overlaps forward DFA: {error}"),
+            )
+        })?;
+    let reverse = HybridDfa::builder()
+        .configure(
+            HybridDfa::config()
+                .match_kind(MatchKind::All)
+                .starts_for_each_pattern(true)
+                .prefilter(None)
+                .specialize_start_states(false)
+                .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),
+        )
+        .build_from_nfa(reverse_nfa)
+        .map_err(|error| {
+            validation(
+                "/entities",
+                format!("could not compile all_overlaps reverse DFA: {error}"),
+            )
+        })?;
+
+    Ok(AllOverlapsMatcher {
+        forward,
+        reverse,
+        local_to_detector,
+    })
 }
 
 fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherShard>> {

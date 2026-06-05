@@ -1,7 +1,7 @@
 # Rust Engine PyO3 Boundary
 
-Issues #50 and #51 expose the native boundary and first Rust scanning path. The native module is still `nerb._engine`;
-the public Python wrapper in `nerb.engine.Bank` is deferred.
+Issues #50, #51, and #52 expose the native boundary, the first Rust scanning path, and the measured `all_overlaps`
+prototype. The native module is still `nerb._engine`; the public Python wrapper in `nerb.engine.Bank` is deferred.
 
 ## Bank Constructors
 
@@ -78,10 +78,10 @@ allocation paths. Later dense-hit measurement may revisit this logical limit.
 
 ## Scanning
 
-`Bank.scan_bytes` implements the initial `entity_independent` mode: one `regex-automata` meta matcher per entity with
-leftmost-first semantics inside each entity and cross-entity overlap preserved. It validates UTF-8 input, releases the
-GIL during the Rust scan, returns raw `(detector_index, start_byte, end_byte)` matches sorted by byte offsets and detector
-index, and optionally fills a caller-provided `MatchBuffer`.
+`Bank.scan_bytes` implements the production-default `entity_independent` mode: one `regex-automata` meta matcher per
+entity with leftmost-first semantics inside each entity and cross-entity overlap preserved. It validates UTF-8 input,
+releases the GIL during the Rust scan, returns raw `(detector_index, start_byte, end_byte)` matches sorted by byte offsets
+and detector index, and optionally fills a caller-provided `MatchBuffer`.
 
 Matcher construction applies bounded `regex-automata` NFA, one-pass, hybrid-cache, and DFA limits. Unsupported syntax and
 compile-bomb shapes fail during bank construction with `ValueError`.
@@ -96,8 +96,61 @@ raw = bank.scan_bytes(b"Samba ships")
 assert [raw[i] for i in range(len(raw))] == [(0, 0, 3), (1, 0, 5)]
 ```
 
+## All Overlaps Prototype
+
+`compile_options_json='{"match_mode":"all_overlaps"}'` builds an internal prototype around lower-level
+`regex-automata` hybrid DFAs:
+
+- a forward DFA runs overlapping search with `MatchKind::All`;
+- a reverse DFA with per-pattern start states recovers the start byte for each reported end;
+- local pattern IDs are translated back to global detector indexes before appending to `MatchBuffer`.
+
+The prototype rejects Unicode word-boundary assertions such as `\b` because the lower-level DFA only provides heuristic
+Unicode-boundary support that can quit on valid non-ASCII UTF-8. Use explicit ASCII word-boundary syntax such as
+`(?-u:\b)` for raw `all_overlaps`, or use the production-default `entity_independent` mode for Unicode boundary
+semantics.
+
+Raw `all_overlaps` output is intentionally not the default contract. It preserves cross-entity overlap, but it also
+reports within-entity overlapping detectors and every matching span for each detector pattern. It does not preserve a
+separate branch identity inside one regex; attribution still stops at the NERB detector index. For example, the
+production `entity_independent` mode chooses `Samwise` for `Samwise|Sam` over `Samwise`, while raw `all_overlaps` exposes
+both `(0, 0, 3)` and `(0, 0, 7)` for that one detector. That means a span-only candidate post-filter cannot prove exact
+leftmost-first reconstruction.
+
+The prototype therefore exposes `Bank.scan_bytes_leftmost_from_all_overlaps` only as a measurement path. It first runs
+the raw overlapping scan, then uses the existing entity-independent shards to reconstruct the exact leftmost-first output.
+This keeps raw overlap cost and exact reconstruction cost visible without pretending that raw candidates alone preserve
+enough ordering information. Reconstruction is exact only when the raw overlapping scan itself fits the `MatchBuffer`
+pre-scan capacity cap; extremely dense raw overlap workloads can fail before the reconstruction pass runs.
+
+```python
+source = b"""
+{"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
+{"entity":"PERSON","canonical_name":"Samwise","surface_name":"Samwise","regex":"Samwise","priority":1}
+{"entity":"PROJECT","canonical_name":"Samba","surface_name":"Samba","regex":"Samba","priority":0}
+"""
+default_bank = _engine.Bank.from_source_bytes(source, format_hint="jsonl")
+overlap_bank = _engine.Bank.from_source_bytes(
+    source,
+    format_hint="jsonl",
+    compile_options_json='{"match_mode":"all_overlaps"}',
+)
+
+raw = overlap_bank.scan_bytes(b"Samba Samwise")
+default_raw = default_bank.scan_bytes(b"Samba Samwise")
+reconstructed = overlap_bank.scan_bytes_leftmost_from_all_overlaps(b"Samba Samwise")
+
+assert [raw[i] for i in range(len(raw))] == [
+    (0, 0, 3),
+    (2, 0, 5),
+    (0, 6, 9),
+    (1, 6, 13),
+]
+assert [reconstructed[i] for i in range(len(reconstructed))] == [default_raw[i] for i in range(len(default_raw))]
+```
+
 `Bank.scan_path` remains a boundary stub in this slice. It raises `NotImplementedError` and does not allocate Python
-match records. All-overlaps and global-leftmost modes remain future work.
+match records. `global_leftmost` remains a future mode and raises a validation error if scanned.
 
 ## Error Boundary
 
