@@ -40,12 +40,9 @@ from .config import (
 )
 from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
+from .engine import Bank
 from .evals import eval_bank as _eval_bank
-from .extraction import (
-    ExtractionError,
-    extract_named_entities_records,
-    extract_named_entity_records,
-)
+from .extraction import ExtractionError
 from .extraction import (
     extract_file as _json_extract_file,
 )
@@ -65,7 +62,7 @@ from .validation import validate_bank as _validate_bank
 COMMAND_ERROR_EXIT_CODE = 1
 OUTPUT_FORMATS = {"json", "jsonl", "table"}
 AUTHORING_OUTPUT_FORMATS = {"json", "text"}
-RECORD_COLUMNS = ["entity", "name", "string", "start", "end"]
+RECORD_COLUMNS = ["entity", "canonical_name", "surface_name", "string", "start", "end", "offset_unit"]
 DIAGNOSTIC_ERROR = "error"
 DIAGNOSTIC_WARNING = "warning"
 
@@ -441,6 +438,8 @@ def _read_extraction_text(document: Path | None, *, read_stdin: bool, text: str 
 
     try:
         return document.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        _exit_error(f"Document file is not valid UTF-8 at {document}: {exc}")
     except OSError as exc:
         _exit_error(f"Could not read document at {document}: {exc}")
 
@@ -516,12 +515,15 @@ def _extract_records(
     *,
     word_boundaries: bool,
 ) -> list[dict[str, Any]]:
-    extractor = _compile_extractor(pattern_config, word_boundaries=word_boundaries)
-
-    if selected_entity is None:
-        return extract_named_entities_records(extractor, text)
-
-    return extract_named_entity_records(extractor, selected_entity, text)
+    try:
+        bank = Bank.from_config(
+            pattern_config,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+        )
+        return bank.scan_text(text)
+    except ValueError as exc:
+        _exit_error(f"Could not compile or scan detectors with the Rust engine: {exc}")
 
 
 def _inline_detector_config(

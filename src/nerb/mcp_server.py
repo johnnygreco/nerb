@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -40,12 +39,9 @@ from .config import (
 )
 from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
+from .engine import Bank
 from .evals import eval_bank as _eval_bank
-from .extraction import (
-    ExtractionError,
-    extract_named_entities_records,
-    extract_named_entity_records,
-)
+from .extraction import ExtractionError
 from .extraction import (
     explain_match as _json_explain_match,
 )
@@ -68,7 +64,6 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
-from .regex_builder import NERB
 from .validation import validate_bank as _validate_bank
 
 Transport = Literal["stdio", "sse", "streamable-http"]
@@ -351,6 +346,8 @@ def _read_text_source(text: str | None, file_path: str | None) -> tuple[str, dic
 
     try:
         return path.read_text(encoding="utf-8"), {"type": "file", "path": str(path)}
+    except UnicodeDecodeError as exc:
+        _raise_tool_error(f"Document file is not valid UTF-8 at {path}: {exc}")
     except OSError as exc:
         _raise_tool_error(f"Could not read document at {path}: {exc}")
 
@@ -365,13 +362,6 @@ def _ensure_configured_patterns(pattern_config: PatternConfig, source: str) -> N
         _raise_tool_error(f"No detector patterns are configured in {source}.")
 
 
-def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) -> NERB:
-    try:
-        return NERB(pattern_config, add_word_boundaries=word_boundaries)
-    except (ConfigError, re.error, ValueError) as exc:
-        _raise_tool_error(f"Could not compile detectors: {exc}")
-
-
 def _extract_records(
     pattern_config: PatternConfig,
     selected_entity: str | None,
@@ -379,10 +369,15 @@ def _extract_records(
     *,
     word_boundaries: bool,
 ) -> list[dict[str, Any]]:
-    extractor = _compile_extractor(pattern_config, word_boundaries=word_boundaries)
-    if selected_entity is None:
-        return extract_named_entities_records(extractor, text)
-    return extract_named_entity_records(extractor, selected_entity, text)
+    try:
+        bank = Bank.from_config(
+            pattern_config,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+        )
+        return bank.scan_text(text)
+    except ValueError as exc:
+        _raise_tool_error(f"Could not compile or scan detectors with the Rust engine: {exc}")
 
 
 def _detector_records(pattern_config: PatternConfig, selected_entity: str | None = None) -> list[dict[str, str]]:

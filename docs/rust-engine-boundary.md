@@ -1,10 +1,10 @@
 # Rust Engine PyO3 Boundary
 
-Issues #50, #51, #52, and #53 expose the native boundary, the first Rust scanning path, the measured `all_overlaps`
-prototype, and the internal `global_leftmost` throughput baseline. The native module is still `nerb._engine`; the public
-Python wrapper in `nerb.engine.Bank` is deferred.
+Issues #50, #51, #52, #53, and #54 expose the native boundary, the first Rust scanning path, the measured
+`all_overlaps` prototype, the internal `global_leftmost` throughput baseline, and the first public Python `Bank` wrapper
+used by CLI/MCP extraction.
 
-## Bank Constructors
+## Native Bank Constructors
 
 ```python
 from nerb import _engine
@@ -193,11 +193,62 @@ assert [default_raw[i] for i in range(len(default_raw))] == [(0, 0, 3), (1, 0, 5
 assert [global_raw[i] for i in range(len(global_raw))] == [(0, 0, 3)]
 ```
 
-`Bank.scan_path` remains a boundary stub in this slice. It raises `NotImplementedError` and does not allocate Python
-match records.
+Native `_engine.Bank.scan_path` remains a boundary stub in this slice. It raises `NotImplementedError` and does not
+allocate Python match records. The public Python `nerb.Bank.scan_path` wrapper reads bytes in Python and calls the native
+`scan_bytes` path.
 
 ## Error Boundary
 
-Native validation and parse failures are translated to `ValueError`. Buffer indexing failures are `IndexError`, scan
-future scan stubs are `NotImplementedError`, native allocation failures are `MemoryError`, and panic-safe wrappers
+Native validation and parse failures are translated to `ValueError`. Buffer indexing failures are `IndexError`, native
+scan stubs are `NotImplementedError`, native allocation failures are `MemoryError`, and panic-safe wrappers
 translate an unexpected Rust panic into `RuntimeError` instead of unwinding through Python.
+
+## Public Python Bank
+
+`from nerb import Bank` exposes the high-level Rust-backed wrapper. It projects raw native matches into the planned public
+record schema:
+
+```python
+from nerb import Bank
+
+bank = Bank.from_source_bytes(b'{"ARTIST":{"Rush":"Rush"}}', format_hint="json")
+records = bank.scan_text("Café Rush")
+assert records == [
+    {
+        "entity": "ARTIST",
+        "canonical_name": "Rush",
+        "surface_name": "Rush",
+        "string": "Rush",
+        "start": 6,
+        "end": 10,
+        "offset_unit": "byte",
+    }
+]
+```
+
+Byte offsets are the default for `scan_text`, `scan_bytes`, `scan_path`, CLI extraction, and MCP extraction. Text callers
+may explicitly ask for character offsets:
+
+```python
+assert bank.scan_text("Café Rush", offsets="char")[0]["offset_unit"] == "char"
+```
+
+`Bank.scan_path(path)` reads the exact file bytes and then uses the native UTF-8 scan path. Invalid UTF-8 raises
+`ValueError`; callers that need lossy or custom decoding must decode text explicitly and pass it to `scan_text`.
+
+CLI `nerb extract` and the config-backed MCP extraction tools now use this wrapper. Their records no longer include the
+old Python `name` field; use `canonical_name` and `surface_name` instead.
+
+```shell
+uv run nerb extract --all --text "Rush played rock." \
+  --detector "ARTIST:Rush=Rush" \
+  --detector "GENRE:Rock=rock" \
+  --format json
+```
+
+```json
+[
+  {"entity": "ARTIST", "canonical_name": "Rush", "surface_name": "Rush", "string": "Rush", "start": 0, "end": 4, "offset_unit": "byte"},
+  {"entity": "GENRE", "canonical_name": "Rock", "surface_name": "Rock", "string": "rock", "start": 12, "end": 16, "offset_unit": "byte"}
+]
+```

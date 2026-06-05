@@ -9,13 +9,12 @@ from typer.testing import CliRunner
 
 from nerb import (
     NERB,
+    Bank,
     apply_bank_patches,
     benchmark_bank,
     clear_compiled_bank_cache,
     diff_banks,
     eval_bank,
-    extract_named_entities_records,
-    extract_named_entity_records,
     load_config,
     regress_bank,
     save_config,
@@ -54,7 +53,7 @@ def _table_records(output: str) -> list[dict[str, str]]:
     columns = _split_table_row(header)
     separator_cells = _split_table_row(separator)
 
-    assert columns == ["entity", "name", "string", "start", "end"]
+    assert columns == ["entity", "canonical_name", "surface_name", "string", "start", "end", "offset_unit"]
     assert len(separator_cells) == len(columns)
     assert all(set(cell) == {"-"} for cell in separator_cells)
 
@@ -76,6 +75,10 @@ def _console_script_entry_points():
 def _load_json(path):
     with open(path, encoding="utf-8") as file:
         return json.load(file)
+
+
+def _expected_config_records(config_path, text: str, entity: str | None = None):
+    return Bank.from_config(load_config(config_path), selected_entity=entity).scan_text(text)
 
 
 def _write_json(path, payload):
@@ -320,7 +323,7 @@ def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_dat
 def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
-    expected_records = extract_named_entity_records(NERB(config_path), "ARTIST", prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki, "ARTIST")
 
     result = runner.invoke(
         app,
@@ -338,12 +341,12 @@ def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path
     assert result.exit_code == 0
     records = _json_records(result.output)
     assert records == expected_records
-    assert set(records[0]) == {"entity", "name", "string", "start", "end"}
+    assert set(records[0]) == {"entity", "canonical_name", "surface_name", "string", "start", "end", "offset_unit"}
 
 
 def test_extract_stdin_jsonl_matches_api_for_fixture_config(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
-    expected_records = extract_named_entity_records(NERB(config_path), "ARTIST", prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki, "ARTIST")
 
     result = runner.invoke(
         app,
@@ -367,7 +370,7 @@ def test_extract_stdin_jsonl_matches_api_for_fixture_config(test_data_path, prog
 def test_extract_all_json_matches_api_for_fixture_config(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
-    expected_records = extract_named_entities_records(NERB(config_path), prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki)
 
     result = runner.invoke(
         app,
@@ -394,7 +397,15 @@ def test_extract_uses_default_config_path_from_env(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert _json_records(result.output) == [
-        {"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": 0, "end": 4}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
     ]
 
 
@@ -417,7 +428,15 @@ def test_extract_inline_pattern_from_literal_text_without_config(monkeypatch, tm
 
     assert result.exit_code == 0
     assert _json_records(result.output) == [
-        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        }
     ]
 
 
@@ -443,8 +462,24 @@ def test_extract_inline_detectors_from_file_without_config(monkeypatch, tmp_path
 
     assert result.exit_code == 0
     assert _json_records(result.output) == [
-        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10},
-        {"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34},
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        },
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "rock",
+            "start": 30,
+            "end": 34,
+            "offset_unit": "byte",
+        },
     ]
 
 
@@ -467,8 +502,24 @@ def test_extract_table_output_records_with_inline_detectors(monkeypatch, tmp_pat
 
     assert result.exit_code == 0
     assert _table_records(result.output) == [
-        {"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": "0", "end": "4"},
-        {"entity": "GENRE", "name": "Rock", "string": "rock", "start": "24", "end": "28"},
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": "0",
+            "end": "4",
+            "offset_unit": "byte",
+        },
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "rock",
+            "start": "24",
+            "end": "28",
+            "offset_unit": "byte",
+        },
     ]
 
 
@@ -522,7 +573,15 @@ def test_cli_end_to_end_add_validate_extract_from_document(tmp_path):
     assert validate_result.exit_code == 0
     assert extract_result.exit_code == 0
     assert _json_records(extract_result.output) == [
-        {"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": 0, "end": 4}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
     ]
 
 
@@ -534,6 +593,17 @@ def test_extract_reports_missing_document_file(test_data_path, tmp_path):
 
     assert result.exit_code == 1
     assert f"Document file does not exist at {missing_document_path}" in result.output
+
+
+def test_extract_reports_invalid_utf8_document_file(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "invalid.bin"
+    document_path.write_bytes(b"\xff")
+
+    result = runner.invoke(app, ["extract", "ARTIST", str(document_path), "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert f"Document file is not valid UTF-8 at {document_path}" in result.output
 
 
 def test_extract_reports_unknown_entity(tmp_path):
@@ -627,7 +697,15 @@ def test_test_literal_detector_json_success_without_config(monkeypatch, tmp_path
 
     assert result.exit_code == 0
     assert json.loads(result.output) == [
-        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        }
     ]
     assert not config_path.exists()
 
@@ -677,7 +755,17 @@ def test_test_saved_detector_against_text_and_document(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.output) == [{"entity": "GENRE", "name": "Rock", "string": "ROCK", "start": 0, "end": 4}]
+    assert json.loads(result.output) == [
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "ROCK",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
+    ]
 
     result = runner.invoke(
         app,
@@ -685,7 +773,17 @@ def test_test_saved_detector_against_text_and_document(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.output) == [{"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": 0, "end": 4}]
+    assert json.loads(result.output) == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
+    ]
 
 
 def test_test_saved_detector_reports_unknown_entity_and_pattern(tmp_path):
