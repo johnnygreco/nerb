@@ -100,6 +100,15 @@ impl PyBank {
             let compile_options = json.call_method1("loads", (compile_options_json,))?;
             metadata.set_item("compile_options", compile_options)?;
 
+            let match_mode = self.inner.match_mode();
+            let mode = PyDict::new(py);
+            mode.set_item("name", match_mode.as_str())?;
+            mode.set_item("status", match_mode.status())?;
+            mode.set_item("production_default", match_mode.production_default())?;
+            mode.set_item("internal_only", match_mode.internal_only())?;
+            mode.set_item("semantic_notes", match_mode.semantic_notes())?;
+            metadata.set_item("match_mode", mode)?;
+
             let detectors = PyList::empty(py);
             for detector in self.inner.detectors() {
                 let item = PyDict::new(py);

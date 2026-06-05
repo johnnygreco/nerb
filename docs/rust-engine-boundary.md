@@ -1,7 +1,8 @@
 # Rust Engine PyO3 Boundary
 
-Issues #50, #51, and #52 expose the native boundary, the first Rust scanning path, and the measured `all_overlaps`
-prototype. The native module is still `nerb._engine`; the public Python wrapper in `nerb.engine.Bank` is deferred.
+Issues #50, #51, #52, and #53 expose the native boundary, the first Rust scanning path, the measured `all_overlaps`
+prototype, and the internal `global_leftmost` throughput baseline. The native module is still `nerb._engine`; the public
+Python wrapper in `nerb.engine.Bank` is deferred.
 
 ## Bank Constructors
 
@@ -33,6 +34,13 @@ assert round_tripped.metadata()["bank_hash"] == bank.metadata()["bank_hash"]
   },
   "compile_options": {
     "match_mode": "entity_independent"
+  },
+  "match_mode": {
+    "name": "entity_independent",
+    "status": "production_default",
+    "production_default": true,
+    "internal_only": false,
+    "semantic_notes": "reports cross-entity overlap with leftmost-first matching within each entity"
   },
   "detectors": [
     {
@@ -149,8 +157,44 @@ assert [raw[i] for i in range(len(raw))] == [
 assert [reconstructed[i] for i in range(len(reconstructed))] == [default_raw[i] for i in range(len(default_raw))]
 ```
 
+## Global Leftmost Internal Baseline
+
+`compile_options_json='{"match_mode":"global_leftmost"}'` builds one combined `regex-automata` meta matcher in
+`LeftmostFirst` mode. It is exposed only as an internal throughput baseline. `metadata()["match_mode"]` labels it with:
+
+```json
+{
+  "name": "global_leftmost",
+  "status": "internal_benchmark_only",
+  "production_default": false,
+  "internal_only": true,
+  "semantic_notes": "collapses cross-entity overlap to one leftmost-first winner per region and is not semantically equivalent to the production default"
+}
+```
+
+The mode intentionally violates NERB's production overlap contract:
+
+```python
+source = b"""
+{"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
+{"entity":"PROJECT","canonical_name":"Samba","surface_name":"Samba","regex":"Samba","priority":0}
+"""
+default_bank = _engine.Bank.from_source_bytes(source, format_hint="jsonl")
+global_bank = _engine.Bank.from_source_bytes(
+    source,
+    format_hint="jsonl",
+    compile_options_json='{"match_mode":"global_leftmost"}',
+)
+
+default_raw = default_bank.scan_bytes(b"Samba ships")
+global_raw = global_bank.scan_bytes(b"Samba ships")
+
+assert [default_raw[i] for i in range(len(default_raw))] == [(0, 0, 3), (1, 0, 5)]
+assert [global_raw[i] for i in range(len(global_raw))] == [(0, 0, 3)]
+```
+
 `Bank.scan_path` remains a boundary stub in this slice. It raises `NotImplementedError` and does not allocate Python
-match records. `global_leftmost` remains a future mode and raises a validation error if scanned.
+match records.
 
 ## Error Boundary
 

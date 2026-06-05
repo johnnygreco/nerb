@@ -92,8 +92,10 @@ failure mode for NERB text scans. Raw `all_overlaps` can still use explicit ASCI
 `(?-u:\b)`, while Unicode boundary semantics stay on the `entity_independent` path unless a later issue adds a measured
 fallback.
 
-`global_leftmost` is an internal throughput baseline only. It collapses cross-entity overlap and must not become the
-default extraction behavior without a separate product decision.
+`global_leftmost` is an internal throughput baseline only. It compiles one combined meta matcher in `LeftmostFirst` mode,
+collapses cross-entity overlap to one winner per region, and must not become the default extraction behavior without a
+separate product decision. Native metadata labels it `internal_benchmark_only` with `production_default: false` and
+`internal_only: true`.
 
 ### Regex Profile
 

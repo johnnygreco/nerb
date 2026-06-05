@@ -95,7 +95,11 @@ filled with defaults. The default compile options are:
 {"match_mode":"entity_independent"}
 ```
 
-Supported `match_mode` values are `entity_independent`, `all_overlaps`, and `global_leftmost`.
+Supported `match_mode` values are:
+
+- `entity_independent`: production default.
+- `all_overlaps`: internal prototype for raw overlap measurement.
+- `global_leftmost`: internal benchmark-only throughput baseline that collapses cross-entity overlap.
 
 Changing semantic options changes the hash:
 

@@ -31,6 +31,15 @@ def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
     assert metadata["entity_count"] == 2
     assert metadata["pattern_count"] == 2
     assert metadata["compile_options"] == {"match_mode": "all_overlaps"}
+    assert metadata["match_mode"] == {
+        "name": "all_overlaps",
+        "status": "internal_prototype",
+        "production_default": False,
+        "internal_only": True,
+        "semantic_notes": (
+            "reports raw cross-entity, within-entity, and within-pattern overlaps for prototype measurement"
+        ),
+    }
     assert metadata["detectors"] == [
         {
             "detector_index": 0,
@@ -286,7 +295,7 @@ def test_native_scan_bytes_out_clears_partial_matches_after_scan_error(engine):
     assert buffer.capacity() >= 1
 
 
-def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
+def test_native_scan_bytes_rejects_invalid_utf8(engine):
     bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
 
     with pytest.raises(ValueError, match="valid UTF-8"):
@@ -299,21 +308,6 @@ def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
     assert len(invalid_utf8_buffer) == 0
     assert invalid_utf8_buffer.capacity() >= 1
 
-    future_mode = engine.Bank.from_source_bytes(
-        b'{"CODE":{"Alpha":"A"}}',
-        format_hint="json",
-        compile_options_json='{"match_mode":"global_leftmost"}',
-    )
-    with pytest.raises(ValueError, match="global_leftmost"):
-        future_mode.scan_bytes(b"Alpha")
-
-    future_mode_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
-    with pytest.raises(ValueError, match="global_leftmost"):
-        future_mode.scan_bytes(b"Alpha", out=future_mode_buffer)
-
-    assert len(future_mode_buffer) == 0
-    assert future_mode_buffer.capacity() >= 1
-
 
 def test_native_scan_path_remains_boundary_stub_without_record_projection(engine):
     bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
@@ -323,3 +317,53 @@ def test_native_scan_path_remains_boundary_stub_without_record_projection(engine
         bank.scan_path("document.txt", out=buffer)
 
     assert len(buffer) == 0
+
+
+def test_native_global_leftmost_scan_is_internal_baseline_and_collapses_cross_entity_overlap(engine):
+    source = b"""
+{"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
+{"entity":"PROJECT","canonical_name":"Samba","surface_name":"Samba","regex":"Samba","priority":0}
+"""
+    default_bank = engine.Bank.from_source_bytes(source, format_hint="jsonl")
+    global_bank = engine.Bank.from_source_bytes(
+        source,
+        format_hint="jsonl",
+        compile_options_json='{"match_mode":"global_leftmost"}',
+    )
+    buffer = engine.MatchBuffer(capacity=8)
+    before = buffer.capacity()
+
+    returned = global_bank.scan_bytes(b"Samba ships", out=buffer)
+
+    assert returned is buffer
+    assert buffer.capacity() >= before
+    assert _raw_tuples(default_bank.scan_bytes(b"Samba ships")) == [(0, 0, 3), (1, 0, 5)]
+    assert _raw_tuples(buffer) == [(0, 0, 3)]
+    assert global_bank.metadata()["compile_options"] == {"match_mode": "global_leftmost"}
+    assert global_bank.metadata()["match_mode"] == {
+        "name": "global_leftmost",
+        "status": "internal_benchmark_only",
+        "production_default": False,
+        "internal_only": True,
+        "semantic_notes": (
+            "collapses cross-entity overlap to one leftmost-first winner per region "
+            "and is not semantically equivalent to the production default"
+        ),
+    }
+
+
+def test_native_default_scan_mode_stays_entity_independent(engine):
+    bank = engine.Bank.from_source_bytes(
+        b"""
+{"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
+{"entity":"PROJECT","canonical_name":"Samba","surface_name":"Samba","regex":"Samba","priority":0}
+""",
+        format_hint="jsonl",
+    )
+
+    assert _raw_tuples(bank.scan_bytes(b"Samba")) == [(0, 0, 3), (1, 0, 5)]
+    assert bank.metadata()["compile_options"] == {"match_mode": "entity_independent"}
+    assert bank.metadata()["match_mode"]["name"] == "entity_independent"
+    assert bank.metadata()["match_mode"]["status"] == "production_default"
+    assert bank.metadata()["match_mode"]["production_default"] is True
+    assert bank.metadata()["match_mode"]["internal_only"] is False

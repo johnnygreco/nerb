@@ -89,17 +89,19 @@ Trimmed output shape:
 }
 ```
 
-## Slice 6 All-Overlaps Probe
+## Slice 6/7 Native Mode Probe
 
-Slice 6 adds a native `all_overlaps` prototype with `regex-automata` lower-level hybrid DFAs. The probe below uses a
-dense one-entity prefix bank with 32 detectors (`A{32}` down to `A`) over a 512-byte `A...A` document. Source order
-prefers the longest detector, so the production `entity_independent` contract emits 16 non-overlapping leftmost matches.
-Raw `all_overlaps` emits every overlapping detector span and amplifies the same scan to 15,888 raw matches.
+Slice 6 added a native `all_overlaps` prototype with `regex-automata` lower-level hybrid DFAs. Slice 7 adds
+`global_leftmost` as an internal throughput baseline only. The probe below uses a dense two-entity prefix bank with 32
+detectors per entity (`A{32}` down to `A`) over a 512-byte `A...A` document. Source order prefers the longest detector.
+The production `entity_independent` contract emits 32 non-overlapping leftmost matches: 16 per entity. The internal
+`global_leftmost` baseline emits 16 matches because it collapses cross-entity overlap to one winner per region. Raw
+`all_overlaps` emits every overlapping detector span and amplifies the same scan to 31,776 raw matches.
 
-Recorded on 2026-06-04 with the editable native extension rebuilt by:
+Recorded on 2026-06-05 with the editable native extension rebuilt by:
 
 ```shell
-maturin develop --skip-install
+uv run --with 'maturin>=1.9.4,<2' maturin develop
 ```
 
 Probe command:
@@ -113,24 +115,26 @@ import statistics
 import time
 from nerb import _engine
 
-pattern_count = 32
+pattern_count_per_entity = 32
+entities = ["ALPHA", "BETA"]
 doc_bytes = 512
 iterations = 25
 source_lines = []
-for index in range(pattern_count, 0, -1):
-    token = "A" * index
-    source_lines.append(
-        json.dumps(
-            {
-                "entity": "DENSE",
-                "canonical_name": f"A{index}",
-                "surface_name": f"A{index}",
-                "regex": token,
-                "priority": pattern_count - index,
-            },
-            separators=(",", ":"),
+for entity in entities:
+    for index in range(pattern_count_per_entity, 0, -1):
+        token = "A" * index
+        source_lines.append(
+            json.dumps(
+                {
+                    "entity": entity,
+                    "canonical_name": f"{entity}_A{index}",
+                    "surface_name": f"{entity}_A{index}",
+                    "regex": token,
+                    "priority": pattern_count_per_entity - index,
+                },
+                separators=(",", ":"),
+            )
         )
-    )
 source = ("\n".join(source_lines) + "\n").encode()
 haystack = b"A" * doc_bytes
 
@@ -152,25 +156,61 @@ def measure(label, func):
     }
 
 
-default_bank = _engine.Bank.from_source_bytes(source, format_hint="jsonl")
-overlap_bank = _engine.Bank.from_source_bytes(
-    source,
-    format_hint="jsonl",
-    compile_options_json='{"match_mode":"all_overlaps"}',
-)
+def mode(options=None):
+    return _engine.Bank.from_source_bytes(source, format_hint="jsonl", compile_options_json=options)
+
+
+def metadata_profile(bank):
+    metadata = bank.metadata()["match_mode"]
+    return {key: metadata[key] for key in ("name", "status", "production_default", "internal_only")}
+
+
+def raw_tuples(buffer):
+    return [buffer[index] for index in range(len(buffer))]
+
+
+default_bank = mode()
+overlap_bank = mode('{"match_mode":"all_overlaps"}')
+global_bank = mode('{"match_mode":"global_leftmost"}')
 entity = measure("entity_independent", lambda: default_bank.scan_bytes(haystack))
+global_leftmost = measure("global_leftmost_internal_baseline", lambda: global_bank.scan_bytes(haystack))
 raw = measure("all_overlaps_raw", lambda: overlap_bank.scan_bytes(haystack))
 reconstructed = measure(
     "all_overlaps_raw_plus_exact_leftmost_reconstruction",
     lambda: overlap_bank.scan_bytes_leftmost_from_all_overlaps(haystack),
 )
+semantics_source = b"""
+{"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
+{"entity":"PROJECT","canonical_name":"Samba","surface_name":"Samba","regex":"Samba","priority":0}
+"""
+semantics_default = _engine.Bank.from_source_bytes(semantics_source, format_hint="jsonl")
+semantics_global = _engine.Bank.from_source_bytes(
+    semantics_source,
+    format_hint="jsonl",
+    compile_options_json='{"match_mode":"global_leftmost"}',
+)
 summary = {
-    "bank": {"entities": 1, "patterns": pattern_count, "pattern_lengths": [1, pattern_count]},
+    "bank": {
+        "entities": len(entities),
+        "patterns": len(entities) * pattern_count_per_entity,
+        "pattern_lengths": [1, pattern_count_per_entity],
+    },
     "document_bytes": doc_bytes,
     "iterations": iterations,
-    "measurements": [entity, raw, reconstructed],
+    "match_mode_metadata": {
+        "entity_independent": metadata_profile(default_bank),
+        "all_overlaps": metadata_profile(overlap_bank),
+        "global_leftmost": metadata_profile(global_bank),
+    },
+    "measurements": [entity, global_leftmost, raw, reconstructed],
+    "global_to_entity_count_ratio": round(global_leftmost["count"] / entity["count"], 3),
     "raw_to_entity_count_ratio": round(raw["count"] / entity["count"], 3),
     "raw_to_reconstructed_count_ratio": round(raw["count"] / reconstructed["count"], 3),
+    "semantic_probe": {
+        "text": "Samba ships",
+        "entity_independent": raw_tuples(semantics_default.scan_bytes(b"Samba ships")),
+        "global_leftmost": raw_tuples(semantics_global.scan_bytes(b"Samba ships")),
+    },
 }
 print(json.dumps(summary, indent=2, sort_keys=True))
 PY
@@ -181,48 +221,88 @@ Output:
 ```json
 {
   "bank": {
-    "entities": 1,
+    "entities": 2,
     "pattern_lengths": [1, 32],
-    "patterns": 32
+    "patterns": 64
   },
   "document_bytes": 512,
+  "global_to_entity_count_ratio": 0.5,
   "iterations": 25,
+  "match_mode_metadata": {
+    "all_overlaps": {
+      "internal_only": true,
+      "name": "all_overlaps",
+      "production_default": false,
+      "status": "internal_prototype"
+    },
+    "entity_independent": {
+      "internal_only": false,
+      "name": "entity_independent",
+      "production_default": true,
+      "status": "production_default"
+    },
+    "global_leftmost": {
+      "internal_only": true,
+      "name": "global_leftmost",
+      "production_default": false,
+      "status": "internal_benchmark_only"
+    }
+  },
   "measurements": [
+    {
+      "count": 32,
+      "count_stable": true,
+      "label": "entity_independent",
+      "median_seconds": 0.000016,
+      "min_seconds": 0.00001
+    },
     {
       "count": 16,
       "count_stable": true,
-      "label": "entity_independent",
-      "median_seconds": 0.000005,
+      "label": "global_leftmost_internal_baseline",
+      "median_seconds": 0.000009,
       "min_seconds": 0.000005
     },
     {
-      "count": 15888,
+      "count": 31776,
       "count_stable": true,
       "label": "all_overlaps_raw",
-      "median_seconds": 0.001666,
-      "min_seconds": 0.001513
+      "median_seconds": 0.004303,
+      "min_seconds": 0.003907
     },
     {
-      "count": 16,
+      "count": 32,
       "count_stable": true,
       "label": "all_overlaps_raw_plus_exact_leftmost_reconstruction",
-      "median_seconds": 0.001735,
-      "min_seconds": 0.001637
+      "median_seconds": 0.004465,
+      "min_seconds": 0.004384
     }
   ],
   "raw_to_entity_count_ratio": 993.0,
-  "raw_to_reconstructed_count_ratio": 993.0
+  "raw_to_reconstructed_count_ratio": 993.0,
+  "semantic_probe": {
+    "entity_independent": [
+      [0, 0, 3],
+      [1, 0, 5]
+    ],
+    "global_leftmost": [
+      [0, 0, 3]
+    ],
+    "text": "Samba ships"
+  }
 }
 ```
 
-Interpretation: raw `all_overlaps` is feasible on the smoke fixture, but dense overlap can multiply materialized matches
-by three orders of magnitude. Exact leftmost reconstruction currently measures raw overlap cost and then reruns the
-entity-independent shards; the incremental median cost in this probe was about 0.000069 seconds after the raw scan, but
-the important finding is semantic: raw candidates alone do not preserve enough ordered-alternation information to prove
-leftmost-first conformance. The reconstruction measurement is exact only when the raw overlapping scan fits the current
-`MatchBuffer` pre-scan capacity cap. The Slice 6 raw prototype also rejects Unicode word-boundary assertions; explicit
-ASCII word boundaries are available, and Unicode boundary behavior remains covered by `entity_independent` unless a later
-issue adds a measured fallback.
+Interpretation: `global_leftmost` is the fastest internal scan baseline in this smoke probe, but it is faster partly
+because it drops valid cross-entity matches. Its output count is half of the production `entity_independent` count on the
+two-entity fixture, and the semantic probe shows `PROJECT/Samba` disappearing when `PERSON/Sam` wins the overlapping
+region. Raw `all_overlaps` is feasible on the smoke fixture, but dense overlap can multiply materialized matches by three
+orders of magnitude. Exact leftmost reconstruction currently measures raw overlap cost and then reruns the
+entity-independent shards; the important finding remains semantic: raw candidates alone do not preserve enough
+ordered-alternation information to prove leftmost-first conformance. The reconstruction measurement is exact only when
+the raw overlapping scan fits the current `MatchBuffer` pre-scan capacity cap. The Slice 6 raw prototype also rejects
+Unicode word-boundary assertions; explicit ASCII word boundaries are available, and Unicode boundary behavior remains
+covered by `entity_independent` unless a later issue adds a measured fallback.
 
 ## Benchmark Commands
 

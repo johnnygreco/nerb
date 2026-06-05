@@ -20,6 +20,7 @@ pub struct NativeEngine {
     detectors: Vec<DetectorMetadata>,
     shards: Vec<MatcherShard>,
     all_overlaps: Option<AllOverlapsMatcher>,
+    global_leftmost: Option<GlobalLeftmostMatcher>,
 }
 
 #[derive(Clone, Debug)]
@@ -46,12 +47,30 @@ struct AllOverlapsMatcher {
     local_to_detector: Vec<u32>,
 }
 
+#[derive(Clone, Debug)]
+struct GlobalLeftmostMatcher {
+    regex: Regex,
+    local_to_detector: Vec<u32>,
+}
+
 impl NativeEngine {
     pub fn compile(canonical: &CanonicalBank, match_mode: MatchMode) -> Result<Self> {
         let detectors = detector_metadata(canonical)?;
-        let shards = compile_entity_independent(canonical)?;
+        let shards = if matches!(
+            match_mode,
+            MatchMode::EntityIndependent | MatchMode::AllOverlaps
+        ) {
+            compile_entity_independent(canonical)?
+        } else {
+            Vec::new()
+        };
         let all_overlaps = if match_mode == MatchMode::AllOverlaps {
             Some(compile_all_overlaps(canonical)?)
+        } else {
+            None
+        };
+        let global_leftmost = if match_mode == MatchMode::GlobalLeftmost {
+            Some(compile_global_leftmost(canonical)?)
         } else {
             None
         };
@@ -60,11 +79,16 @@ impl NativeEngine {
             detectors,
             shards,
             all_overlaps,
+            global_leftmost,
         })
     }
 
     pub fn detectors(&self) -> &[DetectorMetadata] {
         &self.detectors
+    }
+
+    pub fn match_mode(&self) -> MatchMode {
+        self.match_mode
     }
 
     pub fn scan_bytes(&self, haystack: &[u8]) -> Result<NativeMatchBuffer> {
@@ -91,10 +115,13 @@ impl NativeEngine {
                 haystack,
                 buffer,
             ),
-            MatchMode::GlobalLeftmost => Err(validation(
-                "/compile_options/match_mode",
-                "Bank.scan_bytes does not implement global_leftmost yet",
-            )),
+            MatchMode::GlobalLeftmost => scan_global_leftmost(
+                self.global_leftmost
+                    .as_ref()
+                    .expect("global_leftmost matcher must exist for global_leftmost mode"),
+                haystack,
+                buffer,
+            ),
         };
         if result.is_err() {
             buffer.clear();
@@ -245,6 +272,31 @@ fn scan_all_overlaps(
     Ok(())
 }
 
+fn scan_global_leftmost(
+    matcher: &GlobalLeftmostMatcher,
+    haystack: &[u8],
+    buffer: &mut NativeMatchBuffer,
+) -> Result<()> {
+    for raw_match in matcher.regex.find_iter(haystack) {
+        let local_index = raw_match.pattern().as_usize();
+        let Some(&detector_index) = matcher.local_to_detector.get(local_index) else {
+            return Err(validation(
+                "/engine/global_leftmost/local_to_detector",
+                format!(
+                    "regex engine returned local pattern index {local_index} outside detector map"
+                ),
+            ));
+        };
+        buffer.push(RawMatch::new(
+            detector_index,
+            raw_match.start() as u64,
+            raw_match.end() as u64,
+        )?)?;
+    }
+    buffer.sort();
+    Ok(())
+}
+
 fn detector_metadata(canonical: &CanonicalBank) -> Result<Vec<DetectorMetadata>> {
     let mut detectors = Vec::new();
     for entity in &canonical.entities {
@@ -358,6 +410,61 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
     Ok(AllOverlapsMatcher {
         forward,
         reverse,
+        local_to_detector,
+    })
+}
+
+fn compile_global_leftmost(canonical: &CanonicalBank) -> Result<GlobalLeftmostMatcher> {
+    let mut patterns = Vec::new();
+    let mut pattern_paths = Vec::new();
+    let mut local_to_detector = Vec::new();
+    let mut next_detector_index = 0u32;
+    for entity in &canonical.entities {
+        for (pattern_index, pattern) in entity.patterns.iter().enumerate() {
+            patterns.push(parse_pattern_with_flags(
+                &entity.name,
+                pattern_index,
+                &pattern.regex,
+                &pattern.flags,
+            )?);
+            pattern_paths.push(pattern_path_by_index(&entity.name, pattern_index));
+            local_to_detector.push(next_detector_index);
+            next_detector_index = next_detector_index.checked_add(1).ok_or_else(|| {
+                validation(
+                    "/entities",
+                    "detector count exceeds u32::MAX and cannot be represented in raw matches",
+                )
+            })?;
+        }
+    }
+
+    let regex = Regex::builder()
+        .configure(
+            Regex::config()
+                .match_kind(MatchKind::LeftmostFirst)
+                .nfa_size_limit(Some(ENTITY_INDEPENDENT_NFA_SIZE_LIMIT))
+                .onepass_size_limit(Some(ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT))
+                .hybrid_cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY)
+                .dfa_size_limit(Some(ENTITY_INDEPENDENT_DFA_SIZE_LIMIT))
+                .dfa_state_limit(Some(ENTITY_INDEPENDENT_DFA_STATE_LIMIT)),
+        )
+        .build_many_from_hir(&patterns)
+        .map_err(|error| {
+            let path = match error.pattern() {
+                Some(pattern_id) => pattern_paths
+                    .get(pattern_id.as_usize())
+                    .cloned()
+                    .unwrap_or_else(|| format!("/entities/patterns/{}", pattern_id.as_usize())),
+                None => "/entities".to_string(),
+            };
+            validation(
+                path,
+                format!("could not compile global_leftmost regex matcher: {error}"),
+            )
+        })?;
+
+    Ok(GlobalLeftmostMatcher {
+        regex,
         local_to_detector,
     })
 }
@@ -512,6 +619,24 @@ mod tests {
     }
 
     #[test]
+    fn global_leftmost_scan_collapses_cross_entity_overlap() {
+        let source = br#"{"PERSON":{"Sam":"Sam"},"PROJECT":{"Samba":"Samba"}}"#;
+        let default_bank = NativeBank::from_source_bytes(source, Some("json"), None).unwrap();
+        let global_bank = NativeBank::from_source_bytes(
+            source,
+            Some("json"),
+            Some(r#"{"match_mode":"global_leftmost"}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            raw_matches(default_bank, "Samba ships"),
+            [(0, 0, 3), (1, 0, 5)]
+        );
+        assert_eq!(raw_matches(global_bank, "Samba ships"), [(0, 0, 3)]);
+    }
+
+    #[test]
     fn scan_rejects_invalid_utf8() {
         let bank = NativeBank::from_source_bytes(br#"{"CODE":{"Alpha":"A"}}"#, Some("json"), None)
             .unwrap();
@@ -521,16 +646,25 @@ mod tests {
     }
 
     #[test]
-    fn future_match_modes_still_enforce_compile_limits() {
+    fn internal_match_modes_still_enforce_compile_limits() {
         let source =
             br#"{"entity":"CODE","canonical_name":"Bomb","surface_name":"Bomb","regex":"(?:a{1000000}){1000000}"}"#;
-        let error = NativeBank::from_source_bytes(
+        let all_overlaps_error = NativeBank::from_source_bytes(
             source,
             Some("jsonl"),
             Some(r#"{"match_mode":"all_overlaps"}"#),
         )
         .unwrap_err();
+        let global_leftmost_error = NativeBank::from_source_bytes(
+            source,
+            Some("jsonl"),
+            Some(r#"{"match_mode":"global_leftmost"}"#),
+        )
+        .unwrap_err();
 
-        assert!(error.to_string().contains("could not compile"));
+        assert!(all_overlaps_error.to_string().contains("could not compile"));
+        assert!(global_leftmost_error
+            .to_string()
+            .contains("could not compile"));
     }
 }
