@@ -42,6 +42,7 @@ from .config import (
 from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
 from .engine import Bank
+from .engines import DEFAULT_MAX_TEXT_BYTES
 from .evals import eval_bank as _eval_bank
 from .extraction import ExtractionError
 from .extraction import (
@@ -494,11 +495,18 @@ def _read_document_bytes(document: Path) -> bytes:
         _exit_error(f"Document path is not a file: {document}.")
 
     try:
+        document_size = document.stat().st_size
+    except OSError as exc:
+        _exit_error(f"Could not inspect document at {document}: {exc}")
+    if document_size > DEFAULT_MAX_TEXT_BYTES:
+        _exit_error(f"Document file exceeds the configured limit of {DEFAULT_MAX_TEXT_BYTES} bytes at {document}.")
+
+    try:
         document_bytes = document.read_bytes()
-    except UnicodeDecodeError as exc:
-        _exit_error(f"Document file is not valid UTF-8 at {document}: {exc}")
     except OSError as exc:
         _exit_error(f"Could not read document at {document}: {exc}")
+    if len(document_bytes) > DEFAULT_MAX_TEXT_BYTES:
+        _exit_error(f"Document file exceeds the configured limit of {DEFAULT_MAX_TEXT_BYTES} bytes at {document}.")
 
     try:
         document_bytes.decode("utf-8")

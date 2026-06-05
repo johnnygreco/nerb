@@ -274,7 +274,20 @@ def _load_eval_ref(
     options: EvalOptions,
     result: dict[str, Any],
 ) -> Iterable[tuple[int, Mapping[str, Any]]]:
-    path = _resolve_eval_ref_path(eval_ref, base_path)
+    path, resolution_diagnostic = _resolve_eval_ref_path(eval_ref, base_path)
+    if resolution_diagnostic is not None:
+        _append_failure(
+            result,
+            scope=scope,
+            eval_ref=eval_ref,
+            record_index=None,
+            record_type="eval_ref",
+            text=None,
+            expected=None,
+            actual=None,
+            diagnostics=[resolution_diagnostic],
+        )
+        return
     if path is None:
         code = EVAL_REF_UNSUPPORTED if _is_uri(eval_ref) else EVAL_REF_UNRESOLVED
         message = (
@@ -430,15 +443,44 @@ def _load_eval_ref(
         )
 
 
-def _resolve_eval_ref_path(eval_ref: str, base_path: Path | None) -> Path | None:
+def _resolve_eval_ref_path(eval_ref: str, base_path: Path | None) -> tuple[Path | None, Diagnostic | None]:
     if _is_uri(eval_ref):
-        return None
+        return None, None
+    try:
+        eval_ref.encode("utf-8")
+    except UnicodeEncodeError:
+        return None, diagnostic(
+            DIAGNOSTIC_ERROR,
+            EVAL_REF_UNRESOLVED,
+            "",
+            "Eval refs must be encodable as UTF-8.",
+            metadata={"eval_ref": _sanitize_failure_string(eval_ref)},
+        )
     path = Path(eval_ref).expanduser()
     if path.is_absolute():
-        return path
+        return None, diagnostic(
+            DIAGNOSTIC_ERROR,
+            EVAL_REF_UNRESOLVED,
+            "",
+            "Eval refs must be relative paths under the eval base path.",
+            metadata={"eval_ref": eval_ref},
+        )
     if base_path is None:
-        return None
-    return base_path / path
+        return None, None
+
+    resolved_base = base_path.expanduser().resolve()
+    resolved_path = (resolved_base / path).resolve()
+    try:
+        resolved_path.relative_to(resolved_base)
+    except ValueError:
+        return None, diagnostic(
+            DIAGNOSTIC_ERROR,
+            EVAL_REF_UNRESOLVED,
+            "",
+            "Eval refs must stay within the eval base path.",
+            metadata={"eval_ref": eval_ref, "base_path": str(resolved_base)},
+        )
+    return resolved_path, None
 
 
 def _is_uri(eval_ref: str) -> bool:

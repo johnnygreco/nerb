@@ -10,6 +10,7 @@ import pytest
 from click.exceptions import Exit
 from typer.testing import CliRunner
 
+import nerb.cli as cli_module
 from nerb import (
     Bank,
     apply_bank_patches,
@@ -302,7 +303,7 @@ def test_json_bank_extraction_commands_match_helpers(tmp_path, test_data_path):
     bank = _load_json(bank_path)
     text = "Send this to Acme Corp today."
     document_path = tmp_path / "email.txt"
-    document_path.write_text(text, encoding="utf-8")
+    document_path.write_bytes("Café\r\nAcme Corp today.".encode())
 
     clear_bank_cache()
     text_result = runner.invoke(app, ["extract-text", "--bank", str(bank_path), "--text", text])
@@ -323,6 +324,8 @@ def test_json_bank_extraction_commands_match_helpers(tmp_path, test_data_path):
     assert json.loads(text_result.output) == expected_text
     assert json.loads(file_result.output) == expected_file
     assert json.loads(report_result.output) == expected_report
+    assert json.loads(file_result.output)["records"][0]["start"] == 7
+    assert json.loads(file_result.output)["source"]["bytes"] == 23
 
 
 def test_json_bank_cli_enforces_text_source_rules(tmp_path, test_data_path):
@@ -731,6 +734,21 @@ def test_extract_file_preserves_original_utf8_byte_offsets_with_crlf(tmp_path):
             "offset_unit": "byte",
         }
     ]
+
+
+def test_config_extract_rejects_oversized_file_before_read(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli_module, "DEFAULT_MAX_TEXT_BYTES", 4)
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "document.txt"
+    document_path.write_text("Rush!", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["extract", "ARTIST", str(document_path), "--config", str(config_path), "--format", "json"],
+    )
+
+    assert result.exit_code == 1
+    assert "configured limit of 4 bytes" in result.output
 
 
 def test_extract_stdin_preserves_original_utf8_byte_offsets(monkeypatch, tmp_path):

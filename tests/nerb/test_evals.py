@@ -459,6 +459,35 @@ def test_eval_bank_relative_refs_require_base_path(minimal_bank):
     assert result["failures"][0]["diagnostics"][0]["code"] == EVAL_REF_UNRESOLVED
 
 
+def test_eval_bank_rejects_absolute_eval_refs(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "absolute.jsonl"
+    _write_jsonl(eval_ref_path, [_positive_record()])
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [str(eval_ref_path)]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"]["passed"] is False
+    failure = result["failures"][0]
+    assert failure["diagnostics"][0]["code"] == EVAL_REF_UNRESOLVED
+    assert "relative paths" in failure["diagnostics"][0]["message"]
+
+
+def test_eval_bank_rejects_parent_traversal_eval_refs(tmp_path, minimal_bank):
+    base_path = tmp_path / "base"
+    base_path.mkdir()
+    _write_jsonl(tmp_path / "outside.jsonl", [_positive_record()])
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = ["../outside.jsonl"]
+
+    result = eval_bank(minimal_bank, base_path=base_path)
+
+    assert result["summary"]["passed"] is False
+    failure = result["failures"][0]
+    assert failure["diagnostics"][0]["code"] == EVAL_REF_UNRESOLVED
+    assert "within the eval base path" in failure["diagnostics"][0]["message"]
+
+
 def test_eval_bank_remote_refs_are_deferred_not_fetched(minimal_bank):
     pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
     pattern["eval_refs"] = ["https://example.com/acme.jsonl"]

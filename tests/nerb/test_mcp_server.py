@@ -7,6 +7,7 @@ from importlib.metadata import entry_points
 import pytest
 from typer.testing import CliRunner
 
+import nerb.mcp_server as mcp_server_module
 from nerb import (
     Bank,
     clear_bank_cache,
@@ -199,8 +200,8 @@ def test_json_bank_mcp_extraction_and_reports_match_helpers(tmp_path, test_data_
     bank = _load_json(bank_path)
     text = "Send this to Acme Corp today."
     document_path = tmp_path / "email.txt"
-    document_path.write_text(text, encoding="utf-8")
-    documents = [{"document_id": "email_0", "text": text}]
+    document_path.write_bytes("Café\r\nAcme Corp today.".encode())
+    documents = [{"document_id": "email_0", "file_path": str(document_path)}]
 
     clear_bank_cache()
     text_result = extract_text(text, bank_path=str(bank_path))
@@ -233,6 +234,9 @@ def test_json_bank_mcp_extraction_and_reports_match_helpers(tmp_path, test_data_
     assert report_result == expected_report
     assert file_report_result == expected_file_report
     assert report_batch_result == expected_report_batch
+    assert file_result["records"][0]["start"] == 7
+    assert file_result["source"]["bytes"] == 23
+    assert batch_result["documents"][0]["records"][0]["start"] == 7
     assert explain_match("customer", "acme_corp", "primary", bank=bank) == explain_match_helper(
         bank,
         "customer",
@@ -415,7 +419,15 @@ def test_mcp_config_extraction_reuses_rust_bank_cache(tmp_path):
     assert after_second["hits"] == 1
     assert cleared == {
         "cleared": True,
-        "cache": {"size": 0, "source_key_count": 0, "hits": 0, "misses": 0, "keys": []},
+        "cache": {
+            "size": 0,
+            "source_key_count": 0,
+            "max_entries": 128,
+            "max_source_keys": 256,
+            "hits": 0,
+            "misses": 0,
+            "keys": [],
+        },
     }
 
 
@@ -495,6 +507,16 @@ def test_mcp_file_extraction_preserves_original_utf8_byte_offsets_with_crlf(tmp_
             "offset_unit": "byte",
         }
     ]
+
+
+def test_mcp_config_extract_rejects_oversized_file_before_read(monkeypatch, tmp_path):
+    monkeypatch.setattr(mcp_server_module, "DEFAULT_MAX_TEXT_BYTES", 4)
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "document.txt"
+    document_path.write_text("Rush!", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="configured limit of 4 bytes"):
+        extract_entity(str(config_path), "ARTIST", file_path=str(document_path))
 
 
 def test_mcp_tools_report_invalid_config_and_regex(tmp_path):

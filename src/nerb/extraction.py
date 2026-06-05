@@ -48,20 +48,15 @@ def extract_file(
 ) -> dict[str, Any]:
     """Extract rich JSON-bank records from a UTF-8 text file."""
     path = Path(file_path).expanduser()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ExtractionError(f"Could not read extraction source file {str(path)!r}: {exc}.") from exc
-
     resolved = resolve_extraction_options(options)
-    _ensure_text_limit(text, resolved.max_text_bytes)
+    text, byte_count = _read_utf8_file(path, max_bytes=resolved.max_text_bytes)
     compiled, cache_hit = compile_bank(bank, options=options)
     _ensure_bank_status_extractable(compiled.bank, resolved.include_statuses)
     records = _extract_records(compiled, text)
     return {
         "bank": _bank_metadata(compiled),
         "engine": _engine_metadata(compiled, cache_hit),
-        "source": _file_source_metadata(path, text),
+        "source": _file_source_metadata(path, text, byte_count),
         "records": records,
     }
 
@@ -91,14 +86,18 @@ def _prepare_batch_documents(
             f"Batch extraction accepts at most {resolved.max_batch_documents} documents; got {len(documents)}."
         )
 
-    prepared_documents = [_prepare_batch_document(index, document) for index, document in enumerate(documents)]
-    combined_bytes = sum(_text_size_bytes(text) for _, _, text in prepared_documents)
-    if combined_bytes > resolved.max_batch_text_bytes:
-        raise ExtractionError(
-            f"Batch extraction text exceeds the configured combined limit of {resolved.max_batch_text_bytes} bytes."
+    prepared_documents: list[tuple[str, dict[str, Any], str]] = []
+    combined_bytes = 0
+    for index, document in enumerate(documents):
+        prepared_document, byte_count = _prepare_batch_document(
+            index,
+            document,
+            max_text_bytes=resolved.max_text_bytes,
+            max_batch_text_bytes=resolved.max_batch_text_bytes,
+            current_batch_text_bytes=combined_bytes,
         )
-    for _, _, text in prepared_documents:
-        _ensure_text_limit(text, resolved.max_text_bytes)
+        combined_bytes += byte_count
+        prepared_documents.append(prepared_document)
 
     return prepared_documents, combined_bytes
 
@@ -237,11 +236,18 @@ def _text_source_metadata(text: str) -> dict[str, Any]:
     return {"type": "text", "length": len(text), "bytes": _text_size_bytes(text)}
 
 
-def _file_source_metadata(path: Path, text: str) -> dict[str, Any]:
-    return {"type": "file", "path": str(path), "length": len(text), "bytes": _text_size_bytes(text)}
+def _file_source_metadata(path: Path, text: str, byte_count: int) -> dict[str, Any]:
+    return {"type": "file", "path": str(path), "length": len(text), "bytes": byte_count}
 
 
-def _prepare_batch_document(index: int, document: Mapping[str, Any]) -> tuple[str, dict[str, Any], str]:
+def _prepare_batch_document(
+    index: int,
+    document: Mapping[str, Any],
+    *,
+    max_text_bytes: int,
+    max_batch_text_bytes: int,
+    current_batch_text_bytes: int,
+) -> tuple[tuple[str, dict[str, Any], str], int]:
     if not isinstance(document, Mapping):
         raise TypeError("Batch documents must be objects.")
 
@@ -258,17 +264,51 @@ def _prepare_batch_document(index: int, document: Mapping[str, Any]) -> tuple[st
         text = document["text"]
         if not isinstance(text, str):
             raise TypeError("Batch document text must be a string.")
-        return document_id, {"type": "text", "length": len(text), "bytes": _text_size_bytes(text)}, text
+        byte_count = _text_size_bytes(text)
+        _ensure_byte_limit(byte_count, max_text_bytes)
+        _ensure_batch_byte_limit(current_batch_text_bytes, byte_count, max_batch_text_bytes)
+        return (document_id, {"type": "text", "length": len(text), "bytes": byte_count}, text), byte_count
 
     file_path = document["file_path"]
     if not isinstance(file_path, (str, Path)):
         raise TypeError("Batch document file_path must be a string or Path.")
     path = Path(file_path).expanduser()
+    file_size = _file_size(path)
+    _ensure_batch_byte_limit(current_batch_text_bytes, file_size, max_batch_text_bytes)
+    text, byte_count = _read_utf8_file(path, max_bytes=max_text_bytes, known_size=file_size)
+    return (document_id, _file_source_metadata(path, text, byte_count), text), byte_count
+
+
+def _read_utf8_file(path: Path, *, max_bytes: int, known_size: int | None = None) -> tuple[str, int]:
+    byte_count = _file_size(path) if known_size is None else known_size
+    _ensure_byte_limit(byte_count, max_bytes)
     try:
-        text = path.read_text(encoding="utf-8")
+        data = path.read_bytes()
     except OSError as exc:
         raise ExtractionError(f"Could not read extraction source file {str(path)!r}: {exc}.") from exc
-    return document_id, _file_source_metadata(path, text), text
+    if len(data) > max_bytes:
+        _ensure_byte_limit(len(data), max_bytes)
+    try:
+        return data.decode("utf-8"), len(data)
+    except UnicodeDecodeError as exc:
+        raise ExtractionError(f"Extraction source file {str(path)!r} is not valid UTF-8: {exc}.") from exc
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError as exc:
+        raise ExtractionError(f"Could not inspect extraction source file {str(path)!r}: {exc}.") from exc
+
+
+def _ensure_byte_limit(byte_count: int, max_bytes: int) -> None:
+    if byte_count > max_bytes:
+        raise ExtractionError(f"Extraction text exceeds the configured limit of {max_bytes} bytes.")
+
+
+def _ensure_batch_byte_limit(current_bytes: int, document_bytes: int, max_bytes: int) -> None:
+    if current_bytes + document_bytes > max_bytes:
+        raise ExtractionError(f"Batch extraction text exceeds the configured combined limit of {max_bytes} bytes.")
 
 
 def _batch_record_sort_key(record: MatchRecord) -> tuple[str, int, int, str, str, str, str]:

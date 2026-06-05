@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -193,14 +194,29 @@ def test_regex_numeric_backreferences_are_rejected_by_rust_regex_profile(minimal
     assert any("backreferences are not supported" in diagnostic["message"] for diagnostic in exc_info.value.diagnostics)
 
 
-def test_extract_file_uses_file_source_metadata(tmp_path, minimal_bank):
+def test_extract_file_uses_original_file_bytes_for_metadata_and_offsets(tmp_path, minimal_bank):
     source_path = tmp_path / "source.txt"
-    source_path.write_text("Acme Corp\n", encoding="utf-8")
+    source_path.write_bytes("Café\r\nAcme Corp".encode())
 
     result = extract_file(minimal_bank, source_path)
 
-    assert result["source"] == {"type": "file", "path": str(source_path), "length": 10, "bytes": 10}
+    assert result["source"] == {"type": "file", "path": str(source_path), "length": 15, "bytes": 16}
     assert result["records"][0]["string"] == "Acme Corp"
+    assert result["records"][0]["start"] == 7
+    assert result["records"][0]["end"] == 16
+
+
+def test_extract_file_rejects_oversized_file_before_read(monkeypatch, tmp_path, minimal_bank):
+    source_path = tmp_path / "source.txt"
+    source_path.write_text("Acme Corp", encoding="utf-8")
+
+    def fail_read_bytes(self):
+        raise AssertionError("oversized files must be rejected before content is read")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
+    with pytest.raises(ExtractionError, match="configured limit"):
+        extract_file(minimal_bank, source_path, options={"max_text_bytes": 4})
 
 
 def test_extract_batch_groups_documents_and_sorts_flat_records(minimal_bank):
@@ -216,6 +232,20 @@ def test_extract_batch_groups_documents_and_sorts_flat_records(minimal_bank):
     assert "document_id" not in result["documents"][0]["records"][0]
     assert [record["document_id"] for record in result["records"]] == ["a_doc", "b_doc"]
     assert result["summary"] == {"document_count": 2, "record_count": 2, "documents_with_records": 2}
+
+
+def test_extract_batch_file_documents_preserve_original_file_bytes(tmp_path, minimal_bank):
+    source_path = tmp_path / "source.txt"
+    source_path.write_bytes("Café\r\nAcme Corp".encode())
+
+    result = extract_batch(minimal_bank, [{"document_id": "file_doc", "file_path": source_path}])
+
+    document = result["documents"][0]
+    assert document["source"] == {"type": "file", "path": str(source_path), "length": 15, "bytes": 16}
+    assert document["records"][0]["start"] == 7
+    assert document["records"][0]["end"] == 16
+    assert result["records"][0]["document_id"] == "file_doc"
+    assert result["records"][0]["start"] == 7
 
 
 def test_extract_batch_rejects_invalid_document_ids_and_generates_valid_default(minimal_bank):

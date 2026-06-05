@@ -121,17 +121,19 @@ def test_extract_report_shape_defaults_summary_explanation_and_context(minimal_b
 
 def test_extract_report_file_preserves_file_source_metadata(tmp_path, minimal_bank):
     document_path = tmp_path / "email.txt"
-    document_path.write_text("Send Acme Corp now.", encoding="utf-8")
+    document_path.write_bytes("Café\r\nAcme Corp now.".encode())
 
-    report = extract_report_file(minimal_bank, document_path, options={"context_chars": 5})
+    report = extract_report_file(minimal_bank, document_path, options={"context_chars": 10})
 
     assert report["source"] == {
         "type": "file",
         "path": str(document_path),
-        "length": 19,
-        "bytes": 19,
+        "length": 20,
+        "bytes": 21,
     }
-    assert report["resolved_records"][0]["context"] == {"before": "Send ", "match": "Acme Corp", "after": " now."}
+    assert report["records"][0]["start"] == 7
+    assert report["records"][0]["end"] == 16
+    assert report["resolved_records"][0]["context"] == {"before": "Café\r\n", "match": "Acme Corp", "after": " now."}
 
 
 def test_report_uses_rust_leftmost_first_records_before_report_resolution(minimal_bank):
@@ -369,12 +371,11 @@ def test_extract_report_batch_reuses_file_text_snapshot(monkeypatch, tmp_path, m
     source_path.write_text("unused", encoding="utf-8")
     calls: list[Path] = []
 
-    def fake_read_text(path: Path, encoding: str | None = None) -> str:
-        del encoding
+    def fake_read_bytes(path: Path) -> bytes:
         calls.append(path)
-        return "Acme Corp" if len(calls) == 1 else "ZZZZZZZZZ"
+        return b"Acme Corp" if len(calls) == 1 else b"ZZZZZZZZZ"
 
-    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
 
     report = extract_report_batch(
         minimal_bank,

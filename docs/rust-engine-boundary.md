@@ -282,9 +282,9 @@ Example key shape:
 {
   "bank_hash": "sha256:...",
   "schema_version": 1,
-  "semantic_version": "0.0.5",
+  "semantic_version": "0.0.6",
   "engine_name": "nerb_engine",
-  "engine_version": "0.0.5",
+  "engine_version": "0.0.6",
   "canonical_engine": "rust-regex-meta",
   "compile_options": {"match_mode": "entity_independent"},
   "target_triple": "x86_64-linux-gnu",
@@ -295,7 +295,8 @@ Example key shape:
 ```
 
 `use_cache=False` bypasses lookup and insertion for callers that need isolated compilation. `clear_bank_cache()` clears
-only this process. The cache does not serialize matcher state, write engine artifacts, or add a disk cache.
+only this process. The process-local cache uses bounded LRU eviction and reports `max_entries` plus `max_source_keys` in
+`bank_cache_info()`. The cache does not serialize matcher state, write engine artifacts, or add a disk cache.
 
 The config-backed MCP extraction tools return the same per-extraction cache metadata and expose `engine_cache_info` plus
 `clear_engine_cache` for process-local diagnostics.

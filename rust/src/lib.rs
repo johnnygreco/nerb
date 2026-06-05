@@ -1,4 +1,4 @@
-use pyo3::exceptions::{PyIndexError, PyOSError, PyRuntimeError};
+use pyo3::exceptions::{PyIndexError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
 use std::fs;
@@ -14,6 +14,8 @@ mod match_buffer;
 
 use bank::NativeBank;
 use match_buffer::{NativeMatchBuffer, RawMatch};
+
+const MAX_SCAN_PATH_BYTES: u64 = 10 * 1024 * 1024;
 
 fn ffi_boundary<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(operation)) {
@@ -237,9 +239,23 @@ impl PyBank {
 }
 
 fn read_scan_path(path: &str) -> PyResult<Vec<u8>> {
-    fs::read(path).map_err(|error| {
+    let metadata = fs::metadata(path).map_err(|error| {
+        PyOSError::new_err(format!("Could not inspect document path {path:?}: {error}"))
+    })?;
+    if metadata.len() > MAX_SCAN_PATH_BYTES {
+        return Err(PyValueError::new_err(format!(
+            "Document path {path:?} exceeds the configured limit of {MAX_SCAN_PATH_BYTES} bytes"
+        )));
+    }
+    let haystack = fs::read(path).map_err(|error| {
         PyOSError::new_err(format!("Could not read document path {path:?}: {error}"))
-    })
+    })?;
+    if haystack.len() as u64 > MAX_SCAN_PATH_BYTES {
+        return Err(PyValueError::new_err(format!(
+            "Document path {path:?} exceeds the configured limit of {MAX_SCAN_PATH_BYTES} bytes"
+        )));
+    }
+    Ok(haystack)
 }
 
 #[pyclass(name = "MatchBuffer")]
