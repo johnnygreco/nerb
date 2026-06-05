@@ -56,8 +56,9 @@ Pass criteria for each workload:
   including the small-bank floor.
 - Rust `entity_independent` raw-scan and scan/project timings stay under checked-in ceilings, and Rust scan/project
   throughput stays above checked-in floors:
-  - small-bank floor: scan/project <= 0.01s, raw scan <= 0.005s, scan/project >= 1 MB/s;
-  - literal-heavy and regex-heavy: scan/project <= 0.05s, raw scan <= 0.02s, scan/project >= 5 MB/s.
+  - small-bank floor: `entity_independent` scan/project <= 0.01s, raw scan <= 0.005s, scan/project >= 1 MB/s;
+  - literal-heavy and regex-heavy: `entity_independent` scan/project <= 0.05s, raw scan <= 0.02s,
+    scan/project >= 5 MB/s.
 
 Stage coverage:
 
@@ -127,9 +128,10 @@ The sweep also gates order-tens performance in two ways:
   entity scan-time ratio must remain under 40x. The routine report measured 0.000248s for the 32-entity scan and a
   16.533x 32-to-2 ratio.
 - Routine-size sparse no-match probe: 2-entity and 32-entity banks scan the configured target bytes, avoiding
-  `all_overlaps` output amplification while bounding `entity_independent` entity/document scaling. The 32-entity scan
-  must remain under 0.05s and the 32-to-2 ratio under 40x. The routine 100 KB report measured 0.000115s for the
-  32-entity scan and a 10.455x ratio. The 1 MB evidence measured 0.001338s and a 12.164x ratio.
+  `all_overlaps` output amplification while bounding `entity_independent` entity/document scaling. The 32-entity
+  `entity_independent` scan must remain under 0.05s and the 32-to-2 `entity_independent` ratio under 40x. The routine
+  100 KB report measured 0.000115s for the 32-entity scan and a 10.455x ratio. The 1 MB evidence measured 0.001338s and
+  a 12.164x ratio.
 
 Mode decision: keep `entity_independent` as the production default for the current Rust engine path and the synthetic
 order-tens entity-cardinality evidence above. `all_overlaps` remains a measured prototype and `global_leftmost` remains
