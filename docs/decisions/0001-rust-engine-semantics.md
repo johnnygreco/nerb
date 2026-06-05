@@ -95,15 +95,15 @@ separate product decision. Native metadata labels it `internal_benchmark_only` w
 ### Regex Profile
 
 The Rust regex profile rejects constructs that require a backtracking engine, including backreferences and lookaround.
-Existing Python validation may accept some of these patterns because they are valid Python `re`; those cases are
-deliberate migration divergences. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture categories for the
-conformance and validation gates even when the current Python path can compile them.
+Earlier Python validation accepted some of these patterns because they were valid Python `re`; those cases are deliberate
+migration divergences. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture categories for the conformance
+and validation gates even when the removed Python path could compile them.
 
 Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The direct migration set is
 `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`; unsupported flags fail validation.
 
-`add_word_boundaries` remains a first-class bank option, but Rust canonicalization must apply it with explicit boundary
-rules instead of the current string substitution trick.
+`word_boundaries` remains a first-class `Bank.from_config` and compile-option behavior, and Rust canonicalization applies
+it with explicit boundary rules rather than Python-side regex string substitution.
 
 ## Entity Cardinality Assumption
 
@@ -157,7 +157,7 @@ indexes in this baseline schema.
 
 ## Required Conformance Fixture Categories
 
-The differential conformance suite must cover these categories before Rust matching can replace Python matching:
+The conformance suite covers these categories as evidence for the Rust-backed matching contract:
 
 - non-ASCII text before a match, proving character-to-byte offset conversion;
 - cross-entity overlap;

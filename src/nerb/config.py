@@ -19,6 +19,7 @@ __all__ = [
     "FLAGS_KEY",
     "PatternConfig",
     "add_entity_pattern",
+    "ensure_rust_config_compatible",
     "load_config",
     "load_yaml_config",
     "remove_entity_pattern",
@@ -49,33 +50,10 @@ def _yaml_dumper():
     return getattr(yaml, "CSafeDumper", yaml.SafeDumper)
 
 
-def _known_regex_flag_bits() -> int:
-    """Return the bitmask containing every known re.RegexFlag bit."""
-    known_bits = 0
-    for flag in re.RegexFlag:
-        known_bits |= flag.value
-    return known_bits
-
-
-def _validate_regex_flag_bits(flags: int) -> None:
-    """Raise ConfigError when an integer flag bitmask contains unknown bits."""
-    unknown_bits = flags & ~_known_regex_flag_bits()
-    if unknown_bits:
-        raise ConfigError(f"{flags!r} contains unknown regex flag bits: {unknown_bits!r}.")
-
-
 def _validate_detector_name(entity: str, name: str) -> str:
     """Validate a detector name accepted by Rust-backed config extraction."""
     del entity
     return name
-
-
-def _validate_regex_pattern(entity: str, name: str, pattern: str, flags: re.RegexFlag) -> None:
-    """Compile a regex pattern so invalid detector patterns fail during config validation."""
-    try:
-        re.compile(pattern, flags=flags)
-    except (re.error, ValueError) as exc:
-        raise ConfigError(f"Pattern {name!r} for entity {entity!r} is not a valid regex pattern: {exc}.") from exc
 
 
 def _default_user_config_path() -> Path:
@@ -123,22 +101,18 @@ def validate_regex_flags(flags: Any) -> re.RegexFlag:
     """
     Validate regex flags from config and return a combined ``re.RegexFlag``.
 
-    Flags can be stored as an integer bitmask, a single flag name such as ``IGNORECASE``,
-    or a list of flag names/integers such as ``[IGNORECASE, MULTILINE]``.
+    Flags must be Rust-supported flag names such as ``IGNORECASE`` or a list of flag
+    names such as ``[IGNORECASE, MULTILINE]``. Integer bitmasks are not accepted
+    because Rust-backed canonicalization preserves flag names, not Python ``re`` bits.
     """
     if isinstance(flags, bool):
-        raise ConfigError("Regex flags must be an integer, string, or list; booleans are not valid flags.")
+        raise ConfigError("Regex flags must be a string or list of flag names; booleans are not valid flags.")
 
     if isinstance(flags, re.RegexFlag):
-        _validate_regex_flag_bits(flags.value)
-        return flags
+        raise ConfigError("Regex flags must use string flag names; Python RegexFlag values are not accepted.")
 
     if isinstance(flags, int):
-        _validate_regex_flag_bits(flags)
-        try:
-            return re.RegexFlag(flags)
-        except ValueError as exc:
-            raise ConfigError(f"{flags!r} is not a valid regex flag bitmask.") from exc
+        raise ConfigError("Regex flags must use string flag names; integer bitmasks are not accepted.")
 
     if isinstance(flags, str):
         flag_name = flags.strip()
@@ -164,7 +138,7 @@ def validate_regex_flags(flags: Any) -> re.RegexFlag:
             combined_flags |= validate_regex_flags(flag)
         return combined_flags
 
-    raise ConfigError("Regex flags must be an integer, string, or list.")
+    raise ConfigError("Regex flags must be a string or list of flag names.")
 
 
 def validate_pattern_config(config: Any) -> PatternConfig:
@@ -183,8 +157,8 @@ def validate_pattern_config(config: Any) -> PatternConfig:
         if not isinstance(entity_config, Mapping):
             raise ConfigError(f"Entity {entity!r} must map to pattern names and regex strings.")
 
-        raw_flags = entity_config.get(FLAGS_KEY, 0)
-        regex_flags = validate_regex_flags(raw_flags)
+        raw_flags = entity_config.get(FLAGS_KEY, [])
+        validate_regex_flags(raw_flags)
         validated_entity: dict[str, Any] = {}
         pattern_count = 0
         for name, pattern in entity_config.items():
@@ -199,7 +173,6 @@ def validate_pattern_config(config: Any) -> PatternConfig:
                 raise ConfigError(f"Pattern {name!r} for entity {entity!r} must be a regex string.")
 
             _validate_detector_name(entity, name)
-            _validate_regex_pattern(entity, name, pattern, regex_flags)
             validated_entity[name] = pattern
             pattern_count += 1
 
@@ -208,14 +181,21 @@ def validate_pattern_config(config: Any) -> PatternConfig:
 
         validated_config[entity] = validated_entity
 
-    if validated_config:
-        try:
-            from .engine import Bank
+    return validated_config
 
-            Bank.from_config(validated_config, use_cache=False)
-        except ValueError as exc:
-            raise ConfigError(f"Detector config is not compatible with the Rust engine: {exc}.") from exc
 
+def ensure_rust_config_compatible(config: Any) -> PatternConfig:
+    """Validate config shape and compile it once with the Rust-backed Bank API."""
+    validated_config = validate_pattern_config(config)
+    if not validated_config:
+        return validated_config
+
+    try:
+        from .engine import Bank
+
+        Bank.from_config(validated_config, use_cache=False)
+    except ValueError as exc:
+        raise ConfigError(f"Detector config is not compatible with the Rust engine: {exc}.") from exc
     return validated_config
 
 
@@ -240,7 +220,7 @@ def load_yaml_config(file_path: str | Path) -> PatternConfig:
 def save_config(config: Any, file_path: str | Path) -> Path:
     """Validate and atomically save a detector config to YAML using stable insertion order."""
     config_path = Path(file_path).expanduser()
-    validated_config = validate_pattern_config(config)
+    validated_config = ensure_rust_config_compatible(config)
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = None
@@ -301,7 +281,6 @@ def add_entity_pattern(
         raise ConfigError("Patterns must be regex strings.")
 
     _validate_detector_name(entity, name)
-    _validate_regex_pattern(entity, name, pattern, re.RegexFlag(0))
 
     updated_config = validate_pattern_config(config)
     entity_config = dict(updated_config.get(entity, {}))

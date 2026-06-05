@@ -29,6 +29,7 @@ from .config import (
     ConfigError,
     PatternConfig,
     add_entity_pattern,
+    ensure_rust_config_compatible,
     remove_entity_pattern,
     resolve_default_config_path,
     save_config,
@@ -432,6 +433,10 @@ def _mutation_response(action: str, path: Path, config: PatternConfig, entity: s
 def validate_config(config_path: str) -> dict[str, Any]:
     """Validate a detector YAML config file. Reads only the provided config_path."""
     path, pattern_config = _load_tool_config(config_path)
+    try:
+        ensure_rust_config_compatible(pattern_config)
+    except ConfigError as exc:
+        _raise_tool_error(f"Config is invalid at {path}: {exc}")
     return {"valid": True, "path": str(path), **_config_summary(pattern_config)}
 
 

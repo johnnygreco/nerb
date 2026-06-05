@@ -162,10 +162,10 @@ def _standalone_compile(pattern: RegexPattern) -> tuple[re.Pattern[str] | None, 
         return _compile_regex(pattern), None
     except re.error as exc:
         return None, diagnostic(
-            DIAGNOSTIC_ERROR,
+            DIAGNOSTIC_WARNING,
             REGEX_COMPILE_ERROR,
             pattern.path,
-            f"Regex pattern failed to compile for validation: {exc}.",
+            f"Regex pattern could not be parsed by Python validation probes: {exc}.",
             metadata={"entity_id": pattern.entity_id, "name_id": pattern.name_id, "pattern_id": pattern.pattern_id},
         )
 
@@ -196,10 +196,10 @@ def _normalization_diagnostics(pattern: RegexPattern, normalization: str) -> lis
     except re.error as exc:
         diagnostics.append(
             diagnostic(
-                DIAGNOSTIC_ERROR,
+                DIAGNOSTIC_WARNING,
                 REGEX_NORMALIZATION_COMPILE_ERROR,
                 pattern.path,
-                f"Regex pattern fails to compile after {normalization} normalization: {exc}.",
+                f"Regex pattern could not be parsed by Python normalization probes after {normalization}: {exc}.",
                 metadata={"normalization": normalization},
             )
         )
@@ -497,7 +497,7 @@ def _rust_engine_diagnostics(bank: Mapping[str, Any]) -> list[Diagnostic]:
     from .engine import Bank
 
     try:
-        Bank.from_source_bytes(
+        native_bank = Bank.from_source_bytes(
             json.dumps(bank, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
                 "utf-8"
             ),
@@ -511,6 +511,23 @@ def _rust_engine_diagnostics(bank: Mapping[str, Any]) -> list[Diagnostic]:
                 "engine.compile_error",
                 "",
                 f"Rust engine failed to compile the bank: {exc}.",
+            )
+        ]
+    empty_records = native_bank.scan_text("")
+    if empty_records:
+        first_record = empty_records[0]
+        return [
+            diagnostic(
+                DIAGNOSTIC_ERROR,
+                REGEX_MATCHES_EMPTY,
+                "",
+                "Rust engine detector matches the empty string.",
+                suggested_fix="Require at least one concrete character in the regex before extraction.",
+                metadata={
+                    "entity": first_record.get("entity"),
+                    "canonical_name": first_record.get("canonical_name"),
+                    "surface_name": first_record.get("surface_name"),
+                },
             )
         ]
     return []
@@ -587,17 +604,6 @@ def _runtime_validation(
             continue
         if compiled is None:
             continue
-
-        if compiled.search("") is not None:
-            diagnostics.append(
-                diagnostic(
-                    DIAGNOSTIC_ERROR,
-                    REGEX_MATCHES_EMPTY,
-                    pattern.path,
-                    "Regex pattern matches the empty string.",
-                    suggested_fix="Require at least one concrete character in the regex.",
-                )
-            )
 
         if level in {"standard", "deep"}:
             diagnostics.extend(_static_risk_diagnostics(pattern, strict=strict))

@@ -52,20 +52,25 @@ def test_load_config_rejects_schema_errors(tmp_path):
         load_config(config_path)
 
 
-def test_load_config_rejects_invalid_regex_pattern(tmp_path):
+def test_load_config_preserves_regex_syntax_for_rust_engine_validation(tmp_path):
     config_path = tmp_path / "entities.yaml"
     config_path.write_text("ARTIST:\n  Coheed: '('\n", encoding="utf-8")
 
-    with pytest.raises(ConfigError, match="not a valid regex pattern"):
-        load_config(config_path)
+    assert load_config(config_path) == {"ARTIST": {"Coheed": "("}}
 
 
-def test_load_config_rejects_regexes_outside_rust_profile(tmp_path):
+def test_save_config_rejects_regexes_outside_rust_profile(tmp_path):
     config_path = tmp_path / "entities.yaml"
-    config_path.write_text("ARTIST:\n  Code: '([A-Z]+)-" + r"\1" + "'\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match="not compatible with the Rust engine"):
-        load_config(config_path)
+        save_config({"ARTIST": {"Code": r"([A-Z]+)-\1"}}, config_path)
+
+
+def test_load_config_accepts_rust_regex_syntax_that_python_re_cannot_parse(tmp_path):
+    config_path = tmp_path / "entities.yaml"
+    config_path.write_text("ARTIST:\n  Rush: '(?<label>Rush)'\n", encoding="utf-8")
+
+    assert load_config(config_path) == {"ARTIST": {"Rush": "(?<label>Rush)"}}
 
 
 def test_load_config_accepts_detector_names_that_are_not_regex_group_names(tmp_path):
@@ -103,14 +108,13 @@ def test_add_entity_pattern_refuses_and_replaces_duplicates():
     assert config == {"ARTIST": {"Coheed": "Coheed"}}
 
 
-def test_add_entity_pattern_rejects_reserved_name_and_invalid_regex():
+def test_add_entity_pattern_rejects_reserved_name_and_preserves_pattern_syntax():
     config = {"ARTIST": {"Coheed": "Coheed"}}
 
     with pytest.raises(ConfigError, match="reserved"):
         add_entity_pattern(config, "ARTIST", "_flags", "IGNORECASE")
 
-    with pytest.raises(ConfigError, match="not a valid regex pattern"):
-        add_entity_pattern(config, "ARTIST", "Rush", "(")
+    assert add_entity_pattern(config, "ARTIST", "Rush", "(") == {"ARTIST": {"Coheed": "Coheed", "Rush": "("}}
 
 
 def test_add_entity_pattern_preserves_names_that_only_differ_by_spaces_and_underscores():
@@ -144,7 +148,7 @@ def test_validate_regex_flags():
 
 
 def test_validate_regex_flags_rejects_unknown_integer_bits():
-    with pytest.raises(ConfigError, match="unknown regex flag bits"):
+    with pytest.raises(ConfigError, match="integer bitmasks"):
         validate_regex_flags(512)
 
 

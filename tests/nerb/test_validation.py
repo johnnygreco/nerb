@@ -107,6 +107,16 @@ def test_basic_validation_reports_standalone_regex_compile_errors(minimal_bank):
     assert "regex.compile_error" in _codes(result)
 
 
+def test_validation_allows_rust_regex_syntax_that_python_re_cannot_parse(minimal_bank):
+    _add_regex(minimal_bank, "unicode_upper", r"\p{Lu}+")
+
+    result = validate_bank(minimal_bank)
+
+    assert result["valid"] is True
+    assert "regex.compile_error" in _codes(result)
+    assert all(diagnostic["severity"] != "error" for diagnostic in result["diagnostics"])
+
+
 def test_validate_bank_returns_schema_diagnostics_for_non_json_compatible_bank(minimal_bank):
     minimal_bank["metadata"]["bad"] = object()
 

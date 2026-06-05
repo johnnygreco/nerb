@@ -31,6 +31,7 @@ from .config import (
     ConfigError,
     PatternConfig,
     add_entity_pattern,
+    ensure_rust_config_compatible,
     load_config,
     remove_entity_pattern,
     resolve_default_config_path,
@@ -1527,6 +1528,7 @@ def validate_config(
 
     try:
         pattern_config = load_config(config_path)
+        ensure_rust_config_compatible(pattern_config)
     except ConfigError as exc:
         _exit_error(f"Config is invalid at {config_path}: {exc}")
     except OSError as exc:

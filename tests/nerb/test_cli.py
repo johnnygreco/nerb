@@ -762,8 +762,8 @@ def test_extract_reports_invalid_config(tmp_path):
     result = runner.invoke(app, ["extract", "ARTIST", "--text", "Pink Floyd", "--config", str(config_path)])
 
     assert result.exit_code == 1
-    assert f"Could not load config at {config_path}" in result.output
-    assert "not a valid regex pattern" in result.output
+    assert "Could not compile detectors with the Rust engine" in result.output
+    assert "regex parse error" in result.output
 
 
 def test_extract_reports_invalid_yaml_config(tmp_path):
@@ -786,8 +786,8 @@ def test_extract_reports_invalid_inline_regex(monkeypatch, tmp_path):
     )
 
     assert result.exit_code == 1
-    assert "Could not add inline detector ARTIST:Broken" in result.output
-    assert "not a valid regex pattern" in result.output
+    assert "Could not compile detectors with the Rust engine" in result.output
+    assert "regex parse error" in result.output
 
 
 def test_extract_reports_malformed_inline_pattern(monkeypatch, tmp_path):
@@ -871,9 +871,9 @@ def test_test_literal_detector_reports_invalid_regex_without_config_write(monkey
     )
 
     assert result.exit_code == 1
-    assert "Could not compile inline detector ARTIST:Broken" in result.output
-    assert "not a valid regex pattern" in result.output
-    assert "position 0" in result.output
+    assert "Could not compile detectors with the Rust engine" in result.output
+    assert "regex parse error" in result.output
+    assert "unclosed group" in result.output
     assert not config_path.exists()
 
 
@@ -961,8 +961,8 @@ def test_doctor_reports_valid_and_invalid_config_json(tmp_path):
     payload = json.loads(result.output)
     assert payload["valid"] is False
     assert payload["summary"]["errors"] == 1
-    assert payload["diagnostics"][0]["code"] == "validation_error"
-    assert "not a valid regex pattern" in payload["diagnostics"][0]["message"]
+    assert payload["diagnostics"][0]["code"] == "compile_error"
+    assert "regex parse error" in payload["diagnostics"][0]["message"]
 
 
 def test_doctor_accepts_names_that_only_differ_by_spaces_and_underscores(tmp_path):
@@ -1233,7 +1233,7 @@ def test_validate_reports_success_and_invalid_config(tmp_path):
 
     assert result.exit_code == 1
     assert f"Config is invalid at {invalid_config_path}" in result.output
-    assert "not a valid regex pattern" in result.output
+    assert "regex parse error" in result.output
 
 
 def test_validate_reports_missing_config(tmp_path):

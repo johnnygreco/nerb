@@ -119,6 +119,14 @@ def test_regex_records_use_pattern_id_as_surface_name_without_capture_projection
     ]
 
 
+def test_json_bank_extraction_accepts_rust_regex_syntax_that_python_re_cannot_parse(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"named_capture": _regex_pattern(r"(?<label>ACME)")})
+
+    result = extract_text(minimal_bank, "abc ACME")
+
+    assert [(record["pattern_id"], record["string"]) for record in result["records"]] == [("named_capture", "ACME")]
+
+
 def test_unicode_normalization_modes_are_rejected_until_supported_by_rust_engine(minimal_bank):
     minimal_bank["unicode_normalization"] = "NFC"
     _set_customer_patterns(minimal_bank, {"accented": _regex_pattern("Café")})

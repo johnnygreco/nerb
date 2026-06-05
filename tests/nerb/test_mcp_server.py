@@ -504,14 +504,14 @@ def test_mcp_tools_report_invalid_config_and_regex(tmp_path):
     with pytest.raises(ToolError) as invalid_config_error:
         validate_config(str(invalid_config_path))
 
-    assert f"Could not load config at {invalid_config_path}" in str(invalid_config_error.value)
-    assert "not a valid regex pattern" in str(invalid_config_error.value)
+    assert f"Config is invalid at {invalid_config_path}" in str(invalid_config_error.value)
+    assert "regex parse error" in str(invalid_config_error.value)
 
     with pytest.raises(ToolError) as invalid_regex_error:
         extract_inline({"ARTIST": {"Broken": "("}}, text="Pink Floyd")
 
-    assert "Inline detector definitions are invalid" in str(invalid_regex_error.value)
-    assert "not a valid regex pattern" in str(invalid_regex_error.value)
+    assert "Could not compile detectors with the Rust engine" in str(invalid_regex_error.value)
+    assert "regex parse error" in str(invalid_regex_error.value)
 
 
 def test_mcp_tools_report_invalid_inline_detector_definitions():

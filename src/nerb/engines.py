@@ -166,18 +166,6 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
         )
         return compiled, False
 
-    from .validation import validate_bank
-
-    validation_result = validate_bank(
-        extractable_bank,
-        level="standard",
-        engine=resolved.engine,
-        check_engine_compile=False,
-    )
-    validation_diagnostics = validation_result["diagnostics"]
-    if has_errors(validation_diagnostics):
-        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", validation_diagnostics)
-
     compile_options_json = _canonical_options(resolved.engine_options)
     try:
         native_bank = Bank.from_source_bytes(
@@ -196,6 +184,10 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
         ]
         message = f"Bank failed Rust engine validation and cannot be extracted: {exc}."
         raise ExtractionError(message, diagnostics) from exc
+
+    empty_match_diagnostics = _empty_match_diagnostics(native_bank)
+    if empty_match_diagnostics:
+        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", empty_match_diagnostics)
 
     cache_metadata = native_bank.cache_metadata()
     cache_key = cache_metadata.get("key") if isinstance(cache_metadata, Mapping) else None
@@ -218,6 +210,27 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
         detector_index=_json_bank_detector_index(extractable_bank),
     )
     return compiled, bool(cache_metadata.get("hit"))
+
+
+def _empty_match_diagnostics(native_bank: Bank) -> list[Diagnostic]:
+    records = native_bank.scan_text("")
+    if not records:
+        return []
+    first_record = records[0]
+    return [
+        diagnostic(
+            DIAGNOSTIC_ERROR,
+            "regex.matches_empty",
+            "",
+            "Rust engine detector matches the empty string.",
+            suggested_fix="Require at least one concrete character in the regex before extraction.",
+            metadata={
+                "entity": first_record.get("entity"),
+                "canonical_name": first_record.get("canonical_name"),
+                "surface_name": first_record.get("surface_name"),
+            },
+        )
+    ]
 
 
 def _positive_int_option(options: Mapping[str, Any], key: str, default: int) -> int:
