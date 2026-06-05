@@ -3,7 +3,7 @@ name = "nerb_engine"
 version = "0.0.6"
 edition = "2021"
 description = "Native Rust engine skeleton for NERB"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/johnnygreco/nerb"
 
 [lib]

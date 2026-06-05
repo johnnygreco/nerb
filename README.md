@@ -1,7 +1,7 @@
 # Named Entity Regex Builder (NERB)
 
 [![CI](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml/badge.svg)](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml)
-[![License](https://img.shields.io/github/license/johnnygreco/nerb?style=flat)](https://github.com/johnnygreco/nerb/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/johnnygreco/nerb/blob/main/LICENSE)
 
 NERB is a Python package, CLI, and MCP server for validated named-entity regex banks. It lets you define curated entity
 names and aliases, validate them before use, scan text locally with a Rust-backed engine, and return deterministic
