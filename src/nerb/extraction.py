@@ -3,6 +3,7 @@ from __future__ import annotations
 # Standard library
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any
 
 # Project
@@ -276,6 +277,7 @@ def _prepare_batch_document(
     file_size = _file_size(path)
     _ensure_batch_byte_limit(current_batch_text_bytes, file_size, max_batch_text_bytes)
     text, byte_count = _read_utf8_file(path, max_bytes=max_text_bytes, known_size=file_size)
+    _ensure_batch_byte_limit(current_batch_text_bytes, byte_count, max_batch_text_bytes)
     return (document_id, _file_source_metadata(path, text, byte_count), text), byte_count
 
 
@@ -283,7 +285,8 @@ def _read_utf8_file(path: Path, *, max_bytes: int, known_size: int | None = None
     byte_count = _file_size(path) if known_size is None else known_size
     _ensure_byte_limit(byte_count, max_bytes)
     try:
-        data = path.read_bytes()
+        with path.open("rb") as file:
+            data = file.read(max_bytes + 1)
     except OSError as exc:
         raise ExtractionError(f"Could not read extraction source file {str(path)!r}: {exc}.") from exc
     if len(data) > max_bytes:
@@ -296,9 +299,12 @@ def _read_utf8_file(path: Path, *, max_bytes: int, known_size: int | None = None
 
 def _file_size(path: Path) -> int:
     try:
-        return path.stat().st_size
+        metadata = path.stat()
     except OSError as exc:
         raise ExtractionError(f"Could not inspect extraction source file {str(path)!r}: {exc}.") from exc
+    if not S_ISREG(metadata.st_mode):
+        raise ExtractionError(f"Extraction source file {str(path)!r} must be a regular file.")
+    return metadata.st_size
 
 
 def _ensure_byte_limit(byte_count: int, max_bytes: int) -> None:

@@ -488,6 +488,18 @@ def test_eval_bank_rejects_parent_traversal_eval_refs(tmp_path, minimal_bank):
     assert "within the eval base path" in failure["diagnostics"][0]["message"]
 
 
+def test_eval_bank_reports_invalid_eval_ref_path_resolution(tmp_path, minimal_bank):
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = ["bad\0ref.jsonl"]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"]["passed"] is False
+    failure = result["failures"][0]
+    assert failure["diagnostics"][0]["code"] == EVAL_REF_UNRESOLVED
+    assert "Could not resolve eval ref" in failure["diagnostics"][0]["message"]
+
+
 def test_eval_bank_remote_refs_are_deferred_not_fetched(minimal_bank):
     pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
     pattern["eval_refs"] = ["https://example.com/acme.jsonl"]

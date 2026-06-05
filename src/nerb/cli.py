@@ -502,7 +502,8 @@ def _read_document_bytes(document: Path) -> bytes:
         _exit_error(f"Document file exceeds the configured limit of {DEFAULT_MAX_TEXT_BYTES} bytes at {document}.")
 
     try:
-        document_bytes = document.read_bytes()
+        with document.open("rb") as file:
+            document_bytes = file.read(DEFAULT_MAX_TEXT_BYTES + 1)
     except OSError as exc:
         _exit_error(f"Could not read document at {document}: {exc}")
     if len(document_bytes) > DEFAULT_MAX_TEXT_BYTES:

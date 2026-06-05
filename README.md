@@ -16,10 +16,9 @@ pip install --upgrade nerb
 nerb --help
 ```
 
-The current source tree contains the Rust-backed engine. Until a release is cut from this tree, use a source checkout
-for the current Rust-backed CLI/API. Release builds from this tree are configured to publish prebuilt CPython wheels for
-Linux x86_64 (`manylinux_2_28`), macOS universal2 (x86_64 and arm64), and Windows x86_64 for Python 3.10 through 3.14.
-Other platforms can install from the source distribution and need a Rust toolchain available on `PATH`.
+Published wheels include the Rust-backed engine for Linux x86_64 (`manylinux_2_28`), macOS universal2 (x86_64 and
+arm64), and Windows x86_64 for Python 3.10 through 3.14. Other platforms can install from the source distribution and
+need a Rust toolchain available on `PATH`.
 
 From a source checkout:
 

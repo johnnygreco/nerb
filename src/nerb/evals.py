@@ -468,8 +468,17 @@ def _resolve_eval_ref_path(eval_ref: str, base_path: Path | None) -> tuple[Path 
     if base_path is None:
         return None, None
 
-    resolved_base = base_path.expanduser().resolve()
-    resolved_path = (resolved_base / path).resolve()
+    try:
+        resolved_base = base_path.expanduser().resolve()
+        resolved_path = (resolved_base / path).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, diagnostic(
+            DIAGNOSTIC_ERROR,
+            EVAL_REF_UNRESOLVED,
+            "",
+            f"Could not resolve eval ref {_sanitize_failure_string(eval_ref)!r}: {exc}.",
+            metadata={"eval_ref": _sanitize_failure_string(eval_ref)},
+        )
     try:
         resolved_path.relative_to(resolved_base)
     except ValueError:

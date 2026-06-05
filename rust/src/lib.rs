@@ -2,6 +2,7 @@ use pyo3::exceptions::{PyIndexError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
 use std::fs;
+use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 mod bank;
@@ -242,14 +243,23 @@ fn read_scan_path(path: &str) -> PyResult<Vec<u8>> {
     let metadata = fs::metadata(path).map_err(|error| {
         PyOSError::new_err(format!("Could not inspect document path {path:?}: {error}"))
     })?;
+    if !metadata.file_type().is_file() {
+        return Err(PyValueError::new_err(format!(
+            "Document path {path:?} must be a regular file"
+        )));
+    }
     if metadata.len() > MAX_SCAN_PATH_BYTES {
         return Err(PyValueError::new_err(format!(
             "Document path {path:?} exceeds the configured limit of {MAX_SCAN_PATH_BYTES} bytes"
         )));
     }
-    let haystack = fs::read(path).map_err(|error| {
+    let file = fs::File::open(path).map_err(|error| {
         PyOSError::new_err(format!("Could not read document path {path:?}: {error}"))
     })?;
+    let mut haystack = Vec::new();
+    file.take(MAX_SCAN_PATH_BYTES + 1)
+        .read_to_end(&mut haystack)
+        .map_err(|error| PyOSError::new_err(format!("Could not read document path {path:?}: {error}")))?;
     if haystack.len() as u64 > MAX_SCAN_PATH_BYTES {
         return Err(PyValueError::new_err(format!(
             "Document path {path:?} exceeds the configured limit of {MAX_SCAN_PATH_BYTES} bytes"

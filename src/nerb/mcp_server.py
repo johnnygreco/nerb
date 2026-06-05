@@ -357,7 +357,8 @@ def _read_text_source(text: str | None, file_path: str | None) -> tuple[str | by
         _raise_tool_error(f"Document file exceeds the configured limit of {DEFAULT_MAX_TEXT_BYTES} bytes at {path}.")
 
     try:
-        document_bytes = path.read_bytes()
+        with path.open("rb") as file:
+            document_bytes = file.read(DEFAULT_MAX_TEXT_BYTES + 1)
     except OSError as exc:
         _raise_tool_error(f"Could not read document at {path}: {exc}")
     if len(document_bytes) > DEFAULT_MAX_TEXT_BYTES:

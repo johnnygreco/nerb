@@ -210,13 +210,55 @@ def test_extract_file_rejects_oversized_file_before_read(monkeypatch, tmp_path, 
     source_path = tmp_path / "source.txt"
     source_path.write_text("Acme Corp", encoding="utf-8")
 
-    def fail_read_bytes(self):
+    def fail_open(self, *args, **kwargs):
         raise AssertionError("oversized files must be rejected before content is read")
 
-    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    monkeypatch.setattr(Path, "open", fail_open)
 
     with pytest.raises(ExtractionError, match="configured limit"):
         extract_file(minimal_bank, source_path, options={"max_text_bytes": 4})
+
+
+def test_extract_file_uses_bounded_read_when_stat_size_is_stale(monkeypatch, tmp_path, minimal_bank):
+    source_path = tmp_path / "source.txt"
+    source_path.write_bytes(b"Acme Corp")
+    actual_mode = source_path.stat().st_mode
+    original_stat = Path.stat
+
+    class StaleStat:
+        st_mode = actual_mode
+        st_size = 1
+
+    class FakeFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, size=-1):
+            assert size == 5
+            return b"x" * size
+
+    def stale_stat(self, *args, **kwargs):
+        if self == source_path:
+            return StaleStat()
+        return original_stat(self, *args, **kwargs)
+
+    def fake_open(self, *args, **kwargs):
+        assert self == source_path
+        return FakeFile()
+
+    monkeypatch.setattr(Path, "stat", stale_stat)
+    monkeypatch.setattr(Path, "open", fake_open)
+
+    with pytest.raises(ExtractionError, match="configured limit"):
+        extract_file(minimal_bank, source_path, options={"max_text_bytes": 4})
+
+
+def test_extract_file_rejects_non_regular_file(tmp_path, minimal_bank):
+    with pytest.raises(ExtractionError, match="regular file"):
+        extract_file(minimal_bank, tmp_path)
 
 
 def test_extract_batch_groups_documents_and_sorts_flat_records(minimal_bank):
@@ -246,6 +288,31 @@ def test_extract_batch_file_documents_preserve_original_file_bytes(tmp_path, min
     assert document["records"][0]["end"] == 16
     assert result["records"][0]["document_id"] == "file_doc"
     assert result["records"][0]["start"] == 7
+
+
+def test_extract_batch_rechecks_file_batch_limit_after_read(monkeypatch, tmp_path, minimal_bank):
+    source_path = tmp_path / "source.txt"
+    source_path.write_bytes(b"Acme Corp")
+    actual_mode = source_path.stat().st_mode
+    original_stat = Path.stat
+
+    class StaleStat:
+        st_mode = actual_mode
+        st_size = 1
+
+    def stale_stat(self, *args, **kwargs):
+        if self == source_path:
+            return StaleStat()
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stale_stat)
+
+    with pytest.raises(ExtractionError, match="combined limit"):
+        extract_batch(
+            minimal_bank,
+            [{"document_id": "prefix", "text": "ok"}, {"document_id": "file_doc", "file_path": source_path}],
+            options={"max_batch_text_bytes": 5},
+        )
 
 
 def test_extract_batch_rejects_invalid_document_ids_and_generates_valid_default(minimal_bank):
