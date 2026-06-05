@@ -121,20 +121,21 @@ Final routine 100 KB report highlights:
 | mixed | 181 | 0.000660s | 151.5 MB/s |
 
 The mixed corpus-size gate passed at 10 KB and 100 KB in the routine report. The 1 MB report passed with 1,805 records,
-0.002440s scan/project median, and 409.8 MB/s scan/project throughput.
+0.002356s scan/project median, and 424.4 MB/s scan/project throughput.
 
 The final entity-cardinality sweep separates dense overlap stress from the production medium-bank target. Dense prefix
 stress validates semantic reconstruction through 64 synthetic entity classes, with 8 dense prefix detectors per entity
 over 256 bytes. At 64 entities, `entity_independent` emitted 2,048 production matches, raw `all_overlaps` emitted
-129,280 matches, and `global_leftmost` emitted 32 matches. The 64-to-2 dense scan ratio was 35.111x under the 80x
+129,280 matches, and `global_leftmost` emitted 32 matches. The 64-to-2 dense scan ratio was 18.875x under the 80x
 ceiling.
 
 The production medium-bank case validates 1,000 top-level entities with 8 generated patterns per entity over the
-configured 100 KB sparse no-match document. The routine report measured 8,000 patterns, 1,000,000 source bytes,
-0.638117s native compile median, 0.003395s raw scan median, 0.008648s scan/project median, 11.6 MB/s scan/project
-throughput, and a 15.573x raw scan ratio from the 64-entity routine case to the 1,000-entity medium-bank case.
-The 1 MB evidence measured 0.794416s native compile median, 0.033708s raw scan median, 0.043460s scan/project median,
-23.0 MB/s scan/project throughput, and a 15.357x raw scan ratio from the 64-entity routine case to the 1,000-entity
+configured 100 KB sparse no-match document. The routine report measured 8,000 patterns, 1,000,000 JSONL bank-source
+bytes, 100,000 document bytes, 0.635903s native compile median, 0.003640s raw scan median, 0.008654s scan/project
+median, 11.6 MB/s scan/project throughput, and a 16.852x raw scan ratio from the 64-entity routine case to the
+1,000-entity medium-bank case.
+The 1 MB evidence measured 0.704808s native compile median, 0.034258s raw scan median, 0.043692s scan/project median,
+22.9 MB/s scan/project throughput, and a 16.137x raw scan ratio from the 64-entity routine case to the 1,000-entity
 medium-bank case.
 
 ## Slice 6/7 Native Mode Probe

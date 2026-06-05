@@ -21,6 +21,7 @@ CARDINALITY_SCAN_SECONDS_CEILING = 0.01
 CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING = 0.05
 DENSE_CARDINALITY_ENTITY_COUNT = 64
 MEDIUM_BANK_ENTITY_COUNT = 1_000
+MEDIUM_BANK_DOCUMENT_BYTES_FLOOR = 100_000
 MEDIUM_BANK_PATTERNS_PER_ENTITY = 8
 VALIDATED_ENTITY_COUNT = MEDIUM_BANK_ENTITY_COUNT
 CARDINALITY_SCALING_RATIO_CEILING = 80.0
@@ -758,7 +759,13 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
         _entity_cardinality_routine_case(entity_count, iterations, target_bytes)
         for entity_count in (2, DENSE_CARDINALITY_ENTITY_COUNT)
     ]
-    medium_bank_case = _medium_bank_cardinality_case(MEDIUM_BANK_ENTITY_COUNT, iterations, target_bytes)
+    medium_bank_target_bytes = max(target_bytes, MEDIUM_BANK_DOCUMENT_BYTES_FLOOR)
+    medium_bank_baseline_case = _entity_cardinality_routine_case(
+        DENSE_CARDINALITY_ENTITY_COUNT,
+        iterations,
+        medium_bank_target_bytes,
+    )
+    medium_bank_case = _medium_bank_cardinality_case(MEDIUM_BANK_ENTITY_COUNT, iterations, medium_bank_target_bytes)
     base_seconds = max(float(cases[0]["entity_independent"]["median_seconds"]), 0.000001)
     max_case = cases[-1]
     scaling_ratio = _ratio(max_case["entity_independent"]["median_seconds"], base_seconds)
@@ -767,7 +774,7 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
     routine_scaling_ratio = _ratio(routine_max_case["entity_independent"]["median_seconds"], routine_base_seconds)
     medium_to_routine_max_seconds_ratio = _ratio(
         medium_bank_case["entity_independent"]["median_seconds"],
-        max(float(routine_max_case["entity_independent"]["median_seconds"]), 0.000001),
+        max(float(medium_bank_baseline_case["entity_independent"]["median_seconds"]), 0.000001),
     )
     performance_criteria = {
         "max_dense_entity_independent_scan_seconds_under_ceiling": (
@@ -783,20 +790,16 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
             routine_scaling_ratio is not None and routine_scaling_ratio <= CARDINALITY_SCALING_RATIO_CEILING
         ),
         "medium_bank_compile_seconds_under_ceiling": (
-            medium_bank_case["rust_entity_independent_compile"]["median_seconds"]
-            <= MEDIUM_BANK_THRESHOLDS["compile_seconds_ceiling"]
+            medium_bank_case["criteria"]["compile_seconds_under_ceiling"] is True
         ),
         "medium_bank_raw_scan_seconds_under_ceiling": (
-            medium_bank_case["entity_independent"]["median_seconds"]
-            <= MEDIUM_BANK_THRESHOLDS["rust_raw_scan_seconds_ceiling"]
+            medium_bank_case["criteria"]["rust_raw_scan_seconds_under_ceiling"] is True
         ),
         "medium_bank_scan_project_seconds_under_ceiling": (
-            medium_bank_case["entity_independent_scan_project"]["median_seconds"]
-            <= MEDIUM_BANK_THRESHOLDS["rust_scan_project_seconds_ceiling"]
+            medium_bank_case["criteria"]["rust_scan_project_seconds_under_ceiling"] is True
         ),
         "medium_bank_scan_project_throughput_floor": (
-            medium_bank_case["rust_scan_project_bytes_per_second"]
-            >= MEDIUM_BANK_THRESHOLDS["rust_scan_project_bytes_per_second_floor"]
+            medium_bank_case["criteria"]["rust_scan_project_throughput_floor"] is True
         ),
         "medium_bank_to_routine_max_entity_scan_seconds_ratio_under_ceiling": (
             medium_to_routine_max_seconds_ratio is not None
@@ -812,6 +815,7 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
         "validated_entity_count_ceiling": VALIDATED_ENTITY_COUNT,
         "dense_entity_count_ceiling": DENSE_CARDINALITY_ENTITY_COUNT,
         "medium_bank_entity_count": MEDIUM_BANK_ENTITY_COUNT,
+        "medium_bank_document_bytes_floor": MEDIUM_BANK_DOCUMENT_BYTES_FLOOR,
         "entity_counts": [case["entity_count"] for case in cases] + [medium_bank_case["entity_count"]],
         "dense_entity_counts": [case["entity_count"] for case in cases],
         "routine_entity_counts": [case["entity_count"] for case in routine_cases] + [medium_bank_case["entity_count"]],
@@ -830,10 +834,12 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
         },
         "dense_cases": cases,
         "routine_size_cases": routine_cases,
+        "medium_bank_baseline_case": medium_bank_baseline_case,
         "medium_bank_case": medium_bank_case,
         "passed": (
             all(case["passed"] for case in cases)
             and all(case["passed"] for case in routine_cases)
+            and medium_bank_baseline_case["passed"]
             and medium_bank_case["passed"]
             and all(performance_criteria.values())
         ),
@@ -928,6 +934,15 @@ def _medium_bank_cardinality_case(entity_count: int, iterations: int, target_byt
     criteria = {
         "entity_count_stable": entity["count_stable"] is True,
         "scan_project_count_stable": scan_project["count_stable"] is True,
+        "compile_seconds_under_ceiling": compile_seconds["median_seconds"]
+        <= MEDIUM_BANK_THRESHOLDS["compile_seconds_ceiling"],
+        "rust_raw_scan_seconds_under_ceiling": entity["median_seconds"]
+        <= MEDIUM_BANK_THRESHOLDS["rust_raw_scan_seconds_ceiling"],
+        "rust_scan_project_seconds_under_ceiling": scan_project["median_seconds"]
+        <= MEDIUM_BANK_THRESHOLDS["rust_scan_project_seconds_ceiling"],
+        "rust_scan_project_throughput_floor": (
+            bytes_per_second >= MEDIUM_BANK_THRESHOLDS["rust_scan_project_bytes_per_second_floor"]
+        ),
     }
     return {
         "entity_count": entity_count,

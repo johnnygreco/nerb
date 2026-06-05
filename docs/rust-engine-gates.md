@@ -12,10 +12,10 @@ uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 1
 ```
 
 The report emits JSON with conformance, performance, dense-memory, mode-strategy, distribution, and bank-owner
-cardinality sections. The report only includes sections it measures directly in `overall.passed`: performance, dense
+cardinality sections. The default command includes directly measured sections in `overall.passed`: performance, dense
 memory, and mode strategy. Conformance and distribution are marked `external_required` and must be proven by the PR
 validation commands. Bank-owner cardinality is marked `external_required` unless the bank-owner entity-count flags are
-provided.
+provided; with those flags, it is included in `overall.passed` as a recorded count/range signoff.
 
 Routine local target documents are 100 KB and exercise small-bank, literal-heavy, regex-heavy, mixed-bank,
 corpus-size, dense-overlap, memory, cache, projection, and output behavior.
@@ -112,7 +112,7 @@ Routine 100 KB report, 5 iterations, final gate update:
 
 The mixed-bank corpus-size section measured the same mixed workload at 10 KB and 100 KB. Both cases passed the stable
 count and 5 MB/s throughput floor. The 1 MB evidence command measured the mixed corpus case at 1,000,000 bytes,
-0.002440s scan/project median, 1,805 records, and 409.8 MB/s scan/project throughput.
+0.002356s scan/project median, 1,805 records, and 424.4 MB/s scan/project throughput.
 
 ## Dense Memory And Mode Strategy
 
@@ -149,19 +149,20 @@ materializing amplified raw `all_overlaps` output.
 The sweep also gates production-default cardinality performance in three ways:
 
 - Dense 256-byte semantic probe: the max-entity `entity_independent` raw scan must remain under 0.01s and the
-  max-to-2 entity scan-time ratio must remain under 80x. The routine report measured 0.000316s for the 64-entity scan
-  and a 35.111x max-to-2 ratio.
+  max-to-2 entity scan-time ratio must remain under 80x. The routine report measured 0.000302s for the 64-entity scan
+  and an 18.875x max-to-2 ratio.
 - Routine-size sparse no-match probe: 2-entity and 64-entity banks scan the configured target bytes, avoiding
   `all_overlaps` output amplification while bounding `entity_independent` entity/document scaling. The 64-entity
   `entity_independent` scan must remain under 0.05s and the max-to-2 `entity_independent` ratio under 80x. The routine
-  100 KB report measured 0.000218s for the 64-entity scan and a 21.8x ratio. The 1 MB evidence measured a
-  13.981x routine max-to-2 ratio.
+  100 KB report measured 0.000214s for the 64-entity scan and a 21.4x ratio. The 1 MB evidence measured a
+  17.843x routine max-to-2 ratio.
 - Medium-bank sparse no-match probe: 1,000 entities with 8 generated patterns per entity scan the configured target
   bytes using the production default and public projection path. The routine 100 KB report measured 1,000 entities,
-  8,000 patterns, 1,000,000 source bytes, 0.638117s native compile median, 0.003395s raw scan median, 0.008648s
-  scan/project median, and 11.6 MB/s scan/project throughput. The 1,000-to-64 raw scan ratio was 15.573x, below the
-  40x ceiling. The 1 MB evidence measured 0.794416s native compile median, 0.033708s raw scan median, 0.043460s
-  scan/project median, 23.0 MB/s scan/project throughput, and a 15.357x 1,000-to-64 raw scan ratio.
+  8,000 patterns, 1,000,000 JSONL bank-source bytes, 100,000 document bytes, 0.635903s native compile median,
+  0.003640s raw scan median, 0.008654s scan/project median, and 11.6 MB/s scan/project throughput. The 1,000-to-64
+  raw scan ratio was 16.852x, below the 40x ceiling. The 1 MB evidence measured 0.704808s native compile median,
+  0.034258s raw scan median, 0.043692s scan/project median, 22.9 MB/s scan/project throughput, and a 16.137x
+  1,000-to-64 raw scan ratio.
 
 Mode decision: keep `entity_independent` as the production default for the current Rust engine path and the synthetic
 medium-bank entity-cardinality evidence above. `all_overlaps` remains a measured prototype and `global_leftmost` remains

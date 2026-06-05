@@ -77,6 +77,7 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["mode_strategy"]["entity_cardinality_sweep"]["validated_entity_count_ceiling"] == 1000
     assert report["mode_strategy"]["entity_cardinality_sweep"]["dense_entity_count_ceiling"] == 64
     assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_entity_count"] == 1000
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_document_bytes_floor"] == 100_000
     assert report["mode_strategy"]["entity_cardinality_sweep"]["entity_counts"] == [2, 8, 32, 64, 1000]
     assert report["mode_strategy"]["entity_cardinality_sweep"]["routine_entity_counts"] == [2, 64, 1000]
     assert report["mode_strategy"]["entity_cardinality_sweep"]["performance"]["criteria"] == {
@@ -99,8 +100,12 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert [
         case["document_bytes"] for case in report["mode_strategy"]["entity_cardinality_sweep"]["routine_size_cases"]
     ] == [10_000, 10_000]
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_baseline_case"]["entity_count"] == 64
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_baseline_case"]["document_bytes"] == 100_000
     assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_case"]["entity_count"] == 1000
     assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_case"]["pattern_count"] == 8000
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_case"]["document_bytes"] == 100_000
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_case"]["passed"] is True
     assert (
         report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_case"]["workload"]
         == "medium_bank_sparse_no_match"
@@ -183,6 +188,12 @@ def test_entity_cardinality_sweep_fails_when_routine_case_fails(monkeypatch):
             "entity_independent": _measurement(seconds=0.001),
             "entity_independent_scan_project": _measurement(seconds=0.001),
             "rust_scan_project_bytes_per_second": 10_000_000.0,
+            "criteria": {
+                "compile_seconds_under_ceiling": True,
+                "rust_raw_scan_seconds_under_ceiling": True,
+                "rust_scan_project_seconds_under_ceiling": True,
+                "rust_scan_project_throughput_floor": True,
+            },
         }
 
     monkeypatch.setattr(gate_report, "_entity_cardinality_case", dense_case)
