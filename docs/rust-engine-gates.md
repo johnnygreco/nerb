@@ -143,7 +143,8 @@ make build
 The report records package validation as `external_required`; the PR validation log is the authority for pass/fail
 status.
 
-Current supported distribution is the source distribution/source-build path with a Rust toolchain. Local `make build`
-also produces a platform wheel as a smoke artifact and runs `twine check --strict dist/*`, but this repository does not
-yet claim a supported PyPI wheel matrix. `docs/releasing.md` tracks the manylinux/macOS/Windows wheel matrix as future
-distribution work.
+Supported releases publish a source distribution plus CPython 3.10 through 3.14 wheels for Linux x86_64
+`manylinux_2_28`, macOS universal2 (x86_64 and arm64), and Windows x86_64. Other platforms use the source
+distribution and require a Rust toolchain. Local `make build` still builds and verifies the source distribution plus
+the local platform wheel; GitHub Actions is the authority for the full supported wheel matrix and no-Rust wheel install
+smoke tests, including both macOS slices for the universal2 artifact.

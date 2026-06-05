@@ -428,13 +428,15 @@ def _distribution_report() -> dict[str, Any]:
         "included_in_overall": False,
         "external_validation_artifacts": [
             "sdist",
-            "local platform wheel smoke artifact",
+            "supported prebuilt wheel matrix",
+            "no-Rust wheel install smoke tests",
             "twine check --strict dist/*",
         ],
-        "checked_by": "make build external validation",
+        "checked_by": "make build and GitHub Actions wheel matrix external validation",
         "supported_strategy": (
-            "Current supported distribution is the source distribution/source-build path with a Rust toolchain. "
-            "The local wheel produced by make build is a smoke artifact, not a supported wheel matrix."
+            "Supported releases publish an sdist plus CPython 3.10-3.14 wheels for Linux x86_64 manylinux_2_28, "
+            "macOS universal2 (x86_64 and arm64), and Windows x86_64. Other platforms use the source distribution "
+            "with Rust."
         ),
     }
 

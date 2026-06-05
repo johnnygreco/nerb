@@ -64,7 +64,8 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["memory"]["passed"] is True
     assert report["distribution"]["passed"] is None
     assert report["distribution"]["included_in_overall"] is False
-    assert report["distribution"]["checked_by"] == "make build external validation"
+    assert report["distribution"]["checked_by"] == "make build and GitHub Actions wheel matrix external validation"
+    assert "CPython 3.10-3.14 wheels" in report["distribution"]["supported_strategy"]
     assert report["mode_strategy"]["decision"] == "entity_independent remains the production default"
     assert report["mode_strategy"]["dense_probe"]["all_overlaps_reconstructed_matches_entity_independent"] is True
     assert report["mode_strategy"]["entity_cardinality_sweep"]["entity_counts"] == [2, 8, 32]
