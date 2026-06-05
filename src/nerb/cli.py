@@ -1,5 +1,4 @@
 import json
-import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -32,6 +31,7 @@ from .config import (
     ConfigError,
     PatternConfig,
     add_entity_pattern,
+    ensure_rust_config_compatible,
     load_config,
     remove_entity_pattern,
     resolve_default_config_path,
@@ -57,7 +57,7 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
-from .regex_builder import NERB
+from .validation import rust_empty_match_diagnostics
 from .validation import validate_bank as _validate_bank
 
 COMMAND_ERROR_EXIT_CODE = 1
@@ -591,13 +591,6 @@ def _load_extraction_config(
     return validate_pattern_config(pattern_config)
 
 
-def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) -> NERB:
-    try:
-        return NERB(pattern_config, add_word_boundaries=word_boundaries)
-    except (ConfigError, re.error, ValueError) as exc:
-        _exit_error(f"Could not compile detectors: {exc}")
-
-
 def _compile_config_bank(
     pattern_config: PatternConfig,
     selected_entity: str | None,
@@ -605,13 +598,17 @@ def _compile_config_bank(
     word_boundaries: bool,
 ) -> Bank:
     try:
-        return Bank.from_config(
+        bank = Bank.from_config(
             pattern_config,
             selected_entity=selected_entity,
             word_boundaries=word_boundaries,
         )
     except ValueError as exc:
         _exit_error(f"Could not compile detectors with the Rust engine: {exc}")
+    diagnostics = rust_empty_match_diagnostics(bank)
+    if diagnostics:
+        _exit_error(f"Could not compile detectors with the Rust engine: {diagnostics[0]['message']}")
+    return bank
 
 
 def _scan_records(bank: Bank, source: str | bytes) -> list[dict[str, Any]]:
@@ -820,44 +817,6 @@ def _echo_batch_payload(payload: dict[str, Any], output_format: str) -> None:
     typer.echo(_format_batch_table(payload))
 
 
-def _compiled_regex_payload(entity: str, entity_config: dict[str, Any], regex: Any) -> dict[str, Any]:
-    groups = [
-        {"name": group_name.replace("_", " "), "group": group_name, "index": index}
-        for group_name, index in sorted(regex.groupindex.items(), key=lambda item: item[1])
-    ]
-    payload: dict[str, Any] = {
-        "entity": entity,
-        "pattern": regex.pattern,
-        "flags": int(regex.flags),
-        "groups": groups,
-    }
-    if FLAGS_KEY in entity_config:
-        payload["configured_flags"] = entity_config[FLAGS_KEY]
-    return payload
-
-
-def _echo_compiled_regex(
-    entity: str,
-    pattern_config: PatternConfig,
-    output_format: str,
-    *,
-    config_path: Path,
-    word_boundaries: bool,
-) -> None:
-    if entity not in pattern_config:
-        _exit_error(f"Entity {entity!r} does not exist in {config_path}.")
-
-    entity_config = pattern_config[entity]
-    extractor = _compile_extractor({entity: entity_config}, word_boundaries=word_boundaries)
-    regex = getattr(extractor, entity)
-    normalized_format = _normalize_authoring_output_format(output_format)
-    if normalized_format == "json":
-        typer.echo(json.dumps(_compiled_regex_payload(entity, entity_config, regex), ensure_ascii=False))
-        return
-
-    typer.echo(regex.pattern)
-
-
 def _diagnostic(
     level: str,
     code: str,
@@ -955,7 +914,6 @@ def _diagnose_suspicious_names(raw_config: Any) -> list[dict[str, Any]]:
         if not isinstance(entity, str) or not isinstance(entity_config, dict):
             continue
 
-        normalized_names: dict[str, str] = {}
         casefolded_names: dict[str, str] = {}
         for name in entity_config:
             if not isinstance(name, str) or name == FLAGS_KEY:
@@ -971,21 +929,6 @@ def _diagnose_suspicious_names(raw_config: Any) -> list[dict[str, Any]]:
                         name=name,
                     )
                 )
-
-            normalized_name = name.replace(" ", "_")
-            previous_name = normalized_names.get(normalized_name)
-            if previous_name is not None and previous_name != name:
-                diagnostics.append(
-                    _diagnostic(
-                        DIAGNOSTIC_ERROR,
-                        "duplicate_group_name",
-                        f"Pattern names {previous_name!r} and {name!r} both compile to group {normalized_name!r}.",
-                        entity=entity,
-                        name=name,
-                    )
-                )
-            else:
-                normalized_names[normalized_name] = name
 
             casefolded_name = name.casefold()
             previous_case_name = casefolded_names.get(casefolded_name)
@@ -1009,13 +952,16 @@ def _diagnose_compiled_entities(pattern_config: PatternConfig) -> list[dict[str,
     diagnostics: list[dict[str, Any]] = []
     for entity, entity_config in pattern_config.items():
         try:
-            NERB({entity: entity_config})
-        except (ConfigError, re.error, ValueError) as exc:
+            bank = Bank.from_config({entity: entity_config})
+            empty_diagnostics = rust_empty_match_diagnostics(bank)
+            if empty_diagnostics:
+                raise ValueError(empty_diagnostics[0]["message"])
+        except ValueError as exc:
             diagnostics.append(
                 _diagnostic(
                     DIAGNOSTIC_ERROR,
                     "compile_error",
-                    f"Entity {entity!r} could not be compiled: {exc}",
+                    f"Entity {entity!r} could not be compiled with the Rust engine: {exc}",
                     entity=entity,
                 )
             )
@@ -1125,7 +1071,7 @@ def callback(
 def validate_json_bank(
     bank_path: Path = typer.Option(..., "--bank", help="JSON bank path to validate."),
     level: str = typer.Option("standard", "--level", help="Validation level: basic, standard, or deep."),
-    engine: str = typer.Option("python_re", "--engine", help="Validation engine."),
+    engine: str = typer.Option("nerb_engine", "--engine", help="Validation engine."),
     strict: bool = typer.Option(False, "--strict", help="Promote strict validation warnings where supported."),
 ) -> None:
     """Validate a JSON bank and print the helper response as JSON."""
@@ -1145,7 +1091,7 @@ def apply_json_bank_patches(
     bank_path: Path = typer.Option(..., "--bank", help="JSON bank path to patch."),
     patch_path: Path = typer.Option(..., "--patch", help="JSON Patch file path."),
     level: str = typer.Option("standard", "--level", help="Validation level after applying patches."),
-    engine: str = typer.Option("python_re", "--engine", help="Validation engine after applying patches."),
+    engine: str = typer.Option("nerb_engine", "--engine", help="Validation engine after applying patches."),
 ) -> None:
     """Apply JSON Patch operations to a JSON bank and print the validated candidate."""
     bank, path, invalid_payload = _load_raw_bank_json_for_command(bank_path)
@@ -1440,30 +1386,6 @@ def test_detector(
     _echo_records(records, output_format)
 
 
-@app.command("compile")
-def compile_entity(
-    ctx: typer.Context,
-    entity: str = typer.Argument(..., help="Detector entity name."),
-    output_format: str = typer.Option("text", "--format", "-f", help="Output format: json or text."),
-    word_boundaries: bool = typer.Option(
-        False,
-        "--word-boundaries",
-        help="Add regex word boundaries before printing the compiled pattern.",
-    ),
-    config: Path | None = _config_option(),
-) -> None:
-    """Print the compiled regex for one configured entity."""
-    config_path = _command_config_path(ctx, config)
-    pattern_config = _load_command_config(config_path)
-    _echo_compiled_regex(
-        pattern_config=pattern_config,
-        entity=entity,
-        output_format=output_format,
-        config_path=config_path,
-        word_boundaries=word_boundaries,
-    )
-
-
 @app.command("doctor")
 def doctor_config(
     ctx: typer.Context,
@@ -1614,6 +1536,7 @@ def validate_config(
 
     try:
         pattern_config = load_config(config_path)
+        ensure_rust_config_compatible(pattern_config)
     except ConfigError as exc:
         _exit_error(f"Config is invalid at {config_path}: {exc}")
     except OSError as exc:

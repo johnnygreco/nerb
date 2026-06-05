@@ -72,7 +72,7 @@ def test_validate_bank_accepts_levels_and_returns_json_compatible_response(minim
     assert result["valid"] is True
     assert result["hash"].startswith("sha256:")
     assert result["stats"]["totals"] == {"entities": 1, "names": 1, "patterns": 2}
-    assert result["engine_compatibility"]["engine"] == "python_re"
+    assert result["engine_compatibility"]["engine"] == "nerb_engine"
     json.dumps(result)
 
 
@@ -107,6 +107,16 @@ def test_basic_validation_reports_standalone_regex_compile_errors(minimal_bank):
     assert "regex.compile_error" in _codes(result)
 
 
+def test_validation_allows_rust_regex_syntax_that_python_re_cannot_parse(minimal_bank):
+    _add_regex(minimal_bank, "unicode_upper", r"\p{Lu}+")
+
+    result = validate_bank(minimal_bank)
+
+    assert result["valid"] is True
+    assert "regex.compile_error" in _codes(result)
+    assert all(diagnostic["severity"] != "error" for diagnostic in result["diagnostics"])
+
+
 def test_validate_bank_returns_schema_diagnostics_for_non_json_compatible_bank(minimal_bank):
     minimal_bank["metadata"]["bad"] = object()
 
@@ -121,6 +131,15 @@ def test_validation_reports_regexes_that_match_empty_strings(minimal_bank):
     _add_regex(minimal_bank, "empty", r"a*")
 
     result = validate_bank(minimal_bank, level="basic")
+
+    assert result["valid"] is False
+    assert "regex.matches_empty" in _codes(result)
+
+
+def test_validation_reports_zero_width_regexes_that_match_non_empty_text(minimal_bank):
+    _add_regex(minimal_bank, "boundary", r"\b")
+
+    result = validate_bank(minimal_bank)
 
     assert result["valid"] is False
     assert "regex.matches_empty" in _codes(result)
@@ -193,17 +212,16 @@ def test_static_regex_risk_checks_cover_required_categories(minimal_bank):
     assert "regex.short_unbounded" in _codes(result)
 
 
-def test_python_re_composed_validation_reports_duplicate_user_capture_names(minimal_bank):
+def test_validation_allows_duplicate_user_capture_names_without_engine_wrapper_conflict(minimal_bank):
     _add_regex(minimal_bank, "first", r"(?P<label>Acme)")
     _add_regex(minimal_bank, "second", r"(?P<label>Corp)")
 
     result = validate_bank(minimal_bank)
 
-    assert result["valid"] is False
-    assert "regex.capture_conflict" in _codes(result)
+    assert result["valid"] is True
 
 
-def test_python_re_capture_names_can_repeat_across_entity_shards(minimal_bank):
+def test_capture_names_can_repeat_across_entity_shards(minimal_bank):
     minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"] = _regex_pattern(
         r"(?P<label>Acme)"
     )
@@ -212,38 +230,37 @@ def test_python_re_capture_names_can_repeat_across_entity_shards(minimal_bank):
     result = validate_bank(minimal_bank)
 
     assert result["valid"] is True
-    assert "regex.capture_conflict" not in _codes(result)
 
 
-def test_python_re_composed_validation_allows_numeric_backreferences(minimal_bank):
+def test_validation_rejects_numeric_backreferences_by_rust_regex_profile(minimal_bank):
     patterns = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]
     patterns.clear()
     patterns["code"] = _regex_pattern(r"\b([A-Z]+)-\1\b")
 
     result = validate_bank(minimal_bank)
 
-    assert result["valid"] is True
-    assert "regex.compose_compile_error" not in _codes(result)
+    assert result["valid"] is False
+    assert "engine.compile_error" in _codes(result)
+    assert "backreferences are not supported" in result["diagnostics"][0]["message"]
 
 
-def test_python_re_composed_validation_reports_internal_identity_capture_conflicts(minimal_bank):
+def test_validation_allows_capture_names_that_matched_removed_internal_identity_pattern(minimal_bank):
     minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"] = _regex_pattern(
         r"(?P<nerb__customer__acme_corp__primary>Acme)"
     )
 
     result = validate_bank(minimal_bank)
 
-    assert result["valid"] is False
-    assert "regex.capture_conflict" in _codes(result)
+    assert result["valid"] is True
 
 
-def test_python_re_composed_validation_reports_bare_global_inline_flags(minimal_bank):
+def test_validation_allows_bare_global_inline_flags_supported_by_rust_profile(minimal_bank):
     _add_regex(minimal_bank, "inline_flags", r"(?i)Acme")
 
     result = validate_bank(minimal_bank)
 
-    assert result["valid"] is False
-    assert "regex.compose_compile_error" in _codes(result)
+    assert result["valid"] is True
+    assert "engine.compile_error" not in _codes(result)
 
 
 def test_apply_bank_patches_returns_validated_candidate(minimal_bank):

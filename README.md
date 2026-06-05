@@ -90,12 +90,13 @@ nerb eval-bank --bank company.json
 nerb benchmark-bank --bank company.json
 ```
 
-Extraction records include stable core fields (`entity`, `name`, `string`, `start`, `end`) plus JSON-bank IDs, pattern
-kind, and captures:
+Extraction records include the Rust-backed scan fields plus JSON-bank source IDs, pattern kind, and captures:
 
 ```json
 {
   "entity": "customer",
+  "canonical_name": "Acme Corp",
+  "surface_name": "Acme Corp",
   "entity_id": "customer",
   "name": "Acme Corp",
   "name_id": "acme_corp",
@@ -104,6 +105,7 @@ kind, and captures:
   "string": "Acme Corp",
   "start": 13,
   "end": 22,
+  "offset_unit": "byte",
   "captures": {}
 }
 ```
@@ -146,30 +148,30 @@ benchmark = benchmark_bank(bank, options={"benchmark_iterations": 1})
 
 Other public helpers include `Bank`, `bank_stats`, `bank_cache_info`, `canonicalize_bank`, `clear_bank_cache`,
 `hash_bank`, `validate_bank_schema`, `benchmark_fixture_profiles`, `make_benchmark_fixture_profile`, `extract_file`,
-`extract_batch`, `extract_report_file`, `extract_report_batch`, `explain_match`, and `compiled_bank_cache_info`.
+`extract_batch`, `extract_report_file`, `extract_report_batch`, and `explain_match`.
 
-The Rust engine migration is underway. Native source-bank canonicalization is documented in
+Rust source-bank canonicalization is documented in
 [`docs/rust-engine-canonicalization.md`](docs/rust-engine-canonicalization.md), and the current native PyO3 boundary plus
 `entity_independent` `scan_bytes` path are documented in
 [`docs/rust-engine-boundary.md`](docs/rust-engine-boundary.md). Rust engine gate evidence is recorded in
-[`docs/rust-engine-gates.md`](docs/rust-engine-gates.md). The current Python `NERB` API remains only until the
-Rust-backed `Bank` surface replaces it.
+[`docs/rust-engine-gates.md`](docs/rust-engine-gates.md).
 
-The current Python regex-builder API is still present until the Rust-backed `Bank` API replaces it:
+For direct source-bank scanning, use `Bank`:
 
 ```python
 from pathlib import Path
 
-from nerb import NERB
+from nerb import Bank, load_config
 
 config_path = Path("examples/music_entities.yaml")
 document = Path("examples/prog_rock_wiki.txt").read_text(encoding="utf-8")
 
-extractor = NERB(config_path, add_word_boundaries=True)
-records = extractor.extract_named_entities(document).to_records()
+bank = Bank.from_config(load_config(config_path), word_boundaries=True)
+records = bank.scan_text(document)
 ```
 
-Compiled entity regexes are exposed today as attributes such as `extractor.ARTIST`.
+`Bank.scan_text` returns byte-offset records with `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`,
+and `offset_unit`.
 
 ## Eval And Regression
 
@@ -279,7 +281,6 @@ nerb extract --all --text "Pink Floyd played progressive rock." \
   --detector 'GENRE:Rock=rock' \
   --format json
 nerb test ARTIST "Pink Floyd" 'Pink\sFloyd' --text "Pink Floyd played progressive rock."
-nerb compile ARTIST --config detectors.yaml
 nerb doctor --config detectors.yaml --format json
 ```
 
@@ -290,8 +291,8 @@ document; it compiles one Rust `Bank` and scans those documents in input order.
 
 ## Performance
 
-NERB compiles one Python `re` shard per entity for regex patterns, uses separate literal shards for literal patterns,
-caches compiled banks in process by canonical bank hash and extraction options, and keeps disk cache deferred for V1.
+NERB compiles Rust-backed `Bank` instances in process by canonical source bytes, compile options, engine version, target
+platform, and semantic bank hash. Disk cache remains deferred for V1.
 
 See [docs/performance.md](docs/performance.md) for target/stress benchmark commands and recorded results. The V1 review
 keeps PCRE2 optional and does not add a binary literal-matcher dependency.

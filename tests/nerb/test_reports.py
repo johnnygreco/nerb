@@ -72,6 +72,24 @@ def _add_customer_name(bank: dict[str, Any], name_id: str, canonical: str, patte
     }
 
 
+def _add_entity(bank: dict[str, Any], entity_id: str, canonical: str, patterns: dict[str, Any]) -> None:
+    bank["entities"][entity_id] = {
+        "description": f"{entity_id} fixture.",
+        "status": "active",
+        "regex_flags": [],
+        "names": {
+            "primary": {
+                "canonical": canonical,
+                "description": f"{canonical} fixture.",
+                "status": "active",
+                "patterns": patterns,
+                "metadata": {},
+            }
+        },
+        "metadata": {},
+    }
+
+
 def test_extract_report_shape_defaults_summary_explanation_and_context(minimal_bank):
     report = extract_report(minimal_bank, "Send Acme Corp now.", options={"context_chars": 5})
 
@@ -116,7 +134,7 @@ def test_extract_report_file_preserves_file_source_metadata(tmp_path, minimal_ba
     assert report["resolved_records"][0]["context"] == {"before": "Send ", "match": "Acme Corp", "after": " now."}
 
 
-def test_priority_overlap_resolution_keeps_raw_records_and_resolves_by_priority(minimal_bank):
+def test_report_uses_rust_leftmost_first_records_before_report_resolution(minimal_bank):
     _set_customer_patterns(
         minimal_bank,
         {
@@ -128,18 +146,9 @@ def test_priority_overlap_resolution_keeps_raw_records_and_resolves_by_priority(
 
     report = extract_report(minimal_bank, "Acme Corp")
 
-    assert [(record["pattern_id"], record["start"], record["end"]) for record in report["records"]] == [
-        ("short", 0, 4),
-        ("long", 0, 9),
-        ("regex_duplicate", 0, 9),
-    ]
-    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["short"]
-    assert len(report["overlaps"]) == 1
-    assert report["overlaps"][0]["resolved_record"]["pattern_id"] == "short"
-    assert [record["pattern_id"] for record in report["overlaps"][0]["dropped_records"]] == [
-        "long",
-        "regex_duplicate",
-    ]
+    assert [(record["pattern_id"], record["start"], record["end"]) for record in report["records"]] == [("long", 0, 9)]
+    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["long"]
+    assert report["overlaps"] == []
 
 
 def test_priority_overlap_tie_breakers_use_longest_then_pattern_identity(minimal_bank):
@@ -154,8 +163,24 @@ def test_priority_overlap_tie_breakers_use_longest_then_pattern_identity(minimal
 
     report = extract_report(minimal_bank, "Acme Corp")
 
-    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["long"]
-    assert report["overlaps"][0]["resolved_record"]["pattern_id"] == "long"
+    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["short"]
+    assert report["overlaps"] == []
+
+
+def test_report_cross_entity_overlap_uses_ascending_rust_priority(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"long": _literal_pattern("Acme Corp", priority=200)})
+    _add_entity(minimal_bank, "vendor", "Acme Vendor", {"short": _literal_pattern("Acme", priority=20)})
+
+    report = extract_report(minimal_bank, "Acme Corp")
+
+    assert [(record["entity_id"], record["pattern_id"]) for record in report["records"]] == [
+        ("vendor", "short"),
+        ("customer", "long"),
+    ]
+    assert [(item["record"]["entity_id"], item["record"]["pattern_id"]) for item in report["resolved_records"]] == [
+        ("vendor", "short")
+    ]
+    assert report["overlaps"][0]["resolved_record"]["entity_id"] == "vendor"
 
 
 def test_grouped_summary_counts_use_resolved_records(minimal_bank):
@@ -171,6 +196,13 @@ def test_context_snippets_respect_context_chars(minimal_bank):
     report = extract_report(minimal_bank, "abcdef Acme Corp ghijkl", options={"context_chars": 3})
 
     assert report["resolved_records"][0]["context"] == {"before": "ef ", "match": "Acme Corp", "after": " gh"}
+
+
+def test_context_snippets_convert_rust_byte_offsets_before_slicing(minimal_bank):
+    report = extract_report(minimal_bank, "Café Acme Corp now", options={"context_chars": 3})
+
+    assert report["resolved_records"][0]["record"]["offset_unit"] == "byte"
+    assert report["resolved_records"][0]["context"] == {"before": "fé ", "match": "Acme Corp", "after": " no"}
 
 
 def test_metadata_is_excluded_by_default_and_included_when_requested(minimal_bank):
@@ -237,7 +269,7 @@ def test_expected_missing_diagnostic_defaults_to_resolved_scope(minimal_bank):
             },
         }
     ]
-    assert resolved_scope_report["diagnostics"][0]["code"] == "report.expected_missing"
+    assert resolved_scope_report["diagnostics"] == []
     assert raw_scope_report["diagnostics"] == []
 
 

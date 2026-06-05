@@ -10,13 +10,8 @@ from typing import Any, cast
 from .bank import bank_stats, canonicalize_bank, hash_bank
 from .diagnostics import REGEX_EXPENSIVE_PROBE, REGEX_EXPENSIVE_STATIC, Diagnostic
 from .diff import diff_banks
-from .engines import (
-    CompiledBank,
-    ExtractionError,
-    clear_compiled_bank_cache,
-    compile_bank,
-    compiled_bank_cache_info,
-)
+from .engine import bank_cache_info, clear_bank_cache
+from .engines import CompiledBank, ExtractionError, compile_bank
 from .evals import eval_bank
 from .extraction import _prepare_batch_documents
 from .records import record_sort_key
@@ -762,19 +757,19 @@ def _measure_compile(
     bank: Mapping[str, Any],
     options: Mapping[str, Any],
 ) -> tuple[dict[str, Any], CompiledBank]:
-    before_reset = compiled_bank_cache_info()
-    clear_compiled_bank_cache()
-    after_reset = compiled_bank_cache_info()
+    before_reset = bank_cache_info()
+    clear_bank_cache()
+    after_reset = bank_cache_info()
 
     cold_start = time.perf_counter()
     cold_compiled, cold_cache_hit = compile_bank(bank, options=options)
     cold_seconds = time.perf_counter() - cold_start
-    after_cold = compiled_bank_cache_info()
+    after_cold = bank_cache_info()
 
     warm_start = time.perf_counter()
     warm_compiled, warm_cache_hit = compile_bank(bank, options=options)
     warm_seconds = time.perf_counter() - warm_start
-    after_warm = compiled_bank_cache_info()
+    after_warm = bank_cache_info()
 
     return (
         {
@@ -913,9 +908,9 @@ def _benchmark_stages(
                 "schema_validation",
                 "runtime_validation",
                 "cache_lookup",
-                "matcher_compile",
+                "rust_bank_compile",
             ],
-            "note": "Current compile_bank timing is inclusive; do not sum it with sibling stage timings.",
+            "note": "Rust Bank compile timing is inclusive; do not sum it with sibling stage timings.",
             "cold_seconds": compile_report["cold_seconds"],
             "warm_cache_lookup_seconds": compile_report["warm_cache_lookup_seconds"],
             "cache_hit_verified": compile_report["cache"]["cold_hit"] is False
@@ -933,22 +928,19 @@ def _benchmark_stages(
 
 
 def _matcher_profiles(compiled: CompiledBank) -> list[dict[str, Any]]:
-    profiles: list[dict[str, Any]] = []
-    for matcher in compiled.matchers:
-        profile: dict[str, Any] = {"name": matcher.name, "version": matcher.version}
-        pattern_count = getattr(matcher, "pattern_count", None)
-        if isinstance(pattern_count, int):
-            profile["pattern_count"] = pattern_count
-        entity_shards = getattr(matcher, "entity_shards", None)
-        if isinstance(entity_shards, tuple):
-            profile["entity_shard_count"] = len(entity_shards)
-            exact_count = sum(int(getattr(shard, "exact_pattern_count", 0)) for shard in entity_shards)
-            fallback_count = sum(int(getattr(shard, "regex_fallback_pattern_count", 0)) for shard in entity_shards)
-            if exact_count or fallback_count:
-                profile["exact_literal_patterns"] = exact_count
-                profile["regex_fallback_literal_patterns"] = fallback_count
-        profiles.append(profile)
-    return profiles
+    if compiled.native_bank is None:
+        return [{"name": compiled.engine_name, "version": compiled.engine_version, "pattern_count": 0}]
+
+    metadata = compiled.native_bank.metadata()
+    return [
+        {
+            "name": compiled.engine_name,
+            "version": compiled.engine_version,
+            "entity_count": metadata["entity_count"],
+            "pattern_count": metadata["pattern_count"],
+            "match_mode": metadata["match_mode"]["name"],
+        }
+    ]
 
 
 def _benchmark_summary(

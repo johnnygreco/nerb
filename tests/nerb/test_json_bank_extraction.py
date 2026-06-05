@@ -8,12 +8,11 @@ import pytest
 
 from nerb import (
     ExtractionError,
-    clear_compiled_bank_cache,
-    compiled_bank_cache_info,
+    bank_cache_info,
+    clear_bank_cache,
     extract_batch,
     extract_file,
     extract_text,
-    hash_bank,
 )
 
 
@@ -68,32 +67,32 @@ def _set_customer_patterns(bank: dict[str, Any], patterns: dict[str, Any]) -> No
 def test_extract_text_returns_literal_records_with_response_metadata(minimal_bank):
     result = extract_text(minimal_bank, "Send this to Acme Corp today.")
 
-    assert result["bank"] == {
-        "id": "company_entities",
-        "version": "2026.06.03",
-        "schema_version": "nerb.bank.v1",
-        "hash": hash_bank(minimal_bank),
-    }
-    assert result["engine"]["name"] == "python_re"
-    assert result["engine"]["version"] == "1"
+    assert result["bank"]["id"] == "company_entities"
+    assert result["bank"]["version"] == "2026.06.03"
+    assert result["bank"]["schema_version"] == "nerb.bank.v1"
+    assert result["bank"]["hash"].startswith("sha256:")
+    assert result["engine"]["name"] == "nerb_engine"
     assert result["source"] == {"type": "text", "length": 29, "bytes": 29}
     assert result["records"] == [
         {
-            "entity_id": "customer",
             "entity": "customer",
+            "canonical_name": "Acme Corp",
+            "surface_name": "Acme Corp",
+            "string": "Acme Corp",
+            "start": 13,
+            "end": 22,
+            "offset_unit": "byte",
+            "entity_id": "customer",
             "name_id": "acme_corp",
             "name": "Acme Corp",
             "pattern_id": "primary",
             "pattern_kind": "literal",
-            "string": "Acme Corp",
-            "start": 13,
-            "end": 22,
             "captures": {},
         }
     ]
 
 
-def test_regex_records_named_captures_and_optional_capture_handling(minimal_bank):
+def test_regex_records_use_pattern_id_as_surface_name_without_capture_projection(minimal_bank):
     _set_customer_patterns(
         minimal_bank,
         {"invoice": _regex_pattern(r"(?P<prefix>INV)-(?P<number>\d+)(?:-(?P<suffix>[A-Z]+))?(?P<empty>)")},
@@ -103,48 +102,51 @@ def test_regex_records_named_captures_and_optional_capture_handling(minimal_bank
 
     assert result["records"] == [
         {
-            "entity_id": "customer",
             "entity": "customer",
+            "canonical_name": "Acme Corp",
+            "surface_name": "invoice",
+            "string": "INV-123",
+            "start": 11,
+            "end": 18,
+            "offset_unit": "byte",
+            "entity_id": "customer",
             "name_id": "acme_corp",
             "name": "Acme Corp",
             "pattern_id": "invoice",
             "pattern_kind": "regex",
-            "string": "INV-123",
-            "start": 11,
-            "end": 18,
-            "captures": {
-                "empty": {"string": "", "start": 18, "end": 18},
-                "number": {"string": "123", "start": 15, "end": 18},
-                "prefix": {"string": "INV", "start": 11, "end": 14},
-            },
+            "captures": {},
         }
     ]
-    assert "suffix" not in result["records"][0]["captures"]
-    assert all(not name.startswith("nerb__") for name in result["records"][0]["captures"])
 
 
-def test_unicode_normalized_regex_matches_return_original_spans(minimal_bank):
+def test_json_bank_extraction_accepts_rust_regex_syntax_that_python_re_cannot_parse(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"named_capture": _regex_pattern(r"(?<label>ACME)")})
+
+    result = extract_text(minimal_bank, "abc ACME")
+
+    assert [(record["pattern_id"], record["string"]) for record in result["records"]] == [("named_capture", "ACME")]
+
+
+def test_unicode_normalization_modes_are_rejected_until_supported_by_rust_engine(minimal_bank):
     minimal_bank["unicode_normalization"] = "NFC"
     _set_customer_patterns(minimal_bank, {"accented": _regex_pattern("Café")})
 
-    result = extract_text(minimal_bank, "Cafe\u0301 signed.")
+    with pytest.raises(ExtractionError, match="Rust engine validation") as exc_info:
+        extract_text(minimal_bank, "Cafe\u0301 signed.")
+    assert any("unicode_normalization" in diagnostic["message"] for diagnostic in exc_info.value.diagnostics)
 
-    assert result["records"][0]["string"] == "Cafe\u0301"
+
+def test_case_insensitive_literal_uses_original_spans(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"acme": _literal_pattern("Acme Corp", case_sensitive=False)})
+
+    result = extract_text(minimal_bank, "ACME CORP replied.")
+
+    assert result["records"][0]["string"] == "ACME CORP"
     assert result["records"][0]["start"] == 0
-    assert result["records"][0]["end"] == 5
+    assert result["records"][0]["end"] == 9
 
 
-def test_case_insensitive_literal_uses_casefold_with_original_spans(minimal_bank):
-    _set_customer_patterns(minimal_bank, {"german": _literal_pattern("Straße", case_sensitive=False)})
-
-    result = extract_text(minimal_bank, "STRASSE replied.")
-
-    assert result["records"][0]["string"] == "STRASSE"
-    assert result["records"][0]["start"] == 0
-    assert result["records"][0]["end"] == 7
-
-
-def test_raw_extraction_preserves_overlaps_duplicates_and_ordering(minimal_bank):
+def test_rust_entity_independent_scan_uses_within_entity_leftmost_first(minimal_bank):
     _set_customer_patterns(
         minimal_bank,
         {
@@ -167,15 +169,11 @@ def test_raw_extraction_preserves_overlaps_duplicates_and_ordering(minimal_bank)
         for record in result["records"]
     ]
 
-    assert [(record["pattern_id"], record["start"], record["end"]) for record in result["records"]] == [
-        ("short", 0, 4),
-        ("long", 0, 9),
-        ("regex_duplicate", 0, 9),
-    ]
+    assert [(record["pattern_id"], record["start"], record["end"]) for record in result["records"]] == [("short", 0, 4)]
     assert sort_keys == sorted(sort_keys)
 
 
-def test_regex_entity_shards_preserve_duplicate_same_start_matches(minimal_bank):
+def test_regex_entity_shards_use_deterministic_leftmost_first_for_same_start_matches(minimal_bank):
     _set_customer_patterns(
         minimal_bank,
         {
@@ -186,20 +184,15 @@ def test_regex_entity_shards_preserve_duplicate_same_start_matches(minimal_bank)
 
     result = extract_text(minimal_bank, "Acme")
 
-    assert [(record["pattern_id"], record["string"]) for record in result["records"]] == [
-        ("first_regex", "Acme"),
-        ("second_regex", "Acme"),
-    ]
+    assert [(record["pattern_id"], record["string"]) for record in result["records"]] == [("first_regex", "Acme")]
 
 
-def test_regex_numeric_backreferences_are_preserved_under_internal_identity_wrapping(minimal_bank):
+def test_regex_numeric_backreferences_are_rejected_by_rust_regex_profile(minimal_bank):
     _set_customer_patterns(minimal_bank, {"code": _regex_pattern(r"\b([A-Z]+)-\1\b")})
 
-    result = extract_text(minimal_bank, "Ship ABC-ABC today.")
-
-    assert result["records"][0]["string"] == "ABC-ABC"
-    assert result["records"][0]["start"] == 5
-    assert result["records"][0]["end"] == 12
+    with pytest.raises(ExtractionError, match="Rust engine validation") as exc_info:
+        extract_text(minimal_bank, "Ship ABC-ABC today.")
+    assert any("backreferences are not supported" in diagnostic["message"] for diagnostic in exc_info.value.diagnostics)
 
 
 def test_extract_file_uses_file_source_metadata(tmp_path, minimal_bank):
@@ -265,6 +258,15 @@ def test_extraction_rejects_runtime_invalid_banks(minimal_bank):
     assert any(diagnostic["code"] == "regex.matches_empty" for diagnostic in exc_info.value.diagnostics)
 
 
+def test_extraction_rejects_zero_width_regexes_that_match_non_empty_text(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"word_boundary": _regex_pattern(r"\b")})
+
+    with pytest.raises(ExtractionError, match="runtime validation") as exc_info:
+        extract_text(minimal_bank, "abc")
+
+    assert any(diagnostic["code"] == "regex.matches_empty" for diagnostic in exc_info.value.diagnostics)
+
+
 def test_extraction_rejects_non_json_schema_invalid_banks_with_diagnostics(minimal_bank):
     minimal_bank["metadata"]["bad"] = object()
 
@@ -304,7 +306,6 @@ def test_status_filtering_defaults_to_active_chains_and_non_active_bank_errors(m
 
     assert [record["pattern_id"] for record in included_result["records"]] == [
         "inactive_alias",
-        "primary",
         "inactive_alias",
     ]
 
@@ -317,45 +318,78 @@ def test_status_filtering_defaults_to_active_chains_and_non_active_bank_errors(m
     assert result["records"][0]["string"] == "Acme Corp"
 
 
-def test_compiled_bank_cache_key_dimensions_are_exposed(minimal_bank):
-    clear_compiled_bank_cache()
+def test_inactive_rust_incompatible_patterns_do_not_block_active_only_extraction(minimal_bank):
+    _customer_patterns(minimal_bank)["inactive_backreference"] = _regex_pattern(r"\b([A-Z]+)-\1\b", status="inactive")
 
-    first = extract_text(minimal_bank, "Acme Corp", options={"engine_options": {"probe": "a"}})
-    second = extract_text(minimal_bank, "Acme Corp", options={"engine_options": {"probe": "a"}})
+    result = extract_text(minimal_bank, "Acme Corp and ABC-ABC")
+
+    assert [record["pattern_id"] for record in result["records"]] == ["primary"]
+    with pytest.raises(ExtractionError, match="Rust engine validation"):
+        extract_text(minimal_bank, "ABC-ABC", options={"include_statuses": ["active", "inactive"]})
+
+
+def test_json_bank_extraction_rejects_ambiguous_source_detector_metadata(minimal_bank):
+    customer = minimal_bank["entities"]["customer"]
+    customer["names"] = {
+        "first": {
+            "canonical": "Acme Corp",
+            "description": "First ambiguous fixture.",
+            "status": "active",
+            "patterns": {"alias": _regex_pattern(r"\bAcme\b")},
+            "metadata": {},
+        },
+        "second": {
+            "canonical": "Acme Corp",
+            "description": "Second ambiguous fixture.",
+            "status": "active",
+            "patterns": {"alias": _regex_pattern(r"\bCorp\b")},
+            "metadata": {},
+        },
+    }
+
+    with pytest.raises(ExtractionError, match="ambiguous"):
+        extract_text(minimal_bank, "Acme Corp")
+
+
+def test_extraction_runtime_validation_does_not_do_a_separate_rust_compile(monkeypatch, minimal_bank):
+    import nerb.validation as validation
+
+    def fail_if_called(_bank):
+        raise AssertionError("extraction should not run no-cache Rust validation compile")
+
+    monkeypatch.setattr(validation, "_rust_engine_diagnostics", fail_if_called)
+
+    assert extract_text(minimal_bank, "Acme Corp")["records"][0]["string"] == "Acme Corp"
+
+
+def test_rust_bank_cache_key_dimensions_are_exposed(minimal_bank):
+    clear_bank_cache()
+    _customer_patterns(minimal_bank)["inactive_alias"] = _literal_pattern("Acme", status="inactive")
+
+    first = extract_text(minimal_bank, "Acme Corp")
+    second = extract_text(minimal_bank, "Acme Corp")
     with_status = extract_text(
         minimal_bank,
         "Acme Corp",
-        options={"engine_options": {"probe": "a"}, "include_statuses": ["active", "inactive"]},
+        options={"include_statuses": ["active", "inactive"]},
     )
-    with_options = extract_text(minimal_bank, "Acme Corp", options={"engine_options": {"probe": "b"}})
-
-    normalized_bank = copy.deepcopy(minimal_bank)
-    normalized_bank["unicode_normalization"] = "NFKC"
-    with_normalization = extract_text(normalized_bank, "Acme Corp", options={"engine_options": {"probe": "a"}})
-
-    assert first["engine"]["cache"]["hit"] is False
-    assert second["engine"]["cache"]["hit"] is True
-    assert compiled_bank_cache_info() == {"size": 4, "hits": 1, "misses": 4}
-    assert first["engine"]["cache"]["key"]["bank_hash"] == hash_bank(minimal_bank)
-    assert first["engine"]["cache"]["key"]["engine_options"] == {"probe": "a"}
-    assert with_status["engine"]["cache"]["key"]["include_statuses"] == ["active", "inactive"]
-    assert with_options["engine"]["cache"]["key"]["engine_options"] == {"probe": "b"}
-    assert with_normalization["engine"]["cache"]["key"]["normalization"] == "NFKC"
-
-
-def test_compiled_bank_cache_hit_skips_runtime_validation(monkeypatch, minimal_bank):
-    import nerb.validation as validation
-
-    clear_compiled_bank_cache()
-
-    first = extract_text(minimal_bank, "Acme Corp")
-
-    def fail_runtime_validation(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        raise AssertionError("runtime validation should not run for a compiled-bank cache hit")
-
-    monkeypatch.setattr(validation, "validate_bank", fail_runtime_validation)
-
-    second = extract_text(minimal_bank, "Acme Corp")
+    with_options = extract_text(
+        minimal_bank,
+        "Acme Corp",
+        options={"engine_options": {"match_mode": "entity_independent"}},
+    )
 
     assert first["engine"]["cache"]["hit"] is False
     assert second["engine"]["cache"]["hit"] is True
+    assert with_options["engine"]["cache"]["hit"] is True
+    assert bank_cache_info()["size"] == 2
+    assert bank_cache_info()["hits"] == 2
+    assert bank_cache_info()["misses"] == 2
+    assert first["engine"]["cache"]["key"]["bank_hash"] == first["bank"]["hash"]
+    assert with_status["engine"]["cache"]["key"]["bank_hash"] != first["engine"]["cache"]["key"]["bank_hash"]
+    assert with_options["engine"]["cache"]["key"] == first["engine"]["cache"]["key"]
+
+
+def test_json_bank_extraction_rejects_internal_match_modes(minimal_bank):
+    with pytest.raises(ExtractionError, match="only supports match_mode 'entity_independent'"):
+        extract_text(minimal_bank, "Acme Corp", options={"engine_options": {"match_mode": "global_leftmost"}})

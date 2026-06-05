@@ -11,8 +11,8 @@ and newer. The current package targets Python 3.10 and newer, matching the offic
 ## Rust Engine Plan Precedence
 
 When working on tracker #45 or `agent-scratchpads/rust-engine-plan.md`, that plan and the active implementation issue
-override current MCP/Python helper guidance in this skill. New Rust-backed MCP extraction records follow the explicit
-Rust record contract instead of the current Python oracle shape unless the active issue says otherwise.
+override current MCP/Python helper guidance in this skill. Rust-backed MCP extraction records follow the explicit Rust
+record contract unless the active issue says otherwise.
 
 ## Surface
 
@@ -20,9 +20,11 @@ MCP tools wrap the same helpers used by the Python API and CLI:
 
 - validate/load detector configs through `src/nerb/config.py`
 - add, update, remove, and list detector patterns through config helpers
-- extract one entity or all entities through `src/nerb/extraction.py`
+- extract one entity or all entities through the Rust-backed `Bank` API
 - support one-shot inline extraction without requiring a saved config
-- current Python oracle extraction returns JSON-compatible data with `entity`, `name`, `string`, `start`, and `end`
+- config-backed and inline extraction return Rust-backed records with `entity`, `canonical_name`, `surface_name`,
+  `string`, `start`, `end`, and `offset_unit`
+- JSON-bank helper tools additionally expose enriched source IDs and pattern metadata through shared extraction helpers
 
 Avoid broad filesystem access. Tools read only explicit config/document paths or provided text, and writes go through
 explicit config paths. On Python versions unsupported by the MCP SDK, `nerb-mcp` exits with a clear compatibility error.
@@ -59,9 +61,10 @@ Minimal local MCP client config after the entry point exists:
 
 ```shell
 uv run pytest tests/nerb/test_mcp*.py
-uv run pytest tests/nerb/test_extraction.py
+uv run pytest tests/nerb/test_json_bank_extraction.py
 uv run ty check
 make check
 ```
 
-MCP extraction results should match the Python extraction helpers for `tests/data/music_entities.yaml` and `tests/data/prog_rock_wiki.txt`.
+MCP extraction results should match the Rust-backed CLI and Python `Bank` results for `tests/data/music_entities.yaml`
+and `tests/data/prog_rock_wiki.txt`.

@@ -12,16 +12,16 @@ Recorded on 2026-06-03 in the local agent workspace:
 
 ## V1 Implementation Posture
 
-- Compiled banks are cached in process by canonical bank hash, engine name/version, include statuses, engine options, and
-  normalization mode.
-- Cache hits skip bounded runtime validation and reuse the compiled bank. They still compute the canonical hash because
+- Public extraction compiles JSON banks through the Rust-backed `Bank` API and scans with the production
+  `entity_independent` mode.
+- Compiled native banks are cached in process by canonical bank hash, engine name/version, compile options, platform
+  dimensions, and target triple.
+- Extraction still performs schema/canonicalization and extraction-scope authoring diagnostics before native cache lookup;
   v1 intentionally does not maintain a disk cache or caller-supplied cache key.
-- Literal patterns are separate from regex shards. Exact literals compile into per-entity Aho-Corasick-style shards in
-  the portable fallback. Literal patterns with whitespace normalization over actual whitespace stay on the regex
-  fallback path to preserve `\s+` semantics.
-- Regex patterns still compile into one Python `re` shard per entity.
-- Literal and regex records are sorted by the stable record key before returning from compiled extraction.
-- Shards are immutable after construction and can be parallelized later without changing output shape.
+- Literal and regex patterns are canonicalized into Rust engine detector metadata, scanned natively, then projected into
+  stable byte-offset records before returning from extraction helpers.
+- `all_overlaps` and `global_leftmost` remain internal measurement modes for gate reports and are not public
+  JSON-bank extraction semantics.
 
 ## Rust Engine Smoke Profiles
 
@@ -337,7 +337,7 @@ The full stress command exited with status `124` after the 180-second cap and di
 
 ## Recorded Results
 
-| Workload | Names | Patterns | Matcher Shards | Cold Compile | Warm Cache Lookup | Target Warm Extraction | Notes |
+| Workload | Names | Patterns | Engine Profile | Cold Compile | Warm Cache Lookup | Target Warm Extraction | Notes |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
 | Target exact literals | 10,000 | 100,000 literal | literal: 64 | 24.657s | 0.750s | 0.032s | Cache hit verified; 48 target records stable over 2 iterations. |
 | Target mixed | 10,000 | 95,000 literal / 5,000 regex | literal: 64, regex: 32 | 26.461s | 0.777s | 1.266s | Regex shard scanning dominates warm extraction. |
@@ -345,7 +345,7 @@ The full stress command exited with status `124` after the 180-second cap and di
 | Full stress cap exact literals | 100,000 | 1,000,000 literal | intended literal: 128 | >180s | not reached | not reached | Timed out before payload. |
 
 The target exact-literal run is inside the V1 target tier. The full stress tier is not practical as a routine local or
-CI check with the current Python implementation.
+CI check.
 
 ## Bottlenecks
 
@@ -356,8 +356,9 @@ CI check with the current Python implementation.
 - Warm cache lookup is materially cheaper than cold compile but still scales with bank size because v1 hashes the bank
   object for every lookup. A local pre-cleanup target run measured 1.421s warm lookup before avoiding a duplicate
   canonical hash pass; the final target run measured 0.750s.
-- Regex-containing workloads remain sensitive to Python `re` shard scanning. The 5,000-regex mixed target run spent
-  1.266s in target warm extraction, despite similar cold compile time to the exact-literal target.
+- Regex-containing workloads should now be interpreted through the Rust gate report rather than the pre-removal Python
+  shard timings. The current report separates native scan, projection, cache lookup, and output shaping for the measured
+  workloads.
 
 ## Dependency Decision
 

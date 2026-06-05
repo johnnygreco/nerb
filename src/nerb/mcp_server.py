@@ -29,6 +29,7 @@ from .config import (
     ConfigError,
     PatternConfig,
     add_entity_pattern,
+    ensure_rust_config_compatible,
     remove_entity_pattern,
     resolve_default_config_path,
     save_config,
@@ -66,6 +67,7 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
+from .validation import rust_empty_match_diagnostics
 from .validation import validate_bank as _validate_bank
 
 Transport = Literal["stdio", "sse", "streamable-http"]
@@ -377,13 +379,17 @@ def _compile_config_bank(
     word_boundaries: bool,
 ) -> Bank:
     try:
-        return Bank.from_config(
+        bank = Bank.from_config(
             pattern_config,
             selected_entity=selected_entity,
             word_boundaries=word_boundaries,
         )
     except ValueError as exc:
         _raise_tool_error(f"Could not compile detectors with the Rust engine: {exc}")
+    diagnostics = rust_empty_match_diagnostics(bank)
+    if diagnostics:
+        _raise_tool_error(f"Could not compile detectors with the Rust engine: {diagnostics[0]['message']}")
+    return bank
 
 
 def _scan_records(bank: Bank, source: str | bytes) -> list[dict[str, Any]]:
@@ -432,6 +438,10 @@ def _mutation_response(action: str, path: Path, config: PatternConfig, entity: s
 def validate_config(config_path: str) -> dict[str, Any]:
     """Validate a detector YAML config file. Reads only the provided config_path."""
     path, pattern_config = _load_tool_config(config_path)
+    try:
+        ensure_rust_config_compatible(pattern_config)
+    except ConfigError as exc:
+        _raise_tool_error(f"Config is invalid at {path}: {exc}")
     return {"valid": True, "path": str(path), **_config_summary(pattern_config)}
 
 
@@ -604,7 +614,7 @@ def validate_bank(
     bank: Any | None = None,
     bank_path: str | None = None,
     level: str = "standard",
-    engine: str = "python_re",
+    engine: str = "nerb_engine",
     base_path: str | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -636,7 +646,7 @@ def apply_bank_patches(
     patches: Any | None = None,
     patch_path: str | None = None,
     level: str = "standard",
-    engine: str = "python_re",
+    engine: str = "nerb_engine",
     base_path: str | None = None,
 ) -> dict[str, Any]:
     """Apply explicit JSON Patch operations to a JSON bank and validate the candidate."""
@@ -689,7 +699,7 @@ def bank_stats(
     bank: Any | None = None,
     bank_path: str | None = None,
     include_engine: bool = False,
-    engine: str = "python_re",
+    engine: str = "nerb_engine",
 ) -> dict[str, Any]:
     """Return JSON-bank structural counts without compiling patterns."""
     bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path, raw=True)

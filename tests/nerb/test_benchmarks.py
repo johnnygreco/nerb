@@ -50,7 +50,7 @@ EXPECTED_BENCHMARK_PROFILES = {
         "by_kind": {"literal": 4, "regex": 4},
         "bank_profile": "mixed",
         "target_documents": ["adversarial_dense_hits", "adversarial_near_miss", "adversarial_mixed"],
-        "record_counts": {"baseline": 7, "target": 76, "stress": 76},
+        "record_counts": {"baseline": 4, "target": 52, "stress": 52},
     },
 }
 
@@ -112,7 +112,7 @@ def test_benchmark_bank_reports_cache_compile_and_deterministic_tier_counts(mini
         "schema_validation",
         "runtime_validation",
         "cache_lookup",
-        "matcher_compile",
+        "rust_bank_compile",
     ]
     assert first["stages"]["input_parse"]["available"] is False
     assert first["stages"]["input_parse"]["seconds"] is None
@@ -201,18 +201,17 @@ def test_benchmark_bank_profiles_mixed_literal_regex_workload(minimal_bank):
     assert any(diagnostic["code"] == "benchmark.regex_probes" for diagnostic in result["diagnostics"])
 
 
-def test_synthetic_scale_bank_helper_is_deterministic_and_reports_matcher_shards():
+def test_synthetic_scale_bank_helper_is_deterministic_and_reports_rust_engine_profile():
     bank = make_synthetic_bank(name_count=6, patterns_per_name=4, entity_count=3, literal_ratio=0.75)
 
     result = benchmark_bank(bank, options={"benchmark_iterations": 1, "stress_multiplier": 2})
-    matcher_profiles = {profile["name"]: profile for profile in result["engine"]["matchers"]}
+    engine_profiles = {profile["name"]: profile for profile in result["engine"]["matchers"]}
 
     assert result["bank"]["stats"]["active_totals"] == {"entities": 3, "names": 6, "patterns": 24}
     assert result["bank"]["stats"]["by_kind"] == {"literal": 18, "regex": 6}
-    assert matcher_profiles["literal"]["entity_shard_count"] == 3
-    assert matcher_profiles["literal"]["exact_literal_patterns"] == 18
-    assert matcher_profiles["literal"]["regex_fallback_literal_patterns"] == 0
-    assert matcher_profiles["python_re"]["entity_shard_count"] == 3
+    assert engine_profiles["nerb_engine"]["entity_count"] == 3
+    assert engine_profiles["nerb_engine"]["pattern_count"] == 24
+    assert engine_profiles["nerb_engine"]["match_mode"] == "entity_independent"
     assert make_synthetic_bank(name_count=6, patterns_per_name=4, entity_count=3, literal_ratio=0.75) == bank
 
 

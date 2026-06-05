@@ -82,10 +82,10 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert [
         case["document_bytes"] for case in report["mode_strategy"]["entity_cardinality_sweep"]["routine_size_cases"]
     ] == [10_000, 10_000]
-    assert report["performance"]["literal_heavy"]["python_rust_records_equal"] is True
-    assert report["performance"]["regex_heavy"]["python_rust_records_equal"] is True
+    assert report["performance"]["literal_heavy"]["native_public_records_equal"] is True
+    assert report["performance"]["regex_heavy"]["native_public_records_equal"] is True
     assert "source_parse_jsonl" in report["performance"]["small_bank_floor"]["measurements"]
-    assert report["performance"]["small_bank_floor"]["criteria"]["rust_scan_project_not_slower_than_python"] is True
+    assert report["performance"]["small_bank_floor"]["criteria"]["native_public_records_equal"] is True
     assert report["performance"]["small_bank_floor"]["criteria"]["rust_scan_project_under_ceiling"] is True
 
 
@@ -93,9 +93,9 @@ def test_workload_pass_criteria_fail_on_rust_scan_project_regression():
     gate_report = _load_gate_report_module()
 
     criteria = gate_report._workload_pass_criteria(
-        records_equal=True,
+        native_public_records_equal=True,
         text_bytes=100_000,
-        python_scan_project=_measurement(seconds=1.0),
+        rust_native_scan_project=_measurement(seconds=0.02),
         rust_entity_scan=_measurement(seconds=0.001),
         rust_entity_scan_project=_measurement(seconds=0.02),
         rust_all_overlaps_scan=_measurement(),
@@ -108,7 +108,7 @@ def test_workload_pass_criteria_fail_on_rust_scan_project_regression():
         },
     )
 
-    assert criteria["rust_scan_project_not_slower_than_python"] is True
+    assert criteria["native_public_records_equal"] is True
     assert criteria["rust_scan_project_under_ceiling"] is False
     assert all(criteria.values()) is False
 
@@ -128,6 +128,33 @@ def test_mode_pass_criteria_fail_on_reconstruction_tuple_mismatch():
 
     assert criteria["all_overlaps_reconstructs_exact_default_tuples"] is False
     assert all(criteria.values()) is False
+
+
+def test_entity_cardinality_sweep_fails_when_routine_case_fails(monkeypatch):
+    gate_report = _load_gate_report_module()
+
+    def dense_case(entity_count: int, _iterations: int) -> dict[str, Any]:
+        return {
+            "entity_count": entity_count,
+            "passed": True,
+            "entity_independent": _measurement(seconds=0.001),
+        }
+
+    def routine_case(entity_count: int, _iterations: int, target_bytes: int) -> dict[str, Any]:
+        return {
+            "entity_count": entity_count,
+            "document_bytes": target_bytes,
+            "passed": entity_count != 32,
+            "entity_independent": _measurement(seconds=0.001),
+        }
+
+    monkeypatch.setattr(gate_report, "_entity_cardinality_case", dense_case)
+    monkeypatch.setattr(gate_report, "_entity_cardinality_routine_case", routine_case)
+
+    sweep = gate_report._entity_cardinality_sweep(iterations=1, target_bytes=10_000)
+
+    assert sweep["routine_size_cases"][-1]["passed"] is False
+    assert sweep["passed"] is False
 
 
 def test_memory_report_from_child_fails_when_isolated_probe_exceeds_budget():

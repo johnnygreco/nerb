@@ -10,16 +10,13 @@ Implementation issue: <https://github.com/johnnygreco/nerb/issues/46>
 
 ## Context
 
-The Rust engine migration changes NERB from the current Python `re` regex builder into a package with Python as the
-authoring/control plane and Rust as the matching data plane. This is a planned breaking migration: the Rust engine
-behavior is the target, and the current Python object model does not constrain the design. Silent semantic drift is
-unacceptable. Every planned engine mode must either satisfy this record or be documented as a deliberate divergence.
+The Rust engine migration changes NERB into a package with Python as the authoring/control plane and Rust as the matching
+data plane. This is a planned breaking migration: the Rust engine behavior is the target, and the removed Python regex
+object model does not constrain the design. Silent semantic drift is unacceptable. Every planned engine mode must either
+satisfy this record or be documented as a deliberate divergence.
 
-Current Python surfaces expose useful differential oracles. These oracles help identify and name semantic changes; they
-do not define the target surface.
-
-- Current `NERB` extraction returns `entity`, `name`, `string`, `start`, and `end` records with Python string offsets.
-- JSON-bank extraction returns richer pattern identity, but still reports offsets over Python strings.
+The pre-removal Python surfaces were useful differential oracles during migration. They helped identify and name semantic
+changes, but they do not define the target surface.
 
 The Rust engine will store and sort raw byte spans. Python projection can optionally convert to character offsets for
 explicit text callers, but that conversion is outside the Rust scan benchmark.
@@ -46,17 +43,15 @@ New public Rust-backed records use this schema:
 }
 ```
 
-The conformance oracle converts current Python character offsets to UTF-8 byte offsets in tests only.
+Conformance tests compare Rust byte-offset records directly against the planned record schema.
 
 ### Attribution
 
-Attribution is part of correctness. Conformance checks must compare entity and detector identity, not just spans. For
-current Python `NERB` records, the test oracle maps `name` to both `canonical_name` and `surface_name`. Native JSON-bank
-records will keep the two concepts separate once Rust canonicalization exists.
+Attribution is part of correctness. Conformance checks must compare entity and detector identity, not just spans. Native
+JSON-bank records keep `canonical_name` and `surface_name` explicit.
 
-Current `NERB` loses information when detector names contain underscores because spaces are converted to underscores for
-Python capture groups and then underscores are converted back to spaces on extraction. The Rust engine must not inherit
-that limitation. The Slice 0 fixtures mark this as a known Python-oracle divergence instead of behavior to carry forward.
+Detector names with underscores are preserved by the Rust engine because pattern names no longer round-trip through
+Python capture group syntax.
 
 ### Overlap Contract
 
@@ -100,15 +95,16 @@ separate product decision. Native metadata labels it `internal_benchmark_only` w
 ### Regex Profile
 
 The Rust regex profile rejects constructs that require a backtracking engine, including backreferences and lookaround.
-Existing Python validation may accept some of these patterns because they are valid Python `re`; those cases are
-deliberate migration divergences. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture categories for the
-conformance and validation gates even when the current Python path can compile them.
+Earlier Python validation accepted some of these patterns because they were valid Python `re`; those cases are deliberate
+migration divergences. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture categories for the conformance
+and validation gates even when the removed Python path could compile them.
 
-Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The direct migration set is
-`IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`; unsupported flags fail validation.
+Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The current direct migration set is
+`IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE`. `ASCII` is schema-known but runtime-deferred for the UTF-8 native
+scan path and fails validation until a future issue lands safe lowering semantics. Unsupported flags fail validation.
 
-`add_word_boundaries` remains a first-class bank option, but Rust canonicalization must apply it with explicit boundary
-rules instead of the current string substitution trick.
+`word_boundaries` remains a first-class `Bank.from_config` and compile-option behavior, and Rust canonicalization applies
+it with explicit boundary rules rather than Python-side regex string substitution.
 
 ## Entity Cardinality Assumption
 
@@ -118,9 +114,8 @@ No real bank-owner cardinality target is recorded in this repository yet. Curren
 - `examples/music_entities.yaml`: 2 entities.
 
 The working assumption for `entity_independent` is order-tens of entities with many patterns per entity. Slice 10 adds
-synthetic order-tens evidence, but the real bank-owner target remains unrecorded. Before final Python removal, the
-tracker must record expected entity count and growth from the bank owner. If the real bank is expected to grow beyond
-the order-tens entity range validated by Slice 10, open a new issue before changing the default mode strategy.
+synthetic order-tens evidence, but the real bank-owner target remains unrecorded. If the real bank is expected to grow
+beyond the order-tens entity range validated by Slice 10, open a new issue before changing the default mode strategy.
 
 ## Slice 10 Gate Decision
 
@@ -147,8 +142,8 @@ The mode strategy is therefore locked for the current Rust engine path and the o
 - `global_leftmost` remains an internal throughput baseline only and must not be used for production extraction because
   it violates the cross-entity overlap contract.
 
-This decision does not close the missing bank-owner cardinality input. That input must be recorded before final Python
-removal, and any target beyond the order-tens range requires a new mode-strategy issue.
+This decision does not close the missing bank-owner cardinality input. That input must be recorded before changing the
+mode strategy or expanding beyond the order-tens range; any target beyond that range requires a new mode-strategy issue.
 
 ## Deterministic Output Order
 
@@ -163,7 +158,7 @@ indexes in this baseline schema.
 
 ## Required Conformance Fixture Categories
 
-The differential conformance suite must cover these categories before Rust matching can replace Python matching:
+The conformance suite covers these categories as evidence for the Rust-backed matching contract:
 
 - non-ASCII text before a match, proving character-to-byte offset conversion;
 - cross-entity overlap;
@@ -172,7 +167,8 @@ The differential conformance suite must cover these categories before Rust match
 - ordered alternation ties;
 - underscores in detector names as a known Python-oracle divergence;
 - word-boundary behavior, including a Unicode boundary fixture that ASCII-only boundaries would fail;
-- direct flag migration behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`;
+- direct flag migration behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE`, plus explicit rejection of
+  runtime-deferred `ASCII`;
 - unsupported backtracking-only regex syntax;
 - ReDoS-shaped regexes;
 - compile-bomb-shaped regexes.

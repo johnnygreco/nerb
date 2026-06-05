@@ -1,6 +1,7 @@
 # Rust Engine Gate Evidence
 
-Recorded on 2026-06-05 from branch `goal/rust-engine-slice-10-conformance-benchmark-gates`.
+Recorded on 2026-06-05 from branch `goal/rust-engine-slice-10-conformance-benchmark-gates`, then updated by
+slice 11 after the Rust-backed `Bank` surface became the extraction path.
 
 ## Gate Command
 
@@ -14,8 +15,8 @@ The report emits JSON with conformance, performance, dense-memory, mode-strategy
 only includes sections it measures directly in `overall.passed`: performance, dense memory, and mode strategy.
 Conformance and distribution are marked `external_required` and must be proven by the PR validation commands.
 
-Routine local target documents are 100 KB so Python-oracle comparison remains practical while still exercising
-small-bank, literal-heavy, regex-heavy, dense-overlap, memory, cache, projection, and output behavior.
+Routine local target documents are 100 KB and exercise small-bank, literal-heavy, regex-heavy, dense-overlap, memory,
+cache, projection, and output behavior.
 
 Larger 1 MB evidence was recorded with:
 
@@ -23,8 +24,7 @@ Larger 1 MB evidence was recorded with:
 timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --target-bytes 1000000 --dense-bytes 512
 ```
 
-The single-iteration 1 MB comparison passed under the cap. A five-iteration 1 MB comparison is not a routine gate because
-the Python oracle takes about 65 seconds for the literal-heavy scan/project stage alone.
+The single-iteration 1 MB report passed under the cap. A five-iteration 1 MB report is not a routine local gate.
 
 ## Conformance
 
@@ -43,17 +43,15 @@ The accepted conformance decisions remain in `docs/decisions/0001-rust-engine-se
 - raw `all_overlaps` is a measured prototype because dense outputs amplify heavily and raw candidates alone do not prove
   leftmost-first reconstruction.
 - ASCII flag lowering remains explicitly rejected until UTF-8-safe lowering lands.
-- Python oracle underscore-name loss is a named oracle divergence, not Rust target behavior.
+- Detector names with underscores are preserved by the Rust record contract.
 
 ## Performance
 
 Pass criteria for each workload:
 
-- Python oracle projection and Rust projection match exactly.
+- Native raw-match projection and public `Bank` records match exactly.
 - Repeated scan/project counts are stable.
 - Public `Bank` cache misses cold and hits warm for the same source/options.
-- Rust `entity_independent` scan/project median is less than or equal to the Python oracle scan/project median,
-  including the small-bank floor.
 - Rust `entity_independent` raw-scan and scan/project timings stay under checked-in ceilings, and Rust scan/project
   throughput stays above checked-in floors:
   - small-bank floor: `entity_independent` scan/project <= 0.01s, raw scan <= 0.005s, scan/project >= 1 MB/s;
@@ -63,35 +61,27 @@ Pass criteria for each workload:
 Stage coverage:
 
 - `source_parse_jsonl`: Python-side source parse timing for the JSONL source used by the workload.
-- `python_re_compile` and `python_re_scan_project`: current Python oracle compile and extraction projection.
 - `rust_entity_independent_compile`: native compile, inclusive of source parsing, canonicalization, schema validation,
   runtime validation, and matcher construction.
+- `rust_native_scan_project`: native raw scan plus explicit record projection.
 - `rust_public_bank_cache_lookup`: one cold compile/cache miss followed by warm cache lookups.
 - `rust_entity_independent_scan_raw`, `rust_all_overlaps_scan_raw`, and `rust_global_leftmost_scan_raw`: raw native
   scan timings for the three mode strategies.
-- `rust_entity_independent_scan_project`: Rust raw scan plus Python record projection and sorting.
+- `rust_entity_independent_scan_project`: Rust raw scan plus public wrapper record projection.
 - `json_output`: JSON serialization of already projected Rust records.
 
 Routine report, 5 iterations. `--target-bytes` applies to the literal-heavy and regex-heavy workloads; the small-bank
 floor is intentionally fixed at 10 KB.
 
-| Workload | Text Bytes | Patterns | Records Equal | Python Scan/Project | Rust Scan/Project | Rust Raw Scan | Warm Cache | JSON Output |
-| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| Small-bank floor | 10,000 | 4 | true | 0.001676s | 0.000650s | 0.000102s | 0.000012s | 0.000569s |
-| Literal-heavy | 100,000 | 1,000 | true | 6.546564s | 0.000688s | 0.000044s | 0.000103s | 0.000072s |
-| Regex-heavy | 100,000 | 200 | true | 0.574162s | 0.000261s | 0.000070s | 0.000032s | 0.000062s |
+The report emits one object per workload with `native_public_records_equal`, `measurements`, `criteria`, and
+`rust_scan_project_bytes_per_second`. The JSON report is the authority for exact timings.
 
 Larger 1 MB report, 1 iteration:
 
-| Workload | Text Bytes | Records Equal | Python Scan/Project | Rust Scan/Project | Rust Raw Scan |
-| --- | ---: | --- | ---: | ---: | ---: |
-| Small-bank floor | 10,000 | true | 0.002033s | 0.000860s | 0.000115s |
-| Literal-heavy | 1,000,000 | true | 65.475405s | 0.003197s | 0.001112s |
-| Regex-heavy | 1,000,000 | true | 5.725786s | 0.002432s | 0.001890s |
+The 1 MB report uses the same fields as the routine report.
 
 The literal-heavy and regex-heavy gates pass independently. Both preserve the planned records, have stable counts, and
-keep Rust `entity_independent` scan/project below the Python oracle on the measured workloads. The small-bank floor also
-remains below Python oracle time.
+stay inside the Rust timing and throughput thresholds. The small-bank floor also remains inside the checked-in floor.
 
 ## Dense Memory And Mode Strategy
 
@@ -138,7 +128,7 @@ order-tens entity-cardinality evidence above. `all_overlaps` remains a measured 
 an internal benchmark baseline.
 
 The real bank-owner entity-cardinality target is still not recorded in this repository. It must be captured before final
-Python removal; if expected entity classes exceed the order-tens range validated here, open a new issue before changing
+engine cleanup; if expected entity classes exceed the order-tens range validated here, open a new issue before changing
 the default mode strategy.
 
 ## Distribution
