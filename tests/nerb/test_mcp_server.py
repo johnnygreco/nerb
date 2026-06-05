@@ -445,6 +445,26 @@ def test_extract_inline_filters_entity_and_reads_document_file(tmp_path):
     ]
 
 
+def test_mcp_file_extraction_preserves_original_utf8_byte_offsets_with_crlf(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "document.txt"
+    document_path.write_bytes("Café\r\nRush".encode())
+
+    result = extract_entity(str(config_path), "ARTIST", file_path=str(document_path))
+
+    assert result["records"] == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 7,
+            "end": 11,
+            "offset_unit": "byte",
+        }
+    ]
+
+
 def test_mcp_tools_report_invalid_config_and_regex(tmp_path):
     invalid_config_path = tmp_path / "invalid.yaml"
     invalid_config_path.write_text("ARTIST:\n  Broken: '('\n", encoding="utf-8")

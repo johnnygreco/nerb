@@ -236,6 +236,10 @@ assert bank.scan_text("Café Rush", offsets="char")[0]["offset_unit"] == "char"
 `Bank.scan_path(path)` reads the exact file bytes and then uses the native UTF-8 scan path. Invalid UTF-8 raises
 `ValueError`; callers that need lossy or custom decoding must decode text explicitly and pass it to `scan_text`.
 
+`Bank.from_config(..., word_boundaries=True)` passes the boundary policy to Rust canonicalization. Rust emits canonical
+JSON with `defaults.word_boundaries: true`, wraps whole detector regexes once during canonicalization, and includes that
+policy in pattern stable IDs and the bank hash.
+
 CLI `nerb extract` and the config-backed MCP extraction tools now use this wrapper. Their records no longer include the
 old Python `name` field; use `canonical_name` and `surface_name` instead.
 

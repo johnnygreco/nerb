@@ -70,8 +70,8 @@ class Bank:
         source = _config_to_jsonl_source(
             pattern_config,
             selected_entity=selected_entity,
-            word_boundaries=word_boundaries,
         )
+        compile_options_json = _compile_options_with_word_boundaries(compile_options_json, word_boundaries)
         return cls.from_source_bytes(source, format_hint="jsonl", compile_options_json=compile_options_json)
 
     def to_canonical_json_bytes(self) -> bytes:
@@ -107,7 +107,6 @@ def _config_to_jsonl_source(
     pattern_config: PatternConfig,
     *,
     selected_entity: str | None,
-    word_boundaries: bool,
 ) -> bytes:
     rows = []
     for entity, entity_config in pattern_config.items():
@@ -118,13 +117,12 @@ def _config_to_jsonl_source(
         for canonical_name, regex in entity_config.items():
             if canonical_name == FLAGS_KEY:
                 continue
-            wrapped_regex = rf"\b(?:{regex})\b" if word_boundaries else str(regex)
             rows.append(
                 {
                     "entity": entity,
                     "canonical_name": canonical_name,
                     "surface_name": canonical_name,
-                    "regex": wrapped_regex,
+                    "regex": str(regex),
                     "flags": flags,
                     "priority": priority,
                 }
@@ -137,6 +135,22 @@ def _config_to_jsonl_source(
     return ("\n".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) for row in rows) + "\n").encode(
         "utf-8"
     )
+
+
+def _compile_options_with_word_boundaries(compile_options_json: str | None, enabled: bool) -> str | None:
+    if not enabled:
+        return compile_options_json
+
+    if compile_options_json is None:
+        options: dict[str, Any] = {}
+    else:
+        options_value = json.loads(compile_options_json)
+        if not isinstance(options_value, dict):
+            raise ValueError("compile_options_json must decode to a JSON object.")
+        options = dict(options_value)
+
+    options["word_boundaries"] = True
+    return json.dumps(options, sort_keys=True, separators=(",", ":"))
 
 
 def _flag_list(raw_flags: Any) -> list[str]:

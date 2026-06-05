@@ -65,15 +65,18 @@ pub struct NativeBank {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct CompileOptions {
+struct BankOptions {
     #[serde(default = "default_match_mode")]
     match_mode: MatchMode,
+    #[serde(default)]
+    word_boundaries: bool,
 }
 
-impl Default for CompileOptions {
+impl Default for BankOptions {
     fn default() -> Self {
         Self {
             match_mode: default_match_mode(),
+            word_boundaries: false,
         }
     }
 }
@@ -136,6 +139,7 @@ impl NativeBank {
         format_hint: Option<&str>,
         compile_options_json: Option<&str>,
     ) -> Result<Self> {
+        let options = parse_bank_options_struct(compile_options_json)?;
         let format = SourceFormat::from_hint(format_hint)?;
         let (value, source_format) = match format {
             Some(format) => (parse_source_value(source, format)?, format),
@@ -143,16 +147,17 @@ impl NativeBank {
         };
 
         if source_format == SourceFormat::CanonicalJson {
-            return Self::from_canonical_value(value, compile_options_json);
+            return Self::from_canonical_value(value, options);
         }
 
         match &value {
             Value::Object(object) if is_canonical_json_object(object) => {
-                Self::from_canonical_value(value, compile_options_json)
+                Self::from_canonical_value(value, options)
             }
             _ => {
-                let canonical = canonicalize_source_value(value, source_format)?;
-                Self::from_canonical_bank(canonical, compile_options_json)
+                let canonical =
+                    canonicalize_source_value(value, source_format, options.word_boundaries)?;
+                Self::from_canonical_bank(canonical, options.match_mode)
             }
         }
     }
@@ -161,8 +166,9 @@ impl NativeBank {
         source: &[u8],
         compile_options_json: Option<&str>,
     ) -> Result<Self> {
+        let options = parse_bank_options_struct(compile_options_json)?;
         let value = parse_source_value(source, SourceFormat::CanonicalJson)?;
-        Self::from_canonical_value(value, compile_options_json)
+        Self::from_canonical_value(value, options)
     }
 
     pub fn canonical_json(&self) -> &[u8] {
@@ -206,25 +212,27 @@ impl NativeBank {
             .scan_bytes_leftmost_from_all_overlaps(haystack, buffer)
     }
 
-    fn from_canonical_value(value: Value, compile_options_json: Option<&str>) -> Result<Self> {
+    fn from_canonical_value(value: Value, options: BankOptions) -> Result<Self> {
+        if options.word_boundaries {
+            return Err(validation(
+                "/compile_options/word_boundaries",
+                "word_boundaries is a source canonicalization option and cannot be applied to canonical_json input",
+            ));
+        }
         let canonical =
             serde_json::from_value::<CanonicalBank>(value).map_err(|error| BankError::Parse {
                 format: "canonical_json",
                 message: error.to_string(),
             })?;
-        Self::from_canonical_bank(canonical, compile_options_json)
+        Self::from_canonical_bank(canonical, options.match_mode)
     }
 
-    fn from_canonical_bank(
-        mut canonical: CanonicalBank,
-        compile_options_json: Option<&str>,
-    ) -> Result<Self> {
+    fn from_canonical_bank(mut canonical: CanonicalBank, match_mode: MatchMode) -> Result<Self> {
         validate_and_normalize_canonical_bank(&mut canonical)?;
-        let compile_options = parse_compile_options_struct(compile_options_json)?;
-        let compile_options_value = compile_options_value(&compile_options);
+        let compile_options_value = compile_options_value(match_mode);
         let canonical_json = serde_json::to_vec(&canonical).expect("canonical bank must serialize");
         let bank_hash = bank_hash(&canonical, &compile_options_value);
-        let engine = NativeEngine::compile(&canonical, compile_options.match_mode)?;
+        let engine = NativeEngine::compile(&canonical, match_mode)?;
         Ok(Self {
             canonical,
             canonical_json,
@@ -235,9 +243,9 @@ impl NativeBank {
     }
 }
 
-fn parse_compile_options_struct(compile_options_json: Option<&str>) -> Result<CompileOptions> {
+fn parse_bank_options_struct(compile_options_json: Option<&str>) -> Result<BankOptions> {
     let options = match compile_options_json {
-        None => CompileOptions::default(),
+        None => BankOptions::default(),
         Some(raw) => {
             let value = parse_source_value(raw.as_bytes(), SourceFormat::Json)?;
             if !value.is_object() {
@@ -246,7 +254,7 @@ fn parse_compile_options_struct(compile_options_json: Option<&str>) -> Result<Co
                     "compile options must be a JSON object because they are part of the semantic bank hash",
                 ));
             }
-            serde_json::from_value::<CompileOptions>(value).map_err(|error| BankError::Parse {
+            serde_json::from_value::<BankOptions>(value).map_err(|error| BankError::Parse {
                 format: "compile_options_json",
                 message: error.to_string(),
             })?
@@ -255,25 +263,29 @@ fn parse_compile_options_struct(compile_options_json: Option<&str>) -> Result<Co
     Ok(options)
 }
 
-fn compile_options_value(options: &CompileOptions) -> Value {
-    let value = serde_json::to_value(options).expect("compile options must serialize");
+fn compile_options_value(match_mode: MatchMode) -> Value {
+    let value = serde_json::json!({ "match_mode": match_mode });
     crate::ids::canonicalize_json_value(&value)
 }
 
-fn canonicalize_source_value(value: Value, source_format: SourceFormat) -> Result<CanonicalBank> {
+fn canonicalize_source_value(
+    value: Value,
+    source_format: SourceFormat,
+    word_boundaries: bool,
+) -> Result<CanonicalBank> {
     match source_format {
-        SourceFormat::Jsonl => canonicalize_jsonl_rows(value),
+        SourceFormat::Jsonl => canonicalize_jsonl_rows(value, word_boundaries),
         SourceFormat::Json | SourceFormat::Yaml | SourceFormat::CanonicalJson => {
             let object = as_object(&value, "")?;
             if is_current_json_bank_object(object) {
-                canonicalize_current_json_bank(object)
+                canonicalize_current_json_bank(object, word_boundaries)
             } else if object.contains_key("schema") || object.contains_key("schema_version") {
                 Err(validation(
                     "",
                     "compact detector maps cannot use reserved entity names \"schema\" or \"schema_version\"",
                 ))
             } else {
-                canonicalize_detector_map(object)
+                canonicalize_detector_map(object, word_boundaries)
             }
         }
     }
@@ -289,7 +301,7 @@ fn is_current_json_bank_object(object: &Map<String, Value>) -> bool {
     matches!(object.get("schema_version"), Some(Value::String(_)))
 }
 
-fn canonicalize_jsonl_rows(value: Value) -> Result<CanonicalBank> {
+fn canonicalize_jsonl_rows(value: Value, word_boundaries: bool) -> Result<CanonicalBank> {
     let rows = match value {
         Value::Array(rows) => rows,
         _ => {
@@ -335,10 +347,14 @@ fn canonicalize_jsonl_rows(value: Value) -> Result<CanonicalBank> {
             priority,
         });
     }
-    build_canonical_bank(defaults(), candidates)
+    apply_word_boundaries(&mut candidates, word_boundaries);
+    build_canonical_bank(defaults(word_boundaries), candidates)
 }
 
-fn canonicalize_detector_map(object: &Map<String, Value>) -> Result<CanonicalBank> {
+fn canonicalize_detector_map(
+    object: &Map<String, Value>,
+    word_boundaries: bool,
+) -> Result<CanonicalBank> {
     if object.is_empty() {
         return Err(validation(
             "",
@@ -400,10 +416,14 @@ fn canonicalize_detector_map(object: &Map<String, Value>) -> Result<CanonicalBan
             });
         }
     }
-    build_canonical_bank(defaults(), candidates)
+    apply_word_boundaries(&mut candidates, word_boundaries);
+    build_canonical_bank(defaults(word_boundaries), candidates)
 }
 
-fn canonicalize_current_json_bank(object: &Map<String, Value>) -> Result<CanonicalBank> {
+fn canonicalize_current_json_bank(
+    object: &Map<String, Value>,
+    word_boundaries: bool,
+) -> Result<CanonicalBank> {
     reject_unknown(
         object,
         "",
@@ -532,7 +552,8 @@ fn canonicalize_current_json_bank(object: &Map<String, Value>) -> Result<Canonic
             }
         }
     }
-    build_canonical_bank(defaults(), candidates)
+    apply_word_boundaries(&mut candidates, word_boundaries);
+    build_canonical_bank(defaults(word_boundaries), candidates)
 }
 
 fn candidate_from_current_pattern(
@@ -710,6 +731,16 @@ struct PatternCandidate {
     priority: Option<i64>,
 }
 
+fn apply_word_boundaries(candidates: &mut [PatternCandidate], enabled: bool) {
+    if !enabled {
+        return;
+    }
+
+    for candidate in candidates {
+        candidate.regex = format!(r"\b(?:{})\b", candidate.regex);
+    }
+}
+
 fn build_canonical_bank(
     defaults: CanonicalDefaults,
     candidates: Vec<PatternCandidate>,
@@ -818,6 +849,7 @@ fn build_canonical_bank(
                     &pattern.surface_name,
                     &pattern.regex,
                     &pattern.flags,
+                    defaults.word_boundaries,
                     &defaults.normalization,
                 ),
                 priority: pattern.priority.expect("priority assigned above"),
@@ -886,6 +918,7 @@ fn validate_and_normalize_canonical_bank(bank: &mut CanonicalBank) -> Result<()>
                 &pattern.surface_name,
                 &pattern.regex,
                 &flags,
+                bank.defaults.word_boundaries,
                 &bank.defaults.normalization,
             );
             if pattern.stable_id != expected_pattern_id {
@@ -898,6 +931,12 @@ fn validate_and_normalize_canonical_bank(bank: &mut CanonicalBank) -> Result<()>
                         "invalid pattern stable_id {:?}; expected {expected_pattern_id:?}",
                         pattern.stable_id
                     ),
+                ));
+            }
+            if bank.defaults.word_boundaries && !is_word_boundary_wrapped(&pattern.regex) {
+                return Err(validation(
+                    format!("/entities/{}/patterns/{}/regex", entity.name, pattern.canonical_name),
+                    "canonical JSON with defaults.word_boundaries=true must use Rust-emitted word-boundary wrappers",
                 ));
             }
             candidates.push(PatternCandidate {
@@ -918,6 +957,10 @@ fn validate_and_normalize_canonical_bank(bank: &mut CanonicalBank) -> Result<()>
         ));
     }
     Ok(())
+}
+
+fn is_word_boundary_wrapped(regex: &str) -> bool {
+    regex.starts_with(r"\b(?:") && regex.ends_with(r")\b")
 }
 
 fn validate_candidate(candidate: &PatternCandidate, defaults: &CanonicalDefaults) -> Result<()> {
@@ -981,12 +1024,6 @@ fn validate_defaults(defaults: &CanonicalDefaults) -> Result<()> {
             "bank-level case_insensitive defaults are not supported; migrate flags to patterns",
         ));
     }
-    if defaults.word_boundaries {
-        return Err(validation(
-            "/defaults/word_boundaries",
-            "bank-level word_boundaries defaults are not supported; migrate boundaries to patterns",
-        ));
-    }
     if defaults.normalization != "none" {
         return Err(validation(
             "/defaults/normalization",
@@ -996,12 +1033,12 @@ fn validate_defaults(defaults: &CanonicalDefaults) -> Result<()> {
     Ok(())
 }
 
-fn defaults() -> CanonicalDefaults {
+fn defaults(word_boundaries: bool) -> CanonicalDefaults {
     CanonicalDefaults {
         engine: ENGINE_NAME.to_string(),
         unicode: true,
         case_insensitive: false,
-        word_boundaries: false,
+        word_boundaries,
         normalization: "none".to_string(),
     }
 }
@@ -1313,5 +1350,61 @@ GENRE:
         .unwrap();
 
         assert_ne!(first.hash(), second.hash());
+    }
+
+    #[test]
+    fn word_boundaries_are_applied_during_source_canonicalization() {
+        let source = br#"{"TERM":{"Art":"art"}}"#;
+        let plain = NativeBank::from_source_bytes(source, Some("json"), None).unwrap();
+        let bounded = NativeBank::from_source_bytes(
+            source,
+            Some("json"),
+            Some(r#"{"word_boundaries":true}"#),
+        )
+        .unwrap();
+        let round_tripped =
+            NativeBank::from_canonical_json_bytes(bounded.canonical_json(), None).unwrap();
+
+        assert!(!plain.canonical().defaults.word_boundaries);
+        assert!(bounded.canonical().defaults.word_boundaries);
+        assert_eq!(
+            bounded.canonical().entities[0].patterns[0].regex,
+            r"\b(?:art)\b"
+        );
+        assert_eq!(
+            bounded.compile_options(),
+            &serde_json::json!({"match_mode": "entity_independent"})
+        );
+        assert_ne!(plain.hash(), bounded.hash());
+        assert_eq!(round_tripped.hash(), bounded.hash());
+    }
+
+    #[test]
+    fn canonical_json_rejects_unwrapped_regex_with_word_boundary_default() {
+        let bounded = NativeBank::from_source_bytes(
+            br#"{"TERM":{"Art":"art"}}"#,
+            Some("json"),
+            Some(r#"{"word_boundaries":true}"#),
+        )
+        .unwrap();
+        let mut canonical: CanonicalBank =
+            serde_json::from_slice(bounded.canonical_json()).unwrap();
+        canonical.entities[0].patterns[0].regex = "art".to_string();
+        canonical.entities[0].patterns[0].stable_id = pattern_stable_id(
+            &canonical.entities[0].name,
+            &canonical.entities[0].patterns[0].canonical_name,
+            &canonical.entities[0].patterns[0].surface_name,
+            &canonical.entities[0].patterns[0].regex,
+            &canonical.entities[0].patterns[0].flags,
+            canonical.defaults.word_boundaries,
+            &canonical.defaults.normalization,
+        );
+        let source = serde_json::to_vec(&canonical).unwrap();
+
+        let error = NativeBank::from_canonical_json_bytes(&source, None).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("must use Rust-emitted word-boundary wrappers"));
     }
 }

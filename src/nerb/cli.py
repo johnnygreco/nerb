@@ -207,7 +207,20 @@ def _read_json_bank_text_source(
         return text
 
     if read_stdin:
-        return sys.stdin.read()
+        stdin_buffer = getattr(sys.stdin, "buffer", None)
+        if stdin_buffer is not None:
+            stdin_bytes = stdin_buffer.read()
+            try:
+                return stdin_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                _exit_error(f"Standard input is not valid UTF-8: {exc}")
+
+        stdin_text = sys.stdin.read()
+        try:
+            stdin_text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            _exit_error(f"Standard input is not valid UTF-8: {exc}")
+        return stdin_text
 
     if file_path is None:
         _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
@@ -416,7 +429,7 @@ def _resolve_extraction_arguments(
     return entity, document
 
 
-def _read_extraction_text(document: Path | None, *, read_stdin: bool, text: str | None) -> str:
+def _read_extraction_source(document: Path | None, *, read_stdin: bool, text: str | None) -> str | bytes:
     source_count = sum([document is not None, read_stdin, text is not None])
     if source_count != 1:
         _exit_error("Provide exactly one input source: DOCUMENT, --stdin, or --text.")
@@ -425,7 +438,24 @@ def _read_extraction_text(document: Path | None, *, read_stdin: bool, text: str 
         return text
 
     if read_stdin:
-        return sys.stdin.read()
+        stdin_buffer = getattr(sys.stdin, "buffer", None)
+        if stdin_buffer is not None:
+            stdin_bytes = stdin_buffer.read()
+            try:
+                stdin_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                _exit_error(f"Standard input is not valid UTF-8: {exc}")
+            return stdin_bytes
+
+        try:
+            stdin_text = sys.stdin.read()
+        except UnicodeDecodeError as exc:
+            _exit_error(f"Standard input is not valid UTF-8: {exc}")
+        try:
+            stdin_text.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            _exit_error(f"Standard input is not valid UTF-8: {exc}")
+        return stdin_text
 
     if document is None:
         _exit_error("Provide exactly one input source: DOCUMENT, --stdin, or --text.")
@@ -437,11 +467,17 @@ def _read_extraction_text(document: Path | None, *, read_stdin: bool, text: str 
         _exit_error(f"Document path is not a file: {document}.")
 
     try:
-        return document.read_text(encoding="utf-8")
+        document_bytes = document.read_bytes()
     except UnicodeDecodeError as exc:
         _exit_error(f"Document file is not valid UTF-8 at {document}: {exc}")
     except OSError as exc:
         _exit_error(f"Could not read document at {document}: {exc}")
+
+    try:
+        document_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _exit_error(f"Document file is not valid UTF-8 at {document}: {exc}")
+    return document_bytes
 
 
 def _parse_pattern_definition(raw_value: str) -> tuple[str, str]:
@@ -511,7 +547,7 @@ def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) 
 def _extract_records(
     pattern_config: PatternConfig,
     selected_entity: str | None,
-    text: str,
+    source: str | bytes,
     *,
     word_boundaries: bool,
 ) -> list[dict[str, Any]]:
@@ -521,7 +557,9 @@ def _extract_records(
             selected_entity=selected_entity,
             word_boundaries=word_boundaries,
         )
-        return bank.scan_text(text)
+        if isinstance(source, bytes):
+            return bank.scan_bytes(source)
+        return bank.scan_text(source)
     except ValueError as exc:
         _exit_error(f"Could not compile or scan detectors with the Rust engine: {exc}")
 
@@ -1132,7 +1170,7 @@ def extract(
 ) -> None:
     """Extract configured named entities from a document."""
     selected_entity, document_path = _resolve_extraction_arguments(entity, document, all_entities=all_entities)
-    document_text = _read_extraction_text(document_path, read_stdin=read_stdin, text=text)
+    document_source = _read_extraction_source(document_path, read_stdin=read_stdin, text=text)
     config_path = _command_config_path(ctx, config)
     pattern_config = _load_extraction_config(
         ctx,
@@ -1142,7 +1180,7 @@ def extract(
         inline_detectors=inline_detectors or [],
         selected_entity=selected_entity,
     )
-    records = _extract_records(pattern_config, selected_entity, document_text, word_boundaries=word_boundaries)
+    records = _extract_records(pattern_config, selected_entity, document_source, word_boundaries=word_boundaries)
     _echo_records(records, output_format)
 
 
@@ -1174,10 +1212,10 @@ def test_detector(
     config: Path | None = _config_option(),
 ) -> None:
     """Test one detector against literal text, standard input, or a document."""
-    document_text = _read_extraction_text(document, read_stdin=read_stdin, text=text)
+    document_source = _read_extraction_source(document, read_stdin=read_stdin, text=text)
     config_path = _command_config_path(ctx, config)
     pattern_config = _test_detector_config(config_path, entity, name, pattern, flags=flags)
-    records = _extract_records(pattern_config, entity, document_text, word_boundaries=word_boundaries)
+    records = _extract_records(pattern_config, entity, document_source, word_boundaries=word_boundaries)
     _echo_records(records, output_format)
 
 

@@ -12,6 +12,7 @@ pub fn pattern_stable_id(
     surface_name: &str,
     regex: &str,
     flags: &[String],
+    word_boundaries: bool,
     normalization: &str,
 ) -> String {
     let mut fields = vec![
@@ -20,6 +21,7 @@ pub fn pattern_stable_id(
         canonical_name.to_string(),
         surface_name.to_string(),
         regex.to_string(),
+        word_boundaries.to_string(),
         normalization.to_string(),
     ];
     fields.extend(flags.iter().cloned());

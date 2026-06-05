@@ -4,7 +4,10 @@ import json
 import re
 from importlib.metadata import entry_points
 from importlib.metadata import version as package_version
+from io import BytesIO
 
+import pytest
+from click.exceptions import Exit
 from typer.testing import CliRunner
 
 from nerb import (
@@ -24,15 +27,26 @@ from nerb import (
     extract_file as extract_json_file,
 )
 from nerb import (
+    extract_report as extract_json_report,
+)
+from nerb import (
     extract_report_file as extract_json_report_file,
 )
 from nerb import (
     extract_text as extract_json_text,
 )
-from nerb.cli import app
+from nerb.cli import _extract_records, _read_extraction_source, app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
 
 runner = CliRunner()
+
+
+class _BinaryStdin:
+    def __init__(self, payload: bytes) -> None:
+        self.buffer = BytesIO(payload)
+
+    def read(self) -> str:
+        return self.buffer.getvalue().decode()
 
 
 def _json_records(output: str):
@@ -247,6 +261,25 @@ def test_json_bank_cli_enforces_text_source_rules(tmp_path, test_data_path):
     assert duplicate_source.exit_code == 1
     assert "Provide exactly one text source" in missing_source.output
     assert "Provide exactly one text source" in duplicate_source.output
+
+
+def test_json_bank_cli_stdin_extraction_commands_keep_text_inputs(test_data_path):
+    bank_path = test_data_path / "minimal_bank.json"
+    bank = _load_json(bank_path)
+    text = "Send this to Acme Corp today."
+
+    clear_compiled_bank_cache()
+    text_result = runner.invoke(app, ["extract-text", "--bank", str(bank_path), "--stdin"], input=text)
+    clear_compiled_bank_cache()
+    expected_text = extract_json_text(bank, text)
+    clear_compiled_bank_cache()
+    report_result = runner.invoke(app, ["extract-report", "--bank", str(bank_path), "--stdin"], input=text)
+    clear_compiled_bank_cache()
+
+    assert text_result.exit_code == 0
+    assert report_result.exit_code == 0
+    assert json.loads(text_result.output) == expected_text
+    assert json.loads(report_result.output) == extract_json_report(bank, text)
 
 
 def test_json_bank_cli_invalid_bank_returns_diagnostics(tmp_path):
@@ -543,6 +576,60 @@ def test_extract_word_boundaries_option_limits_inline_matches(monkeypatch, tmp_p
 
     assert result.exit_code == 0
     assert [record["start"] for record in _json_records(result.output)] == [0, 12]
+
+
+def test_extract_file_preserves_original_utf8_byte_offsets_with_crlf(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "document.txt"
+    document_path.write_bytes("Café\r\nRush".encode())
+
+    result = runner.invoke(
+        app,
+        ["extract", "ARTIST", str(document_path), "--config", str(config_path), "--format", "json"],
+    )
+
+    assert result.exit_code == 0
+    assert _json_records(result.output) == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 7,
+            "end": 11,
+            "offset_unit": "byte",
+        }
+    ]
+
+
+def test_extract_stdin_preserves_original_utf8_byte_offsets(monkeypatch, tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    monkeypatch.setattr("sys.stdin", _BinaryStdin("Café\r\nRush".encode()))
+
+    source = _read_extraction_source(None, read_stdin=True, text=None)
+    records = _extract_records(load_config(config_path), "ARTIST", source, word_boundaries=False)
+
+    assert records == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 7,
+            "end": 11,
+            "offset_unit": "byte",
+        }
+    ]
+
+
+def test_extract_reports_invalid_utf8_stdin(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", _BinaryStdin(b"\xffRush"))
+
+    with pytest.raises(Exit) as exc_info:
+        _read_extraction_source(None, read_stdin=True, text=None)
+
+    assert exc_info.value.exit_code == 1
+    assert "Standard input is not valid UTF-8" in capsys.readouterr().err
 
 
 def test_extract_no_matches_returns_empty_success(monkeypatch, tmp_path):
