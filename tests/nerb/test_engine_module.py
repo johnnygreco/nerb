@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.metadata
 import json
+from pathlib import Path
 
 import pytest
 
@@ -102,6 +103,63 @@ def test_public_bank_scan_path_rejects_invalid_utf8(tmp_path):
 
     with pytest.raises(ValueError, match="valid UTF-8"):
         bank.scan_path(document_path)
+
+
+def test_public_bank_from_path_rejects_oversized_source_before_read(monkeypatch, tmp_path):
+    monkeypatch.setattr(engine_module, "DEFAULT_MAX_BANK_SOURCE_BYTES", 4)
+    bank_path = tmp_path / "bank.json"
+    bank_path.write_bytes(b'{"CODE":{"A":"A"}}')
+
+    def fail_open(self, *args, **kwargs):
+        raise AssertionError("oversized bank sources must be rejected before content is read")
+
+    monkeypatch.setattr(Path, "open", fail_open)
+
+    with pytest.raises(ValueError, match="configured limit"):
+        nerb.Bank.from_path(bank_path, format_hint="json")
+
+
+def test_public_bank_from_path_rechecks_source_size_after_bounded_read(monkeypatch, tmp_path):
+    monkeypatch.setattr(engine_module, "DEFAULT_MAX_BANK_SOURCE_BYTES", 4)
+    bank_path = tmp_path / "bank.json"
+    bank_path.write_bytes(b"{}")
+    actual_mode = bank_path.stat().st_mode
+    original_stat = Path.stat
+
+    class StaleStat:
+        st_mode = actual_mode
+        st_size = 1
+
+    class FakeFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, size=-1):
+            assert size == 5
+            return b"x" * size
+
+    def stale_stat(self, *args, **kwargs):
+        if self == bank_path:
+            return StaleStat()
+        return original_stat(self, *args, **kwargs)
+
+    def fake_open(self, *args, **kwargs):
+        assert self == bank_path
+        return FakeFile()
+
+    monkeypatch.setattr(Path, "stat", stale_stat)
+    monkeypatch.setattr(Path, "open", fake_open)
+
+    with pytest.raises(ValueError, match="configured limit"):
+        nerb.Bank.from_path(bank_path, format_hint="json")
+
+
+def test_public_bank_from_path_rejects_non_regular_sources(tmp_path):
+    with pytest.raises(ValueError, match="regular file"):
+        nerb.Bank.from_path(tmp_path, format_hint="json")
 
 
 def test_public_bank_from_config_word_boundaries_are_rust_canonicalized():
