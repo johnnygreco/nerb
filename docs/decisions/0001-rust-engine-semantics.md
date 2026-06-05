@@ -77,8 +77,13 @@ collected.
 ### Non-Default Modes
 
 `all_overlaps` has a different semantic contract. It reports cross-entity overlap, within-entity overlap, and all
-matching alternation branches unless a post-filter reconstructs leftmost-first behavior. It must remain a measured
-prototype until its raw semantics, post-filter cost, and dense-hit match amplification are documented.
+matching alternation branches unless a reconstruction step restores leftmost-first behavior. Slice 6 showed that a
+span-only raw-candidate post-filter is not sufficient to prove exact reconstruction: `MatchKind::All` can expose the
+shorter branch of one detector such as `Sam` from `Samwise|Sam`, while leftmost-first semantics choose `Samwise` when
+that branch appears first. The prototype therefore keeps raw `all_overlaps` output separate from an exact reconstruction
+measurement path that reruns the entity-independent shards after measuring raw overlap scan cost. It must remain a
+measured prototype until raw semantics, reconstruction cost, and dense-hit match amplification justify a mode strategy
+change.
 
 `global_leftmost` is an internal throughput baseline only. It collapses cross-entity overlap and must not become the
 default extraction behavior without a separate product decision.

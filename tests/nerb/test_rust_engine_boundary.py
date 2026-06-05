@@ -12,6 +12,10 @@ def engine():
     return importlib.import_module("nerb._engine")
 
 
+def _raw_tuples(buffer):
+    return [buffer[index] for index in range(len(buffer))]
+
+
 def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
     bank = engine.Bank.from_source_bytes(
         b'{"CODE":{"Alpha":"A"},"ARTIST":{"Pink Floyd":"Pink\\\\s+Floyd"}}',
@@ -128,7 +132,7 @@ def test_native_scan_bytes_returns_sorted_raw_matches_and_reuses_output_buffer(e
     returned = bank.scan_bytes(b"early then late", out=buffer)
 
     assert returned is buffer
-    assert [buffer[index] for index in range(len(buffer))] == [(1, 0, 5), (0, 11, 15)]
+    assert _raw_tuples(buffer) == [(1, 0, 5), (0, 11, 15)]
 
 
 def test_native_scan_bytes_out_preserves_reserved_capacity(engine):
@@ -140,7 +144,89 @@ def test_native_scan_bytes_out_preserves_reserved_capacity(engine):
 
     assert returned is buffer
     assert buffer.capacity() >= before
-    assert [buffer[index] for index in range(len(buffer))] == [(0, 0, 5)]
+    assert _raw_tuples(buffer) == [(0, 0, 5)]
+
+
+def test_native_all_overlaps_scan_reports_raw_semantic_differences(engine):
+    source = b"""
+{"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
+{"entity":"PERSON","canonical_name":"Samwise","surface_name":"Samwise","regex":"Samwise","priority":1}
+{"entity":"PROJECT","canonical_name":"Samba","surface_name":"Samba","regex":"Samba","priority":0}
+"""
+    default_bank = engine.Bank.from_source_bytes(source, format_hint="jsonl")
+    overlap_bank = engine.Bank.from_source_bytes(
+        source,
+        format_hint="jsonl",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+
+    assert _raw_tuples(default_bank.scan_bytes(b"Samba Samwise")) == [(0, 0, 3), (2, 0, 5), (0, 6, 9)]
+    assert _raw_tuples(overlap_bank.scan_bytes(b"Samba Samwise")) == [
+        (0, 0, 3),
+        (2, 0, 5),
+        (0, 6, 9),
+        (1, 6, 13),
+    ]
+
+
+def test_native_all_overlaps_leftmost_filter_reconstructs_default_entity_semantics(engine):
+    source = b"""
+{"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
+{"entity":"PERSON","canonical_name":"Samwise","surface_name":"Samwise","regex":"Samwise","priority":1}
+{"entity":"PROJECT","canonical_name":"Samba","surface_name":"Samba","regex":"Samba","priority":0}
+"""
+    default_bank = engine.Bank.from_source_bytes(source, format_hint="jsonl")
+    overlap_bank = engine.Bank.from_source_bytes(
+        source,
+        format_hint="jsonl",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+    buffer = engine.MatchBuffer(capacity=16)
+    before = buffer.capacity()
+
+    returned = overlap_bank.scan_bytes_leftmost_from_all_overlaps(b"Samba Samwise", out=buffer)
+
+    assert returned is buffer
+    assert buffer.capacity() >= before
+    assert _raw_tuples(buffer) == _raw_tuples(default_bank.scan_bytes(b"Samba Samwise"))
+
+
+def test_native_all_overlaps_leftmost_filter_preserves_ordered_alternation(engine):
+    source = b"""
+{"entity":"PERSON","canonical_name":"Alias","surface_name":"Alias","regex":"Samwise|Sam","priority":0}
+"""
+    default_bank = engine.Bank.from_source_bytes(source, format_hint="jsonl")
+    overlap_bank = engine.Bank.from_source_bytes(
+        source,
+        format_hint="jsonl",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+
+    assert _raw_tuples(overlap_bank.scan_bytes(b"Samwise")) == [(0, 0, 3), (0, 0, 7)]
+    assert _raw_tuples(overlap_bank.scan_bytes_leftmost_from_all_overlaps(b"Samwise")) == _raw_tuples(
+        default_bank.scan_bytes(b"Samwise")
+    )
+
+
+def test_native_all_overlaps_leftmost_filter_rejects_wrong_mode_and_invalid_utf8(engine):
+    default_bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"Alpha"}}', format_hint="json")
+    default_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+
+    with pytest.raises(ValueError, match="requires match_mode"):
+        default_bank.scan_bytes_leftmost_from_all_overlaps(b"Alpha", out=default_buffer)
+
+    assert len(default_buffer) == 0
+
+    overlap_bank = engine.Bank.from_source_bytes(
+        b'{"CODE":{"Alpha":"Alpha"}}',
+        format_hint="json",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+    invalid_utf8_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        overlap_bank.scan_bytes_leftmost_from_all_overlaps(b"\xff", out=invalid_utf8_buffer)
+
+    assert len(invalid_utf8_buffer) == 0
 
 
 def test_native_scan_bytes_out_clears_partial_matches_after_scan_error(engine):
@@ -170,13 +256,13 @@ def test_native_scan_bytes_rejects_invalid_utf8_and_future_match_modes(engine):
     future_mode = engine.Bank.from_source_bytes(
         b'{"CODE":{"Alpha":"A"}}',
         format_hint="json",
-        compile_options_json='{"match_mode":"all_overlaps"}',
+        compile_options_json='{"match_mode":"global_leftmost"}',
     )
-    with pytest.raises(ValueError, match="entity_independent"):
+    with pytest.raises(ValueError, match="global_leftmost"):
         future_mode.scan_bytes(b"Alpha")
 
     future_mode_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
-    with pytest.raises(ValueError, match="entity_independent"):
+    with pytest.raises(ValueError, match="global_leftmost"):
         future_mode.scan_bytes(b"Alpha", out=future_mode_buffer)
 
     assert len(future_mode_buffer) == 0
