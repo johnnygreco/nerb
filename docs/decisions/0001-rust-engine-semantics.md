@@ -77,10 +77,11 @@ collected.
 ### Non-Default Modes
 
 `all_overlaps` has a different semantic contract. It reports cross-entity overlap, within-entity overlap, and all
-matching alternation branches unless a reconstruction step restores leftmost-first behavior. Slice 6 showed that a
+matching spans for each detector pattern unless a reconstruction step restores leftmost-first behavior. It does not
+preserve branch identity inside one regex; attribution remains at the NERB detector index. Slice 6 showed that a
 span-only raw-candidate post-filter is not sufficient to prove exact reconstruction: `MatchKind::All` can expose the
-shorter branch of one detector such as `Sam` from `Samwise|Sam`, while leftmost-first semantics choose `Samwise` when
-that branch appears first. The prototype therefore keeps raw `all_overlaps` output separate from an exact reconstruction
+shorter span of one detector such as `Sam` from `Samwise|Sam`, while leftmost-first semantics choose `Samwise` when that
+branch appears first. The prototype therefore keeps raw `all_overlaps` output separate from an exact reconstruction
 measurement path that reruns the entity-independent shards after measuring raw overlap scan cost. It must remain a
 measured prototype until raw semantics, reconstruction cost, and dense-hit match amplification justify a mode strategy
 change.

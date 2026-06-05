@@ -207,37 +207,39 @@ fn scan_all_overlaps(
             ));
         };
 
-        let start_offset = if input.start() == end.offset() {
-            end.offset()
-        } else {
-            let reverse_input = input
-                .clone()
-                .range(input.start()..end.offset())
-                .anchored(Anchored::Pattern(end.pattern()))
-                .earliest(false);
-            let start = matcher
+        let reverse_input = input
+            .clone()
+            .range(input.start()..end.offset())
+            .anchored(Anchored::Pattern(end.pattern()))
+            .earliest(false);
+        let mut reverse_state = OverlappingState::start();
+        let mut recovered_start = false;
+        loop {
+            matcher
                 .reverse
-                .try_search_rev(&mut reverse_cache, &reverse_input)
+                .try_search_overlapping_rev(&mut reverse_cache, &reverse_input, &mut reverse_state)
                 .map_err(|error| {
                     validation(
                         "/engine/all_overlaps/reverse",
                         format!("all_overlaps reverse search failed: {error}"),
                     )
-                })?
-                .ok_or_else(|| {
-                    validation(
-                        "/engine/all_overlaps/reverse",
-                        "all_overlaps reverse search failed to recover a match start",
-                    )
                 })?;
-            start.offset()
-        };
-
-        buffer.push(RawMatch::new(
-            detector_index,
-            start_offset as u64,
-            end.offset() as u64,
-        )?)?;
+            let Some(start) = reverse_state.get_match() else {
+                break;
+            };
+            recovered_start = true;
+            buffer.push(RawMatch::new(
+                detector_index,
+                start.offset() as u64,
+                end.offset() as u64,
+            )?)?;
+        }
+        if !recovered_start {
+            return Err(validation(
+                "/engine/all_overlaps/reverse",
+                "all_overlaps reverse search failed to recover a match start",
+            ));
+        }
     }
     buffer.sort();
     Ok(())
@@ -320,6 +322,7 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
         .configure(
             HybridDfa::config()
                 .match_kind(MatchKind::All)
+                .unicode_word_boundary(true)
                 .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),
         )
         .build_from_nfa(forward_nfa)
@@ -334,6 +337,7 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
             HybridDfa::config()
                 .match_kind(MatchKind::All)
                 .starts_for_each_pattern(true)
+                .unicode_word_boundary(true)
                 .prefilter(None)
                 .specialize_start_states(false)
                 .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),

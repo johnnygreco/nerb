@@ -106,15 +106,17 @@ assert [raw[i] for i in range(len(raw))] == [(0, 0, 3), (1, 0, 5)]
 - local pattern IDs are translated back to global detector indexes before appending to `MatchBuffer`.
 
 Raw `all_overlaps` output is intentionally not the default contract. It preserves cross-entity overlap, but it also
-reports within-entity overlapping detectors and can report shorter branches from a single ordered alternation. For
-example, the production `entity_independent` mode chooses `Samwise` for `Samwise|Sam` over `Samwise`, while raw
-`all_overlaps` may also expose the `Sam` branch. That means a span-only candidate post-filter cannot prove exact
+reports within-entity overlapping detectors and every matching span for each detector pattern. It does not preserve a
+separate branch identity inside one regex; attribution still stops at the NERB detector index. For example, the
+production `entity_independent` mode chooses `Samwise` for `Samwise|Sam` over `Samwise`, while raw `all_overlaps` exposes
+both `(0, 0, 3)` and `(0, 0, 7)` for that one detector. That means a span-only candidate post-filter cannot prove exact
 leftmost-first reconstruction.
 
 The prototype therefore exposes `Bank.scan_bytes_leftmost_from_all_overlaps` only as a measurement path. It first runs
 the raw overlapping scan, then uses the existing entity-independent shards to reconstruct the exact leftmost-first output.
 This keeps raw overlap cost and exact reconstruction cost visible without pretending that raw candidates alone preserve
-enough ordering information.
+enough ordering information. Reconstruction is exact only when the raw overlapping scan itself fits the `MatchBuffer`
+pre-scan capacity cap; extremely dense raw overlap workloads can fail before the reconstruction pass runs.
 
 ```python
 source = b"""

@@ -208,6 +208,39 @@ def test_native_all_overlaps_leftmost_filter_preserves_ordered_alternation(engin
     )
 
 
+def test_native_all_overlaps_scan_reports_quantified_same_detector_spans(engine):
+    source = b"""
+{"entity":"CODE","canonical_name":"Run","surface_name":"Run","regex":"A+","priority":0}
+"""
+    overlap_bank = engine.Bank.from_source_bytes(
+        source,
+        format_hint="jsonl",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+
+    assert _raw_tuples(overlap_bank.scan_bytes(b"AAA")) == [
+        (0, 0, 1),
+        (0, 0, 2),
+        (0, 0, 3),
+        (0, 1, 2),
+        (0, 1, 3),
+        (0, 2, 3),
+    ]
+
+
+def test_native_all_overlaps_scan_supports_unicode_word_boundary_patterns(engine):
+    source = b"""
+{"entity":"CODE","canonical_name":"foo","surface_name":"foo","regex":"\\\\bfoo\\\\b","priority":0}
+"""
+    overlap_bank = engine.Bank.from_source_bytes(
+        source,
+        format_hint="jsonl",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+
+    assert _raw_tuples(overlap_bank.scan_bytes(b"foo bar")) == [(0, 0, 3)]
+
+
 def test_native_all_overlaps_leftmost_filter_rejects_wrong_mode_and_invalid_utf8(engine):
     default_bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"Alpha"}}', format_hint="json")
     default_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])

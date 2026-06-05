@@ -219,7 +219,8 @@ Interpretation: raw `all_overlaps` is feasible on the smoke fixture, but dense o
 by three orders of magnitude. Exact leftmost reconstruction currently measures raw overlap cost and then reruns the
 entity-independent shards; the incremental median cost in this probe was about 0.000069 seconds after the raw scan, but
 the important finding is semantic: raw candidates alone do not preserve enough ordered-alternation information to prove
-leftmost-first conformance.
+leftmost-first conformance. The reconstruction measurement is exact only when the raw overlapping scan fits the current
+`MatchBuffer` pre-scan capacity cap.
 
 ## Benchmark Commands
 
