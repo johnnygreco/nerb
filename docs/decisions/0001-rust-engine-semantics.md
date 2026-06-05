@@ -134,7 +134,8 @@ Slice 10 also adds a synthetic entity-cardinality sweep with 2, 8, and 32 entiti
 entity over 256 bytes, `entity_independent` produced 64, 256, and 1,024 matches respectively; raw `all_overlaps`
 produced 4,040, 16,160, and 64,640 matches; and `global_leftmost` produced 32 matches in each case because it collapses
 cross-entity overlap to one global winner per region. Exact reconstruction matched the production tuples in all sweep
-cases.
+cases. The sweep gates order-tens performance as well: the 32-entity raw scan must stay under 0.01s and the 32-to-2
+entity scan-time ratio must stay under 40x.
 
 The mode strategy is therefore locked for the current Rust engine path and the order-tens entity-cardinality assumption:
 

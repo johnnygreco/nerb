@@ -61,13 +61,19 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["memory"]["passed"] is True
     assert report["distribution"]["passed"] is None
     assert report["distribution"]["included_in_overall"] is False
+    assert report["distribution"]["checked_by"] == "make build external validation"
     assert report["mode_strategy"]["decision"] == "entity_independent remains the production default"
     assert report["mode_strategy"]["dense_probe"]["all_overlaps_reconstructed_matches_entity_independent"] is True
     assert report["mode_strategy"]["entity_cardinality_sweep"]["entity_counts"] == [2, 8, 32]
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["performance"]["criteria"] == {
+        "max_entity_independent_scan_seconds_under_ceiling": True,
+        "entity_independent_scaling_ratio_under_ceiling": True,
+    }
     assert report["performance"]["literal_heavy"]["python_rust_records_equal"] is True
     assert report["performance"]["regex_heavy"]["python_rust_records_equal"] is True
     assert "source_parse_jsonl" in report["performance"]["small_bank_floor"]["measurements"]
     assert report["performance"]["small_bank_floor"]["criteria"]["rust_scan_project_not_slower_than_python"] is True
+    assert report["performance"]["small_bank_floor"]["criteria"]["rust_scan_project_under_ceiling"] is True
 
 
 def test_workload_pass_criteria_fail_on_rust_scan_project_regression():
@@ -75,15 +81,22 @@ def test_workload_pass_criteria_fail_on_rust_scan_project_regression():
 
     criteria = gate_report._workload_pass_criteria(
         records_equal=True,
-        python_scan_project=_measurement(seconds=0.01),
-        rust_entity_scan=_measurement(),
+        text_bytes=100_000,
+        python_scan_project=_measurement(seconds=1.0),
+        rust_entity_scan=_measurement(seconds=0.001),
         rust_entity_scan_project=_measurement(seconds=0.02),
         rust_all_overlaps_scan=_measurement(),
         rust_global_scan=_measurement(),
         rust_public_cache_lookup={"cache_hit_verified": True},
+        thresholds={
+            "rust_scan_project_seconds_ceiling": 0.01,
+            "rust_raw_scan_seconds_ceiling": 0.01,
+            "rust_scan_project_bytes_per_second_floor": 1_000_000.0,
+        },
     )
 
-    assert criteria["rust_scan_project_not_slower_than_python"] is False
+    assert criteria["rust_scan_project_not_slower_than_python"] is True
+    assert criteria["rust_scan_project_under_ceiling"] is False
     assert all(criteria.values()) is False
 
 
@@ -113,15 +126,20 @@ def test_memory_report_from_child_fails_when_isolated_probe_exceeds_budget():
             "dense_probe_bytes": 128,
             "iterations": 1,
             "all_overlaps_raw": _measurement(count=128),
-            "max_rss_kib_before": 10_000,
-            "max_rss_kib_after": 12_500,
-            "max_rss_kib_delta": 2_500,
+            "match_buffer_capacity_after_scan": 128,
+            "max_rss_kib_process_start": 10_000,
+            "max_rss_kib_before_compile": 10_000,
+            "max_rss_kib_after_compile": 11_000,
+            "max_rss_kib_after_scan": 12_500,
+            "max_rss_kib_compile_delta": 1_000,
+            "max_rss_kib_scan_delta": 1_500,
+            "max_rss_kib_growth": 2_500,
         },
         memory_budget_kib=2_000,
     )
 
     assert report["passed"] is False
-    assert report["criteria"]["max_rss_delta_within_budget"] is False
+    assert report["criteria"]["max_rss_growth_within_budget"] is False
 
 
 def test_external_required_sections_are_excluded_from_overall_pass():

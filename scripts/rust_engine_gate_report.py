@@ -15,7 +15,27 @@ from typing import Any
 from nerb import NERB, Bank, __version__, bank_cache_info, clear_bank_cache, extract_named_entities_records
 
 MEMORY_BUDGET_KIB = 64 * 1024
+MEMORY_ABSOLUTE_BUDGET_KIB = 256 * 1024
 MATCH_BUFFER_PRE_SCAN_CAP = 1_000_000
+CARDINALITY_SCAN_SECONDS_CEILING = 0.01
+CARDINALITY_SCALING_RATIO_CEILING = 40.0
+WORKLOAD_THRESHOLDS = {
+    "small_bank_floor": {
+        "rust_scan_project_seconds_ceiling": 0.01,
+        "rust_raw_scan_seconds_ceiling": 0.005,
+        "rust_scan_project_bytes_per_second_floor": 1_000_000.0,
+    },
+    "literal_heavy": {
+        "rust_scan_project_seconds_ceiling": 0.05,
+        "rust_raw_scan_seconds_ceiling": 0.02,
+        "rust_scan_project_bytes_per_second_floor": 5_000_000.0,
+    },
+    "regex_heavy": {
+        "rust_scan_project_seconds_ceiling": 0.05,
+        "rust_raw_scan_seconds_ceiling": 0.02,
+        "rust_scan_project_bytes_per_second_floor": 5_000_000.0,
+    },
+}
 
 
 def main() -> None:
@@ -29,6 +49,12 @@ def main() -> None:
         default=MEMORY_BUDGET_KIB,
         help="Maximum allowed isolated dense-probe max-RSS increase.",
     )
+    parser.add_argument(
+        "--memory-absolute-budget-kib",
+        type=int,
+        default=MEMORY_ABSOLUTE_BUDGET_KIB,
+        help="Maximum allowed isolated dense-probe child max-RSS.",
+    )
     parser.add_argument("--memory-child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.memory_child:
@@ -39,6 +65,7 @@ def main() -> None:
             args.target_bytes,
             args.dense_bytes,
             memory_budget_kib=args.memory_budget_kib,
+            memory_absolute_budget_kib=args.memory_absolute_budget_kib,
         )
     print(json.dumps(report, indent=2, sort_keys=True))
 
@@ -49,6 +76,7 @@ def gate_report(
     dense_bytes: int,
     *,
     memory_budget_kib: int = MEMORY_BUDGET_KIB,
+    memory_absolute_budget_kib: int = MEMORY_ABSOLUTE_BUDGET_KIB,
 ) -> dict[str, Any]:
     if iterations < 1:
         raise ValueError("--iterations must be positive.")
@@ -58,10 +86,12 @@ def gate_report(
         raise ValueError("--dense-bytes must be at least 64.")
     if memory_budget_kib < 0:
         raise ValueError("--memory-budget-kib must be non-negative.")
+    if memory_absolute_budget_kib < 0:
+        raise ValueError("--memory-absolute-budget-kib must be non-negative.")
 
     conformance = _conformance_summary()
     performance = _performance_report(iterations, target_bytes)
-    memory = _memory_report(iterations, dense_bytes, memory_budget_kib)
+    memory = _memory_report(iterations, dense_bytes, memory_budget_kib, memory_absolute_budget_kib)
     mode_strategy = _mode_strategy_report(iterations, dense_bytes)
     distribution = _distribution_report()
     sections = {
@@ -125,6 +155,10 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
                 "Rust entity_independent scan/project median must be less than or equal to the Python oracle "
                 "scan/project median for each workload, including the small-bank floor."
             ),
+            "rust_thresholds": (
+                "Each workload also enforces checked-in Rust raw-scan ceilings, Rust scan/project ceilings, and "
+                "Rust scan/project bytes-per-second floors."
+            ),
         },
         "small_bank_floor": small,
         "literal_heavy": literal,
@@ -137,9 +171,10 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
     text = _repeat_to_size(workload["text_seed"], target_bytes)
     pattern_config = workload["pattern_config"]
     source = _jsonl_source(pattern_config)
+    text_bytes = text.encode("utf-8")
+    thresholds = WORKLOAD_THRESHOLDS[workload["id"]]
 
     native_engine = importlib.import_module("nerb._engine")
-    text_bytes = text.encode("utf-8")
     python_extractor = NERB(dict(pattern_config))
     rust_entity_bank = native_engine.Bank.from_source_bytes(source, format_hint="jsonl")
     rust_all_overlaps_bank = native_engine.Bank.from_source_bytes(
@@ -175,20 +210,23 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
     json_output = _measure(lambda: json.dumps(rust_records, separators=(",", ":")), iterations)
     criteria = _workload_pass_criteria(
         records_equal=python_records == rust_records,
+        text_bytes=len(text_bytes),
         python_scan_project=python_scan_project,
         rust_entity_scan=rust_entity_scan,
         rust_entity_scan_project=rust_entity_scan_project,
         rust_all_overlaps_scan=rust_all_overlaps_scan,
         rust_global_scan=rust_global_scan,
         rust_public_cache_lookup=rust_public_cache_lookup,
+        thresholds=thresholds,
     )
     return {
         "id": workload["id"],
         "pattern_count": _pattern_count(pattern_config),
         "entity_count": len(pattern_config),
-        "text_bytes": len(text.encode("utf-8")),
+        "text_bytes": len(text_bytes),
         "record_count": len(rust_records),
         "python_rust_records_equal": python_records == rust_records,
+        "thresholds": thresholds,
         "measurements": {
             "source_parse_jsonl": source_parse,
             "document_utf8_encode": document_encode,
@@ -214,6 +252,10 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
         "criteria": criteria,
         "speedup_ratio_python_scan_project_to_rust_scan_project": _ratio(
             python_scan_project["median_seconds"],
+            rust_entity_scan_project["median_seconds"],
+        ),
+        "rust_scan_project_bytes_per_second": _bytes_per_second(
+            len(text_bytes),
             rust_entity_scan_project["median_seconds"],
         ),
         "passed": all(criteria.values()),
@@ -285,9 +327,14 @@ def _mode_strategy_report(iterations: int, dense_bytes: int) -> dict[str, Any]:
     }
 
 
-def _memory_report(iterations: int, dense_bytes: int, memory_budget_kib: int) -> dict[str, Any]:
+def _memory_report(
+    iterations: int,
+    dense_bytes: int,
+    memory_budget_kib: int,
+    memory_absolute_budget_kib: int,
+) -> dict[str, Any]:
     child = _run_memory_child(iterations, dense_bytes)
-    return _memory_report_from_child(child, memory_budget_kib)
+    return _memory_report_from_child(child, memory_budget_kib, memory_absolute_budget_kib)
 
 
 def _memory_child_report(iterations: int, dense_bytes: int) -> dict[str, Any]:
@@ -295,40 +342,54 @@ def _memory_child_report(iterations: int, dense_bytes: int) -> dict[str, Any]:
         raise ValueError("--iterations must be positive.")
     if dense_bytes < 64:
         raise ValueError("--dense-bytes must be at least 64.")
+    process_start = _max_rss_kib()
     source, haystack = _dense_prefix_source(dense_bytes)
     native_engine = importlib.import_module("nerb._engine")
+    before_compile = _max_rss_kib()
     bank = native_engine.Bank.from_source_bytes(
         source,
         format_hint="jsonl",
         compile_options_json='{"match_mode":"all_overlaps"}',
     )
-    before = _max_rss_kib()
-    raw = _measure_raw(lambda: bank.scan_bytes(haystack), iterations)
-    after = _max_rss_kib()
+    after_compile = _max_rss_kib()
+    raw, match_buffer_capacity = _measure_raw_with_capacity(lambda: bank.scan_bytes(haystack), iterations)
+    after_scan = _max_rss_kib()
     return {
         "status": "measured",
         "dense_probe_bytes": dense_bytes,
         "iterations": iterations,
         "all_overlaps_raw": raw,
-        "max_rss_kib_before": before,
-        "max_rss_kib_after": after,
-        "max_rss_kib_delta": max(0, after - before),
+        "match_buffer_capacity_after_scan": match_buffer_capacity,
+        "max_rss_kib_process_start": process_start,
+        "max_rss_kib_before_compile": before_compile,
+        "max_rss_kib_after_compile": after_compile,
+        "max_rss_kib_after_scan": after_scan,
+        "max_rss_kib_compile_delta": max(0, after_compile - before_compile),
+        "max_rss_kib_scan_delta": max(0, after_scan - after_compile),
+        "max_rss_kib_growth": max(0, after_scan - process_start),
     }
 
 
-def _memory_report_from_child(child: Mapping[str, Any], memory_budget_kib: int) -> dict[str, Any]:
+def _memory_report_from_child(
+    child: Mapping[str, Any],
+    memory_budget_kib: int,
+    memory_absolute_budget_kib: int = MEMORY_ABSOLUTE_BUDGET_KIB,
+) -> dict[str, Any]:
     if child.get("status") != "measured":
         return {
             "included_in_overall": True,
             "status": child.get("status", "failed"),
             "passed": False,
             "memory_budget_kib": memory_budget_kib,
+            "memory_absolute_budget_kib": memory_absolute_budget_kib,
             "child": dict(child),
             "criteria": {
                 "child_probe_measured": False,
                 "raw_match_count_stable": False,
                 "raw_match_count_under_cap": False,
-                "max_rss_delta_within_budget": False,
+                "match_buffer_capacity_under_cap": False,
+                "max_rss_growth_within_budget": False,
+                "max_rss_absolute_within_budget": False,
             },
         }
 
@@ -337,7 +398,9 @@ def _memory_report_from_child(child: Mapping[str, Any], memory_budget_kib: int) 
         "child_probe_measured": True,
         "raw_match_count_stable": raw["count_stable"] is True,
         "raw_match_count_under_cap": raw["count"] < MATCH_BUFFER_PRE_SCAN_CAP,
-        "max_rss_delta_within_budget": child["max_rss_kib_delta"] <= memory_budget_kib,
+        "match_buffer_capacity_under_cap": child["match_buffer_capacity_after_scan"] <= MATCH_BUFFER_PRE_SCAN_CAP,
+        "max_rss_growth_within_budget": child["max_rss_kib_growth"] <= memory_budget_kib,
+        "max_rss_absolute_within_budget": child["max_rss_kib_after_scan"] <= memory_absolute_budget_kib,
     }
     return {
         "included_in_overall": True,
@@ -346,11 +409,17 @@ def _memory_report_from_child(child: Mapping[str, Any], memory_budget_kib: int) 
         "iterations": child["iterations"],
         "match_buffer_pre_scan_capacity_cap": MATCH_BUFFER_PRE_SCAN_CAP,
         "memory_budget_kib": memory_budget_kib,
+        "memory_absolute_budget_kib": memory_absolute_budget_kib,
         "raw_match_count": raw["count"],
         "raw_match_count_under_cap": criteria["raw_match_count_under_cap"],
-        "max_rss_kib_before": child["max_rss_kib_before"],
-        "max_rss_kib_after": child["max_rss_kib_after"],
-        "max_rss_kib_delta": child["max_rss_kib_delta"],
+        "match_buffer_capacity_after_scan": child["match_buffer_capacity_after_scan"],
+        "max_rss_kib_process_start": child["max_rss_kib_process_start"],
+        "max_rss_kib_before_compile": child["max_rss_kib_before_compile"],
+        "max_rss_kib_after_compile": child["max_rss_kib_after_compile"],
+        "max_rss_kib_after_scan": child["max_rss_kib_after_scan"],
+        "max_rss_kib_compile_delta": child["max_rss_kib_compile_delta"],
+        "max_rss_kib_scan_delta": child["max_rss_kib_scan_delta"],
+        "max_rss_kib_growth": child["max_rss_kib_growth"],
         "criteria": criteria,
         "passed": all(criteria.values()),
     }
@@ -362,7 +431,12 @@ def _distribution_report() -> dict[str, Any]:
         "status": "external_required",
         "passed": None,
         "included_in_overall": False,
-        "artifacts_checked": ["sdist", "local platform wheel smoke artifact", "twine check --strict dist/*"],
+        "external_validation_artifacts": [
+            "sdist",
+            "local platform wheel smoke artifact",
+            "twine check --strict dist/*",
+        ],
+        "checked_by": "make build external validation",
         "supported_strategy": (
             "Current supported distribution is the source distribution/source-build path with a Rust toolchain. "
             "The local wheel produced by make build is a smoke artifact, not a supported wheel matrix."
@@ -419,12 +493,14 @@ def _pattern_count(pattern_config: Mapping[str, Mapping[str, Any]]) -> int:
 def _workload_pass_criteria(
     *,
     records_equal: bool,
+    text_bytes: int,
     python_scan_project: Mapping[str, Any],
     rust_entity_scan: Mapping[str, Any],
     rust_entity_scan_project: Mapping[str, Any],
     rust_all_overlaps_scan: Mapping[str, Any],
     rust_global_scan: Mapping[str, Any],
     rust_public_cache_lookup: Mapping[str, Any],
+    thresholds: Mapping[str, float],
 ) -> dict[str, bool]:
     return {
         "records_equal": records_equal,
@@ -436,6 +512,16 @@ def _workload_pass_criteria(
         "cache_hit_verified": rust_public_cache_lookup["cache_hit_verified"] is True,
         "rust_scan_project_not_slower_than_python": (
             rust_entity_scan_project["median_seconds"] <= python_scan_project["median_seconds"]
+        ),
+        "rust_scan_project_under_ceiling": (
+            rust_entity_scan_project["median_seconds"] <= thresholds["rust_scan_project_seconds_ceiling"]
+        ),
+        "rust_raw_scan_under_ceiling": (
+            rust_entity_scan["median_seconds"] <= thresholds["rust_raw_scan_seconds_ceiling"]
+        ),
+        "rust_scan_project_throughput_floor": (
+            _bytes_per_second(text_bytes, rust_entity_scan_project["median_seconds"])
+            >= thresholds["rust_scan_project_bytes_per_second_floor"]
         ),
     }
 
@@ -484,11 +570,30 @@ def _mode_pass_criteria(
 
 def _entity_cardinality_sweep(iterations: int) -> dict[str, Any]:
     cases = [_entity_cardinality_case(entity_count, iterations) for entity_count in (2, 8, 32)]
+    base_seconds = max(float(cases[0]["entity_independent"]["median_seconds"]), 0.000001)
+    max_case = cases[-1]
+    scaling_ratio = _ratio(max_case["entity_independent"]["median_seconds"], base_seconds)
+    performance_criteria = {
+        "max_entity_independent_scan_seconds_under_ceiling": (
+            max_case["entity_independent"]["median_seconds"] <= CARDINALITY_SCAN_SECONDS_CEILING
+        ),
+        "entity_independent_scaling_ratio_under_ceiling": (
+            scaling_ratio is not None and scaling_ratio <= CARDINALITY_SCALING_RATIO_CEILING
+        ),
+    }
     return {
         "description": "Synthetic order-tens evidence with 8 dense prefix detectors per entity over 256 bytes.",
         "entity_counts": [case["entity_count"] for case in cases],
+        "performance_thresholds": {
+            "max_32_entity_independent_scan_seconds": CARDINALITY_SCAN_SECONDS_CEILING,
+            "max_32_to_2_entity_scan_seconds_ratio": CARDINALITY_SCALING_RATIO_CEILING,
+        },
+        "performance": {
+            "entity_independent_32_to_2_scan_seconds_ratio": scaling_ratio,
+            "criteria": performance_criteria,
+        },
         "cases": cases,
-        "passed": all(case["passed"] for case in cases),
+        "passed": all(case["passed"] for case in cases) and all(performance_criteria.values()),
     }
 
 
@@ -626,6 +731,12 @@ def _ratio(numerator: float, denominator: float) -> float | None:
     return round(numerator / denominator, 3)
 
 
+def _bytes_per_second(byte_count: int, seconds: float) -> float:
+    if seconds <= 0:
+        return float("inf")
+    return round(byte_count / seconds, 3)
+
+
 def _repeat_to_size(seed: str, target_bytes: int) -> str:
     repeated = seed * ((target_bytes // len(seed.encode("utf-8"))) + 1)
     encoded = repeated.encode("utf-8")[:target_bytes]
@@ -737,6 +848,19 @@ def _measure_raw(operation: Callable[[], Any], iterations: int) -> dict[str, Any
         seconds.append(time.perf_counter() - start)
         counts.append(len(buffer))
     return _measurement(seconds, counts)
+
+
+def _measure_raw_with_capacity(operation: Callable[[], Any], iterations: int) -> tuple[dict[str, Any], int]:
+    seconds = []
+    counts = []
+    last_capacity = 0
+    for _ in range(iterations):
+        start = time.perf_counter()
+        buffer = operation()
+        seconds.append(time.perf_counter() - start)
+        counts.append(len(buffer))
+        last_capacity = int(buffer.capacity())
+    return _measurement(seconds, counts), last_capacity
 
 
 def _measurement(seconds: Iterable[float], counts: list[int]) -> dict[str, Any]:

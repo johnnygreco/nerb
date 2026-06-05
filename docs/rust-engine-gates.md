@@ -54,6 +54,10 @@ Pass criteria for each workload:
 - Public `Bank` cache misses cold and hits warm for the same source/options.
 - Rust `entity_independent` scan/project median is less than or equal to the Python oracle scan/project median,
   including the small-bank floor.
+- Rust raw-scan and scan/project timings stay under checked-in ceilings, and Rust scan/project throughput stays above
+  checked-in floors:
+  - small-bank floor: scan/project <= 0.01s, raw scan <= 0.005s, scan/project >= 1 MB/s;
+  - literal-heavy and regex-heavy: scan/project <= 0.05s, raw scan <= 0.02s, scan/project >= 5 MB/s.
 
 Stage coverage:
 
@@ -67,21 +71,22 @@ Stage coverage:
 - `rust_entity_independent_scan_project`: Rust raw scan plus Python record projection and sorting.
 - `json_output`: JSON serialization of already projected Rust records.
 
-Routine 100 KB report, 5 iterations:
+Routine report, 5 iterations. `--target-bytes` applies to the literal-heavy and regex-heavy workloads; the small-bank
+floor is intentionally fixed at 10 KB.
 
-| Workload | Patterns | Records Equal | Python Scan/Project | Rust Scan/Project | Rust Raw Scan | Warm Cache | JSON Output |
-| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| Small-bank floor | 4 | true | 0.001909s | 0.001232s | 0.000153s | 0.000016s | 0.001072s |
-| Literal-heavy | 1,000 | true | 6.538850s | 0.000611s | 0.000043s | 0.000103s | 0.000069s |
-| Regex-heavy | 200 | true | 0.578122s | 0.000247s | 0.000070s | 0.000032s | 0.000074s |
+| Workload | Text Bytes | Patterns | Records Equal | Python Scan/Project | Rust Scan/Project | Rust Raw Scan | Warm Cache | JSON Output |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| Small-bank floor | 10,000 | 4 | true | 0.001738s | 0.000619s | 0.000101s | 0.000013s | 0.000567s |
+| Literal-heavy | 100,000 | 1,000 | true | 6.548379s | 0.000683s | 0.000045s | 0.000106s | 0.000068s |
+| Regex-heavy | 100,000 | 200 | true | 0.573659s | 0.000217s | 0.000068s | 0.000032s | 0.000056s |
 
 Larger 1 MB report, 1 iteration:
 
-| Workload | Records Equal | Python Scan/Project | Rust Scan/Project | Rust Raw Scan |
-| --- | --- | ---: | ---: | ---: |
-| Small-bank floor | true | 0.002039s | 0.000789s | 0.000115s |
-| Literal-heavy | true | 65.470126s | 0.003218s | 0.001152s |
-| Regex-heavy | true | 5.760181s | 0.002827s | 0.001804s |
+| Workload | Text Bytes | Records Equal | Python Scan/Project | Rust Scan/Project | Rust Raw Scan |
+| --- | ---: | --- | ---: | ---: | ---: |
+| Small-bank floor | 10,000 | true | 0.002025s | 0.000836s | 0.000114s |
+| Literal-heavy | 1,000,000 | true | 65.427525s | 0.003107s | 0.001080s |
+| Regex-heavy | 1,000,000 | true | 5.849975s | 0.002818s | 0.001778s |
 
 The literal-heavy and regex-heavy gates pass independently. Both preserve the planned records, have stable counts, and
 keep Rust `entity_independent` scan/project below the Python oracle on the measured workloads. The small-bank floor also
@@ -103,8 +108,10 @@ tuples as production `entity_independent`. `global_leftmost` returned half the p
 valid cross-entity overlap.
 
 The dense memory probe runs in an isolated child process before the parent performs mode scans. It gates on stable raw
-match count, raw count below the `MatchBuffer` pre-scan capacity cap of 1,000,000, and max-RSS delta under a 64 MiB
-budget. The routine report measured 31,776 raw matches and a 0 KiB max-RSS delta.
+match count, raw count below the `MatchBuffer` pre-scan capacity cap of 1,000,000, `MatchBuffer` capacity below that same
+cap, max-RSS growth under a 64 MiB budget, and absolute child max-RSS under a 256 MiB budget. The routine report measured
+31,776 raw matches, `MatchBuffer` capacity 32,768, absolute child max-RSS 58,132 KiB, and max-RSS growth 0 KiB. The
+capacity value is the direct materialized-output allocation evidence; the RSS fields bound the isolated child process.
 
 Synthetic entity-cardinality sweep: 8 dense prefix detectors per entity over 256 bytes.
 
@@ -113,6 +120,10 @@ Synthetic entity-cardinality sweep: 8 dense prefix detectors per entity over 256
 | 2 | 16 | 64 | 4,040 | 32 | 63.125x |
 | 8 | 64 | 256 | 16,160 | 32 | 63.125x |
 | 32 | 256 | 1,024 | 64,640 | 32 | 63.125x |
+
+The sweep also gates order-tens performance: the 32-entity `entity_independent` raw scan must remain under 0.01s and the
+32-to-2 entity scan-time ratio must remain under 40x. The routine report measured 0.000148s for the 32-entity scan and a
+14.8x 32-to-2 ratio.
 
 Mode decision: keep `entity_independent` as the production default for the current Rust engine path and the synthetic
 order-tens entity-cardinality evidence above. `all_overlaps` remains a measured prototype and `global_leftmost` remains
