@@ -371,11 +371,24 @@ def test_extract_report_batch_reuses_file_text_snapshot(monkeypatch, tmp_path, m
     source_path.write_text("unused", encoding="utf-8")
     calls: list[Path] = []
 
-    def fake_read_bytes(path: Path) -> bytes:
-        calls.append(path)
-        return b"Acme Corp" if len(calls) == 1 else b"ZZZZZZZZZ"
+    class FakeFile:
+        def __init__(self, data: bytes) -> None:
+            self.data = data
 
-    monkeypatch.setattr(Path, "read_bytes", fake_read_bytes)
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def read(self, size=-1):
+            return self.data if size < 0 else self.data[:size]
+
+    def fake_open(path: Path, *args, **kwargs) -> FakeFile:
+        calls.append(path)
+        return FakeFile(b"Acme Corp" if len(calls) == 1 else b"ZZZZZZZZZ")
+
+    monkeypatch.setattr(Path, "open", fake_open)
 
     report = extract_report_batch(
         minimal_bank,
