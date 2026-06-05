@@ -376,13 +376,17 @@ def test_native_canonical_json_round_trips_and_validates_stable_ids(engine):
         engine.Bank.from_canonical_json_bytes(json.dumps(reversed_entities).encode())
 
 
-def test_native_bank_hash_is_stable_across_input_key_order_and_semantic_options(engine):
+def test_native_bank_hash_is_stable_across_entity_order_but_changes_with_pattern_priority(engine):
     first = engine.Bank.from_source_bytes(
-        b'{"CODE":{"Beta":"B","Alpha":"A"},"ARTIST":{"Pink Floyd":"Pink\\\\s+Floyd"}}',
+        b'{"CODE":{"Alpha":"A","Beta":"B"},"ARTIST":{"Pink Floyd":"Pink\\\\s+Floyd"}}',
         format_hint="json",
     )
     second = engine.Bank.from_source_bytes(
         b'{"ARTIST":{"Pink Floyd":"Pink\\\\s+Floyd"},"CODE":{"Alpha":"A","Beta":"B"}}',
+        format_hint="json",
+    )
+    different_pattern_priority = engine.Bank.from_source_bytes(
+        b'{"ARTIST":{"Pink Floyd":"Pink\\\\s+Floyd"},"CODE":{"Beta":"B","Alpha":"A"}}',
         format_hint="json",
     )
     different_options = engine.Bank.from_source_bytes(
@@ -392,5 +396,6 @@ def test_native_bank_hash_is_stable_across_input_key_order_and_semantic_options(
     )
 
     assert first.metadata()["bank_hash"] == second.metadata()["bank_hash"]
+    assert first.metadata()["bank_hash"] != different_pattern_priority.metadata()["bank_hash"]
     assert first.metadata()["bank_hash"] != different_options.metadata()["bank_hash"]
     assert different_options.metadata()["compile_options"] == {"match_mode": "all_overlaps"}

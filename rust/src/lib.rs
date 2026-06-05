@@ -1,6 +1,7 @@
-use pyo3::exceptions::{PyIndexError, PyNotImplementedError, PyRuntimeError};
+use pyo3::exceptions::{PyIndexError, PyOSError, PyRuntimeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
+use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 mod bank;
@@ -188,16 +189,57 @@ impl PyBank {
         &self,
         py: Python<'_>,
         path: &str,
-        out: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<PyMatchBuffer> {
+        out: Option<Py<PyMatchBuffer>>,
+    ) -> PyResult<Py<PyMatchBuffer>> {
+        ffi_boundary(|| match out {
+            Some(out) => {
+                let mut buffer = {
+                    let mut borrowed = out.bind(py).borrow_mut();
+                    std::mem::take(&mut borrowed.inner)
+                };
+                let scan_result = py.detach(|| {
+                    buffer.clear();
+                    let haystack = read_scan_path(path)?;
+                    self.inner.scan_bytes_into(&haystack, &mut buffer)?;
+                    Ok::<(), PyErr>(())
+                });
+                out.bind(py).borrow_mut().inner = buffer;
+                scan_result?;
+                Ok(out)
+            }
+            None => {
+                let buffer = py.detach(|| {
+                    let haystack = read_scan_path(path)?;
+                    self.inner.scan_bytes(&haystack).map_err(PyErr::from)
+                })?;
+                Py::new(py, PyMatchBuffer { inner: buffer })
+            }
+        })
+    }
+
+    fn scan_path_with_bytes<'py>(
+        &self,
+        py: Python<'py>,
+        path: &str,
+    ) -> PyResult<(Py<PyMatchBuffer>, Bound<'py, PyBytes>)> {
         ffi_boundary(|| {
-            let _ = (path, out);
-            py.detach(|| ());
-            Err(PyNotImplementedError::new_err(
-                "Bank.scan_path is reserved for the Rust matching slice and is not implemented yet",
+            let (buffer, haystack) = py.detach(|| {
+                let haystack = read_scan_path(path)?;
+                let buffer = self.inner.scan_bytes(&haystack).map_err(PyErr::from)?;
+                Ok::<(NativeMatchBuffer, Vec<u8>), PyErr>((buffer, haystack))
+            })?;
+            Ok((
+                Py::new(py, PyMatchBuffer { inner: buffer })?,
+                PyBytes::new(py, &haystack),
             ))
         })
     }
+}
+
+fn read_scan_path(path: &str) -> PyResult<Vec<u8>> {
+    fs::read(path).map_err(|error| {
+        PyOSError::new_err(format!("Could not read document path {path:?}: {error}"))
+    })
 }
 
 #[pyclass(name = "MatchBuffer")]

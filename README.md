@@ -98,7 +98,6 @@ Extraction records include the Rust-backed scan fields plus JSON-bank source IDs
   "canonical_name": "Acme Corp",
   "surface_name": "Acme Corp",
   "entity_id": "customer",
-  "name": "Acme Corp",
   "name_id": "acme_corp",
   "pattern_id": "primary",
   "pattern_kind": "literal",

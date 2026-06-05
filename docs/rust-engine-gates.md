@@ -42,7 +42,8 @@ The accepted conformance decisions remain in `docs/decisions/0001-rust-engine-se
 - `global_leftmost` is an internal throughput baseline because it drops cross-entity overlap.
 - raw `all_overlaps` is a measured prototype because dense outputs amplify heavily and raw candidates alone do not prove
   leftmost-first reconstruction.
-- ASCII flag lowering remains explicitly rejected until UTF-8-safe lowering lands.
+- ASCII flag lowering rewrites ASCII-sensitive escapes and boundaries while keeping the rest of each pattern in
+  UTF-8-safe Unicode regex mode.
 - Detector names with underscores are preserved by the Rust record contract.
 
 ## Performance

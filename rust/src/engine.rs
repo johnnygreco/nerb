@@ -190,11 +190,13 @@ fn scan_entity_independent(
                     ),
                 ));
             };
-            buffer.push(RawMatch::new(
+            push_utf8_match(
+                buffer,
+                haystack,
                 detector_index,
                 raw_match.start() as u64,
                 raw_match.end() as u64,
-            )?)?;
+            )?;
         }
     }
     buffer.sort();
@@ -255,11 +257,13 @@ fn scan_all_overlaps(
                 break;
             };
             recovered_start = true;
-            buffer.push(RawMatch::new(
+            push_utf8_match(
+                buffer,
+                haystack,
                 detector_index,
                 start.offset() as u64,
                 end.offset() as u64,
-            )?)?;
+            )?;
         }
         if !recovered_start {
             return Err(validation(
@@ -287,13 +291,52 @@ fn scan_global_leftmost(
                 ),
             ));
         };
-        buffer.push(RawMatch::new(
+        push_utf8_match(
+            buffer,
+            haystack,
             detector_index,
             raw_match.start() as u64,
             raw_match.end() as u64,
-        )?)?;
+        )?;
     }
     buffer.sort();
+    Ok(())
+}
+
+fn push_utf8_match(
+    buffer: &mut NativeMatchBuffer,
+    haystack: &[u8],
+    detector_index: u32,
+    start_byte: u64,
+    end_byte: u64,
+) -> Result<()> {
+    let start = usize::try_from(start_byte).map_err(|_| {
+        validation(
+            "/match/start_byte",
+            format!("raw match start_byte {start_byte} cannot be represented on this platform"),
+        )
+    })?;
+    let end = usize::try_from(end_byte).map_err(|_| {
+        validation(
+            "/match/end_byte",
+            format!("raw match end_byte {end_byte} cannot be represented on this platform"),
+        )
+    })?;
+    if end > haystack.len() || start > end {
+        return Err(validation(
+            "/match",
+            format!("raw match span ({start_byte}, {end_byte}) is outside the haystack"),
+        ));
+    }
+    std::str::from_utf8(&haystack[start..end]).map_err(|error| {
+        validation(
+            "/match",
+            format!(
+                "regex match span ({start_byte}, {end_byte}) is not valid UTF-8; ASCII-mode patterns must not match partial codepoints: {error}"
+            ),
+        )
+    })?;
+    buffer.push(RawMatch::new(detector_index, start_byte, end_byte)?)?;
     Ok(())
 }
 
@@ -536,13 +579,11 @@ fn parse_pattern_with_flags(
     flags: &[String],
 ) -> Result<Hir> {
     let mut parser = ParserBuilder::new();
+    let mut ascii = false;
     for flag in flags {
         match flag.as_str() {
             "ASCII" => {
-                return Err(validation(
-                    pattern_path_by_index(entity_name, pattern_index),
-                    "ASCII regex flag is not supported by the UTF-8 native scan path yet",
-                ))
+                ascii = true;
             }
             "DOTALL" => {
                 parser.dot_matches_new_line(true);
@@ -559,12 +600,77 @@ fn parse_pattern_with_flags(
             _ => {}
         }
     }
-    parser.build().parse(regex).map_err(|error| {
+    let pattern = if ascii {
+        ascii_lower_pattern(regex)
+    } else {
+        Ok(regex.to_string())
+    }?;
+    parser.build().parse(&pattern).map_err(|error| {
         validation(
             pattern_path_by_index(entity_name, pattern_index),
             format!("unsupported Rust regex syntax for native scanner: {error}"),
         )
     })
+}
+
+fn ascii_lower_pattern(regex: &str) -> Result<String> {
+    let mut lowered = String::with_capacity(regex.len());
+    let mut chars = regex.chars();
+    let mut in_class = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let Some(escaped) = chars.next() else {
+                lowered.push(ch);
+                break;
+            };
+            match escaped {
+                'w' if in_class => lowered.push_str("A-Za-z0-9_"),
+                'w' => lowered.push_str("[A-Za-z0-9_]"),
+                'W' if in_class => {
+                    return Err(validation(
+                        "/regex",
+                        "ASCII flag lowering does not support \\W inside character classes; use an explicit negated ASCII class",
+                    ))
+                }
+                'W' => lowered.push_str("[^A-Za-z0-9_]"),
+                'd' if in_class => lowered.push_str("0-9"),
+                'd' => lowered.push_str("[0-9]"),
+                'D' if in_class => {
+                    return Err(validation(
+                        "/regex",
+                        "ASCII flag lowering does not support \\D inside character classes; use an explicit negated ASCII digit class",
+                    ))
+                }
+                'D' => lowered.push_str("[^0-9]"),
+                's' if in_class => lowered.push_str(r" \t\n\r\f\x{0B}"),
+                's' => lowered.push_str(r"[ \t\n\r\f\x{0B}]"),
+                'S' if in_class => {
+                    return Err(validation(
+                        "/regex",
+                        "ASCII flag lowering does not support \\S inside character classes; use an explicit negated ASCII whitespace class",
+                    ))
+                }
+                'S' => lowered.push_str(r"[^ \t\n\r\f\x{0B}]"),
+                'b' if in_class => lowered.push_str(r"\b"),
+                'b' => lowered.push_str(r"(?-u:\b)"),
+                'B' if in_class => lowered.push_str(r"\B"),
+                'B' => lowered.push_str(r"(?-u:\B)"),
+                _ => {
+                    lowered.push('\\');
+                    lowered.push(escaped);
+                }
+            }
+            continue;
+        }
+
+        if ch == '[' && !in_class {
+            in_class = true;
+        } else if ch == ']' && in_class {
+            in_class = false;
+        }
+        lowered.push(ch);
+    }
+    Ok(lowered)
 }
 
 fn pattern_path_by_index(entity_name: &str, pattern_index: usize) -> String {

@@ -379,25 +379,28 @@ fn canonicalize_detector_map(
             entity_object.get("_flags"),
             &format!("{entity_path}/_flags"),
         )?;
-        let mut pattern_names: Vec<&String> = entity_object
+        let source_pattern_count = entity_object
             .keys()
             .filter(|key| key.as_str() != "_flags")
-            .collect();
-        pattern_names.sort();
-        if pattern_names.is_empty() {
+            .count();
+        if source_pattern_count == 0 {
             return Err(validation(
                 &entity_path,
                 "entity must define at least one detector pattern",
             ));
         }
-        for pattern_name in pattern_names {
+        let mut next_priority = 0i64;
+        for (pattern_name, pattern_value) in entity_object {
+            if pattern_name == "_flags" {
+                continue;
+            }
             validate_non_empty(
                 pattern_name,
                 &format!("{entity_path}/{pattern_name}"),
                 "pattern names",
             )?;
             let pattern_path = format!("{entity_path}/{pattern_name}");
-            let regex = match &entity_object[pattern_name] {
+            let regex = match pattern_value {
                 Value::String(pattern) => pattern.clone(),
                 _ => {
                     return Err(validation(
@@ -412,8 +415,9 @@ fn canonicalize_detector_map(
                 surface_name: pattern_name.clone(),
                 regex,
                 flags: entity_flags.clone(),
-                priority: None,
+                priority: Some(next_priority),
             });
+            next_priority += 1;
         }
     }
     apply_word_boundaries(&mut candidates, word_boundaries);
@@ -785,27 +789,27 @@ fn build_canonical_bank(
                 ),
             ));
         }
+        for (index, pattern) in entity_patterns.iter_mut().enumerate() {
+            if pattern.priority.is_none() {
+                pattern.priority = Some(index as i64);
+            }
+        }
         entity_patterns.sort_by(|left, right| {
             (
-                left.priority.unwrap_or(i64::MAX),
+                left.priority.expect("priority assigned above"),
                 &left.canonical_name,
                 &left.surface_name,
                 &left.regex,
                 &left.flags,
             )
                 .cmp(&(
-                    right.priority.unwrap_or(i64::MAX),
+                    right.priority.expect("priority assigned above"),
                     &right.canonical_name,
                     &right.surface_name,
                     &right.regex,
                     &right.flags,
                 ))
         });
-        for (index, pattern) in entity_patterns.iter_mut().enumerate() {
-            if pattern.priority.is_none() {
-                pattern.priority = Some(index as i64);
-            }
-        }
 
         let mut canonical_patterns = Vec::with_capacity(entity_patterns.len());
         for pattern in entity_patterns {

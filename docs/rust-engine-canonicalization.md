@@ -79,8 +79,9 @@ Canonical JSON is an engine artifact, not the hand-authored format:
 ```
 
 Entity arrays are ordered by entity name. Patterns are ordered by priority, canonical name, surface name, regex, and flags.
-Map-style detector sources assign default priorities after deterministic key ordering. JSONL rows default priority from
-source row order within each entity unless a row provides an explicit `priority`.
+Map-style detector sources assign default priorities from source order within each entity, so reordering map entries can
+change leftmost-first priority and the bank hash. JSONL rows follow the same source-order default unless a row provides an
+explicit `priority`.
 
 Stable IDs are assigned by Rust. `from_canonical_json_bytes` rejects canonical JSON whose stable IDs do not match the
 deterministic IDs for the logical detector fields.

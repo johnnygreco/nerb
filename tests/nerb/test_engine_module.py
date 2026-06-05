@@ -47,6 +47,53 @@ def test_public_bank_projects_byte_and_char_records_and_scans_paths(tmp_path):
     assert bank.scan_path(document_path) == bank.scan_text("Café Rush")
 
 
+def test_public_bank_scan_path_projects_native_scanned_bytes(tmp_path):
+    class Raw:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, index):
+            assert index == 0
+            return (0, 0, 5)
+
+    class Native:
+        def __init__(self):
+            self.path = None
+
+        def scan_path_with_bytes(self, path):
+            self.path = path
+            return Raw(), b"Alpha"
+
+        def metadata(self):
+            return {
+                "detectors": [
+                    {
+                        "detector_index": 0,
+                        "entity": "CODE",
+                        "canonical_name": "Alpha",
+                        "surface_name": "Alpha",
+                    }
+                ]
+            }
+
+    native = Native()
+    bank = nerb.Bank(native)
+    missing_path = tmp_path / "missing.txt"
+
+    assert bank.scan_path(missing_path) == [
+        {
+            "entity": "CODE",
+            "canonical_name": "Alpha",
+            "surface_name": "Alpha",
+            "string": "Alpha",
+            "start": 0,
+            "end": 5,
+            "offset_unit": "byte",
+        }
+    ]
+    assert native.path == str(missing_path)
+
+
 def test_public_bank_scan_path_rejects_invalid_utf8(tmp_path):
     bank = nerb.Bank.from_source_bytes(b'{"CODE":{"A":"A"}}', format_hint="json")
     document_path = tmp_path / "invalid.bin"
