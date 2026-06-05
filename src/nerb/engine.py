@@ -5,6 +5,7 @@ import json
 import math
 import sys
 import sysconfig
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
@@ -17,6 +18,9 @@ from .config import FLAGS_KEY, PatternConfig
 OffsetUnit = Literal["byte", "char"]
 
 __all__ = ["Bank", "BankCacheKey", "bank_cache_info", "clear_bank_cache"]
+
+DEFAULT_BANK_CACHE_MAX_ENTRIES = 128
+DEFAULT_BANK_SOURCE_CACHE_MAX_ENTRIES = DEFAULT_BANK_CACHE_MAX_ENTRIES * 2
 
 
 @dataclass(frozen=True)
@@ -65,8 +69,8 @@ class _BankSourceCacheKey:
 
 
 _BANK_CACHE_LOCK = RLock()
-_BANK_CACHE: dict[BankCacheKey, Any] = {}
-_SOURCE_CACHE_KEYS: dict[_BankSourceCacheKey, BankCacheKey] = {}
+_BANK_CACHE: OrderedDict[BankCacheKey, Any] = OrderedDict()
+_SOURCE_CACHE_KEYS: OrderedDict[_BankSourceCacheKey, BankCacheKey] = OrderedDict()
 _CACHE_HITS = 0
 _CACHE_MISSES = 0
 
@@ -112,8 +116,11 @@ class Bank:
             if cached_key is not None:
                 cached_bank = _BANK_CACHE.get(cached_key)
                 if cached_bank is not None:
+                    _BANK_CACHE.move_to_end(cached_key)
+                    _SOURCE_CACHE_KEYS.move_to_end(source_key)
                     _record_cache_hit()
                     return cls(cached_bank, cache_key=cached_key, cache_hit=True)
+                del _SOURCE_CACHE_KEYS[source_key]
 
         native_bank = native_engine.Bank.from_source_bytes(
             source_bytes,
@@ -125,11 +132,15 @@ class Bank:
             cached_bank = _BANK_CACHE.get(cache_key)
             if cached_bank is not None:
                 _SOURCE_CACHE_KEYS[source_key] = cache_key
+                _BANK_CACHE.move_to_end(cache_key)
+                _SOURCE_CACHE_KEYS.move_to_end(source_key)
+                _evict_bank_cache_if_needed()
                 _record_cache_hit()
                 return cls(cached_bank, cache_key=cache_key, cache_hit=True)
 
             _BANK_CACHE[cache_key] = native_bank
             _SOURCE_CACHE_KEYS[source_key] = cache_key
+            _evict_bank_cache_if_needed()
             _record_cache_miss()
         return cls(native_bank, cache_key=cache_key, cache_hit=False)
 
@@ -238,6 +249,8 @@ def bank_cache_info() -> dict[str, Any]:
         return {
             "size": len(_BANK_CACHE),
             "source_key_count": len(_SOURCE_CACHE_KEYS),
+            "max_entries": DEFAULT_BANK_CACHE_MAX_ENTRIES,
+            "max_source_keys": DEFAULT_BANK_SOURCE_CACHE_MAX_ENTRIES,
             "hits": _CACHE_HITS,
             "misses": _CACHE_MISSES,
             "keys": [key.to_dict() for key in _BANK_CACHE],
@@ -252,6 +265,17 @@ def _record_cache_hit() -> None:
 def _record_cache_miss() -> None:
     global _CACHE_MISSES
     _CACHE_MISSES += 1
+
+
+def _evict_bank_cache_if_needed() -> None:
+    while len(_BANK_CACHE) > DEFAULT_BANK_CACHE_MAX_ENTRIES:
+        evicted_key, _native_bank = _BANK_CACHE.popitem(last=False)
+        for source_key, cache_key in list(_SOURCE_CACHE_KEYS.items()):
+            if cache_key == evicted_key:
+                del _SOURCE_CACHE_KEYS[source_key]
+
+    while len(_SOURCE_CACHE_KEYS) > DEFAULT_BANK_SOURCE_CACHE_MAX_ENTRIES:
+        _SOURCE_CACHE_KEYS.popitem(last=False)
 
 
 def _source_cache_key(

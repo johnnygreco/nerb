@@ -43,6 +43,7 @@ from .diff import diff_banks as _diff_banks
 from .engine import Bank
 from .engine import bank_cache_info as _bank_cache_info
 from .engine import clear_bank_cache as _clear_bank_cache
+from .engines import DEFAULT_MAX_TEXT_BYTES
 from .evals import eval_bank as _eval_bank
 from .extraction import ExtractionError
 from .extraction import (
@@ -349,11 +350,19 @@ def _read_text_source(text: str | None, file_path: str | None) -> tuple[str | by
         _raise_tool_error(f"Document path is not a file: {path}.")
 
     try:
-        document_bytes = path.read_bytes()
-    except UnicodeDecodeError as exc:
-        _raise_tool_error(f"Document file is not valid UTF-8 at {path}: {exc}")
+        document_size = path.stat().st_size
+    except OSError as exc:
+        _raise_tool_error(f"Could not inspect document at {path}: {exc}")
+    if document_size > DEFAULT_MAX_TEXT_BYTES:
+        _raise_tool_error(f"Document file exceeds the configured limit of {DEFAULT_MAX_TEXT_BYTES} bytes at {path}.")
+
+    try:
+        with path.open("rb") as file:
+            document_bytes = file.read(DEFAULT_MAX_TEXT_BYTES + 1)
     except OSError as exc:
         _raise_tool_error(f"Could not read document at {path}: {exc}")
+    if len(document_bytes) > DEFAULT_MAX_TEXT_BYTES:
+        _raise_tool_error(f"Document file exceeds the configured limit of {DEFAULT_MAX_TEXT_BYTES} bytes at {path}.")
 
     try:
         document_bytes.decode("utf-8")

@@ -7,6 +7,7 @@ import json
 import pytest
 
 import nerb
+import nerb.engine as engine_module
 
 
 def test_native_engine_module_imports():
@@ -149,6 +150,25 @@ def test_public_bank_cache_reuses_compiled_banks_and_reports_key_dimensions():
     assert nerb.bank_cache_info()["hits"] == 1
     assert nerb.bank_cache_info()["misses"] == 2
     assert nerb.bank_cache_info()["size"] == 2
+    assert nerb.bank_cache_info()["max_entries"] == engine_module.DEFAULT_BANK_CACHE_MAX_ENTRIES
+
+
+def test_public_bank_cache_evicts_lru_entries_and_reports_caps(monkeypatch):
+    nerb.clear_bank_cache()
+    monkeypatch.setattr(engine_module, "DEFAULT_BANK_CACHE_MAX_ENTRIES", 3)
+    monkeypatch.setattr(engine_module, "DEFAULT_BANK_SOURCE_CACHE_MAX_ENTRIES", 6)
+
+    banks = [nerb.Bank.from_config({"ARTIST": {f"Rush_{index}": f"Rush {index}"}}) for index in range(5)]
+
+    info = nerb.bank_cache_info()
+    cached_hashes = {key["bank_hash"] for key in info["keys"]}
+    assert info["size"] == 3
+    assert info["source_key_count"] <= 6
+    assert info["max_entries"] == 3
+    assert info["max_source_keys"] == 6
+    assert banks[0].metadata()["bank_hash"] not in cached_hashes
+    assert banks[1].metadata()["bank_hash"] not in cached_hashes
+    assert banks[-1].metadata()["bank_hash"] in cached_hashes
 
 
 def test_public_bank_cache_can_be_bypassed():
@@ -157,7 +177,15 @@ def test_public_bank_cache_can_be_bypassed():
     bank = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}}, use_cache=False)
 
     assert bank.cache_metadata() == {"enabled": False, "hit": False, "key": None}
-    assert nerb.bank_cache_info() == {"size": 0, "source_key_count": 0, "hits": 0, "misses": 0, "keys": []}
+    assert nerb.bank_cache_info() == {
+        "size": 0,
+        "source_key_count": 0,
+        "max_entries": engine_module.DEFAULT_BANK_CACHE_MAX_ENTRIES,
+        "max_source_keys": engine_module.DEFAULT_BANK_SOURCE_CACHE_MAX_ENTRIES,
+        "hits": 0,
+        "misses": 0,
+        "keys": [],
+    }
 
 
 def test_public_bank_compile_options_reject_duplicate_keys_like_native_engine():

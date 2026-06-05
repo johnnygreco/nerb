@@ -335,6 +335,22 @@ def test_native_scan_path_rejects_invalid_utf8_and_clears_buffer(engine, tmp_pat
     assert len(buffer) == 0
 
 
+def test_native_scan_path_rejects_oversized_file_before_scan(engine, tmp_path):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
+    document_path = tmp_path / "large.txt"
+    document_path.write_bytes(b"A" * (10 * 1024 * 1024 + 1))
+
+    with pytest.raises(ValueError, match="configured limit"):
+        bank.scan_path(str(document_path))
+
+
+def test_native_scan_path_rejects_non_regular_paths(engine, tmp_path):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
+
+    with pytest.raises(ValueError, match="regular file"):
+        bank.scan_path(str(tmp_path))
+
+
 def test_native_global_leftmost_scan_is_internal_baseline_and_collapses_cross_entity_overlap(engine):
     source = b"""
 {"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}
