@@ -18,6 +18,7 @@ MEMORY_BUDGET_KIB = 64 * 1024
 MEMORY_ABSOLUTE_BUDGET_KIB = 256 * 1024
 MATCH_BUFFER_PRE_SCAN_CAP = 1_000_000
 CARDINALITY_SCAN_SECONDS_CEILING = 0.01
+CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING = 0.05
 CARDINALITY_SCALING_RATIO_CEILING = 40.0
 WORKLOAD_THRESHOLDS = {
     "small_bank_floor": {
@@ -68,6 +69,8 @@ def main() -> None:
             memory_absolute_budget_kib=args.memory_absolute_budget_kib,
         )
     print(json.dumps(report, indent=2, sort_keys=True))
+    if not args.memory_child and report["overall"]["passed"] is not True:
+        raise SystemExit(1)
 
 
 def gate_report(
@@ -92,7 +95,7 @@ def gate_report(
     conformance = _conformance_summary()
     performance = _performance_report(iterations, target_bytes)
     memory = _memory_report(iterations, dense_bytes, memory_budget_kib, memory_absolute_budget_kib)
-    mode_strategy = _mode_strategy_report(iterations, dense_bytes)
+    mode_strategy = _mode_strategy_report(iterations, dense_bytes, target_bytes)
     distribution = _distribution_report()
     sections = {
         "conformance": conformance,
@@ -262,7 +265,7 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
     }
 
 
-def _mode_strategy_report(iterations: int, dense_bytes: int) -> dict[str, Any]:
+def _mode_strategy_report(iterations: int, dense_bytes: int, target_bytes: int) -> dict[str, Any]:
     source, haystack = _dense_prefix_source(dense_bytes)
     native_engine = importlib.import_module("nerb._engine")
     default_bank = native_engine.Bank.from_source_bytes(source, format_hint="jsonl")
@@ -297,7 +300,7 @@ def _mode_strategy_report(iterations: int, dense_bytes: int) -> dict[str, Any]:
         reconstructed_tuples=reconstructed_tuples,
         metadata=metadata,
     )
-    cardinality_sweep = _entity_cardinality_sweep(iterations)
+    cardinality_sweep = _entity_cardinality_sweep(iterations, target_bytes)
 
     return {
         "included_in_overall": True,
@@ -568,11 +571,17 @@ def _mode_pass_criteria(
     }
 
 
-def _entity_cardinality_sweep(iterations: int) -> dict[str, Any]:
+def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, Any]:
     cases = [_entity_cardinality_case(entity_count, iterations) for entity_count in (2, 8, 32)]
+    routine_cases = [
+        _entity_cardinality_routine_case(entity_count, iterations, target_bytes) for entity_count in (2, 32)
+    ]
     base_seconds = max(float(cases[0]["entity_independent"]["median_seconds"]), 0.000001)
     max_case = cases[-1]
     scaling_ratio = _ratio(max_case["entity_independent"]["median_seconds"], base_seconds)
+    routine_base_seconds = max(float(routine_cases[0]["entity_independent"]["median_seconds"]), 0.000001)
+    routine_max_case = routine_cases[-1]
+    routine_scaling_ratio = _ratio(routine_max_case["entity_independent"]["median_seconds"], routine_base_seconds)
     performance_criteria = {
         "max_entity_independent_scan_seconds_under_ceiling": (
             max_case["entity_independent"]["median_seconds"] <= CARDINALITY_SCAN_SECONDS_CEILING
@@ -580,19 +589,31 @@ def _entity_cardinality_sweep(iterations: int) -> dict[str, Any]:
         "entity_independent_scaling_ratio_under_ceiling": (
             scaling_ratio is not None and scaling_ratio <= CARDINALITY_SCALING_RATIO_CEILING
         ),
+        "routine_32_entity_independent_scan_seconds_under_ceiling": (
+            routine_max_case["entity_independent"]["median_seconds"] <= CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING
+        ),
+        "routine_32_to_2_entity_scan_seconds_ratio_under_ceiling": (
+            routine_scaling_ratio is not None and routine_scaling_ratio <= CARDINALITY_SCALING_RATIO_CEILING
+        ),
     }
     return {
-        "description": "Synthetic order-tens evidence with 8 dense prefix detectors per entity over 256 bytes.",
+        "description": (
+            "Synthetic order-tens evidence. Dense cases use 8 prefix detectors per entity over 256 bytes; routine-size "
+            "cases use sparse no-match text over the configured target bytes."
+        ),
         "entity_counts": [case["entity_count"] for case in cases],
         "performance_thresholds": {
-            "max_32_entity_independent_scan_seconds": CARDINALITY_SCAN_SECONDS_CEILING,
+            "max_dense_32_entity_independent_scan_seconds": CARDINALITY_SCAN_SECONDS_CEILING,
+            "max_routine_32_entity_independent_scan_seconds": CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING,
             "max_32_to_2_entity_scan_seconds_ratio": CARDINALITY_SCALING_RATIO_CEILING,
         },
         "performance": {
-            "entity_independent_32_to_2_scan_seconds_ratio": scaling_ratio,
+            "dense_entity_independent_32_to_2_scan_seconds_ratio": scaling_ratio,
+            "routine_entity_independent_32_to_2_scan_seconds_ratio": routine_scaling_ratio,
             "criteria": performance_criteria,
         },
-        "cases": cases,
+        "dense_cases": cases,
+        "routine_size_cases": routine_cases,
         "passed": all(case["passed"] for case in cases) and all(performance_criteria.values()),
     }
 
@@ -633,6 +654,7 @@ def _entity_cardinality_case(entity_count: int, iterations: int) -> dict[str, An
     )
     return {
         "entity_count": entity_count,
+        "workload": "dense_prefix",
         "pattern_count": entity_count * 8,
         "document_bytes": len(haystack),
         "entity_independent": entity,
@@ -643,6 +665,24 @@ def _entity_cardinality_case(entity_count: int, iterations: int) -> dict[str, An
         "global_to_entity_count_ratio": _ratio(global_leftmost["count"], entity["count"]),
         "criteria": criteria,
         "passed": all(criteria.values()),
+    }
+
+
+def _entity_cardinality_routine_case(entity_count: int, iterations: int, target_bytes: int) -> dict[str, Any]:
+    source, haystack = _sparse_cardinality_source(target_bytes, entity_count=entity_count, pattern_count=8)
+    native_engine = importlib.import_module("nerb._engine")
+    default_bank = native_engine.Bank.from_source_bytes(source, format_hint="jsonl")
+    entity = _measure_raw(lambda: default_bank.scan_bytes(haystack), iterations)
+    return {
+        "entity_count": entity_count,
+        "workload": "routine_size_sparse_no_match",
+        "pattern_count": entity_count * 8,
+        "document_bytes": len(haystack),
+        "entity_independent": entity,
+        "criteria": {
+            "entity_count_stable": entity["count_stable"] is True,
+        },
+        "passed": entity["count_stable"] is True,
     }
 
 
@@ -801,6 +841,25 @@ def _dense_prefix_source(document_bytes: int, *, entity_count: int = 2, pattern_
             )
     source = ("\n".join(json.dumps(row, separators=(",", ":")) for row in rows) + "\n").encode("utf-8")
     return source, b"A" * document_bytes
+
+
+def _sparse_cardinality_source(document_bytes: int, *, entity_count: int, pattern_count: int) -> tuple[bytes, bytes]:
+    rows = []
+    for entity_number in range(entity_count):
+        entity = f"SPARSE_{entity_number:03d}"
+        for index in range(pattern_count):
+            token = f"TOKEN_{entity_number:03d}_{index:03d}"
+            rows.append(
+                {
+                    "entity": entity,
+                    "canonical_name": token,
+                    "surface_name": token,
+                    "regex": token,
+                    "priority": index,
+                }
+            )
+    source = ("\n".join(json.dumps(row, separators=(",", ":")) for row in rows) + "\n").encode("utf-8")
+    return source, b"z" * document_bytes
 
 
 def _measure(operation: Callable[[], Any], iterations: int) -> dict[str, Any]:

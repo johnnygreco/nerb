@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +71,17 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["mode_strategy"]["entity_cardinality_sweep"]["performance"]["criteria"] == {
         "max_entity_independent_scan_seconds_under_ceiling": True,
         "entity_independent_scaling_ratio_under_ceiling": True,
+        "routine_32_entity_independent_scan_seconds_under_ceiling": True,
+        "routine_32_to_2_entity_scan_seconds_ratio_under_ceiling": True,
     }
+    assert [case["entity_count"] for case in report["mode_strategy"]["entity_cardinality_sweep"]["dense_cases"]] == [
+        2,
+        8,
+        32,
+    ]
+    assert [
+        case["document_bytes"] for case in report["mode_strategy"]["entity_cardinality_sweep"]["routine_size_cases"]
+    ] == [10_000, 10_000]
     assert report["performance"]["literal_heavy"]["python_rust_records_equal"] is True
     assert report["performance"]["regex_heavy"]["python_rust_records_equal"] is True
     assert "source_parse_jsonl" in report["performance"]["small_bank_floor"]["measurements"]
@@ -160,3 +173,31 @@ def test_external_required_sections_are_excluded_from_overall_pass():
         "included_sections": {"performance": True, "memory": True, "mode_strategy": True},
         "external_required_sections": ["conformance", "distribution"],
     }
+
+
+def test_gate_report_cli_exits_nonzero_when_measured_gate_fails():
+    module_path = Path(__file__).parents[2] / "scripts" / "rust_engine_gate_report.py"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(module_path),
+            "--iterations",
+            "1",
+            "--target-bytes",
+            "10000",
+            "--dense-bytes",
+            "128",
+            "--memory-absolute-budget-kib",
+            "1",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert completed.returncode == 1
+    report = json.loads(completed.stdout)
+    assert report["overall"]["passed"] is False
+    assert report["memory"]["passed"] is False
+    assert completed.stderr == ""
