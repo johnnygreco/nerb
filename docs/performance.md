@@ -3,7 +3,8 @@
 Rust engine conformance, benchmark, dense-memory, mode-strategy, and distribution gate evidence for the migration is
 recorded in [`rust-engine-gates.md`](rust-engine-gates.md).
 
-Recorded on 2026-06-03 in the local agent workspace:
+Initial scale review recorded on 2026-06-03 in the local agent workspace. Final Rust engine gate evidence was updated on
+2026-06-05 in [`rust-engine-gates.md`](rust-engine-gates.md).
 
 - Python: `Python 3.14.4`
 - Platform: `Linux 6.8.0-1053-gcp x86_64 GNU/Linux`
@@ -41,12 +42,10 @@ Current smoke profiles:
 | `mixed` | balanced literal/regex bank | Exercises both matcher families in one fixture. |
 | `adversarial_smoke` | dense-hit and near-miss text | Exercises overlap, alternation, dense records, and near misses safely. |
 
-The smoke gate currently requires all five profiles, the `baseline`/`target`/`stress` tiers, stable record counts across
-iterations, cache-hit verification, and the expected JSON sections. It intentionally does not enforce wall-clock
-thresholds yet. Full gates are deferred until native Rust modes exist and can report mode-specific compile, scan,
-projection, memory, and match-amplification numbers. Later full gates should use larger real or synthetic banks and may
-add thresholds such as cold compile ceilings, target bytes/records per second, memory caps, and all-overlaps
-amplification limits.
+The smoke-profile gate requires all five profiles, the `baseline`/`target`/`stress` tiers, stable record counts across
+iterations, cache-hit verification, and the expected JSON sections. It remains a structural benchmark-fixture gate. The
+final Rust engine gate report now carries the wall-clock thresholds, corpus-size evidence, memory caps, and
+mode-strategy measurements for the native `Bank` path.
 
 Run one smoke profile with:
 
@@ -91,6 +90,53 @@ Trimmed output shape:
   "sections": ["bank", "compile", "diagnostics", "engine", "options", "stages", "summary", "tiers"]
 }
 ```
+
+## Final Rust Engine Gate Report
+
+The final gate report is the reproducible merge-gate evidence for the Rust-backed `Bank` path:
+
+```shell
+uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 100000 --dense-bytes 512 \
+  --bank-owner-entity-count 1000 \
+  --bank-owner-growth-entity-count 1000 \
+  --bank-owner-note "user-directed representative synthetic medium bank target on 2026-06-05"
+timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --target-bytes 1000000 --dense-bytes 512 \
+  --bank-owner-entity-count 1000 \
+  --bank-owner-growth-entity-count 1000 \
+  --bank-owner-note "user-directed representative synthetic medium bank target on 2026-06-05"
+```
+
+The report's checked-in baseline id is `rust-engine-final-gates-v1`. It directly gates performance, dense memory, and
+mode strategy. Conformance and distribution remain external-required sections proven by the PR validation commands.
+For #73, bank-owner cardinality is recorded as a representative synthetic medium-bank target with 1,000 current and
+expected-growth entities.
+
+Final routine 100 KB report highlights:
+
+| Workload | Records | Scan/project median | Scan/project throughput |
+| --- | ---: | ---: | ---: |
+| small-bank floor | 870 | 0.000643s | 15.6 MB/s |
+| literal-heavy | 96 | 0.000648s | 154.3 MB/s |
+| regex-heavy | 75 | 0.000211s | 473.9 MB/s |
+| mixed | 181 | 0.000660s | 151.5 MB/s |
+
+The mixed corpus-size gate passed at 10 KB and 100 KB in the routine report. The 1 MB report passed with 1,805 records,
+0.002356s scan/project median, and 424.4 MB/s scan/project throughput.
+
+The final entity-cardinality sweep separates dense overlap stress from the production medium-bank target. Dense prefix
+stress validates semantic reconstruction through 64 synthetic entity classes, with 8 dense prefix detectors per entity
+over 256 bytes. At 64 entities, `entity_independent` emitted 2,048 production matches, raw `all_overlaps` emitted
+129,280 matches, and `global_leftmost` emitted 32 matches. The 64-to-2 dense scan ratio was 18.875x under the 80x
+ceiling.
+
+The production medium-bank case validates 1,000 top-level entities with 8 generated patterns per entity over the
+configured 100 KB sparse no-match document. The routine report measured 8,000 patterns, 1,000,000 JSONL bank-source
+bytes, 100,000 document bytes, 0.635903s native compile median, 0.003640s raw scan median, 0.008654s scan/project
+median, 11.6 MB/s scan/project throughput, and a 16.852x raw scan ratio from the 64-entity routine case to the
+1,000-entity medium-bank case.
+The 1 MB evidence measured 0.704808s native compile median, 0.034258s raw scan median, 0.043692s scan/project median,
+22.9 MB/s scan/project throughput, and a 16.137x raw scan ratio from the 64-entity routine case to the 1,000-entity
+medium-bank case.
 
 ## Slice 6/7 Native Mode Probe
 

@@ -109,14 +109,11 @@ it with explicit boundary rules rather than Python-side regex string substitutio
 
 ## Entity Cardinality Assumption
 
-No real bank-owner cardinality target is recorded in this repository yet. Current checked-in evidence is small:
-
-- `tests/data/minimal_bank.json`: 1 entity.
-- `examples/music_entities.yaml`: 2 entities.
-
-The working assumption for `entity_independent` is order-tens of entities with many patterns per entity. Slice 10 adds
-synthetic order-tens evidence, but the real bank-owner target remains unrecorded. If the real bank is expected to grow
-beyond the order-tens entity range validated by Slice 10, open a new issue before changing the default mode strategy.
+The repository's example banks are examples only and do not define the migration target. For #73, the bank-owner target
+is a representative synthetic medium bank with 1,000 top-level entities. Final gate evidence validates the production
+default against that generated 1,000-entity target while keeping the dense raw `all_overlaps` stress probe bounded to 64
+entities. If the target grows beyond the validated 1,000-entity range, open a new issue before changing the default mode
+strategy.
 
 ## Slice 10 Gate Decision
 
@@ -126,16 +123,22 @@ gate report in `docs/rust-engine-gates.md` measured a dense two-entity prefix wo
 matched the production raw tuples, and `global_leftmost` emitted 16 matches. That means raw `all_overlaps` amplified
 materialized output by 993x, while `global_leftmost` dropped half of the valid cross-entity production matches.
 
-Slice 10 also adds a synthetic entity-cardinality sweep with 2, 8, and 32 entities. With 8 dense prefix detectors per
-entity over 256 bytes, `entity_independent` produced 64, 256, and 1,024 matches respectively; raw `all_overlaps`
-produced 4,040, 16,160, and 64,640 matches; and `global_leftmost` produced 32 matches in each case because it collapses
-cross-entity overlap to one global winner per region. Exact reconstruction matched the production tuples in all sweep
-cases. The sweep gates order-tens performance as well: the dense 32-entity `entity_independent` raw scan must stay under
-0.01s, and the dense 32-to-2 `entity_independent` scan-time ratio must stay under 40x. A separate sparse no-match
-routine-size probe scans the configured target bytes with 2 and 32 entities; its 32-entity `entity_independent` raw scan
-must stay under 0.05s, and its 32-to-2 `entity_independent` ratio must stay under 40x.
+Final gate evidence includes a dense synthetic entity-cardinality sweep with 2, 8, 32, and 64 entities. With 8 dense
+prefix detectors per entity over 256 bytes, `entity_independent` produced 64, 256, 1,024, and 2,048 matches
+respectively; raw `all_overlaps` produced 4,040, 16,160, 64,640, and 129,280 matches; and `global_leftmost` produced 32
+matches in each case because it collapses cross-entity overlap to one global winner per region. Exact reconstruction
+matched the production tuples in all sweep cases. The dense sweep gates semantic reconstruction and dense output
+amplification through 64 entities: the max dense `entity_independent` raw scan must stay under 0.01s, and the max-to-2
+`entity_independent` scan-time ratio must stay under 80x.
 
-The mode strategy is therefore locked for the current Rust engine path and the order-tens entity-cardinality assumption:
+A separate sparse no-match routine-size probe scans the configured target bytes with 2 and 64 entities, and the
+representative medium-bank probe scans the configured target bytes with 1,000 entities and 8 generated patterns per
+entity. The 64-entity routine scan must stay under 0.05s and the max-to-2 `entity_independent` ratio must stay under
+80x. The 1,000-entity medium-bank case must compile under 5s, raw scan under 0.2s, scan/project under 0.2s,
+scan/project throughput above 0.5 MB/s, and remain under a 40x raw-scan ratio from the 64-entity routine case.
+
+The mode strategy is therefore locked for the current Rust engine path and the 1,000-entity synthetic medium-bank
+assumption:
 
 - `entity_independent` remains the only production-default mode.
 - `all_overlaps` remains an internal measured prototype until a future issue proves raw dense output and exact
@@ -143,8 +146,9 @@ The mode strategy is therefore locked for the current Rust engine path and the o
 - `global_leftmost` remains an internal throughput baseline only and must not be used for production extraction because
   it violates the cross-entity overlap contract.
 
-This decision does not close the missing bank-owner cardinality input. That input must be recorded before changing the
-mode strategy or expanding beyond the order-tens range; any target beyond that range requires a new mode-strategy issue.
+Issue #73 records the bank-owner signoff target as 1,000 current entities and 1,000 expected-growth entities for the
+representative synthetic medium bank. Any target beyond the validated 1,000-entity range requires a new mode-strategy
+issue.
 
 ## Deterministic Output Order
 

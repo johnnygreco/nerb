@@ -19,7 +19,22 @@ MEMORY_ABSOLUTE_BUDGET_KIB = 256 * 1024
 MATCH_BUFFER_PRE_SCAN_CAP = 1_000_000
 CARDINALITY_SCAN_SECONDS_CEILING = 0.01
 CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING = 0.05
-CARDINALITY_SCALING_RATIO_CEILING = 40.0
+DENSE_CARDINALITY_ENTITY_COUNT = 64
+MEDIUM_BANK_ENTITY_COUNT = 1_000
+MEDIUM_BANK_DOCUMENT_BYTES_FLOOR = 100_000
+MEDIUM_BANK_PATTERNS_PER_ENTITY = 8
+VALIDATED_ENTITY_COUNT = MEDIUM_BANK_ENTITY_COUNT
+CARDINALITY_SCALING_RATIO_CEILING = 80.0
+MEDIUM_BANK_TO_ROUTINE_MAX_RATIO_CEILING = 40.0
+MEDIUM_BANK_THRESHOLDS = {
+    "compile_seconds_ceiling": 5.0,
+    "rust_raw_scan_seconds_ceiling": 0.2,
+    "rust_scan_project_seconds_ceiling": 0.2,
+    "rust_scan_project_bytes_per_second_floor": 500_000.0,
+}
+CORPUS_SIZE_THRESHOLDS = {
+    "rust_scan_project_bytes_per_second_floor": 5_000_000.0,
+}
 WORKLOAD_THRESHOLDS = {
     "small_bank_floor": {
         "rust_scan_project_seconds_ceiling": 0.01,
@@ -32,6 +47,11 @@ WORKLOAD_THRESHOLDS = {
         "rust_scan_project_bytes_per_second_floor": 5_000_000.0,
     },
     "regex_heavy": {
+        "rust_scan_project_seconds_ceiling": 0.05,
+        "rust_raw_scan_seconds_ceiling": 0.02,
+        "rust_scan_project_bytes_per_second_floor": 5_000_000.0,
+    },
+    "mixed": {
         "rust_scan_project_seconds_ceiling": 0.05,
         "rust_raw_scan_seconds_ceiling": 0.02,
         "rust_scan_project_bytes_per_second_floor": 5_000_000.0,
@@ -57,6 +77,23 @@ def main() -> None:
         help="Maximum allowed isolated dense-probe child max-RSS.",
     )
     parser.add_argument("--memory-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--bank-owner-entity-count",
+        type=int,
+        default=None,
+        help="Bank-owner current or target entity count for final cardinality signoff.",
+    )
+    parser.add_argument(
+        "--bank-owner-growth-entity-count",
+        type=int,
+        default=None,
+        help="Bank-owner expected growth entity count for final cardinality signoff.",
+    )
+    parser.add_argument(
+        "--bank-owner-note",
+        default=None,
+        help="Optional note describing the bank-owner cardinality source.",
+    )
     args = parser.parse_args()
     if args.memory_child:
         report = _memory_child_report(args.iterations, args.dense_bytes)
@@ -67,6 +104,9 @@ def main() -> None:
             args.dense_bytes,
             memory_budget_kib=args.memory_budget_kib,
             memory_absolute_budget_kib=args.memory_absolute_budget_kib,
+            bank_owner_entity_count=args.bank_owner_entity_count,
+            bank_owner_growth_entity_count=args.bank_owner_growth_entity_count,
+            bank_owner_note=args.bank_owner_note,
         )
     print(json.dumps(report, indent=2, sort_keys=True))
     if not args.memory_child and report["overall"]["passed"] is not True:
@@ -80,6 +120,9 @@ def gate_report(
     *,
     memory_budget_kib: int = MEMORY_BUDGET_KIB,
     memory_absolute_budget_kib: int = MEMORY_ABSOLUTE_BUDGET_KIB,
+    bank_owner_entity_count: int | None = None,
+    bank_owner_growth_entity_count: int | None = None,
+    bank_owner_note: str | None = None,
 ) -> dict[str, Any]:
     if iterations < 1:
         raise ValueError("--iterations must be positive.")
@@ -91,18 +134,28 @@ def gate_report(
         raise ValueError("--memory-budget-kib must be non-negative.")
     if memory_absolute_budget_kib < 0:
         raise ValueError("--memory-absolute-budget-kib must be non-negative.")
+    if bank_owner_entity_count is not None and bank_owner_entity_count < 1:
+        raise ValueError("--bank-owner-entity-count must be positive when provided.")
+    if bank_owner_growth_entity_count is not None and bank_owner_growth_entity_count < 1:
+        raise ValueError("--bank-owner-growth-entity-count must be positive when provided.")
 
     conformance = _conformance_summary()
     performance = _performance_report(iterations, target_bytes)
     memory = _memory_report(iterations, dense_bytes, memory_budget_kib, memory_absolute_budget_kib)
     mode_strategy = _mode_strategy_report(iterations, dense_bytes, target_bytes)
     distribution = _distribution_report()
+    bank_owner_cardinality = _bank_owner_cardinality_report(
+        bank_owner_entity_count,
+        bank_owner_growth_entity_count,
+        bank_owner_note,
+    )
     sections = {
         "conformance": conformance,
         "performance": performance,
         "memory": memory,
         "mode_strategy": mode_strategy,
         "distribution": distribution,
+        "bank_owner_cardinality": bank_owner_cardinality,
     }
     return {
         "environment": _environment(),
@@ -111,6 +164,7 @@ def gate_report(
         "memory": memory,
         "mode_strategy": mode_strategy,
         "distribution": distribution,
+        "bank_owner_cardinality": bank_owner_cardinality,
         "overall": _overall_report(sections),
     }
 
@@ -134,7 +188,7 @@ def _conformance_summary() -> dict[str, Any]:
         "note": "This report records the required conformance command; the PR validation log is the authority.",
         "decision_record": "docs/decisions/0001-rust-engine-semantics.md",
         "known_decisions": [
-            "ASCII flag lowering for UTF-8-safe native scanning is deferred and explicitly rejected.",
+            "ASCII flag lowering rewrites ASCII-sensitive escapes and boundaries while keeping Unicode-safe scanning.",
             "Detector names with underscores are preserved by the Rust record contract.",
             "global_leftmost remains internal because it drops cross-entity overlap.",
             "raw all_overlaps remains a measured prototype because dense output amplification is high.",
@@ -146,10 +200,18 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
     small = _workload_report(_small_workload(), iterations, 10_000)
     literal = _workload_report(_literal_workload(), iterations, target_bytes)
     regex = _workload_report(_regex_workload(), iterations, target_bytes)
+    mixed = _workload_report(_mixed_workload(), iterations, target_bytes)
+    corpus_size = _corpus_size_report(_mixed_workload(), iterations, target_bytes)
+    workloads = (small, literal, regex, mixed)
     return {
         "included_in_overall": True,
+        "baseline_id": "rust-engine-final-gates-v1",
         "iterations": iterations,
         "target_bytes": target_bytes,
+        "checked_in_thresholds": {
+            "workloads": WORKLOAD_THRESHOLDS,
+            "corpus_size": CORPUS_SIZE_THRESHOLDS,
+        },
         "pass_criteria": {
             "native_public_records_equal": "Native raw-match projection and public Bank records must match exactly.",
             "count_stable": "Repeated measured scan/project counts must be stable.",
@@ -162,7 +224,9 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
         "small_bank_floor": small,
         "literal_heavy": literal,
         "regex_heavy": regex,
-        "passed": all(workload["passed"] for workload in (small, literal, regex)),
+        "mixed": mixed,
+        "corpus_size": corpus_size,
+        "passed": all(workload["passed"] for workload in workloads) and corpus_size["passed"],
     }
 
 
@@ -253,6 +317,64 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
             len(text_bytes),
             rust_entity_scan_project["median_seconds"],
         ),
+        "passed": all(criteria.values()),
+    }
+
+
+def _corpus_size_report(workload: dict[str, Any], iterations: int, target_bytes: int) -> dict[str, Any]:
+    source = _jsonl_source(workload["pattern_config"])
+    native_engine = importlib.import_module("nerb._engine")
+    native_bank = native_engine.Bank.from_source_bytes(source, format_hint="jsonl")
+    public_bank = Bank.from_source_bytes(source, format_hint="jsonl", use_cache=False)
+    sizes = [10_000]
+    if target_bytes != 10_000:
+        sizes.append(target_bytes)
+    cases = [
+        _corpus_size_case(
+            workload,
+            public_bank=public_bank,
+            native_bank=native_bank,
+            iterations=iterations,
+            target_bytes=size,
+        )
+        for size in sizes
+    ]
+    return {
+        "description": "Mixed-bank corpus-size scaling over the routine target document sizes.",
+        "workload_id": workload["id"],
+        "text_bytes": [case["text_bytes"] for case in cases],
+        "thresholds": CORPUS_SIZE_THRESHOLDS,
+        "cases": cases,
+        "passed": all(case["passed"] for case in cases),
+    }
+
+
+def _corpus_size_case(
+    workload: dict[str, Any],
+    *,
+    public_bank: Bank,
+    native_bank: Any,
+    iterations: int,
+    target_bytes: int,
+) -> dict[str, Any]:
+    text = _repeat_to_size(workload["text_seed"], target_bytes)
+    text_bytes = text.encode("utf-8")
+    raw_scan = _measure_raw(lambda: native_bank.scan_bytes(text_bytes), iterations)
+    scan_project = _measure(lambda: public_bank.scan_text(text), iterations)
+    bytes_per_second = _bytes_per_second(len(text_bytes), scan_project["median_seconds"])
+    criteria = {
+        "rust_raw_scan_count_stable": raw_scan["count_stable"] is True,
+        "rust_scan_project_count_stable": scan_project["count_stable"] is True,
+        "rust_scan_project_throughput_floor": (
+            bytes_per_second >= CORPUS_SIZE_THRESHOLDS["rust_scan_project_bytes_per_second_floor"]
+        ),
+    }
+    return {
+        "text_bytes": len(text_bytes),
+        "rust_entity_independent_scan_raw": raw_scan,
+        "rust_entity_independent_scan_project": scan_project,
+        "rust_scan_project_bytes_per_second": bytes_per_second,
+        "criteria": criteria,
         "passed": all(criteria.values()),
     }
 
@@ -441,6 +563,52 @@ def _distribution_report() -> dict[str, Any]:
     }
 
 
+def _bank_owner_cardinality_report(
+    entity_count: int | None,
+    growth_entity_count: int | None,
+    note: str | None,
+) -> dict[str, Any]:
+    if entity_count is None or growth_entity_count is None:
+        return {
+            "status": "external_required",
+            "passed": None,
+            "included_in_overall": False,
+            "required_input": [
+                "--bank-owner-entity-count",
+                "--bank-owner-growth-entity-count",
+            ],
+            "validated_entity_count_ceiling": VALIDATED_ENTITY_COUNT,
+            "decision": (
+                "Record the bank-owner current or target entity count and expected growth before final goal "
+                "completion. Counts above the validated ceiling require a new mode-strategy issue before changing "
+                "the default."
+            ),
+        }
+
+    max_claimed = max(entity_count, growth_entity_count)
+    criteria = {
+        "entity_count_recorded": entity_count > 0,
+        "growth_entity_count_recorded": growth_entity_count > 0,
+        "current_entity_count_within_validated_range": entity_count <= VALIDATED_ENTITY_COUNT,
+        "growth_entity_count_within_validated_range": growth_entity_count <= VALIDATED_ENTITY_COUNT,
+    }
+    return {
+        "status": "recorded",
+        "passed": all(criteria.values()),
+        "included_in_overall": True,
+        "entity_count": entity_count,
+        "growth_entity_count": growth_entity_count,
+        "max_claimed_entity_count": max_claimed,
+        "validated_entity_count_ceiling": VALIDATED_ENTITY_COUNT,
+        "note": note,
+        "decision": (
+            "entity_independent remains the production default when current and expected-growth entity counts stay "
+            "within the synthetic medium-bank range validated by this report."
+        ),
+        "criteria": criteria,
+    }
+
+
 def _small_workload() -> dict[str, Any]:
     return {
         "id": "small_bank_floor",
@@ -481,6 +649,28 @@ def _regex_workload() -> dict[str, Any]:
                 text_tokens.append(f"{prefix}-AB12-tail " + ("regex_miss " * 120))
         pattern_config[entity] = entity_config
     return {"id": "regex_heavy", "pattern_config": pattern_config, "text_seed": " ".join(text_tokens) + " miss "}
+
+
+def _mixed_workload() -> dict[str, Any]:
+    pattern_config: dict[str, dict[str, Any]] = {}
+    text_tokens = []
+    for entity_index in range(6):
+        entity = f"MIXED_{entity_index:02d}"
+        entity_config: dict[str, Any] = {"_flags": "IGNORECASE" if entity_index % 2 == 0 else []}
+        for pattern_index in range(40):
+            literal_token = f"M{entity_index:02d}_L{pattern_index:03d}"
+            entity_config[f"Literal {entity_index:02d} {pattern_index:03d}"] = literal_token
+            if pattern_index % 20 == 0:
+                text_tokens.append(f"{literal_token} " + ("mixed_literal_miss " * 30))
+        for pattern_index in range(20):
+            regex_prefix = f"M{entity_index:02d}R{pattern_index:03d}"
+            entity_config[f"Regex {entity_index:02d} {pattern_index:03d}"] = (
+                rf"{regex_prefix}-(?:alpha|beta|gamma)-\d{{2}}"
+            )
+            if pattern_index % 10 == 0:
+                text_tokens.append(f"{regex_prefix}-alpha-42 " + ("mixed_regex_miss " * 30))
+        pattern_config[entity] = entity_config
+    return {"id": "mixed", "pattern_config": pattern_config, "text_seed": " ".join(text_tokens) + " none "}
 
 
 def _pattern_count(pattern_config: Mapping[str, Mapping[str, Any]]) -> int:
@@ -563,51 +753,94 @@ def _mode_pass_criteria(
 
 
 def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, Any]:
-    cases = [_entity_cardinality_case(entity_count, iterations) for entity_count in (2, 8, 32)]
+    entity_counts = (2, 8, 32, DENSE_CARDINALITY_ENTITY_COUNT)
+    cases = [_entity_cardinality_case(entity_count, iterations) for entity_count in entity_counts]
     routine_cases = [
-        _entity_cardinality_routine_case(entity_count, iterations, target_bytes) for entity_count in (2, 32)
+        _entity_cardinality_routine_case(entity_count, iterations, target_bytes)
+        for entity_count in (2, DENSE_CARDINALITY_ENTITY_COUNT)
     ]
+    medium_bank_target_bytes = max(target_bytes, MEDIUM_BANK_DOCUMENT_BYTES_FLOOR)
+    medium_bank_baseline_case = _entity_cardinality_routine_case(
+        DENSE_CARDINALITY_ENTITY_COUNT,
+        iterations,
+        medium_bank_target_bytes,
+    )
+    medium_bank_case = _medium_bank_cardinality_case(MEDIUM_BANK_ENTITY_COUNT, iterations, medium_bank_target_bytes)
     base_seconds = max(float(cases[0]["entity_independent"]["median_seconds"]), 0.000001)
     max_case = cases[-1]
     scaling_ratio = _ratio(max_case["entity_independent"]["median_seconds"], base_seconds)
     routine_base_seconds = max(float(routine_cases[0]["entity_independent"]["median_seconds"]), 0.000001)
     routine_max_case = routine_cases[-1]
     routine_scaling_ratio = _ratio(routine_max_case["entity_independent"]["median_seconds"], routine_base_seconds)
+    medium_to_routine_max_seconds_ratio = _ratio(
+        medium_bank_case["entity_independent"]["median_seconds"],
+        max(float(medium_bank_baseline_case["entity_independent"]["median_seconds"]), 0.000001),
+    )
     performance_criteria = {
-        "max_entity_independent_scan_seconds_under_ceiling": (
+        "max_dense_entity_independent_scan_seconds_under_ceiling": (
             max_case["entity_independent"]["median_seconds"] <= CARDINALITY_SCAN_SECONDS_CEILING
         ),
-        "entity_independent_scaling_ratio_under_ceiling": (
+        "dense_entity_independent_scaling_ratio_under_ceiling": (
             scaling_ratio is not None and scaling_ratio <= CARDINALITY_SCALING_RATIO_CEILING
         ),
-        "routine_32_entity_independent_scan_seconds_under_ceiling": (
+        "routine_max_entity_independent_scan_seconds_under_ceiling": (
             routine_max_case["entity_independent"]["median_seconds"] <= CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING
         ),
-        "routine_32_to_2_entity_scan_seconds_ratio_under_ceiling": (
+        "routine_max_to_2_entity_scan_seconds_ratio_under_ceiling": (
             routine_scaling_ratio is not None and routine_scaling_ratio <= CARDINALITY_SCALING_RATIO_CEILING
+        ),
+        "medium_bank_compile_seconds_under_ceiling": (
+            medium_bank_case["criteria"]["compile_seconds_under_ceiling"] is True
+        ),
+        "medium_bank_raw_scan_seconds_under_ceiling": (
+            medium_bank_case["criteria"]["rust_raw_scan_seconds_under_ceiling"] is True
+        ),
+        "medium_bank_scan_project_seconds_under_ceiling": (
+            medium_bank_case["criteria"]["rust_scan_project_seconds_under_ceiling"] is True
+        ),
+        "medium_bank_scan_project_throughput_floor": (
+            medium_bank_case["criteria"]["rust_scan_project_throughput_floor"] is True
+        ),
+        "medium_bank_to_routine_max_entity_scan_seconds_ratio_under_ceiling": (
+            medium_to_routine_max_seconds_ratio is not None
+            and medium_to_routine_max_seconds_ratio <= MEDIUM_BANK_TO_ROUTINE_MAX_RATIO_CEILING
         ),
     }
     return {
         "description": (
-            "Synthetic order-tens evidence. Dense cases use 8 prefix detectors per entity over 256 bytes; routine-size "
-            "cases use sparse no-match text over the configured target bytes."
+            "Synthetic cardinality evidence. Dense cases use 8 prefix detectors per entity over 256 bytes through the "
+            "dense all-overlaps stress ceiling; the medium-bank case uses sparse no-match text over the configured "
+            "target bytes with 1,000 top-level entities."
         ),
-        "entity_counts": [case["entity_count"] for case in cases],
+        "validated_entity_count_ceiling": VALIDATED_ENTITY_COUNT,
+        "dense_entity_count_ceiling": DENSE_CARDINALITY_ENTITY_COUNT,
+        "medium_bank_entity_count": MEDIUM_BANK_ENTITY_COUNT,
+        "medium_bank_document_bytes_floor": MEDIUM_BANK_DOCUMENT_BYTES_FLOOR,
+        "entity_counts": [case["entity_count"] for case in cases] + [medium_bank_case["entity_count"]],
+        "dense_entity_counts": [case["entity_count"] for case in cases],
+        "routine_entity_counts": [case["entity_count"] for case in routine_cases] + [medium_bank_case["entity_count"]],
         "performance_thresholds": {
-            "max_dense_32_entity_independent_scan_seconds": CARDINALITY_SCAN_SECONDS_CEILING,
-            "max_routine_32_entity_independent_scan_seconds": CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING,
-            "max_32_to_2_entity_scan_seconds_ratio": CARDINALITY_SCALING_RATIO_CEILING,
+            "max_dense_entity_independent_scan_seconds": CARDINALITY_SCAN_SECONDS_CEILING,
+            "max_routine_entity_independent_scan_seconds": CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING,
+            "max_to_2_entity_scan_seconds_ratio": CARDINALITY_SCALING_RATIO_CEILING,
+            "medium_bank": MEDIUM_BANK_THRESHOLDS,
+            "medium_bank_to_routine_max_entity_scan_seconds_ratio": MEDIUM_BANK_TO_ROUTINE_MAX_RATIO_CEILING,
         },
         "performance": {
-            "dense_entity_independent_32_to_2_scan_seconds_ratio": scaling_ratio,
-            "routine_entity_independent_32_to_2_scan_seconds_ratio": routine_scaling_ratio,
+            "dense_entity_independent_max_to_2_scan_seconds_ratio": scaling_ratio,
+            "routine_entity_independent_max_to_2_scan_seconds_ratio": routine_scaling_ratio,
+            "medium_bank_to_routine_max_entity_scan_seconds_ratio": medium_to_routine_max_seconds_ratio,
             "criteria": performance_criteria,
         },
         "dense_cases": cases,
         "routine_size_cases": routine_cases,
+        "medium_bank_baseline_case": medium_bank_baseline_case,
+        "medium_bank_case": medium_bank_case,
         "passed": (
             all(case["passed"] for case in cases)
             and all(case["passed"] for case in routine_cases)
+            and medium_bank_baseline_case["passed"]
+            and medium_bank_case["passed"]
             and all(performance_criteria.values())
         ),
     }
@@ -678,6 +911,53 @@ def _entity_cardinality_routine_case(entity_count: int, iterations: int, target_
             "entity_count_stable": entity["count_stable"] is True,
         },
         "passed": entity["count_stable"] is True,
+    }
+
+
+def _medium_bank_cardinality_case(entity_count: int, iterations: int, target_bytes: int) -> dict[str, Any]:
+    source, haystack = _sparse_cardinality_source(
+        target_bytes,
+        entity_count=entity_count,
+        pattern_count=MEDIUM_BANK_PATTERNS_PER_ENTITY,
+    )
+    text = haystack.decode("utf-8")
+    native_engine = importlib.import_module("nerb._engine")
+    compile_seconds = _measure_seconds(
+        lambda: native_engine.Bank.from_source_bytes(source, format_hint="jsonl"),
+        iterations,
+    )
+    default_bank = native_engine.Bank.from_source_bytes(source, format_hint="jsonl")
+    public_bank = Bank.from_source_bytes(source, format_hint="jsonl", use_cache=False)
+    entity = _measure_raw(lambda: default_bank.scan_bytes(haystack), iterations)
+    scan_project = _measure(lambda: public_bank.scan_text(text), iterations)
+    bytes_per_second = _bytes_per_second(len(haystack), scan_project["median_seconds"])
+    criteria = {
+        "entity_count_stable": entity["count_stable"] is True,
+        "scan_project_count_stable": scan_project["count_stable"] is True,
+        "compile_seconds_under_ceiling": compile_seconds["median_seconds"]
+        <= MEDIUM_BANK_THRESHOLDS["compile_seconds_ceiling"],
+        "rust_raw_scan_seconds_under_ceiling": entity["median_seconds"]
+        <= MEDIUM_BANK_THRESHOLDS["rust_raw_scan_seconds_ceiling"],
+        "rust_scan_project_seconds_under_ceiling": scan_project["median_seconds"]
+        <= MEDIUM_BANK_THRESHOLDS["rust_scan_project_seconds_ceiling"],
+        "rust_scan_project_throughput_floor": (
+            bytes_per_second >= MEDIUM_BANK_THRESHOLDS["rust_scan_project_bytes_per_second_floor"]
+        ),
+    }
+    return {
+        "entity_count": entity_count,
+        "workload": "medium_bank_sparse_no_match",
+        "pattern_count": entity_count * MEDIUM_BANK_PATTERNS_PER_ENTITY,
+        "patterns_per_entity": MEDIUM_BANK_PATTERNS_PER_ENTITY,
+        "source_bytes": len(source),
+        "document_bytes": len(haystack),
+        "rust_entity_independent_compile": compile_seconds,
+        "entity_independent": entity,
+        "entity_independent_scan_project": scan_project,
+        "rust_scan_project_bytes_per_second": bytes_per_second,
+        "thresholds": MEDIUM_BANK_THRESHOLDS,
+        "criteria": criteria,
+        "passed": all(criteria.values()),
     }
 
 
