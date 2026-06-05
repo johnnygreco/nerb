@@ -220,7 +220,8 @@ class Bank:
 
     def scan_path(self, path: str | Path) -> list[dict[str, Any]]:
         source_path = Path(path).expanduser()
-        return self.scan_bytes(source_path.read_bytes())
+        raw, source = self._native.scan_path_with_bytes(str(source_path))
+        return _project_raw_matches(self.metadata(), raw, bytes(source), offset_unit="byte")
 
 
 def clear_bank_cache() -> None:

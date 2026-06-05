@@ -95,8 +95,8 @@ Matcher construction applies bounded `regex-automata` NFA, one-pass, hybrid-cach
 compile-bomb shapes fail during bank construction with `ValueError`.
 
 `IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE` are applied through per-pattern syntax configuration. The `ASCII` flag
-is rejected in this slice because lowering it correctly for a UTF-8 text scanner requires a narrower rewrite than
-byte-mode `(?-u:...)`; that migration remains explicit future work.
+lowers ASCII-sensitive escapes and boundaries such as `\w`, `\d`, `\s`, and `\b` while leaving the rest of the detector
+pattern in UTF-8-safe Unicode regex mode.
 
 ```python
 bank = _engine.Bank.from_source_bytes(b'{"PERSON":{"Sam":"Sam"},"PROJECT":{"Samba":"Samba"}}')
@@ -193,14 +193,15 @@ assert [default_raw[i] for i in range(len(default_raw))] == [(0, 0, 3), (1, 0, 5
 assert [global_raw[i] for i in range(len(global_raw))] == [(0, 0, 3)]
 ```
 
-Native `_engine.Bank.scan_path` remains a boundary stub in this slice. It raises `NotImplementedError` and does not
-allocate Python match records. The public Python `nerb.Bank.scan_path` wrapper reads bytes in Python and calls the native
-`scan_bytes` path.
+Native `_engine.Bank.scan_path` reads one explicit file path in Rust, validates the bytes through the same UTF-8 scanner,
+and returns raw matches in a `MatchBuffer`. It does not allocate Python match records. The public Python
+`nerb.Bank.scan_path` wrapper uses the native path scan variant that returns the scanned byte snapshot with the raw
+matches, then projects that same snapshot into public records.
 
 ## Error Boundary
 
-Native validation and parse failures are translated to `ValueError`. Buffer indexing failures are `IndexError`, native
-scan stubs are `NotImplementedError`, native allocation failures are `MemoryError`, and panic-safe wrappers
+Native validation and parse failures are translated to `ValueError`. File-read failures are `OSError`. Buffer indexing
+failures are `IndexError`, native allocation failures are `MemoryError`, and panic-safe wrappers
 translate an unexpected Rust panic into `RuntimeError` instead of unwinding through Python.
 
 ## Public Python Bank

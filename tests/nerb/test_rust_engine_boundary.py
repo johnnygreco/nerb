@@ -309,12 +309,28 @@ def test_native_scan_bytes_rejects_invalid_utf8(engine):
     assert invalid_utf8_buffer.capacity() >= 1
 
 
-def test_native_scan_path_remains_boundary_stub_without_record_projection(engine):
+def test_native_scan_path_scans_file_into_raw_match_buffer(engine, tmp_path):
     bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
+    document_path = tmp_path / "document.txt"
+    document_path.write_text("Alpha", encoding="utf-8")
     buffer = engine.MatchBuffer()
 
-    with pytest.raises(NotImplementedError, match="not implemented yet"):
-        bank.scan_path("document.txt", out=buffer)
+    raw = bank.scan_path(str(document_path))
+    returned = bank.scan_path(str(document_path), out=buffer)
+
+    assert [raw[index] for index in range(len(raw))] == [(0, 0, 1)]
+    assert returned is buffer
+    assert [buffer[index] for index in range(len(buffer))] == [(0, 0, 1)]
+
+
+def test_native_scan_path_rejects_invalid_utf8_and_clears_buffer(engine, tmp_path):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Alpha":"A"}}', format_hint="json")
+    document_path = tmp_path / "invalid.bin"
+    document_path.write_bytes(b"\xff")
+    buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+
+    with pytest.raises(ValueError, match="valid UTF-8"):
+        bank.scan_path(str(document_path), out=buffer)
 
     assert len(buffer) == 0
 

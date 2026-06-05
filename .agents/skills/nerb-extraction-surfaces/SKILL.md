@@ -28,7 +28,7 @@ override current-surface guidance in this skill.
 - `Bank.from_source_bytes`, `Bank.from_path`, and `Bank.from_config` compile through the native Rust engine.
 - Public `Bank.scan_text` records include `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`, and
   `offset_unit`.
-- JSON-bank extraction helpers enrich Rust records with `entity_id`, `name_id`, `name`, `pattern_id`, `pattern_kind`, and
+- JSON-bank extraction helpers enrich Rust records with `entity_id`, `name_id`, `pattern_id`, `pattern_kind`, and
   `captures`.
 - Offsets are byte offsets by default unless a caller explicitly asks `Bank.scan_text(..., offsets="char")`.
 - Detector names are preserved as canonical names and are not constrained by Python regex group-name rules.

@@ -100,8 +100,9 @@ migration divergences. ReDoS-shaped patterns and compile-bomb-shaped patterns ar
 and validation gates even when the removed Python path could compile them.
 
 Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The current direct migration set is
-`IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE`. `ASCII` is schema-known but runtime-deferred for the UTF-8 native
-scan path and fails validation until a future issue lands safe lowering semantics. Unsupported flags fail validation.
+`IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`. `ASCII` lowers only ASCII-sensitive escapes and boundaries
+such as `\w`, `\d`, `\s`, and `\b`; the rest of the pattern stays in the UTF-8-safe Unicode regex mode. Unsupported flags
+fail validation.
 
 `word_boundaries` remains a first-class `Bank.from_config` and compile-option behavior, and Rust canonicalization applies
 it with explicit boundary rules rather than Python-side regex string substitution.
@@ -167,8 +168,7 @@ The conformance suite covers these categories as evidence for the Rust-backed ma
 - ordered alternation ties;
 - underscores in detector names as a known Python-oracle divergence;
 - word-boundary behavior, including a Unicode boundary fixture that ASCII-only boundaries would fail;
-- direct flag migration behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE`, plus explicit rejection of
-  runtime-deferred `ASCII`;
+- direct flag migration behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and UTF-8-safe `ASCII` lowering;
 - unsupported backtracking-only regex syntax;
 - ReDoS-shaped regexes;
 - compile-bomb-shaped regexes.

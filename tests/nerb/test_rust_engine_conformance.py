@@ -18,8 +18,6 @@ def engine():
 
 
 def _native_source_for_case(case):
-    if case.case_id == "entity_flag_ascii":
-        pytest.skip("ASCII flag lowering for UTF-8-safe native scanning is deferred beyond #51")
     rows = []
     for entity, patterns in case.pattern_config.items():
         flags = patterns.get("_flags", [])
@@ -70,6 +68,50 @@ def test_native_entity_independent_scan_matches_supported_planned_conformance_ca
     bank = engine.Bank.from_source_bytes(_native_source_for_case(case), format_hint="jsonl")
 
     assert_planned_records_equal(_project_native_scan_records(bank, case.text), case.expected_records)
+
+
+def test_compact_json_source_order_sets_within_entity_priority(engine):
+    short_first = engine.Bank.from_source_bytes(b'{"PERSON":{"Sam":"Sam","Samba":"Samba"}}', format_hint="json")
+    long_first = engine.Bank.from_source_bytes(b'{"PERSON":{"Samba":"Samba","Sam":"Sam"}}', format_hint="json")
+
+    assert _project_native_scan_records(short_first, "Samba ships") == [
+        {
+            "entity": "PERSON",
+            "canonical_name": "Sam",
+            "surface_name": "Sam",
+            "string": "Sam",
+            "start": 0,
+            "end": 3,
+            "offset_unit": "byte",
+        }
+    ]
+    assert _project_native_scan_records(long_first, "Samba ships") == [
+        {
+            "entity": "PERSON",
+            "canonical_name": "Samba",
+            "surface_name": "Samba",
+            "string": "Samba",
+            "start": 0,
+            "end": 5,
+            "offset_unit": "byte",
+        }
+    ]
+
+
+def test_compact_yaml_source_order_sets_within_entity_priority(engine):
+    bank = engine.Bank.from_source_bytes(b"PERSON:\n  Samba: Samba\n  Sam: Sam\n", format_hint="yaml")
+
+    assert _project_native_scan_records(bank, "Samba ships") == [
+        {
+            "entity": "PERSON",
+            "canonical_name": "Samba",
+            "surface_name": "Samba",
+            "string": "Samba",
+            "start": 0,
+            "end": 5,
+            "offset_unit": "byte",
+        }
+    ]
 
 
 def test_utf8_byte_span_converts_character_offsets_without_leaking_to_runtime_projection():
@@ -143,17 +185,53 @@ def test_native_bank_rejects_unsupported_or_compile_bomb_regex_profile_fixtures(
         engine.Bank.from_source_bytes(json.dumps(row).encode(), format_hint="jsonl")
 
 
-def test_native_bank_rejects_ascii_flag_until_utf8_safe_lowering_lands(engine):
+def test_native_bank_applies_ascii_flag_with_utf8_safe_spans(engine):
     row = {
         "entity": "CODE",
-        "canonical_name": "ASCII dot",
-        "surface_name": "ASCII dot",
-        "regex": ".",
+        "canonical_name": "ASCII word",
+        "surface_name": "ASCII word",
+        "regex": r"\b\w\b",
         "flags": ["ASCII"],
     }
 
-    with pytest.raises(ValueError, match="ASCII regex flag is not supported"):
-        engine.Bank.from_source_bytes(json.dumps(row).encode(), format_hint="jsonl")
+    bank = engine.Bank.from_source_bytes(json.dumps(row).encode(), format_hint="jsonl")
+
+    assert _project_native_scan_records(bank, "\u00e9 A") == [
+        {
+            "entity": "CODE",
+            "canonical_name": "ASCII word",
+            "surface_name": "ASCII word",
+            "string": "A",
+            "start": 3,
+            "end": 4,
+            "offset_unit": "byte",
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("regex", "text", "expected"),
+    [
+        (".", "\u00e9", "\u00e9"),
+        (r"\W+", "\u00e9!", "\u00e9!"),
+        (r"\D+", "\u00e9A1", "\u00e9A"),
+        ("[^A]+", "\u00e9B A", "\u00e9B "),
+        ("\u00e9", "\u00e9", "\u00e9"),
+    ],
+    ids=["dot", "non_word", "non_digit", "negated_class", "non_ascii_literal"],
+)
+def test_ascii_mode_keeps_unicode_safe_matching_for_non_ascii_sensitive_patterns(engine, regex, text, expected):
+    row = {
+        "entity": "CODE",
+        "canonical_name": "ASCII pattern",
+        "surface_name": "ASCII pattern",
+        "regex": regex,
+        "flags": ["ASCII"],
+    }
+
+    bank = engine.Bank.from_source_bytes(json.dumps(row).encode(), format_hint="jsonl")
+
+    assert _project_native_scan_records(bank, text)[0]["string"] == expected
 
 
 def test_native_verbose_flag_supports_trailing_comments(engine):

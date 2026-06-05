@@ -348,7 +348,6 @@ def _enrich_json_bank_record(
         **dict(record),
         "entity_id": identity.entity_id,
         "name_id": identity.name_id,
-        "name": identity.canonical_name,
         "pattern_id": identity.pattern_id,
         "pattern_kind": identity.pattern_kind,
         "captures": {},
