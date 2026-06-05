@@ -122,6 +122,22 @@ Rust engine becomes the default, the tracker must record expected entity count a
 real bank is expected to grow beyond order-tens of entity classes, Slice 6 (`all_overlaps`) becomes a prerequisite for
 the default strategy rather than an optional optimization.
 
+## Slice 10 Gate Decision
+
+Slice 10 gate evidence keeps `entity_independent` as the production default. The routine gate report in
+`docs/rust-engine-gates.md` measured a dense two-entity prefix workload where production `entity_independent` emitted 32
+matches, raw `all_overlaps` emitted 31,776 matches, and `global_leftmost` emitted 16 matches. That means raw
+`all_overlaps` amplified materialized output by 993x, while `global_leftmost` dropped half of the valid cross-entity
+production matches.
+
+The mode strategy is therefore locked for the current Rust engine path:
+
+- `entity_independent` remains the only production-default mode.
+- `all_overlaps` remains an internal measured prototype until a future issue proves raw dense output and exact
+  reconstruction cost are acceptable for real banks.
+- `global_leftmost` remains an internal throughput baseline only and must not be used for production extraction because
+  it violates the cross-entity overlap contract.
+
 ## Deterministic Output Order
 
 Projected Rust-backed records sort by:
