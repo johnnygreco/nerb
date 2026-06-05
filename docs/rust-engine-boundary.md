@@ -105,6 +105,11 @@ assert [raw[i] for i in range(len(raw))] == [(0, 0, 3), (1, 0, 5)]
 - a reverse DFA with per-pattern start states recovers the start byte for each reported end;
 - local pattern IDs are translated back to global detector indexes before appending to `MatchBuffer`.
 
+The prototype rejects Unicode word-boundary assertions such as `\b` because the lower-level DFA only provides heuristic
+Unicode-boundary support that can quit on valid non-ASCII UTF-8. Use explicit ASCII word-boundary syntax such as
+`(?-u:\b)` for raw `all_overlaps`, or use the production-default `entity_independent` mode for Unicode boundary
+semantics.
+
 Raw `all_overlaps` output is intentionally not the default contract. It preserves cross-entity overlap, but it also
 reports within-entity overlapping detectors and every matching span for each detector pattern. It does not preserve a
 separate branch identity inside one regex; attribution still stops at the NERB detector index. For example, the

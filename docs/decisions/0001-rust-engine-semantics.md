@@ -86,6 +86,12 @@ measurement path that reruns the entity-independent shards after measuring raw o
 measured prototype until raw semantics, reconstruction cost, and dense-hit match amplification justify a mode strategy
 change.
 
+The Slice 6 lower-level DFA prototype rejects Unicode word-boundary assertions such as `\b`. `regex-automata` hybrid DFA
+support for Unicode boundaries is heuristic and can quit on valid non-ASCII UTF-8, which is not an acceptable runtime
+failure mode for NERB text scans. Raw `all_overlaps` can still use explicit ASCII word-boundary syntax such as
+`(?-u:\b)`, while Unicode boundary semantics stay on the `entity_independent` path unless a later issue adds a measured
+fallback.
+
 `global_leftmost` is an internal throughput baseline only. It collapses cross-entity overlap and must not become the
 default extraction behavior without a separate product decision.
 

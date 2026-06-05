@@ -228,14 +228,27 @@ def test_native_all_overlaps_scan_reports_quantified_same_detector_spans(engine)
     ]
 
 
-def test_native_all_overlaps_scan_supports_unicode_word_boundary_patterns(engine):
+def test_native_all_overlaps_scan_rejects_unicode_word_boundary_patterns(engine):
     source = b"""
 {"entity":"CODE","canonical_name":"foo","surface_name":"foo","regex":"\\\\bfoo\\\\b","priority":0}
 """
+    default_bank = engine.Bank.from_source_bytes(source, format_hint="jsonl")
+
+    assert _raw_tuples(default_bank.scan_bytes("élan foo".encode())) == [(0, 6, 9)]
+    with pytest.raises(ValueError, match="Unicode word-boundary assertions are not supported"):
+        engine.Bank.from_source_bytes(
+            source,
+            format_hint="jsonl",
+            compile_options_json='{"match_mode":"all_overlaps"}',
+        )
+
+
+def test_native_all_overlaps_scan_supports_explicit_ascii_word_boundary_patterns(engine):
+    source = b"""
+{"entity":"CODE","canonical_name":"foo","surface_name":"foo","regex":"(?-u:\\\\b)foo(?-u:\\\\b)","priority":0}
+"""
     overlap_bank = engine.Bank.from_source_bytes(
-        source,
-        format_hint="jsonl",
-        compile_options_json='{"match_mode":"all_overlaps"}',
+        source, format_hint="jsonl", compile_options_json='{"match_mode":"all_overlaps"}'
     )
 
     assert _raw_tuples(overlap_bank.scan_bytes(b"foo bar")) == [(0, 0, 3)]

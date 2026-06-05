@@ -274,12 +274,19 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
     let mut next_detector_index = 0u32;
     for entity in &canonical.entities {
         for (pattern_index, pattern) in entity.patterns.iter().enumerate() {
-            patterns.push(parse_pattern_with_flags(
+            let hir = parse_pattern_with_flags(
                 &entity.name,
                 pattern_index,
                 &pattern.regex,
                 &pattern.flags,
-            )?);
+            )?;
+            if hir.properties().look_set().contains_word_unicode() {
+                return Err(validation(
+                    pattern_path_by_index(&entity.name, pattern_index),
+                    "Unicode word-boundary assertions are not supported by the all_overlaps prototype; use explicit ASCII word boundaries such as (?-u:\\b) or the entity_independent mode",
+                ));
+            }
+            patterns.push(hir);
             local_to_detector.push(next_detector_index);
             next_detector_index = next_detector_index.checked_add(1).ok_or_else(|| {
                 validation(
@@ -322,7 +329,6 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
         .configure(
             HybridDfa::config()
                 .match_kind(MatchKind::All)
-                .unicode_word_boundary(true)
                 .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),
         )
         .build_from_nfa(forward_nfa)
@@ -337,7 +343,6 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
             HybridDfa::config()
                 .match_kind(MatchKind::All)
                 .starts_for_each_pattern(true)
-                .unicode_word_boundary(true)
                 .prefilter(None)
                 .specialize_start_states(false)
                 .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),
