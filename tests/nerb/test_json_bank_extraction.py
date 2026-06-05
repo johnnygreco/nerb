@@ -258,6 +258,15 @@ def test_extraction_rejects_runtime_invalid_banks(minimal_bank):
     assert any(diagnostic["code"] == "regex.matches_empty" for diagnostic in exc_info.value.diagnostics)
 
 
+def test_extraction_rejects_zero_width_regexes_that_match_non_empty_text(minimal_bank):
+    _set_customer_patterns(minimal_bank, {"word_boundary": _regex_pattern(r"\b")})
+
+    with pytest.raises(ExtractionError, match="runtime validation") as exc_info:
+        extract_text(minimal_bank, "abc")
+
+    assert any(diagnostic["code"] == "regex.matches_empty" for diagnostic in exc_info.value.diagnostics)
+
+
 def test_extraction_rejects_non_json_schema_invalid_banks_with_diagnostics(minimal_bank):
     minimal_bank["metadata"]["bad"] = object()
 

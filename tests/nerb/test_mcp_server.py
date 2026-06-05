@@ -514,6 +514,17 @@ def test_mcp_tools_report_invalid_config_and_regex(tmp_path):
     assert "regex parse error" in str(invalid_regex_error.value)
 
 
+def test_mcp_validate_config_rejects_zero_width_regex(tmp_path):
+    config_path = tmp_path / "zero-width.yaml"
+    config_path.write_text("ARTIST:\n  Boundary: '" + r"\b" + "'\n", encoding="utf-8")
+
+    with pytest.raises(ToolError) as error:
+        validate_config(str(config_path))
+
+    assert f"Config is invalid at {config_path}" in str(error.value)
+    assert "zero-length match" in str(error.value)
+
+
 def test_mcp_tools_report_invalid_inline_detector_definitions():
     with pytest.raises(ToolError) as invalid_inline_error:
         extract_inline({"ARTIST": {"_flags": "IGNORECASE"}}, text="Rush")

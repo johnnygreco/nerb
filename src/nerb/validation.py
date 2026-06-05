@@ -49,6 +49,7 @@ REGEX_SCOPED_FLAGS = {
 }
 
 __all__ = ["VALIDATION_LEVELS", "validate_bank"]
+EMPTY_MATCH_PROBES = ("", "a", " a ", "\nword\n")
 
 
 @dataclass(frozen=True)
@@ -513,23 +514,29 @@ def _rust_engine_diagnostics(bank: Mapping[str, Any]) -> list[Diagnostic]:
                 f"Rust engine failed to compile the bank: {exc}.",
             )
         ]
-    empty_records = native_bank.scan_text("")
-    if empty_records:
-        first_record = empty_records[0]
-        return [
-            diagnostic(
-                DIAGNOSTIC_ERROR,
-                REGEX_MATCHES_EMPTY,
-                "",
-                "Rust engine detector matches the empty string.",
-                suggested_fix="Require at least one concrete character in the regex before extraction.",
-                metadata={
-                    "entity": first_record.get("entity"),
-                    "canonical_name": first_record.get("canonical_name"),
-                    "surface_name": first_record.get("surface_name"),
-                },
-            )
-        ]
+    return rust_empty_match_diagnostics(native_bank)
+
+
+def rust_empty_match_diagnostics(native_bank: Any) -> list[Diagnostic]:
+    """Return diagnostics when a Rust-backed bank emits zero-length records."""
+    for probe in EMPTY_MATCH_PROBES:
+        for record in native_bank.scan_text(probe):
+            if int(record["start"]) == int(record["end"]):
+                return [
+                    diagnostic(
+                        DIAGNOSTIC_ERROR,
+                        REGEX_MATCHES_EMPTY,
+                        "",
+                        "Rust engine detector emits a zero-length match.",
+                        suggested_fix="Require at least one concrete character in the regex before extraction.",
+                        metadata={
+                            "entity": record.get("entity"),
+                            "canonical_name": record.get("canonical_name"),
+                            "surface_name": record.get("surface_name"),
+                            "probe": probe,
+                        },
+                    )
+                ]
     return []
 
 

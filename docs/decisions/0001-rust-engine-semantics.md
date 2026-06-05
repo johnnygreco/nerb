@@ -99,8 +99,9 @@ Earlier Python validation accepted some of these patterns because they were vali
 migration divergences. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture categories for the conformance
 and validation gates even when the removed Python path could compile them.
 
-Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The direct migration set is
-`IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`; unsupported flags fail validation.
+Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The current direct migration set is
+`IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE`. `ASCII` is schema-known but runtime-deferred for the UTF-8 native
+scan path and fails validation until a future issue lands safe lowering semantics. Unsupported flags fail validation.
 
 `word_boundaries` remains a first-class `Bank.from_config` and compile-option behavior, and Rust canonicalization applies
 it with explicit boundary rules rather than Python-side regex string substitution.
@@ -141,8 +142,8 @@ The mode strategy is therefore locked for the current Rust engine path and the o
 - `global_leftmost` remains an internal throughput baseline only and must not be used for production extraction because
   it violates the cross-entity overlap contract.
 
-This decision does not close the missing bank-owner cardinality input. That input must be recorded before final Python
-removal, and any target beyond the order-tens range requires a new mode-strategy issue.
+This decision does not close the missing bank-owner cardinality input. That input must be recorded before changing the
+mode strategy or expanding beyond the order-tens range; any target beyond that range requires a new mode-strategy issue.
 
 ## Deterministic Output Order
 
@@ -166,7 +167,8 @@ The conformance suite covers these categories as evidence for the Rust-backed ma
 - ordered alternation ties;
 - underscores in detector names as a known Python-oracle divergence;
 - word-boundary behavior, including a Unicode boundary fixture that ASCII-only boundaries would fail;
-- direct flag migration behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`;
+- direct flag migration behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE`, plus explicit rejection of
+  runtime-deferred `ASCII`;
 - unsupported backtracking-only regex syntax;
 - ReDoS-shaped regexes;
 - compile-bomb-shaped regexes.

@@ -1236,6 +1236,17 @@ def test_validate_reports_success_and_invalid_config(tmp_path):
     assert "regex parse error" in result.output
 
 
+def test_validate_rejects_zero_width_regex_config(tmp_path):
+    config_path = tmp_path / "zero-width.yaml"
+    config_path.write_text("ARTIST:\n  Boundary: '" + r"\b" + "'\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["validate", "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert f"Config is invalid at {config_path}" in result.output
+    assert "zero-length match" in result.output
+
+
 def test_validate_reports_missing_config(tmp_path):
     config_path = tmp_path / "missing.yaml"
 

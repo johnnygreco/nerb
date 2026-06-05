@@ -185,7 +185,9 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
         message = f"Bank failed Rust engine validation and cannot be extracted: {exc}."
         raise ExtractionError(message, diagnostics) from exc
 
-    empty_match_diagnostics = _empty_match_diagnostics(native_bank)
+    from .validation import rust_empty_match_diagnostics
+
+    empty_match_diagnostics = rust_empty_match_diagnostics(native_bank)
     if empty_match_diagnostics:
         raise ExtractionError("Bank failed runtime validation and cannot be extracted.", empty_match_diagnostics)
 
@@ -210,27 +212,6 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
         detector_index=_json_bank_detector_index(extractable_bank),
     )
     return compiled, bool(cache_metadata.get("hit"))
-
-
-def _empty_match_diagnostics(native_bank: Bank) -> list[Diagnostic]:
-    records = native_bank.scan_text("")
-    if not records:
-        return []
-    first_record = records[0]
-    return [
-        diagnostic(
-            DIAGNOSTIC_ERROR,
-            "regex.matches_empty",
-            "",
-            "Rust engine detector matches the empty string.",
-            suggested_fix="Require at least one concrete character in the regex before extraction.",
-            metadata={
-                "entity": first_record.get("entity"),
-                "canonical_name": first_record.get("canonical_name"),
-                "surface_name": first_record.get("surface_name"),
-            },
-        )
-    ]
 
 
 def _positive_int_option(options: Mapping[str, Any], key: str, default: int) -> int:

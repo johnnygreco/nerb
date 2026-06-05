@@ -136,6 +136,15 @@ def test_validation_reports_regexes_that_match_empty_strings(minimal_bank):
     assert "regex.matches_empty" in _codes(result)
 
 
+def test_validation_reports_zero_width_regexes_that_match_non_empty_text(minimal_bank):
+    _add_regex(minimal_bank, "boundary", r"\b")
+
+    result = validate_bank(minimal_bank)
+
+    assert result["valid"] is False
+    assert "regex.matches_empty" in _codes(result)
+
+
 def test_validation_reports_normalization_changes_and_compile_failures(minimal_bank):
     minimal_bank["unicode_normalization"] = "NFKC"
     _add_regex(minimal_bank, "normalized", "（")

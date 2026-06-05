@@ -192,10 +192,14 @@ def ensure_rust_config_compatible(config: Any) -> PatternConfig:
 
     try:
         from .engine import Bank
+        from .validation import rust_empty_match_diagnostics
 
-        Bank.from_config(validated_config, use_cache=False)
+        bank = Bank.from_config(validated_config, use_cache=False)
     except ValueError as exc:
         raise ConfigError(f"Detector config is not compatible with the Rust engine: {exc}.") from exc
+    diagnostics = rust_empty_match_diagnostics(bank)
+    if diagnostics:
+        raise ConfigError(f"Detector config is not compatible with the Rust engine: {diagnostics[0]['message']}")
     return validated_config
 
 

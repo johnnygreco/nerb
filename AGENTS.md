@@ -29,8 +29,9 @@ Equivalent direct command:
 uv sync --all-extras
 ```
 
-The installed console scripts are `nerb` and, on Python 3.10+, `nerb-mcp`. Current CLI commands are `extract`, `init`,
-`add`, `list`, `show`, `remove`, and `validate`.
+The installed console scripts are `nerb` and, on Python 3.10+, `nerb-mcp`. Use `uv run nerb --help` for the current CLI
+surface, including config authoring, config extraction, JSON-bank extraction, reports, evals, benchmarks, and validation
+commands.
 
 ## Verification
 

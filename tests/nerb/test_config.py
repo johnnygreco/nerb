@@ -66,6 +66,13 @@ def test_save_config_rejects_regexes_outside_rust_profile(tmp_path):
         save_config({"ARTIST": {"Code": r"([A-Z]+)-\1"}}, config_path)
 
 
+def test_save_config_rejects_zero_width_regexes(tmp_path):
+    config_path = tmp_path / "entities.yaml"
+
+    with pytest.raises(ConfigError, match="zero-length match"):
+        save_config({"ARTIST": {"Boundary": r"\b"}}, config_path)
+
+
 def test_load_config_accepts_rust_regex_syntax_that_python_re_cannot_parse(tmp_path):
     config_path = tmp_path / "entities.yaml"
     config_path.write_text("ARTIST:\n  Rush: '(?<label>Rush)'\n", encoding="utf-8")
