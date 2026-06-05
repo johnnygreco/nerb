@@ -151,6 +151,27 @@ def test_eval_bank_positive_refs_use_utf8_byte_offsets(tmp_path, minimal_bank):
     assert result["failures"] == []
 
 
+def test_eval_bank_jsonl_lines_do_not_split_on_unicode_line_separators(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "unicode_line_separator.jsonl"
+    eval_ref_path.write_text(
+        json.dumps(_positive_record(text="Acme Corp\u2028 signed."), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref_path.name]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"] == {
+        "passed": True,
+        "positive_total": 1,
+        "positive_failed": 0,
+        "negative_total": 0,
+        "negative_failed": 0,
+    }
+    assert result["failures"] == []
+
+
 def test_eval_bank_positive_refs_reject_character_offsets_when_byte_offsets_differ(tmp_path, minimal_bank):
     text = "Café Acme Corp"
     eval_ref = _write_jsonl(

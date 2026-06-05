@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from stat import S_ISREG
 from typing import Any, cast
@@ -471,7 +472,7 @@ def _load_eval_ref(
         )
         return
 
-    for record_index, line in enumerate(text.splitlines()):
+    for record_index, line in enumerate(StringIO(text, newline=None)):
         stripped = line.strip()
         if not stripped:
             continue
