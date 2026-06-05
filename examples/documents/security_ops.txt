@@ -1,0 +1,3 @@
+INC-9042 escalated to SEV-2 after Okta sign-in telemetry linked CVE-2026-18421 to a Kubernetes service account. The agent pinned Amazon S3 evidence in Runbook R-17 and queued Terraform Cloud drift checks for Detection Engineering.
+
+The responder also mentioned PagerDuty, CloudTrail, and a staging namespace that are not in this bank. Those terms stay as ordinary context while the cached incident, vulnerability, service, severity, and runbook entities keep byte offsets for later citations.

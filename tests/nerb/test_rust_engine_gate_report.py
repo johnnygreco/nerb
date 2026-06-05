@@ -231,6 +231,22 @@ def test_memory_report_from_child_fails_when_isolated_probe_exceeds_budget():
     assert report["criteria"]["max_rss_growth_within_budget"] is False
 
 
+def test_max_rss_kib_normalizes_darwin_bytes(monkeypatch):
+    gate_report = _load_gate_report_module()
+
+    class Usage:
+        ru_maxrss = 12_345
+
+    monkeypatch.setattr(gate_report.resource, "getrusage", lambda _target: Usage())
+    monkeypatch.setattr(gate_report.platform, "system", lambda: "Darwin")
+
+    assert gate_report._max_rss_kib() == 13
+
+    monkeypatch.setattr(gate_report.platform, "system", lambda: "Linux")
+
+    assert gate_report._max_rss_kib() == 12_345
+
+
 def test_external_required_sections_are_excluded_from_overall_pass():
     gate_report = _load_gate_report_module()
 

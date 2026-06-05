@@ -1,0 +1,3 @@
+QBR-7781 says Acme Renewables wants Atlas Copilot and Signal API before the MSA-2209 renewal. Northstar Labs is at risk in EMEA because Drift Monitor alerts lag behind the customer data room.
+
+The same note mentions a champion call, a pricing spreadsheet, and a partner portal that the bank intentionally leaves unresolved. The agent should still cache account, product, commercial artifact, health, and region hits for CRM follow-up.
