@@ -13,8 +13,9 @@ uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 1
 
 The report emits JSON with conformance, performance, dense-memory, mode-strategy, distribution, and bank-owner
 cardinality sections. The report only includes sections it measures directly in `overall.passed`: performance, dense
-memory, and mode strategy. Conformance, distribution, and bank-owner cardinality are marked `external_required` unless
-the bank-owner entity-count flags are provided, and must be proven by the PR validation commands or recorded signoff.
+memory, and mode strategy. Conformance and distribution are marked `external_required` and must be proven by the PR
+validation commands. Bank-owner cardinality is marked `external_required` unless the bank-owner entity-count flags are
+provided.
 
 Routine local target documents are 100 KB and exercise small-bank, literal-heavy, regex-heavy, mixed-bank,
 corpus-size, dense-overlap, memory, cache, projection, and output behavior.
@@ -27,17 +28,19 @@ timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --t
 
 The single-iteration 1 MB report passed under the cap. A five-iteration 1 MB report is not a routine local gate.
 
-When the bank-owner current and expected-growth entity counts are available, add them to the same command:
+For #73, the bank-owner target is a representative synthetic medium bank with 1,000 top-level entities. Record that
+target with:
 
 ```shell
 uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 100000 --dense-bytes 512 \
-  --bank-owner-entity-count <current-count> \
-  --bank-owner-growth-entity-count <expected-growth-count> \
-  --bank-owner-note "<source>"
+  --bank-owner-entity-count 1000 \
+  --bank-owner-growth-entity-count 1000 \
+  --bank-owner-note "user-directed representative synthetic medium bank target on 2026-06-05"
 ```
 
-The bank-owner section passes only when both counts are recorded and both are within the validated 64-entity synthetic
-range. Counts above that range require a new mode-strategy issue before changing the production default.
+The bank-owner section passes only when both counts are recorded and both are within the validated 1,000-entity
+synthetic medium-bank range. Counts above that range require a new mode-strategy issue before changing the production
+default.
 
 ## Conformance
 
@@ -109,7 +112,7 @@ Routine 100 KB report, 5 iterations, final gate update:
 
 The mixed-bank corpus-size section measured the same mixed workload at 10 KB and 100 KB. Both cases passed the stable
 count and 5 MB/s throughput floor. The 1 MB evidence command measured the mixed corpus case at 1,000,000 bytes,
-0.002472s scan/project median, 1,805 records, and 404.5 MB/s scan/project throughput.
+0.002440s scan/project median, 1,805 records, and 409.8 MB/s scan/project throughput.
 
 ## Dense Memory And Mode Strategy
 
@@ -132,8 +135,9 @@ cap, max-RSS growth under a 64 MiB budget, and absolute child max-RSS under a 25
 31,776 raw matches, `MatchBuffer` capacity 32,768, absolute child max-RSS 57,432 KiB, and max-RSS growth 0 KiB. The
 capacity value is the direct materialized-output allocation evidence; the RSS fields bound the isolated child process.
 
-Synthetic entity-cardinality sweep: 8 dense prefix detectors per entity over 256 bytes. The final checked-in ceiling is
-64 entities, which keeps the default mode inside the plan's order-tens assumption.
+Synthetic entity-cardinality sweep: 8 dense prefix detectors per entity over 256 bytes. The dense all-overlaps stress
+ceiling is 64 entities; the separate production-default medium-bank case validates the target 1,000-entity bank without
+materializing amplified raw `all_overlaps` output.
 
 | Entities | Patterns | `entity_independent` | `all_overlaps` raw | `global_leftmost` | Raw/Entity Ratio |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -142,25 +146,30 @@ Synthetic entity-cardinality sweep: 8 dense prefix detectors per entity over 256
 | 32 | 256 | 1,024 | 64,640 | 32 | 63.125x |
 | 64 | 512 | 2,048 | 129,280 | 32 | 63.125x |
 
-The sweep also gates order-tens performance in two ways:
+The sweep also gates production-default cardinality performance in three ways:
 
 - Dense 256-byte semantic probe: the max-entity `entity_independent` raw scan must remain under 0.01s and the
-  max-to-2 entity scan-time ratio must remain under 80x. The routine report measured 0.000341s for the 64-entity scan
-  and a 30.1x max-to-2 ratio.
+  max-to-2 entity scan-time ratio must remain under 80x. The routine report measured 0.000316s for the 64-entity scan
+  and a 35.111x max-to-2 ratio.
 - Routine-size sparse no-match probe: 2-entity and 64-entity banks scan the configured target bytes, avoiding
   `all_overlaps` output amplification while bounding `entity_independent` entity/document scaling. The 64-entity
   `entity_independent` scan must remain under 0.05s and the max-to-2 `entity_independent` ratio under 80x. The routine
-  100 KB report measured 0.000439s for the 64-entity scan and a 43.9x ratio. The 1 MB evidence measured a
-  26.11x routine max-to-2 ratio.
+  100 KB report measured 0.000218s for the 64-entity scan and a 21.8x ratio. The 1 MB evidence measured a
+  13.981x routine max-to-2 ratio.
+- Medium-bank sparse no-match probe: 1,000 entities with 8 generated patterns per entity scan the configured target
+  bytes using the production default and public projection path. The routine 100 KB report measured 1,000 entities,
+  8,000 patterns, 1,000,000 source bytes, 0.638117s native compile median, 0.003395s raw scan median, 0.008648s
+  scan/project median, and 11.6 MB/s scan/project throughput. The 1,000-to-64 raw scan ratio was 15.573x, below the
+  40x ceiling. The 1 MB evidence measured 0.794416s native compile median, 0.033708s raw scan median, 0.043460s
+  scan/project median, 23.0 MB/s scan/project throughput, and a 15.357x 1,000-to-64 raw scan ratio.
 
 Mode decision: keep `entity_independent` as the production default for the current Rust engine path and the synthetic
-order-tens entity-cardinality evidence above. `all_overlaps` remains a measured prototype and `global_leftmost` remains
+medium-bank entity-cardinality evidence above. `all_overlaps` remains a measured prototype and `global_leftmost` remains
 an internal benchmark baseline.
 
-The real bank-owner entity-cardinality target is still not recorded in this repository. Issue #73 records the pending
-input request. Final goal completion requires either recording current and expected-growth entity counts with the report
-flags above or explicitly accepting the missing signoff as a known risk. If expected entity classes exceed the
-64-entity range validated here, open a new mode-strategy issue before changing the default mode strategy.
+Issue #73 records the bank-owner target as a representative synthetic medium bank with 1,000 top-level entities. If
+expected entity classes exceed the 1,000-entity range validated here, open a new mode-strategy issue before changing the
+default mode strategy.
 
 ## Distribution
 

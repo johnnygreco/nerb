@@ -96,14 +96,20 @@ Trimmed output shape:
 The final gate report is the reproducible merge-gate evidence for the Rust-backed `Bank` path:
 
 ```shell
-uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 100000 --dense-bytes 512
-timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --target-bytes 1000000 --dense-bytes 512
+uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 100000 --dense-bytes 512 \
+  --bank-owner-entity-count 1000 \
+  --bank-owner-growth-entity-count 1000 \
+  --bank-owner-note "user-directed representative synthetic medium bank target on 2026-06-05"
+timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --target-bytes 1000000 --dense-bytes 512 \
+  --bank-owner-entity-count 1000 \
+  --bank-owner-growth-entity-count 1000 \
+  --bank-owner-note "user-directed representative synthetic medium bank target on 2026-06-05"
 ```
 
 The report's checked-in baseline id is `rust-engine-final-gates-v1`. It directly gates performance, dense memory, and
 mode strategy. Conformance and distribution remain external-required sections proven by the PR validation commands.
-Bank-owner cardinality is also external-required until the real current and expected-growth entity counts are recorded
-with the report's `--bank-owner-entity-count` and `--bank-owner-growth-entity-count` flags.
+For #73, bank-owner cardinality is recorded as a representative synthetic medium-bank target with 1,000 current and
+expected-growth entities.
 
 Final routine 100 KB report highlights:
 
@@ -115,12 +121,21 @@ Final routine 100 KB report highlights:
 | mixed | 181 | 0.000660s | 151.5 MB/s |
 
 The mixed corpus-size gate passed at 10 KB and 100 KB in the routine report. The 1 MB report passed with 1,805 records,
-0.002472s scan/project median, and 404.5 MB/s scan/project throughput.
+0.002440s scan/project median, and 409.8 MB/s scan/project throughput.
 
-The final entity-cardinality sweep validates the production default through 64 synthetic entity classes, with 8 dense
-prefix detectors per entity over 256 bytes. At 64 entities, `entity_independent` emitted 2,048 production matches, raw
-`all_overlaps` emitted 129,280 matches, and `global_leftmost` emitted 32 matches. The 64-to-2 dense scan ratio was
-30.1x under the 80x ceiling; the 100 KB routine sparse ratio was 43.9x, and the 1 MB routine sparse ratio was 26.11x.
+The final entity-cardinality sweep separates dense overlap stress from the production medium-bank target. Dense prefix
+stress validates semantic reconstruction through 64 synthetic entity classes, with 8 dense prefix detectors per entity
+over 256 bytes. At 64 entities, `entity_independent` emitted 2,048 production matches, raw `all_overlaps` emitted
+129,280 matches, and `global_leftmost` emitted 32 matches. The 64-to-2 dense scan ratio was 35.111x under the 80x
+ceiling.
+
+The production medium-bank case validates 1,000 top-level entities with 8 generated patterns per entity over the
+configured 100 KB sparse no-match document. The routine report measured 8,000 patterns, 1,000,000 source bytes,
+0.638117s native compile median, 0.003395s raw scan median, 0.008648s scan/project median, 11.6 MB/s scan/project
+throughput, and a 15.573x raw scan ratio from the 64-entity routine case to the 1,000-entity medium-bank case.
+The 1 MB evidence measured 0.794416s native compile median, 0.033708s raw scan median, 0.043460s scan/project median,
+23.0 MB/s scan/project throughput, and a 15.357x raw scan ratio from the 64-entity routine case to the 1,000-entity
+medium-bank case.
 
 ## Slice 6/7 Native Mode Probe
 
