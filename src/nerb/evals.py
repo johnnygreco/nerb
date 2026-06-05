@@ -486,8 +486,8 @@ def _record_validation_diagnostics(record: Any) -> list[Diagnostic]:
 
 def _positive_diagnostics(record: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics = _strict_fields(record, required=_POSITIVE_FIELDS, allowed=_POSITIVE_FIELDS)
-    if not isinstance(record.get("text"), str):
-        diagnostics.append(_type_diagnostic("/text", "Positive eval text must be a string."))
+    text_bytes, text_diagnostics = _text_bytes_diagnostics(record.get("text"), label="Positive eval text")
+    diagnostics.extend(text_diagnostics)
     diagnostics.extend(_metadata_diagnostics(record.get("metadata")))
 
     matches = record.get("matches")
@@ -500,30 +500,54 @@ def _positive_diagnostics(record: Mapping[str, Any]) -> list[Diagnostic]:
         )
         return diagnostics
 
-    text = record.get("text")
     for index, match in enumerate(matches):
-        diagnostics.extend(_match_diagnostics(match, index, text if isinstance(text, str) else None))
+        diagnostics.extend(_match_diagnostics(match, index, text_bytes))
     return diagnostics
 
 
 def _negative_diagnostics(record: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics = _strict_fields(record, required=_NEGATIVE_FIELDS, allowed=_NEGATIVE_FIELDS)
-    if not isinstance(record.get("text"), str):
-        diagnostics.append(_type_diagnostic("/text", "Negative eval text must be a string."))
+    _, text_diagnostics = _text_bytes_diagnostics(record.get("text"), label="Negative eval text")
+    diagnostics.extend(text_diagnostics)
     if not isinstance(record.get("reason"), str):
         diagnostics.append(_type_diagnostic("/reason", "Negative eval reason must be a string."))
     diagnostics.extend(_metadata_diagnostics(record.get("metadata")))
     return diagnostics
 
 
+def _text_bytes_diagnostics(value: Any, *, label: str) -> tuple[bytes | None, list[Diagnostic]]:
+    diagnostics = _utf8_string_diagnostics(value, path="/text", label=label)
+    if diagnostics:
+        return None, diagnostics
+    return cast(str, value).encode("utf-8"), []
+
+
+def _utf8_string_diagnostics(value: Any, *, path: str, label: str) -> list[Diagnostic]:
+    if not isinstance(value, str):
+        return [_type_diagnostic(path, f"{label} must be a string.")]
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return [
+            diagnostic(
+                DIAGNOSTIC_ERROR,
+                EVAL_RECORD_INVALID,
+                path,
+                f"{label} must be encodable as UTF-8.",
+            )
+        ]
+    return []
+
+
 def _provenance_diagnostics(record: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics = _strict_fields(record, required=_PROVENANCE_FIELDS, allowed=_PROVENANCE_FIELDS)
-    if not isinstance(record.get("source_type"), str):
-        diagnostics.append(_type_diagnostic("/source_type", "Provenance source_type must be a string."))
-    if not isinstance(record.get("observed_at"), str):
-        diagnostics.append(_type_diagnostic("/observed_at", "Provenance observed_at must be a string."))
-    if not isinstance(record.get("evidence"), str):
-        diagnostics.append(_type_diagnostic("/evidence", "Provenance evidence must be a string."))
+    diagnostics.extend(
+        _utf8_string_diagnostics(record.get("source_type"), path="/source_type", label="Provenance source_type")
+    )
+    diagnostics.extend(
+        _utf8_string_diagnostics(record.get("observed_at"), path="/observed_at", label="Provenance observed_at")
+    )
+    diagnostics.extend(_utf8_string_diagnostics(record.get("evidence"), path="/evidence", label="Provenance evidence"))
     diagnostics.extend(_metadata_diagnostics(record.get("metadata")))
     return diagnostics
 
@@ -561,7 +585,7 @@ def _metadata_diagnostics(metadata: Any) -> list[Diagnostic]:
     return []
 
 
-def _match_diagnostics(match: Any, index: int, text: str | None) -> list[Diagnostic]:
+def _match_diagnostics(match: Any, index: int, text_bytes: bytes | None) -> list[Diagnostic]:
     path = f"/matches/{index}"
     if not isinstance(match, Mapping):
         return [_type_diagnostic(path, "Positive eval match must be an object.")]
@@ -603,25 +627,38 @@ def _match_diagnostics(match: Any, index: int, text: str | None) -> list[Diagnos
                     "Positive eval match end must be greater than or equal to start.",
                 )
             )
-        elif text is not None:
-            if end_int > len(text):
+        elif text_bytes is not None:
+            if end_int > len(text_bytes):
                 diagnostics.append(
                     diagnostic(
                         DIAGNOSTIC_ERROR,
                         EVAL_RECORD_INVALID,
                         f"{path}/end",
-                        "Positive eval match span must be within the eval text.",
+                        "Positive eval match byte span must be within the UTF-8 eval text.",
                     )
                 )
-            elif isinstance(expected_string, str) and text[start_int:end_int] != expected_string:
-                diagnostics.append(
-                    diagnostic(
-                        DIAGNOSTIC_ERROR,
-                        EVAL_RECORD_INVALID,
-                        f"{path}/string",
-                        "Positive eval match string must equal text[start:end].",
+            elif isinstance(expected_string, str):
+                try:
+                    actual_string = text_bytes[start_int:end_int].decode("utf-8")
+                except UnicodeDecodeError:
+                    diagnostics.append(
+                        diagnostic(
+                            DIAGNOSTIC_ERROR,
+                            EVAL_RECORD_INVALID,
+                            f"{path}/start",
+                            "Positive eval match byte span must align to UTF-8 character boundaries.",
+                        )
                     )
-                )
+                else:
+                    if actual_string != expected_string:
+                        diagnostics.append(
+                            diagnostic(
+                                DIAGNOSTIC_ERROR,
+                                EVAL_RECORD_INVALID,
+                                f"{path}/string",
+                                "Positive eval match string must equal the eval text byte span [start:end].",
+                            )
+                        )
 
     for id_field in ("entity", "entity_id", "name", "name_id", "pattern_id", "pattern_kind"):
         if id_field in match and not isinstance(match[id_field], str):
@@ -884,18 +921,38 @@ def _append_failure(
     actual: Any,
     diagnostics: list[Diagnostic],
 ) -> None:
-    result["failures"].append(
-        {
-            "path": scope.path,
-            "eval_ref": eval_ref,
-            "record": record_index,
-            "type": record_type,
-            "text": text,
-            "expected": expected,
-            "actual": actual,
-            "diagnostics": diagnostics,
+    failure = {
+        "path": scope.path,
+        "eval_ref": eval_ref,
+        "record": record_index,
+        "type": record_type,
+        "text": text,
+        "expected": expected,
+        "actual": actual,
+        "diagnostics": diagnostics,
+    }
+    result["failures"].append(_sanitize_failure_payload(failure))
+
+
+def _sanitize_failure_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_failure_string(value)
+    if isinstance(value, Mapping):
+        return {
+            _sanitize_failure_string(key) if isinstance(key, str) else str(key): _sanitize_failure_payload(item)
+            for key, item in value.items()
         }
-    )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_sanitize_failure_payload(item) for item in value]
+    return value
+
+
+def _sanitize_failure_string(value: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return value.encode("utf-8", errors="backslashreplace").decode("utf-8")
+    return value
 
 
 def _json_pointer(parts: Iterable[Any]) -> str:
