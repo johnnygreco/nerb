@@ -203,6 +203,85 @@ def test_json_bank_validate_patch_diff_and_eval_commands_match_helpers(tmp_path,
     assert json.loads(eval_result.output) == eval_bank(eval_bank_payload, base_path=tmp_path)
 
 
+@pytest.mark.parametrize(
+    "eval_record_json",
+    [
+        '{"type":"positive","text":"\\ud800 Acme Corp",'
+        '"matches":[{"string":"Acme Corp","start":1,"end":10}],"metadata":{}}',
+        '{"type":"negative","text":"\\ud800 Acme Corp","reason":"Invalid text guard.","metadata":{}}',
+    ],
+)
+def test_json_bank_eval_command_serializes_invalid_utf8_eval_text(tmp_path, test_data_path, eval_record_json):
+    bank = _load_json(test_data_path / "minimal_bank.json")
+    eval_ref_path = tmp_path / "invalid_utf8_text.jsonl"
+    eval_ref_path.write_text(eval_record_json + "\n", encoding="utf-8")
+    bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["eval_refs"] = [eval_ref_path.name]
+    bank_path = _write_json(tmp_path / "bank.json", bank)
+
+    result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
+
+    assert result.exit_code == 0
+    result.output.encode("utf-8")
+    payload = json.loads(result.output)
+    assert payload["summary"]["passed"] is False
+    assert payload["failures"][0]["text"] == "\\ud800 Acme Corp"
+    assert payload["failures"][0]["diagnostics"][0]["path"] == "/text"
+
+
+def test_json_bank_eval_command_serializes_invalid_utf8_text_with_non_ascii_prefix(tmp_path, test_data_path):
+    bank = _load_json(test_data_path / "minimal_bank.json")
+    eval_ref_path = tmp_path / "invalid_utf8_text_with_non_ascii.jsonl"
+    eval_ref_path.write_text(
+        '{"type":"positive","text":"Caf\\u00e9 \\ud800 Acme Corp",'
+        '"matches":[{"string":"Acme Corp","start":8,"end":17}],"metadata":{}}\n',
+        encoding="utf-8",
+    )
+    bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["eval_refs"] = [eval_ref_path.name]
+    bank_path = _write_json(tmp_path / "bank.json", bank)
+
+    result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
+
+    assert result.exit_code == 0
+    result.output.encode("utf-8")
+    payload = json.loads(result.output)
+    assert payload["summary"]["passed"] is False
+    assert payload["failures"][0]["text"] == "Café \\ud800 Acme Corp"
+
+
+def test_json_bank_eval_command_serializes_invalid_utf8_eval_ref(tmp_path, test_data_path):
+    bank = _load_json(test_data_path / "minimal_bank.json")
+    bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["eval_refs"] = ["missing\ud800.jsonl"]
+    bank_path = _write_json(tmp_path / "bank.json", bank)
+
+    result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
+
+    assert result.exit_code == 0
+    result.output.encode("utf-8")
+    payload = json.loads(result.output)
+    assert payload["summary"]["passed"] is False
+    assert payload["failures"][0]["eval_ref"] == "missing\\ud800.jsonl"
+
+
+def test_json_bank_eval_command_serializes_invalid_utf8_provenance_source_type(tmp_path, test_data_path):
+    bank = _load_json(test_data_path / "minimal_bank.json")
+    eval_ref_path = tmp_path / "invalid_provenance_utf8.jsonl"
+    eval_ref_path.write_text(
+        '{"type":"provenance","source_type":"\\ud800","observed_at":"2026-06-05",'
+        '"evidence":"CRM export.","metadata":{}}\n',
+        encoding="utf-8",
+    )
+    bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]["eval_refs"] = [eval_ref_path.name]
+    bank_path = _write_json(tmp_path / "bank.json", bank)
+
+    result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
+
+    assert result.exit_code == 0
+    result.output.encode("utf-8")
+    payload = json.loads(result.output)
+    assert payload["summary"]["passed"] is False
+    assert payload["failures"][0]["diagnostics"][0]["path"] == "/source_type"
+
+
 def test_json_bank_apply_patches_command_allows_repairing_invalid_bank(tmp_path, test_data_path):
     bank = _load_json(test_data_path / "minimal_bank.json")
     invalid_bank = json.loads(json.dumps(bank))

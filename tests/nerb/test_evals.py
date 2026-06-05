@@ -11,6 +11,7 @@ from nerb import ExtractionError, eval_bank
 from nerb.diagnostics import (
     EVAL_NEGATIVE_FAILED,
     EVAL_POSITIVE_FAILED,
+    EVAL_RECORD_INVALID,
     EVAL_REF_TOO_LARGE,
     EVAL_REF_UNRESOLVED,
     EVAL_REF_UNSUPPORTED,
@@ -129,6 +130,87 @@ def test_eval_bank_positive_refs_cover_bank_entity_and_name_scopes(tmp_path, min
     assert result["by_name"]["customer/acme_corp"]["positive_total"] == 1
 
 
+def test_eval_bank_positive_refs_use_utf8_byte_offsets(tmp_path, minimal_bank):
+    text = "Café Acme Corp"
+    eval_ref = _write_jsonl(
+        tmp_path / "utf8_byte_offsets.jsonl",
+        [_positive_record(text=text, match={"string": "Acme Corp", "start": 6, "end": 15})],
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"] == {
+        "passed": True,
+        "positive_total": 1,
+        "positive_failed": 0,
+        "negative_total": 0,
+        "negative_failed": 0,
+    }
+    assert result["failures"] == []
+
+
+def test_eval_bank_positive_refs_reject_character_offsets_when_byte_offsets_differ(tmp_path, minimal_bank):
+    text = "Café Acme Corp"
+    eval_ref = _write_jsonl(
+        tmp_path / "character_offsets.jsonl",
+        [_positive_record(text=text, match={"string": "Acme Corp", "start": 5, "end": 14})],
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"]["passed"] is False
+    assert result["summary"]["positive_total"] == 0
+    failure = result["failures"][0]
+    assert failure["diagnostics"][0]["code"] == EVAL_RECORD_INVALID
+    assert failure["diagnostics"][0]["path"] == "/matches/0/string"
+    assert "byte span" in failure["diagnostics"][0]["message"]
+
+
+def test_eval_bank_positive_refs_reject_text_that_cannot_encode_as_utf8(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "invalid_utf8_text.jsonl"
+    eval_ref_path.write_text(
+        '{"type":"positive","text":"\\ud800 Acme Corp",'
+        '"matches":[{"string":"Acme Corp","start":1,"end":10}],"metadata":{}}\n',
+        encoding="utf-8",
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref_path.name]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+    json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+    assert result["summary"]["passed"] is False
+    assert result["summary"]["positive_total"] == 0
+    failure = result["failures"][0]
+    assert failure["text"] == "\\ud800 Acme Corp"
+    assert failure["diagnostics"][0]["code"] == EVAL_RECORD_INVALID
+    assert failure["diagnostics"][0]["path"] == "/text"
+    assert "UTF-8" in failure["diagnostics"][0]["message"]
+
+
+def test_eval_bank_sanitizes_invalid_utf8_text_with_non_ascii_prefix(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "invalid_utf8_text_with_non_ascii.jsonl"
+    eval_ref_path.write_text(
+        '{"type":"positive","text":"Caf\\u00e9 \\ud800 Acme Corp",'
+        '"matches":[{"string":"Acme Corp","start":8,"end":17}],"metadata":{}}\n',
+        encoding="utf-8",
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref_path.name]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+    json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+    assert result["summary"]["passed"] is False
+    failure = result["failures"][0]
+    assert failure["text"] == "Café \\ud800 Acme Corp"
+    assert failure["diagnostics"][0]["code"] == EVAL_RECORD_INVALID
+
+
 def test_eval_bank_negative_records_are_scoped_to_attachment_point(tmp_path, minimal_bank):
     _add_customer_name(minimal_bank, "globex", "Globex", "Globex")
     negative_ref = _write_jsonl(tmp_path / "negative.jsonl", [_negative_record("Acme Corp")])
@@ -144,6 +226,62 @@ def test_eval_bank_negative_records_are_scoped_to_attachment_point(tmp_path, min
         "negative_failed": 0,
     }
     assert result["failures"] == []
+
+
+def test_eval_bank_negative_refs_reject_text_that_cannot_encode_as_utf8(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "invalid_negative_utf8_text.jsonl"
+    eval_ref_path.write_text(
+        '{"type":"negative","text":"\\ud800 Acme Corp","reason":"Invalid text guard.","metadata":{}}\n',
+        encoding="utf-8",
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref_path.name]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+    json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+    assert result["summary"]["passed"] is False
+    assert result["summary"]["negative_total"] == 0
+    failure = result["failures"][0]
+    assert failure["text"] == "\\ud800 Acme Corp"
+    assert failure["diagnostics"][0]["code"] == EVAL_RECORD_INVALID
+    assert failure["diagnostics"][0]["path"] == "/text"
+    assert "UTF-8" in failure["diagnostics"][0]["message"]
+
+
+def test_eval_bank_sanitizes_eval_ref_that_cannot_encode_as_utf8(tmp_path, minimal_bank):
+    eval_ref = "missing\ud800.jsonl"
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+    json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+    assert result["summary"]["passed"] is False
+    failure = result["failures"][0]
+    assert failure["eval_ref"] == "missing\\ud800.jsonl"
+    assert failure["diagnostics"][0]["code"] == EVAL_REF_UNRESOLVED
+
+
+def test_eval_bank_rejects_provenance_source_type_that_cannot_encode_as_utf8(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "invalid_provenance_utf8.jsonl"
+    eval_ref_path.write_text(
+        '{"type":"provenance","source_type":"\\ud800","observed_at":"2026-06-05",'
+        '"evidence":"CRM export.","metadata":{}}\n',
+        encoding="utf-8",
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref_path.name]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+    json.dumps(result, ensure_ascii=False).encode("utf-8")
+
+    assert result["summary"]["passed"] is False
+    assert result["provenance"] == {"total": 0, "by_source_type": {}}
+    failure = result["failures"][0]
+    assert failure["diagnostics"][0]["code"] == EVAL_RECORD_INVALID
+    assert failure["diagnostics"][0]["path"] == "/source_type"
+    assert "UTF-8" in failure["diagnostics"][0]["message"]
 
 
 def test_eval_bank_positive_failure_includes_repair_diagnostic_and_raw_details(tmp_path, minimal_bank):
