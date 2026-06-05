@@ -138,8 +138,8 @@
       "cold_hit": false,
       "warm_hit": true
     },
-    "cold_seconds": 0.002580209,
-    "warm_cache_lookup_seconds": 0.001383
+    "cold_seconds": 0.002591542,
+    "warm_cache_lookup_seconds": 0.001460167
   },
   "diagnostics": [
     {
@@ -179,11 +179,11 @@
   },
   "stages": {
     "canonicalize": {
-      "seconds": 4.8541e-05
+      "seconds": 4.9042e-05
     },
     "compile_cache": {
       "cache_hit_verified": true,
-      "cold_seconds": 0.002580209,
+      "cold_seconds": 0.002591542,
       "exclusive": false,
       "includes": [
         "canonicalize",
@@ -193,18 +193,18 @@
         "rust_bank_compile"
       ],
       "note": "Rust Bank compile timing is inclusive; do not sum it with sibling stage timings.",
-      "warm_cache_lookup_seconds": 0.001383
+      "warm_cache_lookup_seconds": 0.001460167
     },
     "document_prepare": {
       "seconds_by_tier": {
-        "baseline": 7.5e-06,
-        "stress": 4.375e-06,
-        "target": 7.25e-06
+        "baseline": 7.25e-06,
+        "stress": 4.584e-06,
+        "target": 7.791e-06
       },
-      "total_seconds": 1.9125e-05
+      "total_seconds": 1.9625e-05
     },
     "document_tier_resolution": {
-      "seconds": 3.1083e-05
+      "seconds": 2.9834e-05
     },
     "input_parse": {
       "available": false,
@@ -213,27 +213,27 @@
     },
     "scan_project_sort": {
       "seconds_by_tier": {
-        "baseline": 3.7375e-05,
-        "stress": 0.000179708,
-        "target": 9.3917e-05
+        "baseline": 3.6e-05,
+        "stress": 0.000183542,
+        "target": 9.9375e-05
       },
-      "total_seconds": 0.000311
+      "total_seconds": 0.000318917
     },
     "validation": {
-      "seconds": 0.00274175
+      "seconds": 0.002823583
     }
   },
   "summary": {
     "benchmark_profile_id": null,
     "cache_hit_verified": true,
-    "cold_compile_seconds": 0.002580209,
+    "cold_compile_seconds": 0.002591542,
     "document_count": 4,
     "extraction_iterations": 3,
     "profile": "mixed",
     "record_count": 93,
-    "target_bytes_per_second": 22072678.108,
-    "target_documents_per_second": 63886.188,
-    "target_records_per_second": 766634.261,
+    "target_bytes_per_second": 44588666.191,
+    "target_documents_per_second": 60377.341,
+    "target_records_per_second": 724528.09,
     "tier_count": 3
   },
   "tiers": {
@@ -266,26 +266,26 @@
         "min_bytes": 111
       },
       "stages": {
-        "document_prepare_seconds": 7.5e-06,
-        "scan_project_sort_seconds": 3.7375e-05
+        "document_prepare_seconds": 7.25e-06,
+        "scan_project_sort_seconds": 3.6e-05
       },
       "throughput": {
-        "bytes_per_second": 8909707.471,
-        "documents_per_second": 80267.635,
-        "records_per_second": 401338.174
+        "bytes_per_second": 9250004.347,
+        "documents_per_second": 83333.372,
+        "records_per_second": 416666.862
       },
-      "warm_extraction_seconds": 3.7375e-05
+      "warm_extraction_seconds": 3.6e-05
     },
     "stress": {
-      "bytes": 1847,
+      "bytes": 3943,
       "document_count": 1,
       "documents": [
         {
           "document_id": "security_ops_stress",
           "record_count": 64,
           "source": {
-            "bytes": 1847,
-            "length": 1847,
+            "bytes": 3943,
+            "length": 3943,
             "type": "text"
           }
         }
@@ -300,31 +300,31 @@
         64
       ],
       "size": {
-        "average_bytes": 1847.0,
-        "max_bytes": 1847,
-        "min_bytes": 1847
+        "average_bytes": 3943.0,
+        "max_bytes": 3943,
+        "min_bytes": 3943
       },
       "stages": {
-        "document_prepare_seconds": 4.375e-06,
-        "scan_project_sort_seconds": 0.000179708
+        "document_prepare_seconds": 4.584e-06,
+        "scan_project_sort_seconds": 0.000183542
       },
       "throughput": {
-        "bytes_per_second": 30833351.196,
-        "documents_per_second": 16693.747,
-        "records_per_second": 1068399.825
+        "bytes_per_second": 64448475.348,
+        "documents_per_second": 16345.036,
+        "records_per_second": 1046082.278
       },
-      "warm_extraction_seconds": 0.000179708
+      "warm_extraction_seconds": 0.000183542
     },
     "target": {
-      "bytes": 691,
+      "bytes": 1477,
       "document_count": 2,
       "documents": [
         {
           "document_id": "security_ops_primary",
           "record_count": 8,
           "source": {
-            "bytes": 230,
-            "length": 230,
+            "bytes": 492,
+            "length": 492,
             "type": "text"
           }
         },
@@ -332,8 +332,8 @@
           "document_id": "security_ops_repeated",
           "record_count": 16,
           "source": {
-            "bytes": 461,
-            "length": 461,
+            "bytes": 985,
+            "length": 985,
             "type": "text"
           }
         }
@@ -348,20 +348,20 @@
         24
       ],
       "size": {
-        "average_bytes": 345.5,
-        "max_bytes": 461,
-        "min_bytes": 230
+        "average_bytes": 738.5,
+        "max_bytes": 985,
+        "min_bytes": 492
       },
       "stages": {
-        "document_prepare_seconds": 7.25e-06,
-        "scan_project_sort_seconds": 9.3917e-05
+        "document_prepare_seconds": 7.791e-06,
+        "scan_project_sort_seconds": 9.9375e-05
       },
       "throughput": {
-        "bytes_per_second": 22072678.108,
-        "documents_per_second": 63886.188,
-        "records_per_second": 766634.261
+        "bytes_per_second": 44588666.191,
+        "documents_per_second": 60377.341,
+        "records_per_second": 724528.09
       },
-      "warm_extraction_seconds": 9.3917e-05
+      "warm_extraction_seconds": 9.9375e-05
     }
   }
 }

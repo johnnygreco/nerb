@@ -90,8 +90,8 @@
           "cold_hit": false,
           "warm_hit": true
         },
-        "cold_seconds": 0.088795666,
-        "warm_cache_lookup_seconds": 0.060086584
+        "cold_seconds": 0.074649125,
+        "warm_cache_lookup_seconds": 0.054932291
       },
       "document_bytes": 49983,
       "engine": {
@@ -125,9 +125,9 @@
       "record_count": 1136,
       "records_per_kb": 23.273,
       "throughput": {
-        "bytes_per_second": 10905481.342,
-        "documents_per_second": 218.184,
-        "records_per_second": 247856.807
+        "bytes_per_second": 10623097.154,
+        "documents_per_second": 212.534,
+        "records_per_second": 241438.857
       }
     },
     {
@@ -220,8 +220,8 @@
           "cold_hit": false,
           "warm_hit": true
         },
-        "cold_seconds": 0.283228208,
-        "warm_cache_lookup_seconds": 0.223036334
+        "cold_seconds": 0.284942792,
+        "warm_cache_lookup_seconds": 0.217348584
       },
       "document_bytes": 149995,
       "engine": {
@@ -255,9 +255,9 @@
       "record_count": 3409,
       "records_per_kb": 23.273,
       "throughput": {
-        "bytes_per_second": 8433940.721,
-        "documents_per_second": 56.228,
-        "records_per_second": 191681.749
+        "bytes_per_second": 8692905.622,
+        "documents_per_second": 57.955,
+        "records_per_second": 197567.354
       }
     },
     {
@@ -350,8 +350,8 @@
           "cold_hit": false,
           "warm_hit": true
         },
-        "cold_seconds": 0.713394,
-        "warm_cache_lookup_seconds": 0.541323958
+        "cold_seconds": 0.716237583,
+        "warm_cache_lookup_seconds": 0.559980375
       },
       "document_bytes": 299991,
       "engine": {
@@ -385,9 +385,9 @@
       "record_count": 6818,
       "records_per_kb": 23.273,
       "throughput": {
-        "bytes_per_second": 6514907.62,
-        "documents_per_second": 21.717,
-        "records_per_second": 148066.576
+        "bytes_per_second": 6918216.01,
+        "documents_per_second": 23.061,
+        "records_per_second": 157232.706
       }
     }
   ],
@@ -395,6 +395,7 @@
   "method": {
     "document_strategy": "repeat exact active pattern examples until the target byte size is reached",
     "iterations": 2,
-    "measurement": "warm extraction scan/project/sort throughput plus cold compile and warm cache lookup"
+    "measurement": "warm extraction scan/project/sort throughput plus cold compile and warm cache-hit path",
+    "workload_profile": "synthetic mostly-literal workload with 75% literal patterns"
   }
 }

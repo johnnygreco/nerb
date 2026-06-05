@@ -1,1 +1,3 @@
 For SOC 2 CC6.1 and ISO 27001 A.8.16, the agent pulled evidence-pack-443 from Vault and matched access-review-2026-05 against GitHub Enterprise ownership. GDPR notes require Snowflake exports to stay inside the EU data boundary.
+
+The audit note also references a vendor questionnaire, a board packet, and a remediation calendar that are not configured entities. NERB leaves them alone while preserving control, framework, evidence, system, and residency matches.

@@ -153,8 +153,8 @@
       "cold_hit": false,
       "warm_hit": true
     },
-    "cold_seconds": 0.003717416,
-    "warm_cache_lookup_seconds": 0.001808209
+    "cold_seconds": 0.003663833,
+    "warm_cache_lookup_seconds": 0.001776459
   },
   "diagnostics": [
     {
@@ -194,11 +194,11 @@
   },
   "stages": {
     "canonicalize": {
-      "seconds": 6.2666e-05
+      "seconds": 6.7041e-05
     },
     "compile_cache": {
       "cache_hit_verified": true,
-      "cold_seconds": 0.003717416,
+      "cold_seconds": 0.003663833,
       "exclusive": false,
       "includes": [
         "canonicalize",
@@ -208,18 +208,18 @@
         "rust_bank_compile"
       ],
       "note": "Rust Bank compile timing is inclusive; do not sum it with sibling stage timings.",
-      "warm_cache_lookup_seconds": 0.001808209
+      "warm_cache_lookup_seconds": 0.001776459
     },
     "document_prepare": {
       "seconds_by_tier": {
-        "baseline": 6.209e-06,
-        "stress": 4.375e-06,
-        "target": 5.042e-06
+        "baseline": 6.084e-06,
+        "stress": 3.916e-06,
+        "target": 5.542e-06
       },
-      "total_seconds": 1.5626e-05
+      "total_seconds": 1.5542e-05
     },
     "document_tier_resolution": {
-      "seconds": 2.7709e-05
+      "seconds": 2.8208e-05
     },
     "input_parse": {
       "available": false,
@@ -228,27 +228,27 @@
     },
     "scan_project_sort": {
       "seconds_by_tier": {
-        "baseline": 2.6125e-05,
-        "stress": 0.000239833,
-        "target": 0.000134292
+        "baseline": 2.4209e-05,
+        "stress": 0.000241125,
+        "target": 0.00012925
       },
-      "total_seconds": 0.00040025
+      "total_seconds": 0.000394584
     },
     "validation": {
-      "seconds": 0.003852333
+      "seconds": 0.003881667
     }
   },
   "summary": {
     "benchmark_profile_id": null,
     "cache_hit_verified": true,
-    "cold_compile_seconds": 0.003717416,
+    "cold_compile_seconds": 0.003663833,
     "document_count": 4,
     "extraction_iterations": 3,
     "profile": "mixed",
     "record_count": 122,
-    "target_bytes_per_second": 15302475.153,
-    "target_documents_per_second": 44678.76,
-    "target_records_per_second": 737199.533,
+    "target_bytes_per_second": 32193424.932,
+    "target_documents_per_second": 46421.665,
+    "target_records_per_second": 765957.479,
     "tier_count": 3
   },
   "tiers": {
@@ -281,26 +281,26 @@
         "min_bytes": 14
       },
       "stages": {
-        "document_prepare_seconds": 6.209e-06,
-        "scan_project_sort_seconds": 2.6125e-05
+        "document_prepare_seconds": 6.084e-06,
+        "scan_project_sort_seconds": 2.4209e-05
       },
       "throughput": {
-        "bytes_per_second": 1607655.798,
-        "documents_per_second": 114832.557,
-        "records_per_second": 114832.557
+        "bytes_per_second": 1734889.701,
+        "documents_per_second": 123920.693,
+        "records_per_second": 123920.693
       },
-      "warm_extraction_seconds": 2.6125e-05
+      "warm_extraction_seconds": 2.4209e-05
     },
     "stress": {
-      "bytes": 1831,
+      "bytes": 3703,
       "document_count": 1,
       "documents": [
         {
           "document_id": "compliance_ops_stress",
           "record_count": 88,
           "source": {
-            "bytes": 1831,
-            "length": 1831,
+            "bytes": 3703,
+            "length": 3703,
             "type": "text"
           }
         }
@@ -315,31 +315,31 @@
         88
       ],
       "size": {
-        "average_bytes": 1831.0,
-        "max_bytes": 1831,
-        "min_bytes": 1831
+        "average_bytes": 3703.0,
+        "max_bytes": 3703,
+        "min_bytes": 3703
       },
       "stages": {
-        "document_prepare_seconds": 4.375e-06,
-        "scan_project_sort_seconds": 0.000239833
+        "document_prepare_seconds": 3.916e-06,
+        "scan_project_sort_seconds": 0.000241125
       },
       "throughput": {
-        "bytes_per_second": 22903440.121,
-        "documents_per_second": 12508.706,
-        "records_per_second": 1100766.101
+        "bytes_per_second": 46071539.18,
+        "documents_per_second": 12441.679,
+        "records_per_second": 1094867.796
       },
-      "warm_extraction_seconds": 0.000239833
+      "warm_extraction_seconds": 0.000241125
     },
     "target": {
-      "bytes": 685,
+      "bytes": 1387,
       "document_count": 2,
       "documents": [
         {
           "document_id": "compliance_ops_primary",
           "record_count": 11,
           "source": {
-            "bytes": 228,
-            "length": 228,
+            "bytes": 462,
+            "length": 462,
             "type": "text"
           }
         },
@@ -347,8 +347,8 @@
           "document_id": "compliance_ops_repeated",
           "record_count": 22,
           "source": {
-            "bytes": 457,
-            "length": 457,
+            "bytes": 925,
+            "length": 925,
             "type": "text"
           }
         }
@@ -363,20 +363,20 @@
         33
       ],
       "size": {
-        "average_bytes": 342.5,
-        "max_bytes": 457,
-        "min_bytes": 228
+        "average_bytes": 693.5,
+        "max_bytes": 925,
+        "min_bytes": 462
       },
       "stages": {
-        "document_prepare_seconds": 5.042e-06,
-        "scan_project_sort_seconds": 0.000134292
+        "document_prepare_seconds": 5.542e-06,
+        "scan_project_sort_seconds": 0.00012925
       },
       "throughput": {
-        "bytes_per_second": 15302475.153,
-        "documents_per_second": 44678.76,
-        "records_per_second": 737199.533
+        "bytes_per_second": 32193424.932,
+        "documents_per_second": 46421.665,
+        "records_per_second": 765957.479
       },
-      "warm_extraction_seconds": 0.000134292
+      "warm_extraction_seconds": 0.00012925
     }
   }
 }

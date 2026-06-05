@@ -6,7 +6,7 @@ intelligence caches, cite byte offsets, and promote detector-bank changes throug
 Run from the repository root:
 
 ```shell
-uv run --with matplotlib python examples/generate_showcase.py
+uv run --with matplotlib==3.10.9 python examples/generate_showcase.py --output-dir /tmp/nerb-showcase
 uv run nerb validate-bank --bank examples/banks/security_ops.json
 uv run nerb validate-bank --bank examples/banks/revenue_ops.json
 uv run nerb validate-bank --bank examples/banks/compliance_ops.json
@@ -15,7 +15,10 @@ uv run nerb extract-report --bank examples/banks/revenue_ops.json --file example
 uv run nerb benchmark-bank --bank examples/banks/compliance_ops.json --benchmark-iterations 3
 ```
 
-`generate_showcase.py` writes machine-readable outputs and matplotlib figures under `examples/artifacts/`:
+The command above writes to a scratch directory so it does not dirty the checkout with local timing and PNG differences.
+To refresh the committed artifacts, run the same command with `--output-dir examples/artifacts`.
+
+`generate_showcase.py` writes machine-readable outputs and matplotlib figures:
 
 - `extractions/*.json`: raw extraction responses with deterministic byte offsets.
 - `reports/*.json`: report responses with explanations, context, summaries, and metadata.
@@ -32,6 +35,6 @@ The banks are intentionally small but domain-specific:
 - `compliance_ops.json`: audit frameworks, controls, evidence artifacts, systems, and data boundaries.
 
 The scale figures are generated from deterministic synthetic JSON banks rather than committed large fixtures. They show
-how warm extraction and process-local bank caching behave as an agent cache grows from 1,000 to 10,000 active patterns
-and from 50 KB to 300 KB of scanned text. The numbers are local illustrative measurements, so use them to compare runs
-on the same machine rather than as portable package-wide performance claims.
+how warm extraction and process-local bank caching behave on a mostly-literal synthetic workload as an agent cache grows
+from 1,000 to 10,000 active patterns and from 50 KB to 300 KB of scanned text. The numbers are local illustrative
+measurements, so use them to compare runs on the same machine rather than as portable package-wide performance claims.

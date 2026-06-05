@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import re
 from collections.abc import Mapping
@@ -13,7 +14,8 @@ from nerb.benchmarks import make_synthetic_bank
 EXAMPLE_DIR = Path(__file__).resolve().parent
 BANK_DIR = EXAMPLE_DIR / "banks"
 DOCUMENT_DIR = EXAMPLE_DIR / "documents"
-ARTIFACT_DIR = EXAMPLE_DIR / "artifacts"
+DEFAULT_ARTIFACT_DIR = EXAMPLE_DIR / "artifacts"
+ARTIFACT_DIR = DEFAULT_ARTIFACT_DIR
 EXTRACTION_DIR = ARTIFACT_DIR / "extractions"
 REPORT_DIR = ARTIFACT_DIR / "reports"
 BENCHMARK_DIR = ARTIFACT_DIR / "benchmarks"
@@ -89,6 +91,9 @@ SCALE_CASES = [
 
 
 def main() -> None:
+    args = _parse_args()
+    _set_artifact_dir(args.output_dir)
+
     try:
         matplotlib = import_module("matplotlib")
         matplotlib.use("Agg")
@@ -96,7 +101,8 @@ def main() -> None:
     except ModuleNotFoundError as exc:
         message = (
             "matplotlib is required for showcase figures. "
-            "Run: uv run --with matplotlib python examples/generate_showcase.py"
+            "Run: uv run --with matplotlib==3.10.9 python examples/generate_showcase.py "
+            "--output-dir /tmp/nerb-showcase"
         )
         raise SystemExit(message) from exc
 
@@ -143,7 +149,42 @@ def main() -> None:
     print("Wrote NERB showcase artifacts:")
     for path in sorted(ARTIFACT_DIR.rglob("*")):
         if path.is_file():
-            print(f"- {path.relative_to(EXAMPLE_DIR)}")
+            print(f"- {_display_path(path)}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate the NERB examples showcase artifacts.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_ARTIFACT_DIR,
+        help=(
+            "Directory for generated artifacts. Defaults to the committed examples/artifacts directory; "
+            "use a scratch path such as /tmp/nerb-showcase to avoid dirtying the worktree."
+        ),
+    )
+    return parser.parse_args()
+
+
+def _set_artifact_dir(output_dir: Path) -> None:
+    global ARTIFACT_DIR, BENCHMARK_DIR, EXTRACTION_DIR, FIGURE_DIR, REPORT_DIR, SCALE_DIR
+
+    ARTIFACT_DIR = output_dir.expanduser().resolve()
+    EXTRACTION_DIR = ARTIFACT_DIR / "extractions"
+    REPORT_DIR = ARTIFACT_DIR / "reports"
+    BENCHMARK_DIR = ARTIFACT_DIR / "benchmarks"
+    SCALE_DIR = ARTIFACT_DIR / "scale"
+    FIGURE_DIR = ARTIFACT_DIR / "figures"
+
+
+def _display_path(path: Path) -> str:
+    resolved = path.resolve()
+    for root in (EXAMPLE_DIR, Path.cwd()):
+        try:
+            return str(resolved.relative_to(root.resolve()))
+        except ValueError:
+            continue
+    return str(resolved)
 
 
 def _configure_matplotlib(plt: Any) -> None:
@@ -225,7 +266,8 @@ def _run_scale_demo() -> dict[str, Any]:
         "method": {
             "iterations": 2,
             "document_strategy": "repeat exact active pattern examples until the target byte size is reached",
-            "measurement": "warm extraction scan/project/sort throughput plus cold compile and warm cache lookup",
+            "measurement": "warm extraction scan/project/sort throughput plus cold compile and warm cache-hit path",
+            "workload_profile": "synthetic mostly-literal workload with 75% literal patterns",
         },
         "cases": cases,
     }
@@ -618,7 +660,7 @@ def _render_benchmark_cache_figure(plt: Any, results: Mapping[str, Mapping[str, 
         warm,
         width=width,
         color="#a855f7",
-        label="Warm cache lookup",
+        label="Warm cache-hit path",
     )
     ax.bar_label(cold_bars, labels=[f"{value:.2f}" for value in cold], fontsize=8, padding=3, color="#334155")
     ax.bar_label(warm_bars, labels=[f"{value:.3f}" for value in warm], fontsize=8, padding=3, color="#334155")
@@ -626,7 +668,7 @@ def _render_benchmark_cache_figure(plt: Any, results: Mapping[str, Mapping[str, 
     _add_figure_header(
         fig,
         "Cache-aware compile cost",
-        "NERB hashes canonical banks, compiles once, then reuses the Rust-backed bank in process.",
+        "Warm bars include the Python compile path up to a Rust bank cache hit.",
     )
     ax.set_ylabel("Milliseconds")
     ax.set_xticks(x_positions)
@@ -663,7 +705,7 @@ def _render_scale_throughput_figure(plt: Any, scale_demo: Mapping[str, Any]) -> 
     _add_figure_header(
         fig,
         "Scale demonstration: warm extraction remains fast",
-        "Generated JSON banks grow from 1k to 10k active patterns; documents grow from 50 KB to 300 KB.",
+        "Synthetic mostly-literal JSON banks grow from 1k to 10k active patterns; documents grow to 300 KB.",
     )
     ax.set_ylabel("Megabytes per second")
     ax.set_xticks(range(len(cases)))
@@ -692,7 +734,7 @@ def _render_scale_compile_figure(plt: Any, scale_demo: Mapping[str, Any]) -> Non
         warm,
         width=width,
         color="#a855f7",
-        label="Warm cache lookup",
+        label="Warm cache-hit path",
     )
     ax.bar_label(cold_bars, labels=[f"{value:.0f} ms" for value in cold], fontsize=8.5, padding=4)
     ax.bar_label(warm_bars, labels=[f"{value:.0f} ms" for value in warm], fontsize=8.5, padding=4)
@@ -700,7 +742,7 @@ def _render_scale_compile_figure(plt: Any, scale_demo: Mapping[str, Any]) -> Non
     _add_figure_header(
         fig,
         "Scale demonstration: compile once, reuse the bank",
-        "Cold compile includes validation and Rust bank construction; warm lookup demonstrates process-local caching.",
+        "Cold compile includes validation and Rust construction; warm bars show the cache-hit compile path.",
     )
     ax.set_ylabel("Milliseconds")
     ax.set_xticks(x_positions)

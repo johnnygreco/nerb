@@ -683,7 +683,7 @@
     },
     {
       "context": {
-        "after": ".",
+        "after": ".\n\nThe audit note also references a ",
         "before": "nowflake exports to stay inside the ",
         "match": "EU data boundary"
       },
@@ -734,8 +734,8 @@
     }
   ],
   "source": {
-    "bytes": 228,
-    "length": 228,
+    "bytes": 462,
+    "length": 462,
     "type": "text"
   },
   "summary": {
