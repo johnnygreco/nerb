@@ -223,6 +223,20 @@ eval_bank
 benchmark_bank
 explain_match
 regress_bank
+```
+
+Rust/config-backed MCP tools:
+
+```text
+validate_config
+load_config
+list_detectors
+add_detector
+update_detector
+remove_detector
+extract_entity
+extract_all_entities
+extract_inline
 engine_cache_info
 clear_engine_cache
 ```

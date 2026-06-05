@@ -313,10 +313,31 @@ def _normalize_format_hint(format_hint: str | None) -> str | None:
 def _canonical_compile_options_json(compile_options_json: str | None) -> str:
     if compile_options_json is None:
         return "{}"
-    options = json.loads(compile_options_json)
+    options = _load_compile_options_json(compile_options_json)
     if not isinstance(options, dict):
         raise ValueError("compile_options_json must decode to a JSON object.")
     return json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _load_compile_options_json(compile_options_json: str) -> Any:
+    return json.loads(
+        compile_options_json,
+        object_pairs_hook=_reject_duplicate_json_object_keys,
+        parse_constant=_reject_non_finite_json_constant,
+    )
+
+
+def _reject_duplicate_json_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"compile_options_json must not contain duplicate key {key!r}.")
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_json_constant(constant: str) -> None:
+    raise ValueError(f"compile_options_json must not contain non-finite value {constant}.")
 
 
 def _config_to_jsonl_source(
@@ -360,7 +381,7 @@ def _compile_options_with_word_boundaries(compile_options_json: str | None, enab
     if compile_options_json is None:
         options: dict[str, Any] = {}
     else:
-        options_value = json.loads(compile_options_json)
+        options_value = _load_compile_options_json(compile_options_json)
         if not isinstance(options_value, dict):
             raise ValueError("compile_options_json must decode to a JSON object.")
         options = dict(options_value)

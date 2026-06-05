@@ -111,3 +111,36 @@ def test_public_bank_cache_can_be_bypassed():
 
     assert bank.cache_metadata() == {"enabled": False, "hit": False, "key": None}
     assert nerb.bank_cache_info() == {"size": 0, "source_key_count": 0, "hits": 0, "misses": 0, "keys": []}
+
+
+def test_public_bank_compile_options_reject_duplicate_keys_like_native_engine():
+    duplicate_match_mode = '{"match_mode":"all_overlaps","match_mode":"entity_independent"}'
+    duplicate_word_boundaries = '{"word_boundaries":false,"word_boundaries":true}'
+    canonical = nerb.Bank.from_config({"CODE": {"A": "A"}}).to_canonical_json_bytes()
+
+    with pytest.raises(ValueError, match="duplicate key 'match_mode'"):
+        nerb.Bank.from_source_bytes(
+            b'{"CODE":{"A":"A"}}',
+            format_hint="json",
+            compile_options_json=duplicate_match_mode,
+            use_cache=False,
+        )
+
+    with pytest.raises(ValueError, match="duplicate key 'match_mode'"):
+        nerb.Bank.from_canonical_json_bytes(canonical, compile_options_json=duplicate_match_mode)
+
+    with pytest.raises(ValueError, match="duplicate key 'word_boundaries'"):
+        nerb.Bank.from_config(
+            {"CODE": {"A": "A"}},
+            compile_options_json=duplicate_word_boundaries,
+            word_boundaries=True,
+        )
+
+
+def test_public_bank_compile_options_reject_non_finite_constants():
+    with pytest.raises(ValueError, match="non-finite value NaN"):
+        nerb.Bank.from_source_bytes(
+            b'{"CODE":{"A":"A"}}',
+            format_hint="json",
+            compile_options_json='{"match_mode":NaN}',
+        )
