@@ -263,8 +263,9 @@ nerb compile ARTIST --config detectors.yaml
 nerb doctor --config detectors.yaml --format json
 ```
 
-YAML extraction supports `--format table`, `--format json`, and `--format jsonl`. JSON and JSONL records use
-`entity`, `name`, `string`, `start`, and `end`.
+YAML extraction supports `--format table`, `--format json`, and `--format jsonl`. JSON and JSONL records are
+Rust-backed byte-offset records with `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`, and
+`offset_unit`.
 
 ## Performance
 

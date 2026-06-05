@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -40,12 +39,9 @@ from .config import (
 )
 from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
+from .engine import Bank
 from .evals import eval_bank as _eval_bank
-from .extraction import (
-    ExtractionError,
-    extract_named_entities_records,
-    extract_named_entity_records,
-)
+from .extraction import ExtractionError
 from .extraction import (
     explain_match as _json_explain_match,
 )
@@ -68,7 +64,6 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
-from .regex_builder import NERB
 from .validation import validate_bank as _validate_bank
 
 Transport = Literal["stdio", "sse", "streamable-http"]
@@ -331,7 +326,7 @@ def _save_tool_config(config: PatternConfig, path: Path) -> PatternConfig:
         _raise_tool_error(f"Could not write config at {path}: {exc}")
 
 
-def _read_text_source(text: str | None, file_path: str | None) -> tuple[str, dict[str, str]]:
+def _read_text_source(text: str | None, file_path: str | None) -> tuple[str | bytes, dict[str, str]]:
     source_count = sum([text is not None, file_path is not None])
     if source_count != 1:
         _raise_tool_error("Provide exactly one input source: text or file_path.")
@@ -350,9 +345,17 @@ def _read_text_source(text: str | None, file_path: str | None) -> tuple[str, dic
         _raise_tool_error(f"Document path is not a file: {path}.")
 
     try:
-        return path.read_text(encoding="utf-8"), {"type": "file", "path": str(path)}
+        document_bytes = path.read_bytes()
+    except UnicodeDecodeError as exc:
+        _raise_tool_error(f"Document file is not valid UTF-8 at {path}: {exc}")
     except OSError as exc:
         _raise_tool_error(f"Could not read document at {path}: {exc}")
+
+    try:
+        document_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _raise_tool_error(f"Document file is not valid UTF-8 at {path}: {exc}")
+    return document_bytes, {"type": "file", "path": str(path)}
 
 
 def _ensure_entity(pattern_config: PatternConfig, entity: str, source: str) -> None:
@@ -365,24 +368,24 @@ def _ensure_configured_patterns(pattern_config: PatternConfig, source: str) -> N
         _raise_tool_error(f"No detector patterns are configured in {source}.")
 
 
-def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) -> NERB:
-    try:
-        return NERB(pattern_config, add_word_boundaries=word_boundaries)
-    except (ConfigError, re.error, ValueError) as exc:
-        _raise_tool_error(f"Could not compile detectors: {exc}")
-
-
 def _extract_records(
     pattern_config: PatternConfig,
     selected_entity: str | None,
-    text: str,
+    source: str | bytes,
     *,
     word_boundaries: bool,
 ) -> list[dict[str, Any]]:
-    extractor = _compile_extractor(pattern_config, word_boundaries=word_boundaries)
-    if selected_entity is None:
-        return extract_named_entities_records(extractor, text)
-    return extract_named_entity_records(extractor, selected_entity, text)
+    try:
+        bank = Bank.from_config(
+            pattern_config,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+        )
+        if isinstance(source, bytes):
+            return bank.scan_bytes(source)
+        return bank.scan_text(source)
+    except ValueError as exc:
+        _raise_tool_error(f"Could not compile or scan detectors with the Rust engine: {exc}")
 
 
 def _detector_records(pattern_config: PatternConfig, selected_entity: str | None = None) -> list[dict[str, str]]:
@@ -484,8 +487,8 @@ def extract_entity(
     """Extract one configured entity from provided text or an explicit document file path."""
     path, pattern_config = _load_tool_config(config_path)
     _ensure_entity(pattern_config, entity, f"config at {path}")
-    document_text, source = _read_text_source(text, file_path)
-    records = _extract_records(pattern_config, entity, document_text, word_boundaries=word_boundaries)
+    document_source, source = _read_text_source(text, file_path)
+    records = _extract_records(pattern_config, entity, document_source, word_boundaries=word_boundaries)
     return {
         "config_path": str(path),
         "entity": entity,
@@ -505,8 +508,8 @@ def extract_all_entities(
     """Extract all configured entities from provided text or an explicit document file path."""
     path, pattern_config = _load_tool_config(config_path)
     _ensure_configured_patterns(pattern_config, f"config at {path}")
-    document_text, source = _read_text_source(text, file_path)
-    records = _extract_records(pattern_config, None, document_text, word_boundaries=word_boundaries)
+    document_source, source = _read_text_source(text, file_path)
+    records = _extract_records(pattern_config, None, document_source, word_boundaries=word_boundaries)
     return {
         "config_path": str(path),
         "source": source,
@@ -537,8 +540,8 @@ def extract_inline(
     if entity is not None:
         _ensure_entity(pattern_config, entity, "inline detector definitions")
 
-    document_text, source = _read_text_source(text, file_path)
-    records = _extract_records(pattern_config, entity, document_text, word_boundaries=word_boundaries)
+    document_source, source = _read_text_source(text, file_path)
+    records = _extract_records(pattern_config, entity, document_source, word_boundaries=word_boundaries)
     return {
         "entity": entity,
         "source": source,

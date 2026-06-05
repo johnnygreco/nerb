@@ -18,6 +18,7 @@ from .config import (
     validate_regex_flags,
 )
 from .diff import diff_banks
+from .engine import Bank
 from .engines import clear_compiled_bank_cache, compiled_bank_cache_info
 from .evals import eval_bank
 from .extraction import (
@@ -54,6 +55,7 @@ __all__ = [
     "BankLoadError",
     "BankPatchError",
     "BankSchemaError",
+    "Bank",
     "benchmark_bank",
     "benchmark_fixture_profiles",
     "ConfigError",

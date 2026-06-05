@@ -4,18 +4,20 @@ import json
 import re
 from importlib.metadata import entry_points
 from importlib.metadata import version as package_version
+from io import BytesIO
 
+import pytest
+from click.exceptions import Exit
 from typer.testing import CliRunner
 
 from nerb import (
     NERB,
+    Bank,
     apply_bank_patches,
     benchmark_bank,
     clear_compiled_bank_cache,
     diff_banks,
     eval_bank,
-    extract_named_entities_records,
-    extract_named_entity_records,
     load_config,
     regress_bank,
     save_config,
@@ -25,15 +27,26 @@ from nerb import (
     extract_file as extract_json_file,
 )
 from nerb import (
+    extract_report as extract_json_report,
+)
+from nerb import (
     extract_report_file as extract_json_report_file,
 )
 from nerb import (
     extract_text as extract_json_text,
 )
-from nerb.cli import app
+from nerb.cli import _extract_records, _read_extraction_source, app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
 
 runner = CliRunner()
+
+
+class _BinaryStdin:
+    def __init__(self, payload: bytes) -> None:
+        self.buffer = BytesIO(payload)
+
+    def read(self) -> str:
+        return self.buffer.getvalue().decode()
 
 
 def _json_records(output: str):
@@ -54,7 +67,7 @@ def _table_records(output: str) -> list[dict[str, str]]:
     columns = _split_table_row(header)
     separator_cells = _split_table_row(separator)
 
-    assert columns == ["entity", "name", "string", "start", "end"]
+    assert columns == ["entity", "canonical_name", "surface_name", "string", "start", "end", "offset_unit"]
     assert len(separator_cells) == len(columns)
     assert all(set(cell) == {"-"} for cell in separator_cells)
 
@@ -76,6 +89,10 @@ def _console_script_entry_points():
 def _load_json(path):
     with open(path, encoding="utf-8") as file:
         return json.load(file)
+
+
+def _expected_config_records(config_path, text: str, entity: str | None = None):
+    return Bank.from_config(load_config(config_path), selected_entity=entity).scan_text(text)
 
 
 def _write_json(path, payload):
@@ -246,6 +263,25 @@ def test_json_bank_cli_enforces_text_source_rules(tmp_path, test_data_path):
     assert "Provide exactly one text source" in duplicate_source.output
 
 
+def test_json_bank_cli_stdin_extraction_commands_keep_text_inputs(test_data_path):
+    bank_path = test_data_path / "minimal_bank.json"
+    bank = _load_json(bank_path)
+    text = "Send this to Acme Corp today."
+
+    clear_compiled_bank_cache()
+    text_result = runner.invoke(app, ["extract-text", "--bank", str(bank_path), "--stdin"], input=text)
+    clear_compiled_bank_cache()
+    expected_text = extract_json_text(bank, text)
+    clear_compiled_bank_cache()
+    report_result = runner.invoke(app, ["extract-report", "--bank", str(bank_path), "--stdin"], input=text)
+    clear_compiled_bank_cache()
+
+    assert text_result.exit_code == 0
+    assert report_result.exit_code == 0
+    assert json.loads(text_result.output) == expected_text
+    assert json.loads(report_result.output) == extract_json_report(bank, text)
+
+
 def test_json_bank_cli_invalid_bank_returns_diagnostics(tmp_path):
     invalid_bank_path = tmp_path / "invalid_bank.json"
     invalid_bank_path.write_text('{"schema_version":"nerb.bank.v1"}', encoding="utf-8")
@@ -320,7 +356,7 @@ def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_dat
 def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
-    expected_records = extract_named_entity_records(NERB(config_path), "ARTIST", prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki, "ARTIST")
 
     result = runner.invoke(
         app,
@@ -338,12 +374,12 @@ def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path
     assert result.exit_code == 0
     records = _json_records(result.output)
     assert records == expected_records
-    assert set(records[0]) == {"entity", "name", "string", "start", "end"}
+    assert set(records[0]) == {"entity", "canonical_name", "surface_name", "string", "start", "end", "offset_unit"}
 
 
 def test_extract_stdin_jsonl_matches_api_for_fixture_config(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
-    expected_records = extract_named_entity_records(NERB(config_path), "ARTIST", prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki, "ARTIST")
 
     result = runner.invoke(
         app,
@@ -367,7 +403,7 @@ def test_extract_stdin_jsonl_matches_api_for_fixture_config(test_data_path, prog
 def test_extract_all_json_matches_api_for_fixture_config(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
-    expected_records = extract_named_entities_records(NERB(config_path), prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki)
 
     result = runner.invoke(
         app,
@@ -394,7 +430,15 @@ def test_extract_uses_default_config_path_from_env(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert _json_records(result.output) == [
-        {"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": 0, "end": 4}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
     ]
 
 
@@ -417,7 +461,15 @@ def test_extract_inline_pattern_from_literal_text_without_config(monkeypatch, tm
 
     assert result.exit_code == 0
     assert _json_records(result.output) == [
-        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        }
     ]
 
 
@@ -443,8 +495,24 @@ def test_extract_inline_detectors_from_file_without_config(monkeypatch, tmp_path
 
     assert result.exit_code == 0
     assert _json_records(result.output) == [
-        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10},
-        {"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34},
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        },
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "rock",
+            "start": 30,
+            "end": 34,
+            "offset_unit": "byte",
+        },
     ]
 
 
@@ -467,8 +535,24 @@ def test_extract_table_output_records_with_inline_detectors(monkeypatch, tmp_pat
 
     assert result.exit_code == 0
     assert _table_records(result.output) == [
-        {"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": "0", "end": "4"},
-        {"entity": "GENRE", "name": "Rock", "string": "rock", "start": "24", "end": "28"},
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": "0",
+            "end": "4",
+            "offset_unit": "byte",
+        },
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "rock",
+            "start": "24",
+            "end": "28",
+            "offset_unit": "byte",
+        },
     ]
 
 
@@ -492,6 +576,60 @@ def test_extract_word_boundaries_option_limits_inline_matches(monkeypatch, tmp_p
 
     assert result.exit_code == 0
     assert [record["start"] for record in _json_records(result.output)] == [0, 12]
+
+
+def test_extract_file_preserves_original_utf8_byte_offsets_with_crlf(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "document.txt"
+    document_path.write_bytes("Café\r\nRush".encode())
+
+    result = runner.invoke(
+        app,
+        ["extract", "ARTIST", str(document_path), "--config", str(config_path), "--format", "json"],
+    )
+
+    assert result.exit_code == 0
+    assert _json_records(result.output) == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 7,
+            "end": 11,
+            "offset_unit": "byte",
+        }
+    ]
+
+
+def test_extract_stdin_preserves_original_utf8_byte_offsets(monkeypatch, tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    monkeypatch.setattr("sys.stdin", _BinaryStdin("Café\r\nRush".encode()))
+
+    source = _read_extraction_source(None, read_stdin=True, text=None)
+    records = _extract_records(load_config(config_path), "ARTIST", source, word_boundaries=False)
+
+    assert records == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 7,
+            "end": 11,
+            "offset_unit": "byte",
+        }
+    ]
+
+
+def test_extract_reports_invalid_utf8_stdin(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", _BinaryStdin(b"\xffRush"))
+
+    with pytest.raises(Exit) as exc_info:
+        _read_extraction_source(None, read_stdin=True, text=None)
+
+    assert exc_info.value.exit_code == 1
+    assert "Standard input is not valid UTF-8" in capsys.readouterr().err
 
 
 def test_extract_no_matches_returns_empty_success(monkeypatch, tmp_path):
@@ -522,7 +660,15 @@ def test_cli_end_to_end_add_validate_extract_from_document(tmp_path):
     assert validate_result.exit_code == 0
     assert extract_result.exit_code == 0
     assert _json_records(extract_result.output) == [
-        {"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": 0, "end": 4}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
     ]
 
 
@@ -534,6 +680,17 @@ def test_extract_reports_missing_document_file(test_data_path, tmp_path):
 
     assert result.exit_code == 1
     assert f"Document file does not exist at {missing_document_path}" in result.output
+
+
+def test_extract_reports_invalid_utf8_document_file(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "invalid.bin"
+    document_path.write_bytes(b"\xff")
+
+    result = runner.invoke(app, ["extract", "ARTIST", str(document_path), "--config", str(config_path)])
+
+    assert result.exit_code == 1
+    assert f"Document file is not valid UTF-8 at {document_path}" in result.output
 
 
 def test_extract_reports_unknown_entity(tmp_path):
@@ -627,7 +784,15 @@ def test_test_literal_detector_json_success_without_config(monkeypatch, tmp_path
 
     assert result.exit_code == 0
     assert json.loads(result.output) == [
-        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10}
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        }
     ]
     assert not config_path.exists()
 
@@ -677,7 +842,17 @@ def test_test_saved_detector_against_text_and_document(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.output) == [{"entity": "GENRE", "name": "Rock", "string": "ROCK", "start": 0, "end": 4}]
+    assert json.loads(result.output) == [
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "ROCK",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
+    ]
 
     result = runner.invoke(
         app,
@@ -685,7 +860,17 @@ def test_test_saved_detector_against_text_and_document(tmp_path):
     )
 
     assert result.exit_code == 0
-    assert json.loads(result.output) == [{"entity": "ARTIST", "name": "Rush", "string": "Rush", "start": 0, "end": 4}]
+    assert json.loads(result.output) == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        }
+    ]
 
 
 def test_test_saved_detector_reports_unknown_entity_and_pattern(tmp_path):

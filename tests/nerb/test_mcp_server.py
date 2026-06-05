@@ -8,10 +8,8 @@ import pytest
 from typer.testing import CliRunner
 
 from nerb import (
-    NERB,
+    Bank,
     clear_compiled_bank_cache,
-    extract_named_entities_records,
-    extract_named_entity_records,
     load_config,
     save_config,
 )
@@ -101,6 +99,10 @@ def _console_script_entry_points():
 def _load_json(path):
     with open(path, encoding="utf-8") as file:
         return json.load(file)
+
+
+def _expected_config_records(config_path, text: str, entity: str | None = None):
+    return Bank.from_config(load_config(config_path), selected_entity=entity).scan_text(text)
 
 
 def _write_json(path, payload):
@@ -347,7 +349,7 @@ def test_config_mutation_tools_report_duplicate_add(tmp_path):
 def test_extract_entity_matches_cli_and_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
-    expected_records = extract_named_entity_records(NERB(config_path), "ARTIST", prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki, "ARTIST")
 
     mcp_result = extract_entity(str(config_path), "ARTIST", file_path=str(document_path))
     cli_result = CliRunner().invoke(
@@ -358,13 +360,21 @@ def test_extract_entity_matches_cli_and_api_for_fixture_config_and_document(test
     assert cli_result.exit_code == 0
     assert mcp_result["records"] == expected_records
     assert mcp_result["records"] == json.loads(cli_result.output)
-    assert set(mcp_result["records"][0]) == {"entity", "name", "string", "start", "end"}
+    assert set(mcp_result["records"][0]) == {
+        "entity",
+        "canonical_name",
+        "surface_name",
+        "string",
+        "start",
+        "end",
+        "offset_unit",
+    }
 
 
 def test_extract_all_matches_cli_and_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
-    expected_records = extract_named_entities_records(NERB(config_path), prog_rock_wiki)
+    expected_records = _expected_config_records(config_path, prog_rock_wiki)
 
     mcp_result = extract_all_entities(str(config_path), file_path=str(document_path))
     cli_result = CliRunner().invoke(
@@ -387,8 +397,24 @@ def test_extract_inline_does_not_require_or_write_config(monkeypatch, tmp_path):
     )
 
     assert result["records"] == [
-        {"entity": "ARTIST", "name": "Pink Floyd", "string": "Pink Floyd", "start": 0, "end": 10},
-        {"entity": "GENRE", "name": "Rock", "string": "rock", "start": 30, "end": 34},
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        },
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "rock",
+            "start": 30,
+            "end": 34,
+            "offset_unit": "byte",
+        },
     ]
     assert not missing_default_config.exists()
 
@@ -406,7 +432,37 @@ def test_extract_inline_filters_entity_and_reads_document_file(tmp_path):
     assert result["entity"] == "GENRE"
     assert result["source"] == {"type": "file", "path": str(document_path)}
     assert result["record_count"] == 1
-    assert result["records"] == [{"entity": "GENRE", "name": "Rock", "string": "rock", "start": 12, "end": 16}]
+    assert result["records"] == [
+        {
+            "entity": "GENRE",
+            "canonical_name": "Rock",
+            "surface_name": "Rock",
+            "string": "rock",
+            "start": 12,
+            "end": 16,
+            "offset_unit": "byte",
+        }
+    ]
+
+
+def test_mcp_file_extraction_preserves_original_utf8_byte_offsets_with_crlf(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "document.txt"
+    document_path.write_bytes("Café\r\nRush".encode())
+
+    result = extract_entity(str(config_path), "ARTIST", file_path=str(document_path))
+
+    assert result["records"] == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Rush",
+            "surface_name": "Rush",
+            "string": "Rush",
+            "start": 7,
+            "end": 11,
+            "offset_unit": "byte",
+        }
+    ]
 
 
 def test_mcp_tools_report_invalid_config_and_regex(tmp_path):
@@ -437,6 +493,8 @@ def test_mcp_tools_report_invalid_inline_detector_definitions():
 def test_mcp_tools_report_missing_entity_and_missing_file(tmp_path):
     config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
     missing_document_path = tmp_path / "missing.txt"
+    invalid_document_path = tmp_path / "invalid.bin"
+    invalid_document_path.write_bytes(b"\xff")
 
     with pytest.raises(ToolError) as missing_entity_error:
         extract_entity(str(config_path), "GENRE", text="jazz")
@@ -447,3 +505,8 @@ def test_mcp_tools_report_missing_entity_and_missing_file(tmp_path):
         extract_entity(str(config_path), "ARTIST", file_path=str(missing_document_path))
 
     assert f"Document file does not exist at {missing_document_path}" in str(missing_file_error.value)
+
+    with pytest.raises(ToolError) as invalid_utf8_error:
+        extract_entity(str(config_path), "ARTIST", file_path=str(invalid_document_path))
+
+    assert f"Document file is not valid UTF-8 at {invalid_document_path}" in str(invalid_utf8_error.value)
