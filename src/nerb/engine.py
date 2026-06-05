@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from stat import S_ISREG
 from threading import RLock
 from typing import Any, Literal
 
@@ -21,6 +22,7 @@ __all__ = ["Bank", "BankCacheKey", "bank_cache_info", "clear_bank_cache"]
 
 DEFAULT_BANK_CACHE_MAX_ENTRIES = 128
 DEFAULT_BANK_SOURCE_CACHE_MAX_ENTRIES = DEFAULT_BANK_CACHE_MAX_ENTRIES * 2
+DEFAULT_MAX_BANK_SOURCE_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -170,7 +172,7 @@ class Bank:
     ) -> Bank:
         source_path = Path(path).expanduser()
         return cls.from_source_bytes(
-            source_path.read_bytes(),
+            _read_bank_source_path(source_path),
             format_hint=format_hint,
             compile_options_json=compile_options_json,
             use_cache=use_cache,
@@ -316,6 +318,29 @@ def _cache_key_from_metadata(native_engine: Any, metadata: Mapping[str, Any]) ->
         pointer_width=_pointer_width(),
         endian=sys.byteorder,
     )
+
+
+def _read_bank_source_path(path: Path) -> bytes:
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise OSError(f"Could not inspect bank source path {str(path)!r}: {exc}") from exc
+    if not S_ISREG(metadata.st_mode):
+        raise ValueError(f"Bank source path {str(path)!r} must be a regular file.")
+    if metadata.st_size > DEFAULT_MAX_BANK_SOURCE_BYTES:
+        raise ValueError(
+            f"Bank source path {str(path)!r} exceeds the configured limit of {DEFAULT_MAX_BANK_SOURCE_BYTES} bytes."
+        )
+    try:
+        with path.open("rb") as file:
+            source = file.read(DEFAULT_MAX_BANK_SOURCE_BYTES + 1)
+    except OSError as exc:
+        raise OSError(f"Could not read bank source path {str(path)!r}: {exc}") from exc
+    if len(source) > DEFAULT_MAX_BANK_SOURCE_BYTES:
+        raise ValueError(
+            f"Bank source path {str(path)!r} exceeds the configured limit of {DEFAULT_MAX_BANK_SOURCE_BYTES} bytes."
+        )
+    return source
 
 
 def _target_triple() -> str:

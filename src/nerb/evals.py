@@ -4,7 +4,9 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
+from stat import S_ISREG
 from typing import Any, cast
 
 from .bank import canonicalize_bank
@@ -331,7 +333,7 @@ def _load_eval_ref(
         return
 
     try:
-        size = path.stat().st_size
+        metadata = path.stat()
     except OSError as exc:
         _append_failure(
             result,
@@ -354,6 +356,29 @@ def _load_eval_ref(
         )
         return
 
+    if not S_ISREG(metadata.st_mode):
+        _append_failure(
+            result,
+            scope=scope,
+            eval_ref=eval_ref,
+            record_index=None,
+            record_type="eval_ref",
+            text=None,
+            expected=None,
+            actual=None,
+            diagnostics=[
+                diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    EVAL_REF_UNRESOLVED,
+                    scope.path,
+                    f"Could not read eval ref {eval_ref!r}: path is not a regular file.",
+                    metadata={"file_path": str(path)},
+                )
+            ],
+        )
+        return
+
+    size = metadata.st_size
     if size > options.max_eval_ref_bytes:
         _append_failure(
             result,
@@ -377,50 +402,8 @@ def _load_eval_ref(
         return
 
     try:
-        with path.open(encoding="utf-8") as file:
-            for record_index, line in enumerate(file):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    record = json.loads(stripped, parse_constant=_reject_json_constant)
-                except (json.JSONDecodeError, ValueError) as exc:
-                    _append_failure(
-                        result,
-                        scope=scope,
-                        eval_ref=eval_ref,
-                        record_index=record_index,
-                        record_type="invalid",
-                        text=None,
-                        expected=None,
-                        actual=None,
-                        diagnostics=[
-                            diagnostic(
-                                DIAGNOSTIC_ERROR,
-                                JSON_PARSE,
-                                scope.path,
-                                f"Could not parse eval JSONL record {record_index}: {exc}.",
-                            )
-                        ],
-                    )
-                    continue
-
-                diagnostics = _record_validation_diagnostics(record)
-                if diagnostics:
-                    _append_failure(
-                        result,
-                        scope=scope,
-                        eval_ref=eval_ref,
-                        record_index=record_index,
-                        record_type=str(record.get("type", "invalid")) if isinstance(record, Mapping) else "invalid",
-                        text=record.get("text") if isinstance(record, Mapping) else None,
-                        expected=record.get("matches") if isinstance(record, Mapping) else None,
-                        actual=None,
-                        diagnostics=diagnostics,
-                    )
-                    continue
-
-                yield record_index, cast(Mapping[str, Any], record)
+        with path.open("rb") as file:
+            data = file.read(options.max_eval_ref_bytes + 1)
     except OSError as exc:
         _append_failure(
             result,
@@ -441,6 +424,97 @@ def _load_eval_ref(
                 )
             ],
         )
+        return
+
+    if len(data) > options.max_eval_ref_bytes:
+        _append_failure(
+            result,
+            scope=scope,
+            eval_ref=eval_ref,
+            record_index=None,
+            record_type="eval_ref",
+            text=None,
+            expected=None,
+            actual=None,
+            diagnostics=[
+                diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    EVAL_REF_TOO_LARGE,
+                    scope.path,
+                    f"Eval ref {eval_ref!r} exceeds the configured limit of {options.max_eval_ref_bytes} bytes.",
+                    metadata={"file_path": str(path), "bytes": len(data)},
+                )
+            ],
+        )
+        return
+
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _append_failure(
+            result,
+            scope=scope,
+            eval_ref=eval_ref,
+            record_index=None,
+            record_type="eval_ref",
+            text=None,
+            expected=None,
+            actual=None,
+            diagnostics=[
+                diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    EVAL_REF_UNRESOLVED,
+                    scope.path,
+                    f"Could not read eval ref {eval_ref!r}: file is not valid UTF-8: {exc}.",
+                    metadata={"file_path": str(path)},
+                )
+            ],
+        )
+        return
+
+    for record_index, line in enumerate(StringIO(text, newline=None)):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            record = json.loads(stripped, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
+            _append_failure(
+                result,
+                scope=scope,
+                eval_ref=eval_ref,
+                record_index=record_index,
+                record_type="invalid",
+                text=None,
+                expected=None,
+                actual=None,
+                diagnostics=[
+                    diagnostic(
+                        DIAGNOSTIC_ERROR,
+                        JSON_PARSE,
+                        scope.path,
+                        f"Could not parse eval JSONL record {record_index}: {exc}.",
+                    )
+                ],
+            )
+            continue
+
+        diagnostics = _record_validation_diagnostics(record)
+        if diagnostics:
+            _append_failure(
+                result,
+                scope=scope,
+                eval_ref=eval_ref,
+                record_index=record_index,
+                record_type=str(record.get("type", "invalid")) if isinstance(record, Mapping) else "invalid",
+                text=record.get("text") if isinstance(record, Mapping) else None,
+                expected=record.get("matches") if isinstance(record, Mapping) else None,
+                actual=None,
+                diagnostics=diagnostics,
+            )
+            continue
+
+        yield record_index, cast(Mapping[str, Any], record)
 
 
 def _resolve_eval_ref_path(eval_ref: str, base_path: Path | None) -> tuple[Path | None, Diagnostic | None]:

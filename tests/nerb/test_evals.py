@@ -151,6 +151,27 @@ def test_eval_bank_positive_refs_use_utf8_byte_offsets(tmp_path, minimal_bank):
     assert result["failures"] == []
 
 
+def test_eval_bank_jsonl_lines_do_not_split_on_unicode_line_separators(tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "unicode_line_separator.jsonl"
+    eval_ref_path.write_text(
+        json.dumps(_positive_record(text="Acme Corp\u2028 signed."), ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref_path.name]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"] == {
+        "passed": True,
+        "positive_total": 1,
+        "positive_failed": 0,
+        "negative_total": 0,
+        "negative_failed": 0,
+    }
+    assert result["failures"] == []
+
+
 def test_eval_bank_positive_refs_reject_character_offsets_when_byte_offsets_differ(tmp_path, minimal_bank):
     text = "Café Acme Corp"
     eval_ref = _write_jsonl(
@@ -520,6 +541,45 @@ def test_eval_bank_enforces_eval_ref_size_limit(test_data_path, minimal_bank):
 
     assert result["summary"]["passed"] is False
     assert result["failures"][0]["diagnostics"][0]["code"] == EVAL_REF_TOO_LARGE
+
+
+def test_eval_bank_rechecks_eval_ref_size_after_bounded_read(monkeypatch, tmp_path, minimal_bank):
+    eval_ref_path = tmp_path / "stale_size.jsonl"
+    _write_jsonl(eval_ref_path, [_positive_record()])
+    actual_mode = eval_ref_path.stat().st_mode
+    original_stat = Path.stat
+
+    class StaleStat:
+        st_mode = actual_mode
+        st_size = 1
+
+    def stale_stat(self, *args, **kwargs):
+        if self == eval_ref_path:
+            return StaleStat()
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stale_stat)
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = [eval_ref_path.name]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path, options={"max_eval_ref_bytes": 4})
+
+    assert result["summary"]["passed"] is False
+    failure = result["failures"][0]
+    assert failure["diagnostics"][0]["code"] == EVAL_REF_TOO_LARGE
+    assert failure["diagnostics"][0]["metadata"]["bytes"] == 5
+
+
+def test_eval_bank_rejects_non_regular_eval_refs(tmp_path, minimal_bank):
+    pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
+    pattern["eval_refs"] = ["."]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"]["passed"] is False
+    failure = result["failures"][0]
+    assert failure["diagnostics"][0]["code"] == EVAL_REF_UNRESOLVED
+    assert "regular file" in failure["diagnostics"][0]["message"]
 
 
 def test_eval_bank_rejects_invalid_eval_options(minimal_bank):
