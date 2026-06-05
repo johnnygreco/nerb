@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from typing import Any
 
 
 def _load_gate_report_module():
@@ -14,17 +15,130 @@ def _load_gate_report_module():
     return module
 
 
+def _measurement(*, count: int = 1, seconds: float = 0.01, stable: bool = True) -> dict[str, Any]:
+    return {"count": count, "count_stable": stable, "median_seconds": seconds, "min_seconds": seconds}
+
+
+def _expected_mode_metadata() -> dict[str, dict[str, Any]]:
+    return {
+        "entity_independent": {
+            "name": "entity_independent",
+            "status": "production_default",
+            "production_default": True,
+            "internal_only": False,
+        },
+        "all_overlaps": {
+            "name": "all_overlaps",
+            "status": "internal_prototype",
+            "production_default": False,
+            "internal_only": True,
+        },
+        "global_leftmost": {
+            "name": "global_leftmost",
+            "status": "internal_benchmark_only",
+            "production_default": False,
+            "internal_only": True,
+        },
+    }
+
+
 def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shape():
     gate_report = _load_gate_report_module()
 
     report = gate_report.gate_report(iterations=1, target_bytes=10_000, dense_bytes=128)
 
     assert report["overall"]["passed"] is True
-    assert report["conformance"]["passed"] is True
+    assert report["overall"]["included_sections"] == {
+        "performance": True,
+        "memory": True,
+        "mode_strategy": True,
+    }
+    assert report["overall"]["external_required_sections"] == ["conformance", "distribution"]
+    assert report["conformance"]["passed"] is None
+    assert report["conformance"]["included_in_overall"] is False
     assert report["performance"]["passed"] is True
     assert report["mode_strategy"]["passed"] is True
     assert report["memory"]["passed"] is True
-    assert report["distribution"]["passed"] is True
+    assert report["distribution"]["passed"] is None
+    assert report["distribution"]["included_in_overall"] is False
     assert report["mode_strategy"]["decision"] == "entity_independent remains the production default"
+    assert report["mode_strategy"]["dense_probe"]["all_overlaps_reconstructed_matches_entity_independent"] is True
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["entity_counts"] == [2, 8, 32]
     assert report["performance"]["literal_heavy"]["python_rust_records_equal"] is True
     assert report["performance"]["regex_heavy"]["python_rust_records_equal"] is True
+    assert "source_parse_jsonl" in report["performance"]["small_bank_floor"]["measurements"]
+    assert report["performance"]["small_bank_floor"]["criteria"]["rust_scan_project_not_slower_than_python"] is True
+
+
+def test_workload_pass_criteria_fail_on_rust_scan_project_regression():
+    gate_report = _load_gate_report_module()
+
+    criteria = gate_report._workload_pass_criteria(
+        records_equal=True,
+        python_scan_project=_measurement(seconds=0.01),
+        rust_entity_scan=_measurement(),
+        rust_entity_scan_project=_measurement(seconds=0.02),
+        rust_all_overlaps_scan=_measurement(),
+        rust_global_scan=_measurement(),
+        rust_public_cache_lookup={"cache_hit_verified": True},
+    )
+
+    assert criteria["rust_scan_project_not_slower_than_python"] is False
+    assert all(criteria.values()) is False
+
+
+def test_mode_pass_criteria_fail_on_reconstruction_tuple_mismatch():
+    gate_report = _load_gate_report_module()
+
+    criteria = gate_report._mode_pass_criteria(
+        entity=_measurement(count=4),
+        raw=_measurement(count=8),
+        reconstructed=_measurement(count=4),
+        global_leftmost=_measurement(count=2),
+        entity_tuples=[(0, 0, 4), (1, 0, 4)],
+        reconstructed_tuples=[(0, 0, 4), (1, 4, 8)],
+        metadata=_expected_mode_metadata(),
+    )
+
+    assert criteria["all_overlaps_reconstructs_exact_default_tuples"] is False
+    assert all(criteria.values()) is False
+
+
+def test_memory_report_from_child_fails_when_isolated_probe_exceeds_budget():
+    gate_report = _load_gate_report_module()
+
+    report = gate_report._memory_report_from_child(
+        {
+            "status": "measured",
+            "dense_probe_bytes": 128,
+            "iterations": 1,
+            "all_overlaps_raw": _measurement(count=128),
+            "max_rss_kib_before": 10_000,
+            "max_rss_kib_after": 12_500,
+            "max_rss_kib_delta": 2_500,
+        },
+        memory_budget_kib=2_000,
+    )
+
+    assert report["passed"] is False
+    assert report["criteria"]["max_rss_delta_within_budget"] is False
+
+
+def test_external_required_sections_are_excluded_from_overall_pass():
+    gate_report = _load_gate_report_module()
+
+    report = gate_report._overall_report(
+        {
+            "conformance": {"passed": None, "included_in_overall": False},
+            "performance": {"passed": True, "included_in_overall": True},
+            "memory": {"passed": True, "included_in_overall": True},
+            "mode_strategy": {"passed": True, "included_in_overall": True},
+            "distribution": {"passed": None, "included_in_overall": False},
+        }
+    )
+
+    assert report == {
+        "passed": True,
+        "included_sections": {"performance": True, "memory": True, "mode_strategy": True},
+        "external_required_sections": ["conformance", "distribution"],
+    }
