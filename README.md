@@ -3,205 +3,124 @@
 [![CI](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml/badge.svg)](https://github.com/johnnygreco/nerb/actions/workflows/tests.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](https://github.com/johnnygreco/nerb/blob/main/LICENSE)
 
-NERB builds, validates, extracts, reports, evaluates, diffs, and benchmarks named-entity regex banks. The current
-agent-first surface uses JSON banks and returns JSON-compatible facts for local tools, CI gates, and MCP clients. The
-older YAML detector-config workflow is still available for simple regex extraction and authoring.
+NERB is a Python package, CLI, and MCP server for validated named-entity regex banks. It lets you define curated entity
+names and aliases, validate them before use, scan text locally with a Rust-backed engine, and return deterministic
+JSON records for agents, services, and CI gates.
+
+Use NERB when you need:
+
+- local, explainable extraction for known entities such as companies, people, products, codes, accounts, or domains;
+- stable byte-offset records that agents can cite, patch, diff, evaluate, and promote;
+- one shared extraction surface across Python code, shell commands, and MCP clients;
+- Rust-backed matching performance without moving authoring, validation, and workflow control out of Python.
 
 ## Installation
-
-For the latest published package:
 
 ```shell
 pip install --upgrade nerb
 nerb --help
 ```
 
-Published wheels include the Rust-backed engine for Linux x86_64 (`manylinux_2_28`), macOS universal2 (x86_64 and
-arm64), and Windows x86_64 for Python 3.10 through 3.14. Other platforms can install from the source distribution and
-need a Rust toolchain available on `PATH`.
+NERB requires Python 3.10 or newer. Published releases include the Rust extension in CPython 3.10 through 3.14 wheels
+for Linux x86_64 (`manylinux_2_28`), macOS universal2 (x86_64 and arm64), and Windows x86_64. Source installs and other
+platform builds require a Rust toolchain with `cargo` available on `PATH`.
 
 From a source checkout:
 
 ```shell
 git clone https://github.com/johnnygreco/nerb.git
 cd nerb
-uv sync --all-extras
+make sync
 uv run nerb --help
 ```
 
-The current package targets Python 3.10 and newer. The `nerb-mcp` entry point also requires Python 3.10 or newer because
-it uses the official MCP SDK.
+## Quickstart
 
-## JSON Banks
+JSON banks are the main format for agent and service workflows. A bank stores entity types, canonical names, literal or
+regex patterns, statuses, metadata, and optional eval references in one validated JSON object. See
+[`docs/schemas.md`](docs/schemas.md) for the complete bank schema, extraction record contracts, eval JSONL format, and a
+copyable minimal `company.json`.
 
-A JSON bank is the agent-first format. It stores entities, canonical names, pattern metadata, statuses, eval references,
-and literal or regex pattern settings in one validated object.
-
-```json
-{
-  "schema_version": "nerb.bank.v1",
-  "id": "company_entities",
-  "name": "Company Entities",
-  "description": "Known private entities for agent workflows.",
-  "version": "2026.06.03",
-  "status": "active",
-  "created_at": "2026-06-03T00:00:00Z",
-  "updated_at": "2026-06-03T00:00:00Z",
-  "unicode_normalization": "none",
-  "default_regex_flags": ["IGNORECASE"],
-  "entities": {
-    "customer": {
-      "description": "Customer organizations and accounts.",
-      "status": "active",
-      "regex_flags": [],
-      "names": {
-        "acme_corp": {
-          "canonical": "Acme Corp",
-          "description": "Strategic customer account.",
-          "status": "active",
-          "patterns": {
-            "primary": {
-              "kind": "literal",
-              "value": "Acme Corp",
-              "description": "Exact Acme Corp alias.",
-              "status": "active",
-              "priority": 100,
-              "case_sensitive": false,
-              "normalize_whitespace": true,
-              "left_boundary": "word",
-              "right_boundary": "word",
-              "metadata": {}
-            }
-          },
-          "metadata": {}
-        }
-      },
-      "metadata": {}
-    }
-  },
-  "metadata": {}
-}
-```
-
-## CLI Quickstart
-
-JSON-bank commands emit JSON matching the Python helper response shape.
+Validate and extract:
 
 ```shell
 nerb validate-bank --bank company.json
 nerb extract-text --bank company.json --text "Send this to Acme Corp today."
 nerb extract-file --bank company.json --file email.txt
 nerb extract-report --bank company.json --file email.txt
-nerb eval-bank --bank company.json
-nerb benchmark-bank --bank company.json
 ```
 
-Extraction records include the Rust-backed scan fields plus JSON-bank source IDs, pattern kind, and captures:
+Extraction responses are JSON. Records include canonical names, matched strings, byte offsets, JSON-bank IDs, pattern
+kind, and the current captures object.
 
-```json
-{
-  "entity": "customer",
-  "canonical_name": "Acme Corp",
-  "surface_name": "Acme Corp",
-  "entity_id": "customer",
-  "name_id": "acme_corp",
-  "pattern_id": "primary",
-  "pattern_kind": "literal",
-  "string": "Acme Corp",
-  "start": 13,
-  "end": 22,
-  "offset_unit": "byte",
-  "captures": {}
-}
-```
-
-Agent repair and promotion workflows use the same helper surfaces:
+Agent repair and promotion commands use the same JSON-compatible response style:
 
 ```shell
 nerb apply-patches --bank company.json --patch patches.json
 nerb diff-banks old-company.json new-company.json
+nerb eval-bank --bank company.json
+nerb benchmark-bank --bank company.json
 nerb regress-bank --old-bank old-company.json --new-bank new-company.json
 ```
 
-`apply-patches` applies RFC 6902 JSON Patch operations before validation, so a patch can repair an invalid bank and
-return the validated candidate plus diagnostics.
+`apply-patches` accepts RFC 6902 JSON Patch operations, validates the patched candidate, and returns diagnostics with
+the candidate response. `regress-bank` combines diff, eval, and benchmark checks so a bank update can be promoted by a
+machine-readable gate.
 
 ## Python API
 
-Use the JSON-bank helpers when building agent or service integrations:
+Use JSON-bank helpers for agent, service, and test integrations:
 
 ```python
-from nerb import (
-    apply_bank_patches,
-    benchmark_bank,
-    diff_banks,
-    eval_bank,
-    extract_report,
-    extract_text,
-    load_bank,
-    regress_bank,
-    validate_bank,
-)
+from nerb import extract_text, load_bank, validate_bank
 
 bank = load_bank("company.json")
 
 validation = validate_bank(bank)
-extraction = extract_text(bank, "Send this to Acme Corp today.")
-report = extract_report(bank, "Send this to Acme Corp today.")
-benchmark = benchmark_bank(bank, options={"benchmark_iterations": 1})
+result = extract_text(bank, "Send this to Acme Corp today.")
+
+print(validation["valid"])
+print(result["records"])
 ```
 
-Other public helpers include `Bank`, `bank_stats`, `bank_cache_info`, `canonicalize_bank`, `clear_bank_cache`,
-`hash_bank`, `validate_bank_schema`, `benchmark_fixture_profiles`, `make_benchmark_fixture_profile`, `extract_file`,
-`extract_batch`, `extract_report_file`, `extract_report_batch`, and `explain_match`.
-
-Rust source-bank canonicalization is documented in
-[`docs/rust-engine-canonicalization.md`](docs/rust-engine-canonicalization.md), and the current native PyO3 boundary plus
-`entity_independent` `scan_bytes` path are documented in
-[`docs/rust-engine-boundary.md`](docs/rust-engine-boundary.md). Rust engine gate evidence is recorded in
-[`docs/rust-engine-gates.md`](docs/rust-engine-gates.md).
-
-For direct source-bank scanning, use `Bank`:
+For direct source-bank scanning, use the Rust-backed `Bank` API:
 
 ```python
-from pathlib import Path
+from nerb import Bank
 
-from nerb import Bank, load_config
-
-config_path = Path("examples/music_entities.yaml")
-document = Path("examples/prog_rock_wiki.txt").read_text(encoding="utf-8")
-
-bank = Bank.from_config(load_config(config_path), word_boundaries=True)
-records = bank.scan_text(document)
+bank = Bank.from_source_bytes(b'{"ARTIST":{"Rush":"Rush"}}', format_hint="json")
+records = bank.scan_text("Rush played in Toronto.")
 ```
 
-`Bank.scan_text` returns byte-offset records with `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`,
-and `offset_unit`.
+`Bank.scan_text` returns records with `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`, and
+`offset_unit`. Byte offsets are the default record contract across the CLI, Python helpers, and MCP tools.
 
-## Eval And Regression
-
-Eval references are local JSONL files attached at the bank, entity, name, or pattern level through `eval_refs`. Positive
-records assert exact expected matches, negative records assert that scoped extraction returns no matches, and provenance
-records are counted without affecting pass/fail.
-
-`regress_bank` runs:
-
-```text
-diff_banks -> eval old/new -> benchmark old/new -> quality and performance deltas
-```
-
-Regression output is machine-readable for external promotion gates. NERB does not own publishing, approval, signing,
-scheduling, deployment, or disk cache behavior.
+Other public helpers include `apply_bank_patches`, `bank_stats`, `benchmark_bank`, `canonicalize_bank`, `diff_banks`,
+`eval_bank`, `extract_batch`, `extract_file`, `extract_report`, `explain_match`, `hash_bank`, `regress_bank`, and
+`validate_bank_schema`.
 
 ## MCP Server
 
-Run the local stdio MCP server from the repo:
+NERB ships a local stdio MCP server for agents that should validate, patch, diff, scan, report, evaluate, benchmark, or
+regress banks without reimplementing file handling or serialization.
 
 ```shell
-uv run nerb-mcp
+nerb-mcp --version
 ```
 
-Minimal MCP client config:
+Minimal installed-package client config:
+
+```json
+{
+  "mcpServers": {
+    "nerb": {
+      "command": "nerb-mcp"
+    }
+  }
+}
+```
+
+From a source checkout, point the client at the repo:
 
 ```json
 {
@@ -215,48 +134,13 @@ Minimal MCP client config:
 }
 ```
 
-JSON-bank MCP tools:
-
-```text
-validate_bank
-apply_bank_patches
-diff_banks
-bank_stats
-extract_text
-extract_file
-extract_batch
-extract_report
-extract_report_batch
-eval_bank
-benchmark_bank
-explain_match
-regress_bank
-```
-
-Rust/config-backed MCP tools:
-
-```text
-validate_config
-load_config
-list_detectors
-add_detector
-update_detector
-remove_detector
-extract_entity
-extract_all_entities
-extract_inline
-engine_cache_info
-clear_engine_cache
-```
-
-JSON-bank MCP tools accept explicit bank objects or explicit bank paths, depending on the tool. Rust/config-backed tools
-accept explicit config paths, provided inline detector definitions, and explicit document paths or text. File reads are
-limited to explicit bank, config, document, patch, and eval paths; config writes are limited to the explicit
-`config_path` passed by the client.
+The MCP tools mirror the Python and CLI surfaces: JSON-bank validation, patching, diffing, extraction, reporting, eval,
+benchmarking, regression, stats, and match explanation. Config-backed extraction tools are also available for YAML
+detector configs.
 
 ## YAML Detector Configs
 
-The YAML detector-config workflow is useful for simple regex extraction and authoring.
+YAML detector configs are a compact authoring format for simple regex extraction:
 
 ```yaml
 ARTIST:
@@ -268,39 +152,32 @@ GENRE:
   Rock: '(?:progressive\s)?rock'
 ```
 
-Config path resolution:
-
-1. explicit `--config`
-2. `NERB_CONFIG_PATH`
-3. the platform user config path
-
 Common commands:
 
 ```shell
 nerb init --config detectors.yaml
 nerb add ARTIST "Pink Floyd" 'Pink\sFloyd' --config detectors.yaml
-nerb extract ARTIST examples/prog_rock_wiki.txt --config detectors.yaml --format json
-nerb extract-batch examples/prog_rock_wiki.txt examples/other.txt --entity ARTIST --config detectors.yaml --format json
+nerb validate --config detectors.yaml
+nerb doctor --config detectors.yaml --format json
+nerb extract ARTIST document.txt --config detectors.yaml --format json
 nerb extract --all --text "Pink Floyd played progressive rock." \
   --detector 'ARTIST:Pink Floyd=Pink\sFloyd' \
   --detector 'GENRE:Rock=rock' \
   --format json
-nerb test ARTIST "Pink Floyd" 'Pink\sFloyd' --text "Pink Floyd played progressive rock."
-nerb doctor --config detectors.yaml --format json
 ```
 
-YAML extraction supports `--format table`, `--format json`, and `--format jsonl`. JSON and JSONL records are
-Rust-backed byte-offset records with `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`, and
-`offset_unit`. `extract-batch` accepts explicit document paths, `--manifest` path lists, and one optional `--stdin`
-document; it compiles one Rust `Bank` and scans those documents in input order.
+Config path resolution is explicit `--config`, then `NERB_CONFIG_PATH`, then the platform user config path. YAML
+extraction uses the same Rust-backed `Bank` scanner and byte-offset record contract.
 
 ## Performance
 
-NERB compiles Rust-backed `Bank` instances in process by canonical source bytes, compile options, engine version, target
-platform, and semantic bank hash. Disk cache remains deferred for V1.
+NERB uses Python as the authoring and control plane, and Rust as the matching data plane. Literal and regex patterns are
+canonicalized into Rust detector metadata, scanned natively, then projected into stable JSON records. Compiled banks are
+cached in process by canonical bank hash, engine version, compile options, and platform dimensions.
 
-See [docs/performance.md](docs/performance.md) for target/stress benchmark commands and recorded results. The V1 review
-keeps PCRE2 optional and does not add a binary literal-matcher dependency.
+The final Rust engine gate covers conformance, dense memory, mode strategy, wheel smoke tests, and a representative
+synthetic medium bank with 1,000 entities. See [`docs/performance.md`](docs/performance.md) and
+[`docs/rust-engine-gates.md`](docs/rust-engine-gates.md) for reproducible benchmark and release-gate evidence.
 
 ## Development
 
@@ -310,4 +187,5 @@ make check
 make build
 ```
 
-`make check` runs Ruff linting and formatting checks, `mypy src/nerb`, `ty check`, and pytest.
+`make check` runs Ruff linting and formatting checks, `mypy src/nerb`, `ty check`, and pytest. `make build` builds and
+validates the source distribution plus the local platform wheel with `twine check --strict`.
