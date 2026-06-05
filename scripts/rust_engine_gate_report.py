@@ -1224,7 +1224,10 @@ def _raw_tuples(buffer: Any) -> list[tuple[int, int, int]]:
 
 
 def _max_rss_kib() -> int:
-    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    max_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    if platform.system() == "Darwin":
+        return (max_rss + 1023) // 1024
+    return max_rss
 
 
 def _record_sort_key(record: dict[str, Any]) -> tuple[int, int, str, str, str, str]:

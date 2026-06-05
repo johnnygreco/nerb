@@ -1,0 +1,575 @@
+{
+  "bank": {
+    "hash": "sha256:d6f533974ce246f837c205ce37a6f43d01efddb0b66034dd6a34e04b9a201035",
+    "id": "security_ops_agent_cache",
+    "schema_version": "nerb.bank.v1",
+    "version": "2026.06.05"
+  },
+  "diagnostics": [],
+  "engine": {
+    "cache": {
+      "enabled": true,
+      "hit": true,
+      "key": {
+        "bank_hash": "sha256:d6f533974ce246f837c205ce37a6f43d01efddb0b66034dd6a34e04b9a201035",
+        "canonical_engine": "rust-regex-meta",
+        "compile_options": {
+          "match_mode": "entity_independent"
+        },
+        "endian": "little",
+        "engine_name": "nerb_engine",
+        "engine_version": "0.0.6",
+        "platform": "macosx-11.0-arm64",
+        "pointer_width": 64,
+        "schema_version": 1,
+        "semantic_version": "0.0.6",
+        "target_triple": "darwin"
+      }
+    },
+    "name": "nerb_engine",
+    "version": "0.0.6"
+  },
+  "overlaps": [],
+  "records": [
+    {
+      "canonical_name": "Incident Ticket",
+      "captures": {},
+      "end": 8,
+      "entity": "incident",
+      "entity_id": "incident",
+      "name_id": "incident_ticket",
+      "offset_unit": "byte",
+      "pattern_id": "inc_id",
+      "pattern_kind": "regex",
+      "start": 0,
+      "string": "INC-9042",
+      "surface_name": "inc_id"
+    },
+    {
+      "canonical_name": "SEV Priority",
+      "captures": {},
+      "end": 27,
+      "entity": "severity",
+      "entity_id": "severity",
+      "name_id": "sev_priority",
+      "offset_unit": "byte",
+      "pattern_id": "sev_id",
+      "pattern_kind": "regex",
+      "start": 22,
+      "string": "SEV-2",
+      "surface_name": "sev_id"
+    },
+    {
+      "canonical_name": "Okta",
+      "captures": {},
+      "end": 38,
+      "entity": "service",
+      "entity_id": "service",
+      "name_id": "okta",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 34,
+      "string": "Okta",
+      "surface_name": "Okta"
+    },
+    {
+      "canonical_name": "CVE Finding",
+      "captures": {},
+      "end": 78,
+      "entity": "vulnerability",
+      "entity_id": "vulnerability",
+      "name_id": "cve",
+      "offset_unit": "byte",
+      "pattern_id": "cve_id",
+      "pattern_kind": "regex",
+      "start": 64,
+      "string": "CVE-2026-18421",
+      "surface_name": "cve_id"
+    },
+    {
+      "canonical_name": "Kubernetes",
+      "captures": {},
+      "end": 94,
+      "entity": "service",
+      "entity_id": "service",
+      "name_id": "kubernetes",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 84,
+      "string": "Kubernetes",
+      "surface_name": "Kubernetes"
+    },
+    {
+      "canonical_name": "Amazon S3",
+      "captures": {},
+      "end": 138,
+      "entity": "service",
+      "entity_id": "service",
+      "name_id": "amazon_s3",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 129,
+      "string": "Amazon S3",
+      "surface_name": "Amazon S3"
+    },
+    {
+      "canonical_name": "Runbook ID",
+      "captures": {},
+      "end": 163,
+      "entity": "runbook",
+      "entity_id": "runbook",
+      "name_id": "runbook_id",
+      "offset_unit": "byte",
+      "pattern_id": "runbook_code",
+      "pattern_kind": "regex",
+      "start": 159,
+      "string": "R-17",
+      "surface_name": "runbook_code"
+    },
+    {
+      "canonical_name": "Terraform Cloud",
+      "captures": {},
+      "end": 190,
+      "entity": "service",
+      "entity_id": "service",
+      "name_id": "terraform_cloud",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 175,
+      "string": "Terraform Cloud",
+      "surface_name": "Terraform Cloud"
+    }
+  ],
+  "resolved_records": [
+    {
+      "context": {
+        "after": " escalated to SEV-2 after Okta sign-",
+        "before": "",
+        "match": "INC-9042"
+      },
+      "explanation": {
+        "description": "Four-digit incident ID.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "security-operations"
+          },
+          "name": {
+            "cache_slot": "incident.id",
+            "confidence": "authoritative"
+          },
+          "pattern": {
+            "agent_action": "open_incident_timeline",
+            "benchmark_text": "INC-9042",
+            "routing_key": "secops.incident"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/incident/names/incident_ticket/patterns/inc_id",
+        "pattern_value": "\\bINC-\\d{4}\\b",
+        "priority": 10
+      },
+      "record": {
+        "canonical_name": "Incident Ticket",
+        "captures": {},
+        "end": 8,
+        "entity": "incident",
+        "entity_id": "incident",
+        "name_id": "incident_ticket",
+        "offset_unit": "byte",
+        "pattern_id": "inc_id",
+        "pattern_kind": "regex",
+        "start": 0,
+        "string": "INC-9042",
+        "surface_name": "inc_id"
+      }
+    },
+    {
+      "context": {
+        "after": " after Okta sign-in telemetry linked",
+        "before": "INC-9042 escalated to ",
+        "match": "SEV-2"
+      },
+      "explanation": {
+        "description": "SEV marker.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "security-operations"
+          },
+          "name": {
+            "cache_slot": "incident.severity",
+            "sla": "incident_response"
+          },
+          "pattern": {
+            "agent_action": "set_response_sla",
+            "benchmark_text": "SEV-2",
+            "routing_key": "secops.severity"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/severity/names/sev_priority/patterns/sev_id",
+        "pattern_value": "\\bSEV-[1-3]\\b",
+        "priority": 15
+      },
+      "record": {
+        "canonical_name": "SEV Priority",
+        "captures": {},
+        "end": 27,
+        "entity": "severity",
+        "entity_id": "severity",
+        "name_id": "sev_priority",
+        "offset_unit": "byte",
+        "pattern_id": "sev_id",
+        "pattern_kind": "regex",
+        "start": 22,
+        "string": "SEV-2",
+        "surface_name": "sev_id"
+      }
+    },
+    {
+      "context": {
+        "after": " sign-in telemetry linked CVE-2026-1",
+        "before": "INC-9042 escalated to SEV-2 after ",
+        "match": "Okta"
+      },
+      "explanation": {
+        "description": "Exact identity provider name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "platform-security"
+          },
+          "name": {
+            "cloud": "saas",
+            "runbook": "identity-triage"
+          },
+          "pattern": {
+            "agent_action": "query_identity_logs",
+            "routing_key": "identity.okta"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/service/names/okta/patterns/literal",
+        "pattern_value": "Okta",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Okta",
+        "captures": {},
+        "end": 38,
+        "entity": "service",
+        "entity_id": "service",
+        "name_id": "okta",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 34,
+        "string": "Okta",
+        "surface_name": "Okta"
+      }
+    },
+    {
+      "context": {
+        "after": " to a Kubernetes service account. Th",
+        "before": "after Okta sign-in telemetry linked ",
+        "match": "CVE-2026-18421"
+      },
+      "explanation": {
+        "description": "CVE identifier.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "detection-engineering"
+          },
+          "name": {
+            "cache_slot": "vulnerability.id",
+            "confidence": "pattern"
+          },
+          "pattern": {
+            "agent_action": "fetch_vulnerability_brief",
+            "benchmark_text": "CVE-2026-18421",
+            "routing_key": "secops.vulnerability"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/vulnerability/names/cve/patterns/cve_id",
+        "pattern_value": "\\bCVE-\\d{4}-\\d{4,7}\\b",
+        "priority": 20
+      },
+      "record": {
+        "canonical_name": "CVE Finding",
+        "captures": {},
+        "end": 78,
+        "entity": "vulnerability",
+        "entity_id": "vulnerability",
+        "name_id": "cve",
+        "offset_unit": "byte",
+        "pattern_id": "cve_id",
+        "pattern_kind": "regex",
+        "start": 64,
+        "string": "CVE-2026-18421",
+        "surface_name": "cve_id"
+      }
+    },
+    {
+      "context": {
+        "after": " service account. The agent pinned A",
+        "before": "elemetry linked CVE-2026-18421 to a ",
+        "match": "Kubernetes"
+      },
+      "explanation": {
+        "description": "Exact platform name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "platform-security"
+          },
+          "name": {
+            "cloud": "multi",
+            "runbook": "cluster-forensics"
+          },
+          "pattern": {
+            "agent_action": "inspect_cluster_events",
+            "routing_key": "platform.kubernetes"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/service/names/kubernetes/patterns/literal",
+        "pattern_value": "Kubernetes",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Kubernetes",
+        "captures": {},
+        "end": 94,
+        "entity": "service",
+        "entity_id": "service",
+        "name_id": "kubernetes",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 84,
+        "string": "Kubernetes",
+        "surface_name": "Kubernetes"
+      }
+    },
+    {
+      "context": {
+        "after": " evidence in Runbook R-17 and queued",
+        "before": "s service account. The agent pinned ",
+        "match": "Amazon S3"
+      },
+      "explanation": {
+        "description": "Exact service name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "platform-security"
+          },
+          "name": {
+            "cloud": "aws",
+            "runbook": "s3-evidence"
+          },
+          "pattern": {
+            "agent_action": "attach_storage_evidence",
+            "routing_key": "cloud.aws.storage"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/service/names/amazon_s3/patterns/literal",
+        "pattern_value": "Amazon S3",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Amazon S3",
+        "captures": {},
+        "end": 138,
+        "entity": "service",
+        "entity_id": "service",
+        "name_id": "amazon_s3",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 129,
+        "string": "Amazon S3",
+        "surface_name": "Amazon S3"
+      }
+    },
+    {
+      "context": {
+        "after": " and queued Terraform Cloud drift ch",
+        "before": "inned Amazon S3 evidence in Runbook ",
+        "match": "R-17"
+      },
+      "explanation": {
+        "description": "Runbook code.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "knowledge-management"
+          },
+          "name": {
+            "cache_slot": "runbook.id",
+            "confidence": "pattern"
+          },
+          "pattern": {
+            "agent_action": "load_runbook",
+            "benchmark_text": "R-17",
+            "routing_key": "knowledge.runbook"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/runbook/names/runbook_id/patterns/runbook_code",
+        "pattern_value": "\\bR-\\d{2}\\b",
+        "priority": 30
+      },
+      "record": {
+        "canonical_name": "Runbook ID",
+        "captures": {},
+        "end": 163,
+        "entity": "runbook",
+        "entity_id": "runbook",
+        "name_id": "runbook_id",
+        "offset_unit": "byte",
+        "pattern_id": "runbook_code",
+        "pattern_kind": "regex",
+        "start": 159,
+        "string": "R-17",
+        "surface_name": "runbook_code"
+      }
+    },
+    {
+      "context": {
+        "after": " drift checks for Detection Engineer",
+        "before": "evidence in Runbook R-17 and queued ",
+        "match": "Terraform Cloud"
+      },
+      "explanation": {
+        "description": "Exact platform name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "route incident facts into a local response cache with byte-offset citations",
+            "example_domain": "security operations"
+          },
+          "entity": {
+            "owner": "platform-security"
+          },
+          "name": {
+            "cloud": "saas",
+            "runbook": "drift-review"
+          },
+          "pattern": {
+            "agent_action": "check_drift_queue",
+            "routing_key": "infra.terraform"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/service/names/terraform_cloud/patterns/literal",
+        "pattern_value": "Terraform Cloud",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Terraform Cloud",
+        "captures": {},
+        "end": 190,
+        "entity": "service",
+        "entity_id": "service",
+        "name_id": "terraform_cloud",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 175,
+        "string": "Terraform Cloud",
+        "surface_name": "Terraform Cloud"
+      }
+    }
+  ],
+  "source": {
+    "bytes": 230,
+    "length": 230,
+    "type": "text"
+  },
+  "summary": {
+    "entity_counts": {
+      "incident": 1,
+      "runbook": 1,
+      "service": 4,
+      "severity": 1,
+      "vulnerability": 1
+    },
+    "name_counts": {
+      "incident/incident_ticket": 1,
+      "runbook/runbook_id": 1,
+      "service/amazon_s3": 1,
+      "service/kubernetes": 1,
+      "service/okta": 1,
+      "service/terraform_cloud": 1,
+      "severity/sev_priority": 1,
+      "vulnerability/cve": 1
+    },
+    "record_count": 8,
+    "resolved_record_count": 8
+  }
+}

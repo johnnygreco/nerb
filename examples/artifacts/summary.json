@@ -1,0 +1,527 @@
+{
+  "domains": [
+    {
+      "bank_hash": "sha256:d6f533974ce246f837c205ce37a6f43d01efddb0b66034dd6a34e04b9a201035",
+      "bank_id": "security_ops_agent_cache",
+      "document": "documents/security_ops.txt",
+      "engine": {
+        "cache": {
+          "enabled": true,
+          "hit": false,
+          "key": {
+            "bank_hash": "sha256:d6f533974ce246f837c205ce37a6f43d01efddb0b66034dd6a34e04b9a201035",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        },
+        "name": "nerb_engine",
+        "version": "0.0.6"
+      },
+      "entity_counts": {
+        "incident": 1,
+        "runbook": 1,
+        "service": 4,
+        "severity": 1,
+        "vulnerability": 1
+      },
+      "id": "security_ops",
+      "record_count": 8,
+      "resolved_record_count": 8,
+      "target_bytes_per_second": 22072678.108,
+      "target_records_per_second": 766634.261,
+      "title": "Security Ops"
+    },
+    {
+      "bank_hash": "sha256:797b58fe6012d71271740a2436121e5cbfe273eb2a5a413a997ca79046915f9d",
+      "bank_id": "revenue_ops_agent_cache",
+      "document": "documents/revenue_ops.txt",
+      "engine": {
+        "cache": {
+          "enabled": true,
+          "hit": false,
+          "key": {
+            "bank_hash": "sha256:797b58fe6012d71271740a2436121e5cbfe273eb2a5a413a997ca79046915f9d",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        },
+        "name": "nerb_engine",
+        "version": "0.0.6"
+      },
+      "entity_counts": {
+        "account": 2,
+        "account_health": 1,
+        "commercial_artifact": 2,
+        "product": 3,
+        "region": 1
+      },
+      "id": "revenue_ops",
+      "record_count": 9,
+      "resolved_record_count": 9,
+      "target_bytes_per_second": 15684196.183,
+      "target_records_per_second": 737758.357,
+      "title": "Revenue Ops"
+    },
+    {
+      "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+      "bank_id": "compliance_ops_agent_cache",
+      "document": "documents/compliance_ops.txt",
+      "engine": {
+        "cache": {
+          "enabled": true,
+          "hit": false,
+          "key": {
+            "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        },
+        "name": "nerb_engine",
+        "version": "0.0.6"
+      },
+      "entity_counts": {
+        "control": 2,
+        "data_boundary": 1,
+        "evidence": 2,
+        "framework": 3,
+        "system": 3
+      },
+      "id": "compliance_ops",
+      "record_count": 11,
+      "resolved_record_count": 11,
+      "target_bytes_per_second": 15302475.153,
+      "target_records_per_second": 737199.533,
+      "title": "Compliance Ops"
+    }
+  ],
+  "scale": {
+    "cases": [
+      {
+        "compile": {
+          "cache": {
+            "after_cold": {
+              "hits": 0,
+              "keys": [
+                {
+                  "bank_hash": "sha256:2e75c2d984f71e739ed9a8357da8ff4398f58bc10bca8e2fa6ec2947324e0377",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "after_reset": {
+              "hits": 0,
+              "keys": [],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 0,
+              "size": 0,
+              "source_key_count": 0
+            },
+            "after_warm": {
+              "hits": 1,
+              "keys": [
+                {
+                  "bank_hash": "sha256:2e75c2d984f71e739ed9a8357da8ff4398f58bc10bca8e2fa6ec2947324e0377",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "before_reset": {
+              "hits": 1,
+              "keys": [
+                {
+                  "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "cold_hit": false,
+            "warm_hit": true
+          },
+          "cold_seconds": 0.088795666,
+          "warm_cache_lookup_seconds": 0.060086584
+        },
+        "document_bytes": 49983,
+        "engine": {
+          "include_statuses": [
+            "active"
+          ],
+          "matchers": [
+            {
+              "entity_count": 16,
+              "match_mode": "entity_independent",
+              "name": "nerb_engine",
+              "pattern_count": 1000,
+              "version": "0.0.6"
+            }
+          ],
+          "name": "nerb_engine",
+          "normalization": "none",
+          "version": "0.0.6"
+        },
+        "entities": 16,
+        "id": "team_cache_1k",
+        "label": "Team cache",
+        "names": 250,
+        "patterns": 1000,
+        "profile": {
+          "active_patterns": 1000,
+          "literal_patterns": 750,
+          "profile": "mostly_literal",
+          "regex_patterns": 250
+        },
+        "record_count": 1136,
+        "records_per_kb": 23.273,
+        "throughput": {
+          "bytes_per_second": 10905481.342,
+          "documents_per_second": 218.184,
+          "records_per_second": 247856.807
+        }
+      },
+      {
+        "compile": {
+          "cache": {
+            "after_cold": {
+              "hits": 0,
+              "keys": [
+                {
+                  "bank_hash": "sha256:2611fe010a2e5aac02408d69db38b0f24c43b96e44df1e85d0073ca2b38db6b8",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "after_reset": {
+              "hits": 0,
+              "keys": [],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 0,
+              "size": 0,
+              "source_key_count": 0
+            },
+            "after_warm": {
+              "hits": 1,
+              "keys": [
+                {
+                  "bank_hash": "sha256:2611fe010a2e5aac02408d69db38b0f24c43b96e44df1e85d0073ca2b38db6b8",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "before_reset": {
+              "hits": 1,
+              "keys": [
+                {
+                  "bank_hash": "sha256:2e75c2d984f71e739ed9a8357da8ff4398f58bc10bca8e2fa6ec2947324e0377",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "cold_hit": false,
+            "warm_hit": true
+          },
+          "cold_seconds": 0.283228208,
+          "warm_cache_lookup_seconds": 0.223036334
+        },
+        "document_bytes": 149995,
+        "engine": {
+          "include_statuses": [
+            "active"
+          ],
+          "matchers": [
+            {
+              "entity_count": 64,
+              "match_mode": "entity_independent",
+              "name": "nerb_engine",
+              "pattern_count": 4000,
+              "version": "0.0.6"
+            }
+          ],
+          "name": "nerb_engine",
+          "normalization": "none",
+          "version": "0.0.6"
+        },
+        "entities": 64,
+        "id": "org_cache_4k",
+        "label": "Org cache",
+        "names": 1000,
+        "patterns": 4000,
+        "profile": {
+          "active_patterns": 4000,
+          "literal_patterns": 3000,
+          "profile": "mostly_literal",
+          "regex_patterns": 1000
+        },
+        "record_count": 3409,
+        "records_per_kb": 23.273,
+        "throughput": {
+          "bytes_per_second": 8433940.721,
+          "documents_per_second": 56.228,
+          "records_per_second": 191681.749
+        }
+      },
+      {
+        "compile": {
+          "cache": {
+            "after_cold": {
+              "hits": 0,
+              "keys": [
+                {
+                  "bank_hash": "sha256:519d3f5ac8487933d290861ffd39a711ce4d709432502b71c3fac856771844dd",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "after_reset": {
+              "hits": 0,
+              "keys": [],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 0,
+              "size": 0,
+              "source_key_count": 0
+            },
+            "after_warm": {
+              "hits": 1,
+              "keys": [
+                {
+                  "bank_hash": "sha256:519d3f5ac8487933d290861ffd39a711ce4d709432502b71c3fac856771844dd",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "before_reset": {
+              "hits": 1,
+              "keys": [
+                {
+                  "bank_hash": "sha256:2611fe010a2e5aac02408d69db38b0f24c43b96e44df1e85d0073ca2b38db6b8",
+                  "canonical_engine": "rust-regex-meta",
+                  "compile_options": {
+                    "match_mode": "entity_independent"
+                  },
+                  "endian": "little",
+                  "engine_name": "nerb_engine",
+                  "engine_version": "0.0.6",
+                  "platform": "macosx-11.0-arm64",
+                  "pointer_width": 64,
+                  "schema_version": 1,
+                  "semantic_version": "0.0.6",
+                  "target_triple": "darwin"
+                }
+              ],
+              "max_entries": 128,
+              "max_source_keys": 256,
+              "misses": 1,
+              "size": 1,
+              "source_key_count": 1
+            },
+            "cold_hit": false,
+            "warm_hit": true
+          },
+          "cold_seconds": 0.713394,
+          "warm_cache_lookup_seconds": 0.541323958
+        },
+        "document_bytes": 299991,
+        "engine": {
+          "include_statuses": [
+            "active"
+          ],
+          "matchers": [
+            {
+              "entity_count": 128,
+              "match_mode": "entity_independent",
+              "name": "nerb_engine",
+              "pattern_count": 10000,
+              "version": "0.0.6"
+            }
+          ],
+          "name": "nerb_engine",
+          "normalization": "none",
+          "version": "0.0.6"
+        },
+        "entities": 128,
+        "id": "fleet_cache_10k",
+        "label": "Fleet cache",
+        "names": 2500,
+        "patterns": 10000,
+        "profile": {
+          "active_patterns": 10000,
+          "literal_patterns": 7500,
+          "profile": "mostly_literal",
+          "regex_patterns": 2500
+        },
+        "record_count": 6818,
+        "records_per_kb": 23.273,
+        "throughput": {
+          "bytes_per_second": 6514907.62,
+          "documents_per_second": 21.717,
+          "records_per_second": 148066.576
+        }
+      }
+    ],
+    "description": "Generated scale demonstration using deterministic synthetic JSON banks and documents.",
+    "method": {
+      "document_strategy": "repeat exact active pattern examples until the target byte size is reached",
+      "iterations": 2,
+      "measurement": "warm extraction scan/project/sort throughput plus cold compile and warm cache lookup"
+    }
+  }
+}

@@ -1,0 +1,382 @@
+{
+  "bank": {
+    "hash": "sha256:26da148cea0da771d0c4a07fb51b10f459e353f98f49929bbe44e9ab75a8c290",
+    "id": "compliance_ops_agent_cache",
+    "profile": {
+      "active_patterns": 12,
+      "literal_patterns": 8,
+      "profile": "mixed",
+      "regex_patterns": 4
+    },
+    "schema_version": "nerb.bank.v1",
+    "stats": {
+      "active_totals": {
+        "entities": 5,
+        "names": 12,
+        "patterns": 12
+      },
+      "by_kind": {
+        "literal": 8,
+        "regex": 4
+      },
+      "by_status": {
+        "active": {
+          "entities": 5,
+          "names": 12,
+          "patterns": 12
+        },
+        "deprecated": {
+          "entities": 0,
+          "names": 0,
+          "patterns": 0
+        },
+        "draft": {
+          "entities": 0,
+          "names": 0,
+          "patterns": 0
+        },
+        "inactive": {
+          "entities": 0,
+          "names": 0,
+          "patterns": 0
+        }
+      },
+      "totals": {
+        "entities": 5,
+        "names": 12,
+        "patterns": 12
+      }
+    },
+    "version": "2026.06.05"
+  },
+  "compile": {
+    "cache": {
+      "after_cold": {
+        "hits": 0,
+        "keys": [
+          {
+            "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        ],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 1,
+        "size": 1,
+        "source_key_count": 1
+      },
+      "after_reset": {
+        "hits": 0,
+        "keys": [],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 0,
+        "size": 0,
+        "source_key_count": 0
+      },
+      "after_warm": {
+        "hits": 1,
+        "keys": [
+          {
+            "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        ],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 1,
+        "size": 1,
+        "source_key_count": 1
+      },
+      "before_reset": {
+        "hits": 2,
+        "keys": [
+          {
+            "bank_hash": "sha256:797b58fe6012d71271740a2436121e5cbfe273eb2a5a413a997ca79046915f9d",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          },
+          {
+            "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        ],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 2,
+        "size": 2,
+        "source_key_count": 2
+      },
+      "cold_hit": false,
+      "warm_hit": true
+    },
+    "cold_seconds": 0.003717416,
+    "warm_cache_lookup_seconds": 0.001808209
+  },
+  "diagnostics": [
+    {
+      "code": "benchmark.regex_probes",
+      "message": "Benchmark used bounded regex probe diagnostics from validation.",
+      "metadata": {
+        "enabled": true,
+        "max_per_regex": 5
+      },
+      "path": "",
+      "severity": "info"
+    }
+  ],
+  "engine": {
+    "include_statuses": [
+      "active"
+    ],
+    "matchers": [
+      {
+        "entity_count": 5,
+        "match_mode": "entity_independent",
+        "name": "nerb_engine",
+        "pattern_count": 12,
+        "version": "0.0.6"
+      }
+    ],
+    "name": "nerb_engine",
+    "normalization": "none",
+    "version": "0.0.6"
+  },
+  "options": {
+    "benchmark_profile_id": null,
+    "iterations": 3,
+    "max_pattern_examples": 12,
+    "stress_multiplier": 4,
+    "validation_level": "standard"
+  },
+  "stages": {
+    "canonicalize": {
+      "seconds": 6.2666e-05
+    },
+    "compile_cache": {
+      "cache_hit_verified": true,
+      "cold_seconds": 0.003717416,
+      "exclusive": false,
+      "includes": [
+        "canonicalize",
+        "schema_validation",
+        "runtime_validation",
+        "cache_lookup",
+        "rust_bank_compile"
+      ],
+      "note": "Rust Bank compile timing is inclusive; do not sum it with sibling stage timings.",
+      "warm_cache_lookup_seconds": 0.001808209
+    },
+    "document_prepare": {
+      "seconds_by_tier": {
+        "baseline": 6.209e-06,
+        "stress": 4.375e-06,
+        "target": 5.042e-06
+      },
+      "total_seconds": 1.5626e-05
+    },
+    "document_tier_resolution": {
+      "seconds": 2.7709e-05
+    },
+    "input_parse": {
+      "available": false,
+      "note": "benchmark_bank receives an already-loaded bank object.",
+      "seconds": null
+    },
+    "scan_project_sort": {
+      "seconds_by_tier": {
+        "baseline": 2.6125e-05,
+        "stress": 0.000239833,
+        "target": 0.000134292
+      },
+      "total_seconds": 0.00040025
+    },
+    "validation": {
+      "seconds": 0.003852333
+    }
+  },
+  "summary": {
+    "benchmark_profile_id": null,
+    "cache_hit_verified": true,
+    "cold_compile_seconds": 0.003717416,
+    "document_count": 4,
+    "extraction_iterations": 3,
+    "profile": "mixed",
+    "record_count": 122,
+    "target_bytes_per_second": 15302475.153,
+    "target_documents_per_second": 44678.76,
+    "target_records_per_second": 737199.533,
+    "tier_count": 3
+  },
+  "tiers": {
+    "baseline": {
+      "bytes": 14,
+      "document_count": 1,
+      "documents": [
+        {
+          "document_id": "compliance_ops_baseline",
+          "record_count": 1,
+          "source": {
+            "bytes": 14,
+            "length": 14,
+            "type": "text"
+          }
+        }
+      ],
+      "documents_with_records": 1,
+      "iterations": 3,
+      "record_count": 1,
+      "record_count_stable": true,
+      "record_counts_by_run": [
+        1,
+        1,
+        1
+      ],
+      "size": {
+        "average_bytes": 14.0,
+        "max_bytes": 14,
+        "min_bytes": 14
+      },
+      "stages": {
+        "document_prepare_seconds": 6.209e-06,
+        "scan_project_sort_seconds": 2.6125e-05
+      },
+      "throughput": {
+        "bytes_per_second": 1607655.798,
+        "documents_per_second": 114832.557,
+        "records_per_second": 114832.557
+      },
+      "warm_extraction_seconds": 2.6125e-05
+    },
+    "stress": {
+      "bytes": 1831,
+      "document_count": 1,
+      "documents": [
+        {
+          "document_id": "compliance_ops_stress",
+          "record_count": 88,
+          "source": {
+            "bytes": 1831,
+            "length": 1831,
+            "type": "text"
+          }
+        }
+      ],
+      "documents_with_records": 1,
+      "iterations": 3,
+      "record_count": 88,
+      "record_count_stable": true,
+      "record_counts_by_run": [
+        88,
+        88,
+        88
+      ],
+      "size": {
+        "average_bytes": 1831.0,
+        "max_bytes": 1831,
+        "min_bytes": 1831
+      },
+      "stages": {
+        "document_prepare_seconds": 4.375e-06,
+        "scan_project_sort_seconds": 0.000239833
+      },
+      "throughput": {
+        "bytes_per_second": 22903440.121,
+        "documents_per_second": 12508.706,
+        "records_per_second": 1100766.101
+      },
+      "warm_extraction_seconds": 0.000239833
+    },
+    "target": {
+      "bytes": 685,
+      "document_count": 2,
+      "documents": [
+        {
+          "document_id": "compliance_ops_primary",
+          "record_count": 11,
+          "source": {
+            "bytes": 228,
+            "length": 228,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "compliance_ops_repeated",
+          "record_count": 22,
+          "source": {
+            "bytes": 457,
+            "length": 457,
+            "type": "text"
+          }
+        }
+      ],
+      "documents_with_records": 2,
+      "iterations": 3,
+      "record_count": 33,
+      "record_count_stable": true,
+      "record_counts_by_run": [
+        33,
+        33,
+        33
+      ],
+      "size": {
+        "average_bytes": 342.5,
+        "max_bytes": 457,
+        "min_bytes": 228
+      },
+      "stages": {
+        "document_prepare_seconds": 5.042e-06,
+        "scan_project_sort_seconds": 0.000134292
+      },
+      "throughput": {
+        "bytes_per_second": 15302475.153,
+        "documents_per_second": 44678.76,
+        "records_per_second": 737199.533
+      },
+      "warm_extraction_seconds": 0.000134292
+    }
+  }
+}

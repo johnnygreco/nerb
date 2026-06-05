@@ -1,0 +1,643 @@
+{
+  "bank": {
+    "hash": "sha256:797b58fe6012d71271740a2436121e5cbfe273eb2a5a413a997ca79046915f9d",
+    "id": "revenue_ops_agent_cache",
+    "schema_version": "nerb.bank.v1",
+    "version": "2026.06.05"
+  },
+  "diagnostics": [],
+  "engine": {
+    "cache": {
+      "enabled": true,
+      "hit": true,
+      "key": {
+        "bank_hash": "sha256:797b58fe6012d71271740a2436121e5cbfe273eb2a5a413a997ca79046915f9d",
+        "canonical_engine": "rust-regex-meta",
+        "compile_options": {
+          "match_mode": "entity_independent"
+        },
+        "endian": "little",
+        "engine_name": "nerb_engine",
+        "engine_version": "0.0.6",
+        "platform": "macosx-11.0-arm64",
+        "pointer_width": 64,
+        "schema_version": 1,
+        "semantic_version": "0.0.6",
+        "target_triple": "darwin"
+      }
+    },
+    "name": "nerb_engine",
+    "version": "0.0.6"
+  },
+  "overlaps": [],
+  "records": [
+    {
+      "canonical_name": "Quarterly Business Review",
+      "captures": {},
+      "end": 8,
+      "entity": "commercial_artifact",
+      "entity_id": "commercial_artifact",
+      "name_id": "qbr",
+      "offset_unit": "byte",
+      "pattern_id": "qbr_id",
+      "pattern_kind": "regex",
+      "start": 0,
+      "string": "QBR-7781",
+      "surface_name": "qbr_id"
+    },
+    {
+      "canonical_name": "Acme Renewables",
+      "captures": {},
+      "end": 29,
+      "entity": "account",
+      "entity_id": "account",
+      "name_id": "acme_renewables",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 14,
+      "string": "Acme Renewables",
+      "surface_name": "Acme Renewables"
+    },
+    {
+      "canonical_name": "Atlas Copilot",
+      "captures": {},
+      "end": 49,
+      "entity": "product",
+      "entity_id": "product",
+      "name_id": "atlas_copilot",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 36,
+      "string": "Atlas Copilot",
+      "surface_name": "Atlas Copilot"
+    },
+    {
+      "canonical_name": "Signal API",
+      "captures": {},
+      "end": 64,
+      "entity": "product",
+      "entity_id": "product",
+      "name_id": "signal_api",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 54,
+      "string": "Signal API",
+      "surface_name": "Signal API"
+    },
+    {
+      "canonical_name": "Master Services Agreement",
+      "captures": {},
+      "end": 84,
+      "entity": "commercial_artifact",
+      "entity_id": "commercial_artifact",
+      "name_id": "msa",
+      "offset_unit": "byte",
+      "pattern_id": "msa_id",
+      "pattern_kind": "regex",
+      "start": 76,
+      "string": "MSA-2209",
+      "surface_name": "msa_id"
+    },
+    {
+      "canonical_name": "Northstar Labs",
+      "captures": {},
+      "end": 108,
+      "entity": "account",
+      "entity_id": "account",
+      "name_id": "northstar_labs",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 94,
+      "string": "Northstar Labs",
+      "surface_name": "Northstar Labs"
+    },
+    {
+      "canonical_name": "At Risk",
+      "captures": {},
+      "end": 119,
+      "entity": "account_health",
+      "entity_id": "account_health",
+      "name_id": "at_risk",
+      "offset_unit": "byte",
+      "pattern_id": "phrase",
+      "pattern_kind": "literal",
+      "start": 112,
+      "string": "at risk",
+      "surface_name": "at risk"
+    },
+    {
+      "canonical_name": "EMEA",
+      "captures": {},
+      "end": 127,
+      "entity": "region",
+      "entity_id": "region",
+      "name_id": "emea",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 123,
+      "string": "EMEA",
+      "surface_name": "EMEA"
+    },
+    {
+      "canonical_name": "Drift Monitor",
+      "captures": {},
+      "end": 149,
+      "entity": "product",
+      "entity_id": "product",
+      "name_id": "drift_monitor",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 136,
+      "string": "Drift Monitor",
+      "surface_name": "Drift Monitor"
+    }
+  ],
+  "resolved_records": [
+    {
+      "context": {
+        "after": " says Acme Renewables wants Atlas Co",
+        "before": "",
+        "match": "QBR-7781"
+      },
+      "explanation": {
+        "description": "QBR record ID.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "deal-desk"
+          },
+          "name": {
+            "cache_slot": "commercial.qbr_id"
+          },
+          "pattern": {
+            "agent_action": "open_qbr_packet",
+            "benchmark_text": "QBR-7781",
+            "routing_key": "revops.qbr"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/commercial_artifact/names/qbr/patterns/qbr_id",
+        "pattern_value": "\\bQBR-\\d{4}\\b",
+        "priority": 20
+      },
+      "record": {
+        "canonical_name": "Quarterly Business Review",
+        "captures": {},
+        "end": 8,
+        "entity": "commercial_artifact",
+        "entity_id": "commercial_artifact",
+        "name_id": "qbr",
+        "offset_unit": "byte",
+        "pattern_id": "qbr_id",
+        "pattern_kind": "regex",
+        "start": 0,
+        "string": "QBR-7781",
+        "surface_name": "qbr_id"
+      }
+    },
+    {
+      "context": {
+        "after": " wants Atlas Copilot and Signal API ",
+        "before": "QBR-7781 says ",
+        "match": "Acme Renewables"
+      },
+      "explanation": {
+        "description": "Exact account name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "revenue-operations"
+          },
+          "name": {
+            "owner": "camila",
+            "segment": "enterprise"
+          },
+          "pattern": {
+            "agent_action": "open_account_workspace",
+            "crm_id": "acct_1007"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/account/names/acme_renewables/patterns/literal",
+        "pattern_value": "Acme Renewables",
+        "priority": 40
+      },
+      "record": {
+        "canonical_name": "Acme Renewables",
+        "captures": {},
+        "end": 29,
+        "entity": "account",
+        "entity_id": "account",
+        "name_id": "acme_renewables",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 14,
+        "string": "Acme Renewables",
+        "surface_name": "Acme Renewables"
+      }
+    },
+    {
+      "context": {
+        "after": " and Signal API before the MSA-2209 ",
+        "before": "QBR-7781 says Acme Renewables wants ",
+        "match": "Atlas Copilot"
+      },
+      "explanation": {
+        "description": "Exact product name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "product-operations"
+          },
+          "name": {
+            "sku": "atlas-copilot"
+          },
+          "pattern": {
+            "agent_action": "attach_solution_brief",
+            "product_area": "agent_workflows"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/product/names/atlas_copilot/patterns/literal",
+        "pattern_value": "Atlas Copilot",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Atlas Copilot",
+        "captures": {},
+        "end": 49,
+        "entity": "product",
+        "entity_id": "product",
+        "name_id": "atlas_copilot",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 36,
+        "string": "Atlas Copilot",
+        "surface_name": "Atlas Copilot"
+      }
+    },
+    {
+      "context": {
+        "after": " before the MSA-2209 renewal. Norths",
+        "before": " Renewables wants Atlas Copilot and ",
+        "match": "Signal API"
+      },
+      "explanation": {
+        "description": "Exact product name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "product-operations"
+          },
+          "name": {
+            "sku": "signal-api"
+          },
+          "pattern": {
+            "agent_action": "attach_api_limits",
+            "product_area": "platform"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/product/names/signal_api/patterns/literal",
+        "pattern_value": "Signal API",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Signal API",
+        "captures": {},
+        "end": 64,
+        "entity": "product",
+        "entity_id": "product",
+        "name_id": "signal_api",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 54,
+        "string": "Signal API",
+        "surface_name": "Signal API"
+      }
+    },
+    {
+      "context": {
+        "after": " renewal. Northstar Labs is at risk ",
+        "before": "s Copilot and Signal API before the ",
+        "match": "MSA-2209"
+      },
+      "explanation": {
+        "description": "MSA record ID.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "deal-desk"
+          },
+          "name": {
+            "cache_slot": "commercial.msa_id"
+          },
+          "pattern": {
+            "agent_action": "open_contract_record",
+            "benchmark_text": "MSA-2209",
+            "routing_key": "revops.contract"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/commercial_artifact/names/msa/patterns/msa_id",
+        "pattern_value": "\\bMSA-\\d{4}\\b",
+        "priority": 20
+      },
+      "record": {
+        "canonical_name": "Master Services Agreement",
+        "captures": {},
+        "end": 84,
+        "entity": "commercial_artifact",
+        "entity_id": "commercial_artifact",
+        "name_id": "msa",
+        "offset_unit": "byte",
+        "pattern_id": "msa_id",
+        "pattern_kind": "regex",
+        "start": 76,
+        "string": "MSA-2209",
+        "surface_name": "msa_id"
+      }
+    },
+    {
+      "context": {
+        "after": " is at risk in EMEA because Drift Mo",
+        "before": "al API before the MSA-2209 renewal. ",
+        "match": "Northstar Labs"
+      },
+      "explanation": {
+        "description": "Exact account name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "revenue-operations"
+          },
+          "name": {
+            "owner": "reid",
+            "segment": "mid_market"
+          },
+          "pattern": {
+            "agent_action": "open_account_workspace",
+            "crm_id": "acct_2114"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/account/names/northstar_labs/patterns/literal",
+        "pattern_value": "Northstar Labs",
+        "priority": 40
+      },
+      "record": {
+        "canonical_name": "Northstar Labs",
+        "captures": {},
+        "end": 108,
+        "entity": "account",
+        "entity_id": "account",
+        "name_id": "northstar_labs",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 94,
+        "string": "Northstar Labs",
+        "surface_name": "Northstar Labs"
+      }
+    },
+    {
+      "context": {
+        "after": " in EMEA because Drift Monitor alert",
+        "before": "MSA-2209 renewal. Northstar Labs is ",
+        "match": "at risk"
+      },
+      "explanation": {
+        "description": "Account health phrase.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "customer-success"
+          },
+          "name": {
+            "cache_slot": "account.health"
+          },
+          "pattern": {
+            "agent_action": "raise_health_review",
+            "routing_key": "customer_health.risk"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/account_health/names/at_risk/patterns/phrase",
+        "pattern_value": "at risk",
+        "priority": 25
+      },
+      "record": {
+        "canonical_name": "At Risk",
+        "captures": {},
+        "end": 119,
+        "entity": "account_health",
+        "entity_id": "account_health",
+        "name_id": "at_risk",
+        "offset_unit": "byte",
+        "pattern_id": "phrase",
+        "pattern_kind": "literal",
+        "start": 112,
+        "string": "at risk",
+        "surface_name": "at risk"
+      }
+    },
+    {
+      "context": {
+        "after": " because Drift Monitor alerts lag be",
+        "before": "newal. Northstar Labs is at risk in ",
+        "match": "EMEA"
+      },
+      "explanation": {
+        "description": "Exact region marker.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "sales-operations"
+          },
+          "name": {
+            "owner": "lucia"
+          },
+          "pattern": {
+            "agent_action": "route_regional_owner",
+            "routing_key": "region.emea"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/region/names/emea/patterns/literal",
+        "pattern_value": "EMEA",
+        "priority": 60
+      },
+      "record": {
+        "canonical_name": "EMEA",
+        "captures": {},
+        "end": 127,
+        "entity": "region",
+        "entity_id": "region",
+        "name_id": "emea",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 123,
+        "string": "EMEA",
+        "surface_name": "EMEA"
+      }
+    },
+    {
+      "context": {
+        "after": " alerts lag behind the customer data",
+        "before": "tar Labs is at risk in EMEA because ",
+        "match": "Drift Monitor"
+      },
+      "explanation": {
+        "description": "Exact product name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "turn account notes into deterministic CRM and playbook lookups",
+            "example_domain": "revenue operations"
+          },
+          "entity": {
+            "owner": "product-operations"
+          },
+          "name": {
+            "sku": "drift-monitor"
+          },
+          "pattern": {
+            "agent_action": "attach_health_dashboard",
+            "product_area": "customer_health"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/product/names/drift_monitor/patterns/literal",
+        "pattern_value": "Drift Monitor",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Drift Monitor",
+        "captures": {},
+        "end": 149,
+        "entity": "product",
+        "entity_id": "product",
+        "name_id": "drift_monitor",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 136,
+        "string": "Drift Monitor",
+        "surface_name": "Drift Monitor"
+      }
+    }
+  ],
+  "source": {
+    "bytes": 191,
+    "length": 191,
+    "type": "text"
+  },
+  "summary": {
+    "entity_counts": {
+      "account": 2,
+      "account_health": 1,
+      "commercial_artifact": 2,
+      "product": 3,
+      "region": 1
+    },
+    "name_counts": {
+      "account/acme_renewables": 1,
+      "account/northstar_labs": 1,
+      "account_health/at_risk": 1,
+      "commercial_artifact/msa": 1,
+      "commercial_artifact/qbr": 1,
+      "product/atlas_copilot": 1,
+      "product/drift_monitor": 1,
+      "product/signal_api": 1,
+      "region/emea": 1
+    },
+    "record_count": 9,
+    "resolved_record_count": 9
+  }
+}

@@ -1,0 +1,360 @@
+{
+  "schema_version": "nerb.bank.v1",
+  "id": "compliance_ops_agent_cache",
+  "name": "Compliance Ops Agent Cache",
+  "description": "Audit and evidence entities for compliance-assistant workflows.",
+  "version": "2026.06.05",
+  "status": "active",
+  "created_at": "2026-06-05T00:00:00Z",
+  "updated_at": "2026-06-05T00:00:00Z",
+  "unicode_normalization": "none",
+  "default_regex_flags": [],
+  "entities": {
+    "framework": {
+      "description": "Audit and privacy frameworks.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "soc_2": {
+          "canonical": "SOC 2",
+          "description": "SOC 2 audit framework.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "SOC 2",
+              "description": "Exact framework name.",
+              "status": "active",
+              "priority": 40,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "load_audit_scope",
+                "routing_key": "audit.soc2"
+              }
+            }
+          },
+          "metadata": {
+            "evidence_model": "trust-services"
+          }
+        },
+        "iso_27001": {
+          "canonical": "ISO 27001",
+          "description": "Information security management framework.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "ISO 27001",
+              "description": "Exact framework name.",
+              "status": "active",
+              "priority": 40,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "load_audit_scope",
+                "routing_key": "audit.iso27001"
+              }
+            }
+          },
+          "metadata": {
+            "evidence_model": "isms"
+          }
+        },
+        "gdpr": {
+          "canonical": "GDPR",
+          "description": "General Data Protection Regulation marker.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "GDPR",
+              "description": "Exact privacy framework name.",
+              "status": "active",
+              "priority": 40,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "load_privacy_requirements",
+                "routing_key": "privacy.gdpr"
+              }
+            }
+          },
+          "metadata": {
+            "evidence_model": "privacy"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "compliance"
+      }
+    },
+    "control": {
+      "description": "Audit control identifiers.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "soc2_control": {
+          "canonical": "SOC 2 Control",
+          "description": "SOC 2 control identifier.",
+          "status": "active",
+          "patterns": {
+            "cc_control": {
+              "kind": "regex",
+              "value": "\\bCC\\d+\\.\\d+\\b",
+              "description": "SOC 2 CC control.",
+              "status": "active",
+              "priority": 20,
+              "regex_flags": [],
+              "metadata": {
+                "benchmark_text": "CC6.1",
+                "agent_action": "link_control_owner",
+                "routing_key": "audit.control.soc2"
+              }
+            }
+          },
+          "metadata": {
+            "cache_slot": "audit.control"
+          }
+        },
+        "iso_control": {
+          "canonical": "ISO Control",
+          "description": "ISO-style Annex A control identifier.",
+          "status": "active",
+          "patterns": {
+            "annex_control": {
+              "kind": "regex",
+              "value": "\\bA\\.\\d+\\.\\d+\\b",
+              "description": "ISO Annex A control.",
+              "status": "active",
+              "priority": 20,
+              "regex_flags": [],
+              "metadata": {
+                "benchmark_text": "A.8.16",
+                "agent_action": "link_control_owner",
+                "routing_key": "audit.control.iso"
+              }
+            }
+          },
+          "metadata": {
+            "cache_slot": "audit.control"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "control-library"
+      }
+    },
+    "evidence": {
+      "description": "Evidence packages and access-review artifacts.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "evidence_pack": {
+          "canonical": "Evidence Pack",
+          "description": "Evidence package identifier.",
+          "status": "active",
+          "patterns": {
+            "pack_id": {
+              "kind": "regex",
+              "value": "\\bevidence-pack-\\d{3}\\b",
+              "description": "Evidence package ID.",
+              "status": "active",
+              "priority": 30,
+              "regex_flags": [],
+              "metadata": {
+                "benchmark_text": "evidence-pack-443",
+                "agent_action": "open_evidence_pack",
+                "routing_key": "evidence.pack"
+              }
+            }
+          },
+          "metadata": {
+            "retention": "audit_window"
+          }
+        },
+        "access_review": {
+          "canonical": "Access Review",
+          "description": "Monthly access review artifact.",
+          "status": "active",
+          "patterns": {
+            "review_id": {
+              "kind": "regex",
+              "value": "\\baccess-review-\\d{4}-\\d{2}\\b",
+              "description": "Access review artifact ID.",
+              "status": "active",
+              "priority": 30,
+              "regex_flags": [],
+              "metadata": {
+                "benchmark_text": "access-review-2026-05",
+                "agent_action": "open_access_review",
+                "routing_key": "evidence.access_review"
+              }
+            }
+          },
+          "metadata": {
+            "retention": "audit_window"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "audit-operations"
+      }
+    },
+    "system": {
+      "description": "Systems that hold evidence or regulated data.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "vault": {
+          "canonical": "Vault",
+          "description": "Secrets and evidence storage system.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Vault",
+              "description": "Exact system name.",
+              "status": "active",
+              "priority": 50,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "query_system_owner",
+                "routing_key": "system.vault"
+              }
+            }
+          },
+          "metadata": {
+            "owner": "platform-security"
+          }
+        },
+        "snowflake": {
+          "canonical": "Snowflake",
+          "description": "Data warehouse system.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Snowflake",
+              "description": "Exact system name.",
+              "status": "active",
+              "priority": 50,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "query_data_owner",
+                "routing_key": "system.snowflake"
+              }
+            }
+          },
+          "metadata": {
+            "owner": "data-platform"
+          }
+        },
+        "github_enterprise": {
+          "canonical": "GitHub Enterprise",
+          "description": "Source-code and access-control system.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "GitHub Enterprise",
+              "description": "Exact system name.",
+              "status": "active",
+              "priority": 50,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "query_repo_ownership",
+                "routing_key": "system.github"
+              }
+            }
+          },
+          "metadata": {
+            "owner": "developer-platform"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "systems-inventory"
+      }
+    },
+    "data_boundary": {
+      "description": "Regulated data boundaries.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "eu_data_boundary": {
+          "canonical": "EU Data Boundary",
+          "description": "EU data residency boundary.",
+          "status": "active",
+          "patterns": {
+            "phrase": {
+              "kind": "literal",
+              "value": "EU data boundary",
+              "description": "Data boundary phrase.",
+              "status": "active",
+              "priority": 25,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "check_residency_requirement",
+                "routing_key": "privacy.boundary.eu"
+              }
+            }
+          },
+          "metadata": {
+            "residency": "eu"
+          }
+        },
+        "us_data_boundary": {
+          "canonical": "US Data Boundary",
+          "description": "US data residency boundary.",
+          "status": "active",
+          "patterns": {
+            "phrase": {
+              "kind": "literal",
+              "value": "US data boundary",
+              "description": "Data boundary phrase.",
+              "status": "active",
+              "priority": 25,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "check_residency_requirement",
+                "routing_key": "privacy.boundary.us"
+              }
+            }
+          },
+          "metadata": {
+            "residency": "us"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "privacy-engineering"
+      }
+    }
+  },
+  "metadata": {
+    "example_domain": "compliance operations",
+    "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations"
+  }
+}

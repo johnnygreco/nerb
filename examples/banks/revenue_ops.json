@@ -1,0 +1,342 @@
+{
+  "schema_version": "nerb.bank.v1",
+  "id": "revenue_ops_agent_cache",
+  "name": "Revenue Ops Agent Cache",
+  "description": "Customer, product, and commercial artifact entities for account-assistant workflows.",
+  "version": "2026.06.05",
+  "status": "active",
+  "created_at": "2026-06-05T00:00:00Z",
+  "updated_at": "2026-06-05T00:00:00Z",
+  "unicode_normalization": "none",
+  "default_regex_flags": [],
+  "entities": {
+    "account": {
+      "description": "Named customer accounts with CRM routing metadata.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "acme_renewables": {
+          "canonical": "Acme Renewables",
+          "description": "Strategic clean-energy account.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Acme Renewables",
+              "description": "Exact account name.",
+              "status": "active",
+              "priority": 40,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "open_account_workspace",
+                "crm_id": "acct_1007"
+              }
+            }
+          },
+          "metadata": {
+            "segment": "enterprise",
+            "owner": "camila"
+          }
+        },
+        "northstar_labs": {
+          "canonical": "Northstar Labs",
+          "description": "Expansion account.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Northstar Labs",
+              "description": "Exact account name.",
+              "status": "active",
+              "priority": 40,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "open_account_workspace",
+                "crm_id": "acct_2114"
+              }
+            }
+          },
+          "metadata": {
+            "segment": "mid_market",
+            "owner": "reid"
+          }
+        },
+        "meridian_freight": {
+          "canonical": "Meridian Freight",
+          "description": "Logistics account used in benchmark probes.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Meridian Freight",
+              "description": "Exact account name.",
+              "status": "active",
+              "priority": 40,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "open_account_workspace",
+                "crm_id": "acct_3450"
+              }
+            }
+          },
+          "metadata": {
+            "segment": "enterprise",
+            "owner": "samir"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "revenue-operations"
+      }
+    },
+    "product": {
+      "description": "Products that should trigger specialized playbooks.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "atlas_copilot": {
+          "canonical": "Atlas Copilot",
+          "description": "Agentic workflow product.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Atlas Copilot",
+              "description": "Exact product name.",
+              "status": "active",
+              "priority": 50,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "attach_solution_brief",
+                "product_area": "agent_workflows"
+              }
+            }
+          },
+          "metadata": {
+            "sku": "atlas-copilot"
+          }
+        },
+        "signal_api": {
+          "canonical": "Signal API",
+          "description": "Event-ingestion API.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Signal API",
+              "description": "Exact product name.",
+              "status": "active",
+              "priority": 50,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "attach_api_limits",
+                "product_area": "platform"
+              }
+            }
+          },
+          "metadata": {
+            "sku": "signal-api"
+          }
+        },
+        "drift_monitor": {
+          "canonical": "Drift Monitor",
+          "description": "Account telemetry and alerting product.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "Drift Monitor",
+              "description": "Exact product name.",
+              "status": "active",
+              "priority": 50,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "attach_health_dashboard",
+                "product_area": "customer_health"
+              }
+            }
+          },
+          "metadata": {
+            "sku": "drift-monitor"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "product-operations"
+      }
+    },
+    "commercial_artifact": {
+      "description": "Commercial workflow documents.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "qbr": {
+          "canonical": "Quarterly Business Review",
+          "description": "QBR identifier.",
+          "status": "active",
+          "patterns": {
+            "qbr_id": {
+              "kind": "regex",
+              "value": "\\bQBR-\\d{4}\\b",
+              "description": "QBR record ID.",
+              "status": "active",
+              "priority": 20,
+              "regex_flags": [],
+              "metadata": {
+                "benchmark_text": "QBR-7781",
+                "agent_action": "open_qbr_packet",
+                "routing_key": "revops.qbr"
+              }
+            }
+          },
+          "metadata": {
+            "cache_slot": "commercial.qbr_id"
+          }
+        },
+        "msa": {
+          "canonical": "Master Services Agreement",
+          "description": "MSA identifier.",
+          "status": "active",
+          "patterns": {
+            "msa_id": {
+              "kind": "regex",
+              "value": "\\bMSA-\\d{4}\\b",
+              "description": "MSA record ID.",
+              "status": "active",
+              "priority": 20,
+              "regex_flags": [],
+              "metadata": {
+                "benchmark_text": "MSA-2209",
+                "agent_action": "open_contract_record",
+                "routing_key": "revops.contract"
+              }
+            }
+          },
+          "metadata": {
+            "cache_slot": "commercial.msa_id"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "deal-desk"
+      }
+    },
+    "region": {
+      "description": "Sales and support regions.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "emea": {
+          "canonical": "EMEA",
+          "description": "Europe, Middle East, and Africa region.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "EMEA",
+              "description": "Exact region marker.",
+              "status": "active",
+              "priority": 60,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "route_regional_owner",
+                "routing_key": "region.emea"
+              }
+            }
+          },
+          "metadata": {
+            "owner": "lucia"
+          }
+        },
+        "north_america": {
+          "canonical": "North America",
+          "description": "North America region.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "North America",
+              "description": "Exact region marker.",
+              "status": "active",
+              "priority": 60,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "route_regional_owner",
+                "routing_key": "region.north_america"
+              }
+            }
+          },
+          "metadata": {
+            "owner": "arden"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "sales-operations"
+      }
+    },
+    "account_health": {
+      "description": "Account health language used by support agents.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "at_risk": {
+          "canonical": "At Risk",
+          "description": "At-risk account marker.",
+          "status": "active",
+          "patterns": {
+            "phrase": {
+              "kind": "literal",
+              "value": "at risk",
+              "description": "Account health phrase.",
+              "status": "active",
+              "priority": 25,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "agent_action": "raise_health_review",
+                "routing_key": "customer_health.risk"
+              }
+            }
+          },
+          "metadata": {
+            "cache_slot": "account.health"
+          }
+        }
+      },
+      "metadata": {
+        "owner": "customer-success"
+      }
+    }
+  },
+  "metadata": {
+    "example_domain": "revenue operations",
+    "agent_value": "turn account notes into deterministic CRM and playbook lookups"
+  }
+}

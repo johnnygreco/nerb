@@ -1,0 +1,192 @@
+{
+  "bank": {
+    "hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+    "id": "compliance_ops_agent_cache",
+    "schema_version": "nerb.bank.v1",
+    "version": "2026.06.05"
+  },
+  "engine": {
+    "cache": {
+      "enabled": true,
+      "hit": false,
+      "key": {
+        "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+        "canonical_engine": "rust-regex-meta",
+        "compile_options": {
+          "match_mode": "entity_independent"
+        },
+        "endian": "little",
+        "engine_name": "nerb_engine",
+        "engine_version": "0.0.6",
+        "platform": "macosx-11.0-arm64",
+        "pointer_width": 64,
+        "schema_version": 1,
+        "semantic_version": "0.0.6",
+        "target_triple": "darwin"
+      }
+    },
+    "name": "nerb_engine",
+    "version": "0.0.6"
+  },
+  "records": [
+    {
+      "canonical_name": "SOC 2",
+      "captures": {},
+      "end": 9,
+      "entity": "framework",
+      "entity_id": "framework",
+      "name_id": "soc_2",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 4,
+      "string": "SOC 2",
+      "surface_name": "SOC 2"
+    },
+    {
+      "canonical_name": "SOC 2 Control",
+      "captures": {},
+      "end": 15,
+      "entity": "control",
+      "entity_id": "control",
+      "name_id": "soc2_control",
+      "offset_unit": "byte",
+      "pattern_id": "cc_control",
+      "pattern_kind": "regex",
+      "start": 10,
+      "string": "CC6.1",
+      "surface_name": "cc_control"
+    },
+    {
+      "canonical_name": "ISO 27001",
+      "captures": {},
+      "end": 29,
+      "entity": "framework",
+      "entity_id": "framework",
+      "name_id": "iso_27001",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 20,
+      "string": "ISO 27001",
+      "surface_name": "ISO 27001"
+    },
+    {
+      "canonical_name": "ISO Control",
+      "captures": {},
+      "end": 36,
+      "entity": "control",
+      "entity_id": "control",
+      "name_id": "iso_control",
+      "offset_unit": "byte",
+      "pattern_id": "annex_control",
+      "pattern_kind": "regex",
+      "start": 30,
+      "string": "A.8.16",
+      "surface_name": "annex_control"
+    },
+    {
+      "canonical_name": "Evidence Pack",
+      "captures": {},
+      "end": 72,
+      "entity": "evidence",
+      "entity_id": "evidence",
+      "name_id": "evidence_pack",
+      "offset_unit": "byte",
+      "pattern_id": "pack_id",
+      "pattern_kind": "regex",
+      "start": 55,
+      "string": "evidence-pack-443",
+      "surface_name": "pack_id"
+    },
+    {
+      "canonical_name": "Vault",
+      "captures": {},
+      "end": 83,
+      "entity": "system",
+      "entity_id": "system",
+      "name_id": "vault",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 78,
+      "string": "Vault",
+      "surface_name": "Vault"
+    },
+    {
+      "canonical_name": "Access Review",
+      "captures": {},
+      "end": 117,
+      "entity": "evidence",
+      "entity_id": "evidence",
+      "name_id": "access_review",
+      "offset_unit": "byte",
+      "pattern_id": "review_id",
+      "pattern_kind": "regex",
+      "start": 96,
+      "string": "access-review-2026-05",
+      "surface_name": "review_id"
+    },
+    {
+      "canonical_name": "GitHub Enterprise",
+      "captures": {},
+      "end": 143,
+      "entity": "system",
+      "entity_id": "system",
+      "name_id": "github_enterprise",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 126,
+      "string": "GitHub Enterprise",
+      "surface_name": "GitHub Enterprise"
+    },
+    {
+      "canonical_name": "GDPR",
+      "captures": {},
+      "end": 159,
+      "entity": "framework",
+      "entity_id": "framework",
+      "name_id": "gdpr",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 155,
+      "string": "GDPR",
+      "surface_name": "GDPR"
+    },
+    {
+      "canonical_name": "Snowflake",
+      "captures": {},
+      "end": 183,
+      "entity": "system",
+      "entity_id": "system",
+      "name_id": "snowflake",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 174,
+      "string": "Snowflake",
+      "surface_name": "Snowflake"
+    },
+    {
+      "canonical_name": "EU Data Boundary",
+      "captures": {},
+      "end": 227,
+      "entity": "data_boundary",
+      "entity_id": "data_boundary",
+      "name_id": "eu_data_boundary",
+      "offset_unit": "byte",
+      "pattern_id": "phrase",
+      "pattern_kind": "literal",
+      "start": 211,
+      "string": "EU data boundary",
+      "surface_name": "EU data boundary"
+    }
+  ],
+  "source": {
+    "bytes": 228,
+    "length": 228,
+    "type": "text"
+  }
+}

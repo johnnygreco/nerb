@@ -1,0 +1,765 @@
+{
+  "bank": {
+    "hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+    "id": "compliance_ops_agent_cache",
+    "schema_version": "nerb.bank.v1",
+    "version": "2026.06.05"
+  },
+  "diagnostics": [],
+  "engine": {
+    "cache": {
+      "enabled": true,
+      "hit": true,
+      "key": {
+        "bank_hash": "sha256:7dbfe01e9c5ccbd06934e51bd6da52d7172a1e29400659ef476f23983f662e5f",
+        "canonical_engine": "rust-regex-meta",
+        "compile_options": {
+          "match_mode": "entity_independent"
+        },
+        "endian": "little",
+        "engine_name": "nerb_engine",
+        "engine_version": "0.0.6",
+        "platform": "macosx-11.0-arm64",
+        "pointer_width": 64,
+        "schema_version": 1,
+        "semantic_version": "0.0.6",
+        "target_triple": "darwin"
+      }
+    },
+    "name": "nerb_engine",
+    "version": "0.0.6"
+  },
+  "overlaps": [],
+  "records": [
+    {
+      "canonical_name": "SOC 2",
+      "captures": {},
+      "end": 9,
+      "entity": "framework",
+      "entity_id": "framework",
+      "name_id": "soc_2",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 4,
+      "string": "SOC 2",
+      "surface_name": "SOC 2"
+    },
+    {
+      "canonical_name": "SOC 2 Control",
+      "captures": {},
+      "end": 15,
+      "entity": "control",
+      "entity_id": "control",
+      "name_id": "soc2_control",
+      "offset_unit": "byte",
+      "pattern_id": "cc_control",
+      "pattern_kind": "regex",
+      "start": 10,
+      "string": "CC6.1",
+      "surface_name": "cc_control"
+    },
+    {
+      "canonical_name": "ISO 27001",
+      "captures": {},
+      "end": 29,
+      "entity": "framework",
+      "entity_id": "framework",
+      "name_id": "iso_27001",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 20,
+      "string": "ISO 27001",
+      "surface_name": "ISO 27001"
+    },
+    {
+      "canonical_name": "ISO Control",
+      "captures": {},
+      "end": 36,
+      "entity": "control",
+      "entity_id": "control",
+      "name_id": "iso_control",
+      "offset_unit": "byte",
+      "pattern_id": "annex_control",
+      "pattern_kind": "regex",
+      "start": 30,
+      "string": "A.8.16",
+      "surface_name": "annex_control"
+    },
+    {
+      "canonical_name": "Evidence Pack",
+      "captures": {},
+      "end": 72,
+      "entity": "evidence",
+      "entity_id": "evidence",
+      "name_id": "evidence_pack",
+      "offset_unit": "byte",
+      "pattern_id": "pack_id",
+      "pattern_kind": "regex",
+      "start": 55,
+      "string": "evidence-pack-443",
+      "surface_name": "pack_id"
+    },
+    {
+      "canonical_name": "Vault",
+      "captures": {},
+      "end": 83,
+      "entity": "system",
+      "entity_id": "system",
+      "name_id": "vault",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 78,
+      "string": "Vault",
+      "surface_name": "Vault"
+    },
+    {
+      "canonical_name": "Access Review",
+      "captures": {},
+      "end": 117,
+      "entity": "evidence",
+      "entity_id": "evidence",
+      "name_id": "access_review",
+      "offset_unit": "byte",
+      "pattern_id": "review_id",
+      "pattern_kind": "regex",
+      "start": 96,
+      "string": "access-review-2026-05",
+      "surface_name": "review_id"
+    },
+    {
+      "canonical_name": "GitHub Enterprise",
+      "captures": {},
+      "end": 143,
+      "entity": "system",
+      "entity_id": "system",
+      "name_id": "github_enterprise",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 126,
+      "string": "GitHub Enterprise",
+      "surface_name": "GitHub Enterprise"
+    },
+    {
+      "canonical_name": "GDPR",
+      "captures": {},
+      "end": 159,
+      "entity": "framework",
+      "entity_id": "framework",
+      "name_id": "gdpr",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 155,
+      "string": "GDPR",
+      "surface_name": "GDPR"
+    },
+    {
+      "canonical_name": "Snowflake",
+      "captures": {},
+      "end": 183,
+      "entity": "system",
+      "entity_id": "system",
+      "name_id": "snowflake",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 174,
+      "string": "Snowflake",
+      "surface_name": "Snowflake"
+    },
+    {
+      "canonical_name": "EU Data Boundary",
+      "captures": {},
+      "end": 227,
+      "entity": "data_boundary",
+      "entity_id": "data_boundary",
+      "name_id": "eu_data_boundary",
+      "offset_unit": "byte",
+      "pattern_id": "phrase",
+      "pattern_kind": "literal",
+      "start": 211,
+      "string": "EU data boundary",
+      "surface_name": "EU data boundary"
+    }
+  ],
+  "resolved_records": [
+    {
+      "context": {
+        "after": " CC6.1 and ISO 27001 A.8.16, the age",
+        "before": "For ",
+        "match": "SOC 2"
+      },
+      "explanation": {
+        "description": "Exact framework name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "compliance"
+          },
+          "name": {
+            "evidence_model": "trust-services"
+          },
+          "pattern": {
+            "agent_action": "load_audit_scope",
+            "routing_key": "audit.soc2"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/framework/names/soc_2/patterns/literal",
+        "pattern_value": "SOC 2",
+        "priority": 40
+      },
+      "record": {
+        "canonical_name": "SOC 2",
+        "captures": {},
+        "end": 9,
+        "entity": "framework",
+        "entity_id": "framework",
+        "name_id": "soc_2",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 4,
+        "string": "SOC 2",
+        "surface_name": "SOC 2"
+      }
+    },
+    {
+      "context": {
+        "after": " and ISO 27001 A.8.16, the agent pul",
+        "before": "For SOC 2 ",
+        "match": "CC6.1"
+      },
+      "explanation": {
+        "description": "SOC 2 CC control.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "control-library"
+          },
+          "name": {
+            "cache_slot": "audit.control"
+          },
+          "pattern": {
+            "agent_action": "link_control_owner",
+            "benchmark_text": "CC6.1",
+            "routing_key": "audit.control.soc2"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/control/names/soc2_control/patterns/cc_control",
+        "pattern_value": "\\bCC\\d+\\.\\d+\\b",
+        "priority": 20
+      },
+      "record": {
+        "canonical_name": "SOC 2 Control",
+        "captures": {},
+        "end": 15,
+        "entity": "control",
+        "entity_id": "control",
+        "name_id": "soc2_control",
+        "offset_unit": "byte",
+        "pattern_id": "cc_control",
+        "pattern_kind": "regex",
+        "start": 10,
+        "string": "CC6.1",
+        "surface_name": "cc_control"
+      }
+    },
+    {
+      "context": {
+        "after": " A.8.16, the agent pulled evidence-p",
+        "before": "For SOC 2 CC6.1 and ",
+        "match": "ISO 27001"
+      },
+      "explanation": {
+        "description": "Exact framework name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "compliance"
+          },
+          "name": {
+            "evidence_model": "isms"
+          },
+          "pattern": {
+            "agent_action": "load_audit_scope",
+            "routing_key": "audit.iso27001"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/framework/names/iso_27001/patterns/literal",
+        "pattern_value": "ISO 27001",
+        "priority": 40
+      },
+      "record": {
+        "canonical_name": "ISO 27001",
+        "captures": {},
+        "end": 29,
+        "entity": "framework",
+        "entity_id": "framework",
+        "name_id": "iso_27001",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 20,
+        "string": "ISO 27001",
+        "surface_name": "ISO 27001"
+      }
+    },
+    {
+      "context": {
+        "after": ", the agent pulled evidence-pack-443",
+        "before": "For SOC 2 CC6.1 and ISO 27001 ",
+        "match": "A.8.16"
+      },
+      "explanation": {
+        "description": "ISO Annex A control.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "control-library"
+          },
+          "name": {
+            "cache_slot": "audit.control"
+          },
+          "pattern": {
+            "agent_action": "link_control_owner",
+            "benchmark_text": "A.8.16",
+            "routing_key": "audit.control.iso"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/control/names/iso_control/patterns/annex_control",
+        "pattern_value": "\\bA\\.\\d+\\.\\d+\\b",
+        "priority": 20
+      },
+      "record": {
+        "canonical_name": "ISO Control",
+        "captures": {},
+        "end": 36,
+        "entity": "control",
+        "entity_id": "control",
+        "name_id": "iso_control",
+        "offset_unit": "byte",
+        "pattern_id": "annex_control",
+        "pattern_kind": "regex",
+        "start": 30,
+        "string": "A.8.16",
+        "surface_name": "annex_control"
+      }
+    },
+    {
+      "context": {
+        "after": " from Vault and matched access-revie",
+        "before": " ISO 27001 A.8.16, the agent pulled ",
+        "match": "evidence-pack-443"
+      },
+      "explanation": {
+        "description": "Evidence package ID.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "audit-operations"
+          },
+          "name": {
+            "retention": "audit_window"
+          },
+          "pattern": {
+            "agent_action": "open_evidence_pack",
+            "benchmark_text": "evidence-pack-443",
+            "routing_key": "evidence.pack"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/evidence/names/evidence_pack/patterns/pack_id",
+        "pattern_value": "\\bevidence-pack-\\d{3}\\b",
+        "priority": 30
+      },
+      "record": {
+        "canonical_name": "Evidence Pack",
+        "captures": {},
+        "end": 72,
+        "entity": "evidence",
+        "entity_id": "evidence",
+        "name_id": "evidence_pack",
+        "offset_unit": "byte",
+        "pattern_id": "pack_id",
+        "pattern_kind": "regex",
+        "start": 55,
+        "string": "evidence-pack-443",
+        "surface_name": "pack_id"
+      }
+    },
+    {
+      "context": {
+        "after": " and matched access-review-2026-05 a",
+        "before": "agent pulled evidence-pack-443 from ",
+        "match": "Vault"
+      },
+      "explanation": {
+        "description": "Exact system name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "systems-inventory"
+          },
+          "name": {
+            "owner": "platform-security"
+          },
+          "pattern": {
+            "agent_action": "query_system_owner",
+            "routing_key": "system.vault"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/system/names/vault/patterns/literal",
+        "pattern_value": "Vault",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Vault",
+        "captures": {},
+        "end": 83,
+        "entity": "system",
+        "entity_id": "system",
+        "name_id": "vault",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 78,
+        "string": "Vault",
+        "surface_name": "Vault"
+      }
+    },
+    {
+      "context": {
+        "after": " against GitHub Enterprise ownership",
+        "before": "nce-pack-443 from Vault and matched ",
+        "match": "access-review-2026-05"
+      },
+      "explanation": {
+        "description": "Access review artifact ID.",
+        "effective_regex_flags": [],
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "audit-operations"
+          },
+          "name": {
+            "retention": "audit_window"
+          },
+          "pattern": {
+            "agent_action": "open_access_review",
+            "benchmark_text": "access-review-2026-05",
+            "routing_key": "evidence.access_review"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "regex",
+        "pattern_path": "/entities/evidence/names/access_review/patterns/review_id",
+        "pattern_value": "\\baccess-review-\\d{4}-\\d{2}\\b",
+        "priority": 30
+      },
+      "record": {
+        "canonical_name": "Access Review",
+        "captures": {},
+        "end": 117,
+        "entity": "evidence",
+        "entity_id": "evidence",
+        "name_id": "access_review",
+        "offset_unit": "byte",
+        "pattern_id": "review_id",
+        "pattern_kind": "regex",
+        "start": 96,
+        "string": "access-review-2026-05",
+        "surface_name": "review_id"
+      }
+    },
+    {
+      "context": {
+        "after": " ownership. GDPR notes require Snowf",
+        "before": "tched access-review-2026-05 against ",
+        "match": "GitHub Enterprise"
+      },
+      "explanation": {
+        "description": "Exact system name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "systems-inventory"
+          },
+          "name": {
+            "owner": "developer-platform"
+          },
+          "pattern": {
+            "agent_action": "query_repo_ownership",
+            "routing_key": "system.github"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/system/names/github_enterprise/patterns/literal",
+        "pattern_value": "GitHub Enterprise",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "GitHub Enterprise",
+        "captures": {},
+        "end": 143,
+        "entity": "system",
+        "entity_id": "system",
+        "name_id": "github_enterprise",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 126,
+        "string": "GitHub Enterprise",
+        "surface_name": "GitHub Enterprise"
+      }
+    },
+    {
+      "context": {
+        "after": " notes require Snowflake exports to ",
+        "before": "gainst GitHub Enterprise ownership. ",
+        "match": "GDPR"
+      },
+      "explanation": {
+        "description": "Exact privacy framework name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "compliance"
+          },
+          "name": {
+            "evidence_model": "privacy"
+          },
+          "pattern": {
+            "agent_action": "load_privacy_requirements",
+            "routing_key": "privacy.gdpr"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/framework/names/gdpr/patterns/literal",
+        "pattern_value": "GDPR",
+        "priority": 40
+      },
+      "record": {
+        "canonical_name": "GDPR",
+        "captures": {},
+        "end": 159,
+        "entity": "framework",
+        "entity_id": "framework",
+        "name_id": "gdpr",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 155,
+        "string": "GDPR",
+        "surface_name": "GDPR"
+      }
+    },
+    {
+      "context": {
+        "after": " exports to stay inside the EU data ",
+        "before": "prise ownership. GDPR notes require ",
+        "match": "Snowflake"
+      },
+      "explanation": {
+        "description": "Exact system name.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "systems-inventory"
+          },
+          "name": {
+            "owner": "data-platform"
+          },
+          "pattern": {
+            "agent_action": "query_data_owner",
+            "routing_key": "system.snowflake"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/system/names/snowflake/patterns/literal",
+        "pattern_value": "Snowflake",
+        "priority": 50
+      },
+      "record": {
+        "canonical_name": "Snowflake",
+        "captures": {},
+        "end": 183,
+        "entity": "system",
+        "entity_id": "system",
+        "name_id": "snowflake",
+        "offset_unit": "byte",
+        "pattern_id": "literal",
+        "pattern_kind": "literal",
+        "start": 174,
+        "string": "Snowflake",
+        "surface_name": "Snowflake"
+      }
+    },
+    {
+      "context": {
+        "after": ".",
+        "before": "nowflake exports to stay inside the ",
+        "match": "EU data boundary"
+      },
+      "explanation": {
+        "description": "Data boundary phrase.",
+        "literal_settings": {
+          "case_sensitive": false,
+          "left_boundary": "word",
+          "normalize_whitespace": true,
+          "right_boundary": "word"
+        },
+        "metadata": {
+          "bank": {
+            "agent_value": "bind audit notes to validated controls, systems, and evidence with local citations",
+            "example_domain": "compliance operations"
+          },
+          "entity": {
+            "owner": "privacy-engineering"
+          },
+          "name": {
+            "residency": "eu"
+          },
+          "pattern": {
+            "agent_action": "check_residency_requirement",
+            "routing_key": "privacy.boundary.eu"
+          }
+        },
+        "normalization_mode": "none",
+        "pattern_kind": "literal",
+        "pattern_path": "/entities/data_boundary/names/eu_data_boundary/patterns/phrase",
+        "pattern_value": "EU data boundary",
+        "priority": 25
+      },
+      "record": {
+        "canonical_name": "EU Data Boundary",
+        "captures": {},
+        "end": 227,
+        "entity": "data_boundary",
+        "entity_id": "data_boundary",
+        "name_id": "eu_data_boundary",
+        "offset_unit": "byte",
+        "pattern_id": "phrase",
+        "pattern_kind": "literal",
+        "start": 211,
+        "string": "EU data boundary",
+        "surface_name": "EU data boundary"
+      }
+    }
+  ],
+  "source": {
+    "bytes": 228,
+    "length": 228,
+    "type": "text"
+  },
+  "summary": {
+    "entity_counts": {
+      "control": 2,
+      "data_boundary": 1,
+      "evidence": 2,
+      "framework": 3,
+      "system": 3
+    },
+    "name_counts": {
+      "control/iso_control": 1,
+      "control/soc2_control": 1,
+      "data_boundary/eu_data_boundary": 1,
+      "evidence/access_review": 1,
+      "evidence/evidence_pack": 1,
+      "framework/gdpr": 1,
+      "framework/iso_27001": 1,
+      "framework/soc_2": 1,
+      "system/github_enterprise": 1,
+      "system/snowflake": 1,
+      "system/vault": 1
+    },
+    "record_count": 11,
+    "resolved_record_count": 11
+  }
+}

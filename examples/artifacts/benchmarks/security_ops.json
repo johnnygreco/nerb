@@ -1,0 +1,367 @@
+{
+  "bank": {
+    "hash": "sha256:5855504d2c043573b810402ae0caa652ece30995a5402b6bf9bc057b69908d19",
+    "id": "security_ops_agent_cache",
+    "profile": {
+      "active_patterns": 8,
+      "literal_patterns": 4,
+      "profile": "mixed",
+      "regex_patterns": 4
+    },
+    "schema_version": "nerb.bank.v1",
+    "stats": {
+      "active_totals": {
+        "entities": 5,
+        "names": 8,
+        "patterns": 8
+      },
+      "by_kind": {
+        "literal": 4,
+        "regex": 4
+      },
+      "by_status": {
+        "active": {
+          "entities": 5,
+          "names": 8,
+          "patterns": 8
+        },
+        "deprecated": {
+          "entities": 0,
+          "names": 0,
+          "patterns": 0
+        },
+        "draft": {
+          "entities": 0,
+          "names": 0,
+          "patterns": 0
+        },
+        "inactive": {
+          "entities": 0,
+          "names": 0,
+          "patterns": 0
+        }
+      },
+      "totals": {
+        "entities": 5,
+        "names": 8,
+        "patterns": 8
+      }
+    },
+    "version": "2026.06.05"
+  },
+  "compile": {
+    "cache": {
+      "after_cold": {
+        "hits": 0,
+        "keys": [
+          {
+            "bank_hash": "sha256:d6f533974ce246f837c205ce37a6f43d01efddb0b66034dd6a34e04b9a201035",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        ],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 1,
+        "size": 1,
+        "source_key_count": 1
+      },
+      "after_reset": {
+        "hits": 0,
+        "keys": [],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 0,
+        "size": 0,
+        "source_key_count": 0
+      },
+      "after_warm": {
+        "hits": 1,
+        "keys": [
+          {
+            "bank_hash": "sha256:d6f533974ce246f837c205ce37a6f43d01efddb0b66034dd6a34e04b9a201035",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        ],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 1,
+        "size": 1,
+        "source_key_count": 1
+      },
+      "before_reset": {
+        "hits": 1,
+        "keys": [
+          {
+            "bank_hash": "sha256:d6f533974ce246f837c205ce37a6f43d01efddb0b66034dd6a34e04b9a201035",
+            "canonical_engine": "rust-regex-meta",
+            "compile_options": {
+              "match_mode": "entity_independent"
+            },
+            "endian": "little",
+            "engine_name": "nerb_engine",
+            "engine_version": "0.0.6",
+            "platform": "macosx-11.0-arm64",
+            "pointer_width": 64,
+            "schema_version": 1,
+            "semantic_version": "0.0.6",
+            "target_triple": "darwin"
+          }
+        ],
+        "max_entries": 128,
+        "max_source_keys": 256,
+        "misses": 1,
+        "size": 1,
+        "source_key_count": 1
+      },
+      "cold_hit": false,
+      "warm_hit": true
+    },
+    "cold_seconds": 0.002580209,
+    "warm_cache_lookup_seconds": 0.001383
+  },
+  "diagnostics": [
+    {
+      "code": "benchmark.regex_probes",
+      "message": "Benchmark used bounded regex probe diagnostics from validation.",
+      "metadata": {
+        "enabled": true,
+        "max_per_regex": 5
+      },
+      "path": "",
+      "severity": "info"
+    }
+  ],
+  "engine": {
+    "include_statuses": [
+      "active"
+    ],
+    "matchers": [
+      {
+        "entity_count": 5,
+        "match_mode": "entity_independent",
+        "name": "nerb_engine",
+        "pattern_count": 8,
+        "version": "0.0.6"
+      }
+    ],
+    "name": "nerb_engine",
+    "normalization": "none",
+    "version": "0.0.6"
+  },
+  "options": {
+    "benchmark_profile_id": null,
+    "iterations": 3,
+    "max_pattern_examples": 12,
+    "stress_multiplier": 4,
+    "validation_level": "standard"
+  },
+  "stages": {
+    "canonicalize": {
+      "seconds": 4.8541e-05
+    },
+    "compile_cache": {
+      "cache_hit_verified": true,
+      "cold_seconds": 0.002580209,
+      "exclusive": false,
+      "includes": [
+        "canonicalize",
+        "schema_validation",
+        "runtime_validation",
+        "cache_lookup",
+        "rust_bank_compile"
+      ],
+      "note": "Rust Bank compile timing is inclusive; do not sum it with sibling stage timings.",
+      "warm_cache_lookup_seconds": 0.001383
+    },
+    "document_prepare": {
+      "seconds_by_tier": {
+        "baseline": 7.5e-06,
+        "stress": 4.375e-06,
+        "target": 7.25e-06
+      },
+      "total_seconds": 1.9125e-05
+    },
+    "document_tier_resolution": {
+      "seconds": 3.1083e-05
+    },
+    "input_parse": {
+      "available": false,
+      "note": "benchmark_bank receives an already-loaded bank object.",
+      "seconds": null
+    },
+    "scan_project_sort": {
+      "seconds_by_tier": {
+        "baseline": 3.7375e-05,
+        "stress": 0.000179708,
+        "target": 9.3917e-05
+      },
+      "total_seconds": 0.000311
+    },
+    "validation": {
+      "seconds": 0.00274175
+    }
+  },
+  "summary": {
+    "benchmark_profile_id": null,
+    "cache_hit_verified": true,
+    "cold_compile_seconds": 0.002580209,
+    "document_count": 4,
+    "extraction_iterations": 3,
+    "profile": "mixed",
+    "record_count": 93,
+    "target_bytes_per_second": 22072678.108,
+    "target_documents_per_second": 63886.188,
+    "target_records_per_second": 766634.261,
+    "tier_count": 3
+  },
+  "tiers": {
+    "baseline": {
+      "bytes": 111,
+      "document_count": 1,
+      "documents": [
+        {
+          "document_id": "security_ops_baseline",
+          "record_count": 5,
+          "source": {
+            "bytes": 111,
+            "length": 111,
+            "type": "text"
+          }
+        }
+      ],
+      "documents_with_records": 1,
+      "iterations": 3,
+      "record_count": 5,
+      "record_count_stable": true,
+      "record_counts_by_run": [
+        5,
+        5,
+        5
+      ],
+      "size": {
+        "average_bytes": 111.0,
+        "max_bytes": 111,
+        "min_bytes": 111
+      },
+      "stages": {
+        "document_prepare_seconds": 7.5e-06,
+        "scan_project_sort_seconds": 3.7375e-05
+      },
+      "throughput": {
+        "bytes_per_second": 8909707.471,
+        "documents_per_second": 80267.635,
+        "records_per_second": 401338.174
+      },
+      "warm_extraction_seconds": 3.7375e-05
+    },
+    "stress": {
+      "bytes": 1847,
+      "document_count": 1,
+      "documents": [
+        {
+          "document_id": "security_ops_stress",
+          "record_count": 64,
+          "source": {
+            "bytes": 1847,
+            "length": 1847,
+            "type": "text"
+          }
+        }
+      ],
+      "documents_with_records": 1,
+      "iterations": 3,
+      "record_count": 64,
+      "record_count_stable": true,
+      "record_counts_by_run": [
+        64,
+        64,
+        64
+      ],
+      "size": {
+        "average_bytes": 1847.0,
+        "max_bytes": 1847,
+        "min_bytes": 1847
+      },
+      "stages": {
+        "document_prepare_seconds": 4.375e-06,
+        "scan_project_sort_seconds": 0.000179708
+      },
+      "throughput": {
+        "bytes_per_second": 30833351.196,
+        "documents_per_second": 16693.747,
+        "records_per_second": 1068399.825
+      },
+      "warm_extraction_seconds": 0.000179708
+    },
+    "target": {
+      "bytes": 691,
+      "document_count": 2,
+      "documents": [
+        {
+          "document_id": "security_ops_primary",
+          "record_count": 8,
+          "source": {
+            "bytes": 230,
+            "length": 230,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "security_ops_repeated",
+          "record_count": 16,
+          "source": {
+            "bytes": 461,
+            "length": 461,
+            "type": "text"
+          }
+        }
+      ],
+      "documents_with_records": 2,
+      "iterations": 3,
+      "record_count": 24,
+      "record_count_stable": true,
+      "record_counts_by_run": [
+        24,
+        24,
+        24
+      ],
+      "size": {
+        "average_bytes": 345.5,
+        "max_bytes": 461,
+        "min_bytes": 230
+      },
+      "stages": {
+        "document_prepare_seconds": 7.25e-06,
+        "scan_project_sort_seconds": 9.3917e-05
+      },
+      "throughput": {
+        "bytes_per_second": 22072678.108,
+        "documents_per_second": 63886.188,
+        "records_per_second": 766634.261
+      },
+      "warm_extraction_seconds": 9.3917e-05
+    }
+  }
+}

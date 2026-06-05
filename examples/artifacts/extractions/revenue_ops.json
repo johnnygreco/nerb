@@ -1,0 +1,164 @@
+{
+  "bank": {
+    "hash": "sha256:797b58fe6012d71271740a2436121e5cbfe273eb2a5a413a997ca79046915f9d",
+    "id": "revenue_ops_agent_cache",
+    "schema_version": "nerb.bank.v1",
+    "version": "2026.06.05"
+  },
+  "engine": {
+    "cache": {
+      "enabled": true,
+      "hit": false,
+      "key": {
+        "bank_hash": "sha256:797b58fe6012d71271740a2436121e5cbfe273eb2a5a413a997ca79046915f9d",
+        "canonical_engine": "rust-regex-meta",
+        "compile_options": {
+          "match_mode": "entity_independent"
+        },
+        "endian": "little",
+        "engine_name": "nerb_engine",
+        "engine_version": "0.0.6",
+        "platform": "macosx-11.0-arm64",
+        "pointer_width": 64,
+        "schema_version": 1,
+        "semantic_version": "0.0.6",
+        "target_triple": "darwin"
+      }
+    },
+    "name": "nerb_engine",
+    "version": "0.0.6"
+  },
+  "records": [
+    {
+      "canonical_name": "Quarterly Business Review",
+      "captures": {},
+      "end": 8,
+      "entity": "commercial_artifact",
+      "entity_id": "commercial_artifact",
+      "name_id": "qbr",
+      "offset_unit": "byte",
+      "pattern_id": "qbr_id",
+      "pattern_kind": "regex",
+      "start": 0,
+      "string": "QBR-7781",
+      "surface_name": "qbr_id"
+    },
+    {
+      "canonical_name": "Acme Renewables",
+      "captures": {},
+      "end": 29,
+      "entity": "account",
+      "entity_id": "account",
+      "name_id": "acme_renewables",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 14,
+      "string": "Acme Renewables",
+      "surface_name": "Acme Renewables"
+    },
+    {
+      "canonical_name": "Atlas Copilot",
+      "captures": {},
+      "end": 49,
+      "entity": "product",
+      "entity_id": "product",
+      "name_id": "atlas_copilot",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 36,
+      "string": "Atlas Copilot",
+      "surface_name": "Atlas Copilot"
+    },
+    {
+      "canonical_name": "Signal API",
+      "captures": {},
+      "end": 64,
+      "entity": "product",
+      "entity_id": "product",
+      "name_id": "signal_api",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 54,
+      "string": "Signal API",
+      "surface_name": "Signal API"
+    },
+    {
+      "canonical_name": "Master Services Agreement",
+      "captures": {},
+      "end": 84,
+      "entity": "commercial_artifact",
+      "entity_id": "commercial_artifact",
+      "name_id": "msa",
+      "offset_unit": "byte",
+      "pattern_id": "msa_id",
+      "pattern_kind": "regex",
+      "start": 76,
+      "string": "MSA-2209",
+      "surface_name": "msa_id"
+    },
+    {
+      "canonical_name": "Northstar Labs",
+      "captures": {},
+      "end": 108,
+      "entity": "account",
+      "entity_id": "account",
+      "name_id": "northstar_labs",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 94,
+      "string": "Northstar Labs",
+      "surface_name": "Northstar Labs"
+    },
+    {
+      "canonical_name": "At Risk",
+      "captures": {},
+      "end": 119,
+      "entity": "account_health",
+      "entity_id": "account_health",
+      "name_id": "at_risk",
+      "offset_unit": "byte",
+      "pattern_id": "phrase",
+      "pattern_kind": "literal",
+      "start": 112,
+      "string": "at risk",
+      "surface_name": "at risk"
+    },
+    {
+      "canonical_name": "EMEA",
+      "captures": {},
+      "end": 127,
+      "entity": "region",
+      "entity_id": "region",
+      "name_id": "emea",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 123,
+      "string": "EMEA",
+      "surface_name": "EMEA"
+    },
+    {
+      "canonical_name": "Drift Monitor",
+      "captures": {},
+      "end": 149,
+      "entity": "product",
+      "entity_id": "product",
+      "name_id": "drift_monitor",
+      "offset_unit": "byte",
+      "pattern_id": "literal",
+      "pattern_kind": "literal",
+      "start": 136,
+      "string": "Drift Monitor",
+      "surface_name": "Drift Monitor"
+    }
+  ],
+  "source": {
+    "bytes": 191,
+    "length": 191,
+    "type": "text"
+  }
+}
