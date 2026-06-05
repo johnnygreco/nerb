@@ -213,7 +213,7 @@ jobs:
       - wheel-install-smoke
     runs-on: ubuntu-latest
     environment:
-      name: pypi
+      name: release
       url: https://pypi.org/project/nerb/
     permissions:
       contents: read

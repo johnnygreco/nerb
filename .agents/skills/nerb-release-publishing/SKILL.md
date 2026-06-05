@@ -42,7 +42,7 @@ Do not run publish targets unless the user explicitly asks for a publish operati
 
 - Keep `pyproject.toml` version and `src/nerb/__init__.py` `__version__` aligned.
 - Keep release docs and workflow names in sync.
-- Preserve the trusted-publisher setup: owner `johnnygreco`, repository `nerb`, workflow `publish.yml`, environment `pypi`.
+- Preserve the trusted-publisher setup: owner `johnnygreco`, repository `nerb`, workflow `publish.yml`, environment `release`.
 - Prefer `make build` for local distribution validation; it runs `uv build --clear` and strict `twine check`.
 - Keep CI PR-safe. Publishing should remain release-triggered or manually dispatched, not run on pull requests.
 

@@ -9,7 +9,7 @@ Configure a PyPI trusted publisher for the `nerb` project:
 - Owner: `johnnygreco`
 - Repository: `nerb`
 - Workflow filename: `publish.yml`
-- Environment name: `pypi`
+- Environment name: `release`
 
 The workflow uses GitHub OIDC with `id-token: write` and does not require a PyPI API token secret.
 
