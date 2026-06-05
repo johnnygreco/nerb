@@ -55,7 +55,7 @@ make build
 
 ## Development Rules
 
-- During the Rust engine migration, treat the Rust-backed `Bank` API as the target. Do not add shims for current Python regex-builder callers unless an active issue explicitly requires one.
+- During the Rust engine migration, treat the Rust-backed `Bank` API as the target. Do not add shims for removed Python regex-builder callers unless an active issue explicitly requires one.
 - Put shared behavior in `config.py`, `engine.py`, `engines.py`, `extraction.py`, `records.py`, or the existing bank/report
   helpers; have CLI and MCP code call those helpers instead of reimplementing parsing, validation, scanning, or
   serialization.

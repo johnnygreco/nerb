@@ -57,6 +57,7 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
+from .validation import rust_empty_match_diagnostics
 from .validation import validate_bank as _validate_bank
 
 COMMAND_ERROR_EXIT_CODE = 1
@@ -597,13 +598,17 @@ def _compile_config_bank(
     word_boundaries: bool,
 ) -> Bank:
     try:
-        return Bank.from_config(
+        bank = Bank.from_config(
             pattern_config,
             selected_entity=selected_entity,
             word_boundaries=word_boundaries,
         )
     except ValueError as exc:
         _exit_error(f"Could not compile detectors with the Rust engine: {exc}")
+    diagnostics = rust_empty_match_diagnostics(bank)
+    if diagnostics:
+        _exit_error(f"Could not compile detectors with the Rust engine: {diagnostics[0]['message']}")
+    return bank
 
 
 def _scan_records(bank: Bank, source: str | bytes) -> list[dict[str, Any]]:
@@ -947,7 +952,10 @@ def _diagnose_compiled_entities(pattern_config: PatternConfig) -> list[dict[str,
     diagnostics: list[dict[str, Any]] = []
     for entity, entity_config in pattern_config.items():
         try:
-            Bank.from_config({entity: entity_config})
+            bank = Bank.from_config({entity: entity_config})
+            empty_diagnostics = rust_empty_match_diagnostics(bank)
+            if empty_diagnostics:
+                raise ValueError(empty_diagnostics[0]["message"])
         except ValueError as exc:
             diagnostics.append(
                 _diagnostic(

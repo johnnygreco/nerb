@@ -67,6 +67,7 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
+from .validation import rust_empty_match_diagnostics
 from .validation import validate_bank as _validate_bank
 
 Transport = Literal["stdio", "sse", "streamable-http"]
@@ -378,13 +379,17 @@ def _compile_config_bank(
     word_boundaries: bool,
 ) -> Bank:
     try:
-        return Bank.from_config(
+        bank = Bank.from_config(
             pattern_config,
             selected_entity=selected_entity,
             word_boundaries=word_boundaries,
         )
     except ValueError as exc:
         _raise_tool_error(f"Could not compile detectors with the Rust engine: {exc}")
+    diagnostics = rust_empty_match_diagnostics(bank)
+    if diagnostics:
+        _raise_tool_error(f"Could not compile detectors with the Rust engine: {diagnostics[0]['message']}")
+    return bank
 
 
 def _scan_records(bank: Bank, source: str | bytes) -> list[dict[str, Any]]:

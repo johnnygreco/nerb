@@ -525,6 +525,17 @@ def test_mcp_validate_config_rejects_zero_width_regex(tmp_path):
     assert "zero-length match" in str(error.value)
 
 
+def test_mcp_config_extraction_rejects_zero_width_regex(tmp_path):
+    config_path = tmp_path / "zero-width.yaml"
+    config_path.write_text("ARTIST:\n  Boundary: '" + r"\b" + "'\n", encoding="utf-8")
+
+    with pytest.raises(ToolError) as error:
+        extract_entity(str(config_path), "ARTIST", text="abc")
+
+    assert "Could not compile detectors with the Rust engine" in str(error.value)
+    assert "zero-length match" in str(error.value)
+
+
 def test_mcp_tools_report_invalid_inline_detector_definitions():
     with pytest.raises(ToolError) as invalid_inline_error:
         extract_inline({"ARTIST": {"_flags": "IGNORECASE"}}, text="Rush")
