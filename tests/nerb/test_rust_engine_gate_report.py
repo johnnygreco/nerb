@@ -56,7 +56,11 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
         "memory": True,
         "mode_strategy": True,
     }
-    assert report["overall"]["external_required_sections"] == ["conformance", "distribution"]
+    assert report["overall"]["external_required_sections"] == [
+        "conformance",
+        "distribution",
+        "bank_owner_cardinality",
+    ]
     assert report["conformance"]["passed"] is None
     assert report["conformance"]["included_in_overall"] is False
     assert report["performance"]["passed"] is True
@@ -66,25 +70,32 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["distribution"]["included_in_overall"] is False
     assert report["distribution"]["checked_by"] == "make build and GitHub Actions wheel matrix external validation"
     assert "CPython 3.10-3.14 wheels" in report["distribution"]["supported_strategy"]
+    assert report["bank_owner_cardinality"]["passed"] is None
+    assert report["bank_owner_cardinality"]["included_in_overall"] is False
     assert report["mode_strategy"]["decision"] == "entity_independent remains the production default"
     assert report["mode_strategy"]["dense_probe"]["all_overlaps_reconstructed_matches_entity_independent"] is True
-    assert report["mode_strategy"]["entity_cardinality_sweep"]["entity_counts"] == [2, 8, 32]
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["validated_entity_count_ceiling"] == 64
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["entity_counts"] == [2, 8, 32, 64]
     assert report["mode_strategy"]["entity_cardinality_sweep"]["performance"]["criteria"] == {
-        "max_entity_independent_scan_seconds_under_ceiling": True,
-        "entity_independent_scaling_ratio_under_ceiling": True,
-        "routine_32_entity_independent_scan_seconds_under_ceiling": True,
-        "routine_32_to_2_entity_scan_seconds_ratio_under_ceiling": True,
+        "max_dense_entity_independent_scan_seconds_under_ceiling": True,
+        "dense_entity_independent_scaling_ratio_under_ceiling": True,
+        "routine_max_entity_independent_scan_seconds_under_ceiling": True,
+        "routine_max_to_2_entity_scan_seconds_ratio_under_ceiling": True,
     }
     assert [case["entity_count"] for case in report["mode_strategy"]["entity_cardinality_sweep"]["dense_cases"]] == [
         2,
         8,
         32,
+        64,
     ]
     assert [
         case["document_bytes"] for case in report["mode_strategy"]["entity_cardinality_sweep"]["routine_size_cases"]
     ] == [10_000, 10_000]
     assert report["performance"]["literal_heavy"]["native_public_records_equal"] is True
     assert report["performance"]["regex_heavy"]["native_public_records_equal"] is True
+    assert report["performance"]["mixed"]["native_public_records_equal"] is True
+    assert report["performance"]["corpus_size"]["text_bytes"] == [10_000]
+    assert report["performance"]["corpus_size"]["passed"] is True
     assert "source_parse_jsonl" in report["performance"]["small_bank_floor"]["measurements"]
     assert report["performance"]["small_bank_floor"]["criteria"]["native_public_records_equal"] is True
     assert report["performance"]["small_bank_floor"]["criteria"]["rust_scan_project_under_ceiling"] is True
@@ -145,7 +156,7 @@ def test_entity_cardinality_sweep_fails_when_routine_case_fails(monkeypatch):
         return {
             "entity_count": entity_count,
             "document_bytes": target_bytes,
-            "passed": entity_count != 32,
+            "passed": entity_count != 64,
             "entity_independent": _measurement(seconds=0.001),
         }
 
@@ -201,6 +212,21 @@ def test_external_required_sections_are_excluded_from_overall_pass():
         "included_sections": {"performance": True, "memory": True, "mode_strategy": True},
         "external_required_sections": ["conformance", "distribution"],
     }
+
+
+def test_bank_owner_cardinality_report_fails_when_growth_exceeds_validated_range():
+    gate_report = _load_gate_report_module()
+
+    report = gate_report._bank_owner_cardinality_report(
+        entity_count=24,
+        growth_entity_count=128,
+        note="test signoff",
+    )
+
+    assert report["included_in_overall"] is True
+    assert report["passed"] is False
+    assert report["criteria"]["current_entity_count_within_validated_range"] is True
+    assert report["criteria"]["growth_entity_count_within_validated_range"] is False
 
 
 def test_gate_report_cli_exits_nonzero_when_measured_gate_fails():

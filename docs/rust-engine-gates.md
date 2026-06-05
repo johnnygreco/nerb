@@ -1,7 +1,7 @@
 # Rust Engine Gate Evidence
 
-Recorded on 2026-06-05 from branch `goal/rust-engine-slice-10-conformance-benchmark-gates`, then updated by
-slice 11 after the Rust-backed `Bank` surface became the extraction path.
+Recorded on 2026-06-05 from the Rust engine migration branches, then updated by the final gate follow-up after the
+Rust-backed `Bank` surface, wheel matrix, and record contract follow-ups merged.
 
 ## Gate Command
 
@@ -11,12 +11,13 @@ The reproducible local report command is:
 uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 100000 --dense-bytes 512
 ```
 
-The report emits JSON with conformance, performance, dense-memory, mode-strategy, and distribution sections. The report
-only includes sections it measures directly in `overall.passed`: performance, dense memory, and mode strategy.
-Conformance and distribution are marked `external_required` and must be proven by the PR validation commands.
+The report emits JSON with conformance, performance, dense-memory, mode-strategy, distribution, and bank-owner
+cardinality sections. The report only includes sections it measures directly in `overall.passed`: performance, dense
+memory, and mode strategy. Conformance, distribution, and bank-owner cardinality are marked `external_required` unless
+the bank-owner entity-count flags are provided, and must be proven by the PR validation commands or recorded signoff.
 
-Routine local target documents are 100 KB and exercise small-bank, literal-heavy, regex-heavy, dense-overlap, memory,
-cache, projection, and output behavior.
+Routine local target documents are 100 KB and exercise small-bank, literal-heavy, regex-heavy, mixed-bank,
+corpus-size, dense-overlap, memory, cache, projection, and output behavior.
 
 Larger 1 MB evidence was recorded with:
 
@@ -25,6 +26,18 @@ timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --t
 ```
 
 The single-iteration 1 MB report passed under the cap. A five-iteration 1 MB report is not a routine local gate.
+
+When the bank-owner current and expected-growth entity counts are available, add them to the same command:
+
+```shell
+uv run python scripts/rust_engine_gate_report.py --iterations 5 --target-bytes 100000 --dense-bytes 512 \
+  --bank-owner-entity-count <current-count> \
+  --bank-owner-growth-entity-count <expected-growth-count> \
+  --bank-owner-note "<source>"
+```
+
+The bank-owner section passes only when both counts are recorded and both are within the validated 64-entity synthetic
+range. Counts above that range require a new mode-strategy issue before changing the production default.
 
 ## Conformance
 
@@ -56,8 +69,9 @@ Pass criteria for each workload:
 - Rust `entity_independent` raw-scan and scan/project timings stay under checked-in ceilings, and Rust scan/project
   throughput stays above checked-in floors:
   - small-bank floor: `entity_independent` scan/project <= 0.01s, raw scan <= 0.005s, scan/project >= 1 MB/s;
-  - literal-heavy and regex-heavy: `entity_independent` scan/project <= 0.05s, raw scan <= 0.02s,
+  - literal-heavy, regex-heavy, and mixed: `entity_independent` scan/project <= 0.05s, raw scan <= 0.02s,
     scan/project >= 5 MB/s.
+  - corpus-size mixed-bank scaling: scan/project >= 5 MB/s for the 10 KB floor and configured target bytes.
 
 Stage coverage:
 
@@ -71,8 +85,8 @@ Stage coverage:
 - `rust_entity_independent_scan_project`: Rust raw scan plus public wrapper record projection.
 - `json_output`: JSON serialization of already projected Rust records.
 
-Routine report, 5 iterations. `--target-bytes` applies to the literal-heavy and regex-heavy workloads; the small-bank
-floor is intentionally fixed at 10 KB.
+Routine report, 5 iterations. `--target-bytes` applies to the literal-heavy, regex-heavy, mixed, and configured-size
+mixed corpus-size workloads; the small-bank floor and the corpus-size floor are intentionally fixed at 10 KB.
 
 The report emits one object per workload with `native_public_records_equal`, `measurements`, `criteria`, and
 `rust_scan_project_bytes_per_second`. The JSON report is the authority for exact timings.
@@ -81,8 +95,21 @@ Larger 1 MB report, 1 iteration:
 
 The 1 MB report uses the same fields as the routine report.
 
-The literal-heavy and regex-heavy gates pass independently. Both preserve the planned records, have stable counts, and
-stay inside the Rust timing and throughput thresholds. The small-bank floor also remains inside the checked-in floor.
+The literal-heavy, regex-heavy, and mixed gates pass independently. All preserve the planned records, have stable counts,
+and stay inside the Rust timing and throughput thresholds. The small-bank floor also remains inside the checked-in floor.
+
+Routine 100 KB report, 5 iterations, final gate update:
+
+| Workload | Text bytes | Records | Scan/project median | Scan/project throughput |
+| --- | ---: | ---: | ---: | ---: |
+| small-bank floor | 10,000 | 870 | 0.000643s | 15.6 MB/s |
+| literal-heavy | 100,000 | 96 | 0.000648s | 154.3 MB/s |
+| regex-heavy | 100,000 | 75 | 0.000211s | 473.9 MB/s |
+| mixed | 100,000 | 181 | 0.000660s | 151.5 MB/s |
+
+The mixed-bank corpus-size section measured the same mixed workload at 10 KB and 100 KB. Both cases passed the stable
+count and 5 MB/s throughput floor. The 1 MB evidence command measured the mixed corpus case at 1,000,000 bytes,
+0.002472s scan/project median, 1,805 records, and 404.5 MB/s scan/project throughput.
 
 ## Dense Memory And Mode Strategy
 
@@ -102,35 +129,38 @@ valid cross-entity overlap.
 The dense memory probe runs in an isolated child process before the parent performs mode scans. It gates on stable raw
 match count, raw count below the `MatchBuffer` pre-scan capacity cap of 1,000,000, `MatchBuffer` capacity below that same
 cap, max-RSS growth under a 64 MiB budget, and absolute child max-RSS under a 256 MiB budget. The routine report measured
-31,776 raw matches, `MatchBuffer` capacity 32,768, absolute child max-RSS 58,508 KiB, and max-RSS growth 0 KiB. The
+31,776 raw matches, `MatchBuffer` capacity 32,768, absolute child max-RSS 57,432 KiB, and max-RSS growth 0 KiB. The
 capacity value is the direct materialized-output allocation evidence; the RSS fields bound the isolated child process.
 
-Synthetic entity-cardinality sweep: 8 dense prefix detectors per entity over 256 bytes.
+Synthetic entity-cardinality sweep: 8 dense prefix detectors per entity over 256 bytes. The final checked-in ceiling is
+64 entities, which keeps the default mode inside the plan's order-tens assumption.
 
 | Entities | Patterns | `entity_independent` | `all_overlaps` raw | `global_leftmost` | Raw/Entity Ratio |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 2 | 16 | 64 | 4,040 | 32 | 63.125x |
 | 8 | 64 | 256 | 16,160 | 32 | 63.125x |
 | 32 | 256 | 1,024 | 64,640 | 32 | 63.125x |
+| 64 | 512 | 2,048 | 129,280 | 32 | 63.125x |
 
 The sweep also gates order-tens performance in two ways:
 
-- Dense 256-byte semantic probe: the 32-entity `entity_independent` raw scan must remain under 0.01s and the 32-to-2
-  entity scan-time ratio must remain under 40x. The routine report measured 0.000248s for the 32-entity scan and a
-  16.533x 32-to-2 ratio.
-- Routine-size sparse no-match probe: 2-entity and 32-entity banks scan the configured target bytes, avoiding
-  `all_overlaps` output amplification while bounding `entity_independent` entity/document scaling. The 32-entity
-  `entity_independent` scan must remain under 0.05s and the 32-to-2 `entity_independent` ratio under 40x. The routine
-  100 KB report measured 0.000115s for the 32-entity scan and a 10.455x ratio. The 1 MB evidence measured 0.001338s and
-  a 12.164x ratio.
+- Dense 256-byte semantic probe: the max-entity `entity_independent` raw scan must remain under 0.01s and the
+  max-to-2 entity scan-time ratio must remain under 80x. The routine report measured 0.000341s for the 64-entity scan
+  and a 30.1x max-to-2 ratio.
+- Routine-size sparse no-match probe: 2-entity and 64-entity banks scan the configured target bytes, avoiding
+  `all_overlaps` output amplification while bounding `entity_independent` entity/document scaling. The 64-entity
+  `entity_independent` scan must remain under 0.05s and the max-to-2 `entity_independent` ratio under 80x. The routine
+  100 KB report measured 0.000439s for the 64-entity scan and a 43.9x ratio. The 1 MB evidence measured a
+  26.11x routine max-to-2 ratio.
 
 Mode decision: keep `entity_independent` as the production default for the current Rust engine path and the synthetic
 order-tens entity-cardinality evidence above. `all_overlaps` remains a measured prototype and `global_leftmost` remains
 an internal benchmark baseline.
 
-The real bank-owner entity-cardinality target is still not recorded in this repository. It must be captured before final
-engine cleanup; if expected entity classes exceed the order-tens range validated here, open a new issue before changing
-the default mode strategy.
+The real bank-owner entity-cardinality target is still not recorded in this repository. Issue #73 records the pending
+input request. Final goal completion requires either recording current and expected-growth entity counts with the report
+flags above or explicitly accepting the missing signoff as a known risk. If expected entity classes exceed the
+64-entity range validated here, open a new mode-strategy issue before changing the default mode strategy.
 
 ## Distribution
 
