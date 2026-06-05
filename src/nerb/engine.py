@@ -2,22 +2,81 @@ from __future__ import annotations
 
 import importlib
 import json
+import sys
+import sysconfig
 from collections.abc import Mapping
+from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
+from threading import RLock
 from typing import Any, Literal
 
 from .config import FLAGS_KEY, PatternConfig
 
 OffsetUnit = Literal["byte", "char"]
 
-__all__ = ["Bank"]
+__all__ = ["Bank", "BankCacheKey", "bank_cache_info", "clear_bank_cache"]
+
+
+@dataclass(frozen=True)
+class BankCacheKey:
+    bank_hash: str
+    schema_version: int
+    semantic_version: str
+    engine_name: str
+    engine_version: str
+    canonical_engine: str
+    compile_options_json: str
+    target_triple: str
+    platform: str
+    pointer_width: int
+    endian: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "bank_hash": self.bank_hash,
+            "schema_version": self.schema_version,
+            "semantic_version": self.semantic_version,
+            "engine_name": self.engine_name,
+            "engine_version": self.engine_version,
+            "canonical_engine": self.canonical_engine,
+            "compile_options": json.loads(self.compile_options_json),
+            "target_triple": self.target_triple,
+            "platform": self.platform,
+            "pointer_width": self.pointer_width,
+            "endian": self.endian,
+        }
+
+
+@dataclass(frozen=True)
+class _BankSourceCacheKey:
+    source_sha256: str
+    source_size: int
+    format_hint: str | None
+    compile_options_json: str
+    semantic_version: str
+    engine_name: str
+    engine_version: str
+    target_triple: str
+    platform: str
+    pointer_width: int
+    endian: str
+
+
+_BANK_CACHE_LOCK = RLock()
+_BANK_CACHE: dict[BankCacheKey, Any] = {}
+_SOURCE_CACHE_KEYS: dict[_BankSourceCacheKey, BankCacheKey] = {}
+_CACHE_HITS = 0
+_CACHE_MISSES = 0
 
 
 class Bank:
     """High-level Python wrapper around the native Rust NERB bank."""
 
-    def __init__(self, native_bank: Any) -> None:
+    def __init__(self, native_bank: Any, *, cache_key: BankCacheKey | None = None, cache_hit: bool = False) -> None:
         self._native = native_bank
+        self._cache_key = cache_key
+        self._cache_hit = cache_hit
 
     @classmethod
     def from_source_bytes(
@@ -26,22 +85,67 @@ class Bank:
         *,
         format_hint: str | None = None,
         compile_options_json: str | None = None,
+        use_cache: bool = True,
     ) -> Bank:
         native_engine = importlib.import_module("nerb._engine")
+        source_bytes = bytes(source)
+        normalized_options = _canonical_compile_options_json(compile_options_json)
+        native_options = None if normalized_options == "{}" else normalized_options
 
-        return cls(
-            native_engine.Bank.from_source_bytes(
-                source,
+        if not use_cache:
+            native_bank = native_engine.Bank.from_source_bytes(
+                source_bytes,
                 format_hint=format_hint,
-                compile_options_json=compile_options_json,
+                compile_options_json=native_options,
             )
+            return cls(native_bank)
+
+        source_key = _source_cache_key(
+            native_engine,
+            source_bytes,
+            format_hint=format_hint,
+            compile_options_json=normalized_options,
         )
+        with _BANK_CACHE_LOCK:
+            cached_key = _SOURCE_CACHE_KEYS.get(source_key)
+            if cached_key is not None:
+                cached_bank = _BANK_CACHE.get(cached_key)
+                if cached_bank is not None:
+                    _record_cache_hit()
+                    return cls(cached_bank, cache_key=cached_key, cache_hit=True)
+
+        native_bank = native_engine.Bank.from_source_bytes(
+            source_bytes,
+            format_hint=format_hint,
+            compile_options_json=native_options,
+        )
+        cache_key = _cache_key_from_metadata(native_engine, native_bank.metadata())
+        with _BANK_CACHE_LOCK:
+            cached_bank = _BANK_CACHE.get(cache_key)
+            if cached_bank is not None:
+                _SOURCE_CACHE_KEYS[source_key] = cache_key
+                _record_cache_hit()
+                return cls(cached_bank, cache_key=cache_key, cache_hit=True)
+
+            _BANK_CACHE[cache_key] = native_bank
+            _SOURCE_CACHE_KEYS[source_key] = cache_key
+            _record_cache_miss()
+        return cls(native_bank, cache_key=cache_key, cache_hit=False)
 
     @classmethod
-    def from_canonical_json_bytes(cls, source: bytes, *, compile_options_json: str | None = None) -> Bank:
-        native_engine = importlib.import_module("nerb._engine")
-
-        return cls(native_engine.Bank.from_canonical_json_bytes(source, compile_options_json=compile_options_json))
+    def from_canonical_json_bytes(
+        cls,
+        source: bytes,
+        *,
+        compile_options_json: str | None = None,
+        use_cache: bool = True,
+    ) -> Bank:
+        return cls.from_source_bytes(
+            source,
+            format_hint="canonical_json",
+            compile_options_json=compile_options_json,
+            use_cache=use_cache,
+        )
 
     @classmethod
     def from_path(
@@ -50,12 +154,14 @@ class Bank:
         *,
         format_hint: str | None = None,
         compile_options_json: str | None = None,
+        use_cache: bool = True,
     ) -> Bank:
         source_path = Path(path).expanduser()
         return cls.from_source_bytes(
             source_path.read_bytes(),
             format_hint=format_hint,
             compile_options_json=compile_options_json,
+            use_cache=use_cache,
         )
 
     @classmethod
@@ -66,13 +172,26 @@ class Bank:
         selected_entity: str | None = None,
         word_boundaries: bool = False,
         compile_options_json: str | None = None,
+        use_cache: bool = True,
     ) -> Bank:
         source = _config_to_jsonl_source(
             pattern_config,
             selected_entity=selected_entity,
         )
         compile_options_json = _compile_options_with_word_boundaries(compile_options_json, word_boundaries)
-        return cls.from_source_bytes(source, format_hint="jsonl", compile_options_json=compile_options_json)
+        return cls.from_source_bytes(
+            source,
+            format_hint="jsonl",
+            compile_options_json=compile_options_json,
+            use_cache=use_cache,
+        )
+
+    def cache_metadata(self) -> dict[str, Any]:
+        return {
+            "enabled": self._cache_key is not None,
+            "hit": self._cache_hit,
+            "key": self._cache_key.to_dict() if self._cache_key is not None else None,
+        }
 
     def to_canonical_json_bytes(self) -> bytes:
         return self._native.to_canonical_json_bytes()
@@ -101,6 +220,103 @@ class Bank:
     def scan_path(self, path: str | Path) -> list[dict[str, Any]]:
         source_path = Path(path).expanduser()
         return self.scan_bytes(source_path.read_bytes())
+
+
+def clear_bank_cache() -> None:
+    global _CACHE_HITS, _CACHE_MISSES
+    with _BANK_CACHE_LOCK:
+        _BANK_CACHE.clear()
+        _SOURCE_CACHE_KEYS.clear()
+        _CACHE_HITS = 0
+        _CACHE_MISSES = 0
+
+
+def bank_cache_info() -> dict[str, Any]:
+    with _BANK_CACHE_LOCK:
+        return {
+            "size": len(_BANK_CACHE),
+            "source_key_count": len(_SOURCE_CACHE_KEYS),
+            "hits": _CACHE_HITS,
+            "misses": _CACHE_MISSES,
+            "keys": [key.to_dict() for key in _BANK_CACHE],
+        }
+
+
+def _record_cache_hit() -> None:
+    global _CACHE_HITS
+    _CACHE_HITS += 1
+
+
+def _record_cache_miss() -> None:
+    global _CACHE_MISSES
+    _CACHE_MISSES += 1
+
+
+def _source_cache_key(
+    native_engine: Any,
+    source: bytes,
+    *,
+    format_hint: str | None,
+    compile_options_json: str,
+) -> _BankSourceCacheKey:
+    return _BankSourceCacheKey(
+        source_sha256=sha256(source).hexdigest(),
+        source_size=len(source),
+        format_hint=_normalize_format_hint(format_hint),
+        compile_options_json=compile_options_json,
+        semantic_version=str(native_engine.__version__),
+        engine_name=str(native_engine.ENGINE_NAME),
+        engine_version=str(native_engine.__version__),
+        target_triple=_target_triple(),
+        platform=sysconfig.get_platform(),
+        pointer_width=_pointer_width(),
+        endian=sys.byteorder,
+    )
+
+
+def _cache_key_from_metadata(native_engine: Any, metadata: Mapping[str, Any]) -> BankCacheKey:
+    defaults = dict(metadata["defaults"])
+    compile_options = dict(metadata["compile_options"])
+    return BankCacheKey(
+        bank_hash=str(metadata["bank_hash"]),
+        schema_version=int(metadata["schema"]),
+        semantic_version=str(native_engine.__version__),
+        engine_name=str(native_engine.ENGINE_NAME),
+        engine_version=str(native_engine.__version__),
+        canonical_engine=str(defaults["engine"]),
+        compile_options_json=json.dumps(compile_options, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+        target_triple=_target_triple(),
+        platform=sysconfig.get_platform(),
+        pointer_width=_pointer_width(),
+        endian=sys.byteorder,
+    )
+
+
+def _target_triple() -> str:
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    if multiarch:
+        return str(multiarch)
+    return sysconfig.get_platform()
+
+
+def _pointer_width() -> int:
+    return 64 if sys.maxsize > 2**32 else 32
+
+
+def _normalize_format_hint(format_hint: str | None) -> str | None:
+    if format_hint is None:
+        return None
+    normalized = format_hint.strip().lower().replace("-", "_")
+    return normalized or None
+
+
+def _canonical_compile_options_json(compile_options_json: str | None) -> str:
+    if compile_options_json is None:
+        return "{}"
+    options = json.loads(compile_options_json)
+    if not isinstance(options, dict):
+        raise ValueError("compile_options_json must decode to a JSON object.")
+    return json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def _config_to_jsonl_source(
@@ -150,7 +366,7 @@ def _compile_options_with_word_boundaries(compile_options_json: str | None, enab
         options = dict(options_value)
 
     options["word_boundaries"] = True
-    return json.dumps(options, sort_keys=True, separators=(",", ":"))
+    return json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
 
 
 def _flag_list(raw_flags: Any) -> list[str]:

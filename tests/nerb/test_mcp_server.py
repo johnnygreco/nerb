@@ -65,7 +65,9 @@ from nerb.mcp_server import (
     apply_bank_patches,
     bank_stats,
     benchmark_bank,
+    clear_engine_cache,
     diff_banks,
+    engine_cache_info,
     eval_bank,
     explain_match,
     extract_all_entities,
@@ -125,6 +127,8 @@ def test_mcp_server_registers_expected_tools():
     assert {tool.name for tool in tools} >= {
         "validate_config",
         "load_config",
+        "engine_cache_info",
+        "clear_engine_cache",
         "list_detectors",
         "add_detector",
         "update_detector",
@@ -385,6 +389,34 @@ def test_extract_all_matches_cli_and_api_for_fixture_config_and_document(test_da
     assert cli_result.exit_code == 0
     assert mcp_result["records"] == expected_records
     assert mcp_result["records"] == json.loads(cli_result.output)
+
+
+def test_mcp_config_extraction_reuses_rust_bank_cache(tmp_path):
+    config_path = save_config({"ARTIST": {"Rush": "Rush"}}, tmp_path / "entities.yaml")
+
+    clear_engine_cache()
+    first = extract_entity(str(config_path), "ARTIST", text="Rush released 2112.")
+    after_first = engine_cache_info()
+    second = extract_entity(str(config_path), "ARTIST", text="Rush released 2112.")
+    after_second = engine_cache_info()
+    cleared = clear_engine_cache()
+
+    assert first["records"] == second["records"]
+    assert first["cache"]["hit"] is False
+    assert second["cache"]["hit"] is True
+    assert second["cache"]["key"] == first["cache"]["key"]
+    assert first["cache"]["key"]["schema_version"] == 1
+    assert first["cache"]["key"]["compile_options"] == {"match_mode": "entity_independent"}
+    assert after_first["size"] == 1
+    assert after_first["misses"] == 1
+    assert after_first["hits"] == 0
+    assert after_second["size"] == 1
+    assert after_second["misses"] == 1
+    assert after_second["hits"] == 1
+    assert cleared == {
+        "cleared": True,
+        "cache": {"size": 0, "source_key_count": 0, "hits": 0, "misses": 0, "keys": []},
+    }
 
 
 def test_extract_inline_does_not_require_or_write_config(monkeypatch, tmp_path):

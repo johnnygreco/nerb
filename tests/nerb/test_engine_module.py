@@ -68,3 +68,46 @@ def test_public_bank_from_config_word_boundaries_are_rust_canonicalized():
     assert plain.metadata()["bank_hash"] != bounded.metadata()["bank_hash"]
     assert round_tripped.metadata()["bank_hash"] == bounded.metadata()["bank_hash"]
     assert [record["start"] for record in bounded.scan_text("art article art")] == [0, 12]
+
+
+def test_public_bank_cache_reuses_compiled_banks_and_reports_key_dimensions():
+    nerb.clear_bank_cache()
+
+    first = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}})
+    second = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}})
+    bounded = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}}, word_boundaries=True)
+
+    first_cache = first.cache_metadata()
+    second_cache = second.cache_metadata()
+    bounded_cache = bounded.cache_metadata()
+    key = first_cache["key"]
+
+    assert first_cache["enabled"] is True
+    assert first_cache["hit"] is False
+    assert second_cache["hit"] is True
+    assert second_cache["key"] == key
+    assert bounded_cache["hit"] is False
+    assert bounded_cache["key"]["bank_hash"] != key["bank_hash"]
+    assert key["bank_hash"] == first.metadata()["bank_hash"]
+    assert key["schema_version"] == first.metadata()["schema"]
+    assert key["semantic_version"] == nerb.__version__
+    assert key["engine_name"] == "nerb_engine"
+    assert key["engine_version"] == nerb.__version__
+    assert key["canonical_engine"] == first.metadata()["defaults"]["engine"]
+    assert key["compile_options"] == {"match_mode": "entity_independent"}
+    assert isinstance(key["target_triple"], str) and key["target_triple"]
+    assert isinstance(key["platform"], str) and key["platform"]
+    assert key["pointer_width"] in {32, 64}
+    assert key["endian"] in {"little", "big"}
+    assert nerb.bank_cache_info()["hits"] == 1
+    assert nerb.bank_cache_info()["misses"] == 2
+    assert nerb.bank_cache_info()["size"] == 2
+
+
+def test_public_bank_cache_can_be_bypassed():
+    nerb.clear_bank_cache()
+
+    bank = nerb.Bank.from_config({"ARTIST": {"Rush": "Rush"}}, use_cache=False)
+
+    assert bank.cache_metadata() == {"enabled": False, "hit": False, "key": None}
+    assert nerb.bank_cache_info() == {"size": 0, "source_key_count": 0, "hits": 0, "misses": 0, "keys": []}

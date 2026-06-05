@@ -144,9 +144,9 @@ report = extract_report(bank, "Send this to Acme Corp today.")
 benchmark = benchmark_bank(bank, options={"benchmark_iterations": 1})
 ```
 
-Other public helpers include `bank_stats`, `canonicalize_bank`, `hash_bank`, `validate_bank_schema`,
-`benchmark_fixture_profiles`, `make_benchmark_fixture_profile`, `extract_file`, `extract_batch`,
-`extract_report_file`, `extract_report_batch`, `explain_match`, and `compiled_bank_cache_info`.
+Other public helpers include `Bank`, `bank_stats`, `bank_cache_info`, `canonicalize_bank`, `clear_bank_cache`,
+`hash_bank`, `validate_bank_schema`, `benchmark_fixture_profiles`, `make_benchmark_fixture_profile`, `extract_file`,
+`extract_batch`, `extract_report_file`, `extract_report_batch`, `explain_match`, and `compiled_bank_cache_info`.
 
 The Rust engine migration is underway. Native source-bank canonicalization is documented in
 [`docs/rust-engine-canonicalization.md`](docs/rust-engine-canonicalization.md), and the current native PyO3 boundary plus
@@ -223,6 +223,8 @@ eval_bank
 benchmark_bank
 explain_match
 regress_bank
+engine_cache_info
+clear_engine_cache
 ```
 
 MCP tools accept explicit bank objects or explicit bank paths, depending on the tool. File reads are limited to explicit
@@ -254,6 +256,7 @@ Common commands:
 nerb init --config detectors.yaml
 nerb add ARTIST "Pink Floyd" 'Pink\sFloyd' --config detectors.yaml
 nerb extract ARTIST examples/prog_rock_wiki.txt --config detectors.yaml --format json
+nerb extract-batch examples/prog_rock_wiki.txt examples/other.txt --entity ARTIST --config detectors.yaml --format json
 nerb extract --all --text "Pink Floyd played progressive rock." \
   --detector 'ARTIST:Pink Floyd=Pink\sFloyd' \
   --detector 'GENRE:Rock=rock' \
@@ -265,7 +268,8 @@ nerb doctor --config detectors.yaml --format json
 
 YAML extraction supports `--format table`, `--format json`, and `--format jsonl`. JSON and JSONL records are
 Rust-backed byte-offset records with `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`, and
-`offset_unit`.
+`offset_unit`. `extract-batch` accepts explicit document paths, `--manifest` path lists, and one optional `--stdin`
+document; it compiles one Rust `Bank` and scans those documents in input order.
 
 ## Performance
 

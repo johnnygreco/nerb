@@ -2,6 +2,7 @@ import json
 import re
 import sys
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
@@ -63,6 +64,7 @@ COMMAND_ERROR_EXIT_CODE = 1
 OUTPUT_FORMATS = {"json", "jsonl", "table"}
 AUTHORING_OUTPUT_FORMATS = {"json", "text"}
 RECORD_COLUMNS = ["entity", "canonical_name", "surface_name", "string", "start", "end", "offset_unit"]
+BATCH_RECORD_COLUMNS = ["document_id", *RECORD_COLUMNS]
 DIAGNOSTIC_ERROR = "error"
 DIAGNOSTIC_WARNING = "warning"
 
@@ -73,6 +75,13 @@ app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode=None,
 )
+
+
+@dataclass(frozen=True)
+class _BatchDocument:
+    document_id: str
+    source: dict[str, str]
+    content: str | bytes
 
 
 def _installed_version() -> str:
@@ -429,6 +438,17 @@ def _resolve_extraction_arguments(
     return entity, document
 
 
+def _resolve_batch_entity(entity: str | None, *, all_entities: bool) -> str | None:
+    if all_entities:
+        if entity is not None:
+            _exit_error("Do not provide --entity when using --all.")
+        return None
+
+    if entity is None:
+        _exit_error("--entity is required unless --all is used.")
+    return entity
+
+
 def _read_extraction_source(document: Path | None, *, read_stdin: bool, text: str | None) -> str | bytes:
     source_count = sum([document is not None, read_stdin, text is not None])
     if source_count != 1:
@@ -438,28 +458,35 @@ def _read_extraction_source(document: Path | None, *, read_stdin: bool, text: st
         return text
 
     if read_stdin:
-        stdin_buffer = getattr(sys.stdin, "buffer", None)
-        if stdin_buffer is not None:
-            stdin_bytes = stdin_buffer.read()
-            try:
-                stdin_bytes.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                _exit_error(f"Standard input is not valid UTF-8: {exc}")
-            return stdin_bytes
-
-        try:
-            stdin_text = sys.stdin.read()
-        except UnicodeDecodeError as exc:
-            _exit_error(f"Standard input is not valid UTF-8: {exc}")
-        try:
-            stdin_text.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            _exit_error(f"Standard input is not valid UTF-8: {exc}")
-        return stdin_text
+        return _read_stdin_bytes()
 
     if document is None:
         _exit_error("Provide exactly one input source: DOCUMENT, --stdin, or --text.")
 
+    return _read_document_bytes(document)
+
+
+def _read_stdin_bytes() -> bytes:
+    stdin_buffer = getattr(sys.stdin, "buffer", None)
+    if stdin_buffer is not None:
+        stdin_bytes = stdin_buffer.read()
+        try:
+            stdin_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            _exit_error(f"Standard input is not valid UTF-8: {exc}")
+        return stdin_bytes
+
+    try:
+        stdin_text = sys.stdin.read()
+    except UnicodeDecodeError as exc:
+        _exit_error(f"Standard input is not valid UTF-8: {exc}")
+    try:
+        return stdin_text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        _exit_error(f"Standard input is not valid UTF-8: {exc}")
+
+
+def _read_document_bytes(document: Path) -> bytes:
     if not document.exists():
         _exit_error(f"Document file does not exist at {document}.")
 
@@ -478,6 +505,33 @@ def _read_extraction_source(document: Path | None, *, read_stdin: bool, text: st
     except UnicodeDecodeError as exc:
         _exit_error(f"Document file is not valid UTF-8 at {document}: {exc}")
     return document_bytes
+
+
+def _read_manifest_document_paths(manifest: Path) -> list[Path]:
+    manifest_path = _ensure_explicit_file(manifest, "Manifest")
+    try:
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        _exit_error(f"Manifest file is not valid UTF-8 at {manifest_path}: {exc}")
+    except OSError as exc:
+        _exit_error(f"Could not read manifest at {manifest_path}: {exc}")
+
+    document_paths = []
+    for line_number, raw_line in enumerate(manifest_text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        path = Path(line).expanduser()
+        if not path.is_absolute():
+            path = manifest_path.parent / path
+        if not path.exists():
+            _exit_error(f"Manifest document path on line {line_number} does not exist at {path}.")
+        if not path.is_file():
+            _exit_error(f"Manifest document path on line {line_number} is not a file: {path}.")
+        document_paths.append(path)
+    if not document_paths:
+        _exit_error(f"Manifest file at {manifest_path} does not list any document paths.")
+    return document_paths
 
 
 def _parse_pattern_definition(raw_value: str) -> tuple[str, str]:
@@ -544,6 +598,31 @@ def _compile_extractor(pattern_config: PatternConfig, *, word_boundaries: bool) 
         _exit_error(f"Could not compile detectors: {exc}")
 
 
+def _compile_config_bank(
+    pattern_config: PatternConfig,
+    selected_entity: str | None,
+    *,
+    word_boundaries: bool,
+) -> Bank:
+    try:
+        return Bank.from_config(
+            pattern_config,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+        )
+    except ValueError as exc:
+        _exit_error(f"Could not compile detectors with the Rust engine: {exc}")
+
+
+def _scan_records(bank: Bank, source: str | bytes) -> list[dict[str, Any]]:
+    try:
+        if isinstance(source, bytes):
+            return bank.scan_bytes(source)
+        return bank.scan_text(source)
+    except ValueError as exc:
+        _exit_error(f"Could not scan document with the Rust engine: {exc}")
+
+
 def _extract_records(
     pattern_config: PatternConfig,
     selected_entity: str | None,
@@ -551,17 +630,8 @@ def _extract_records(
     *,
     word_boundaries: bool,
 ) -> list[dict[str, Any]]:
-    try:
-        bank = Bank.from_config(
-            pattern_config,
-            selected_entity=selected_entity,
-            word_boundaries=word_boundaries,
-        )
-        if isinstance(source, bytes):
-            return bank.scan_bytes(source)
-        return bank.scan_text(source)
-    except ValueError as exc:
-        _exit_error(f"Could not compile or scan detectors with the Rust engine: {exc}")
+    bank = _compile_config_bank(pattern_config, selected_entity, word_boundaries=word_boundaries)
+    return _scan_records(bank, source)
 
 
 def _inline_detector_config(
@@ -647,6 +717,107 @@ def _echo_records(records: list[dict[str, Any]], output_format: str) -> None:
         return
 
     typer.echo(_format_records_table(records))
+
+
+def _batch_documents(
+    document_paths: list[Path],
+    *,
+    read_stdin: bool,
+    manifest: Path | None,
+) -> list[_BatchDocument]:
+    documents = []
+    for document_path in document_paths:
+        path = document_path.expanduser()
+        documents.append(
+            _BatchDocument(
+                document_id=str(path),
+                source={"type": "file", "path": str(path)},
+                content=_read_document_bytes(path),
+            )
+        )
+
+    if manifest is not None:
+        for manifest_document_path in _read_manifest_document_paths(manifest):
+            documents.append(
+                _BatchDocument(
+                    document_id=str(manifest_document_path),
+                    source={"type": "file", "path": str(manifest_document_path)},
+                    content=_read_document_bytes(manifest_document_path),
+                )
+            )
+
+    if read_stdin:
+        documents.append(
+            _BatchDocument(
+                document_id="stdin",
+                source={"type": "stdin"},
+                content=_read_stdin_bytes(),
+            )
+        )
+
+    if not documents:
+        _exit_error("Provide at least one batch input source: DOCUMENT, --manifest, or --stdin.")
+    return documents
+
+
+def _batch_payload(bank: Bank, documents: list[_BatchDocument]) -> dict[str, Any]:
+    document_payloads = []
+    record_count = 0
+    for document in documents:
+        records = _scan_records(bank, document.content)
+        record_count += len(records)
+        document_payloads.append(
+            {
+                "document_id": document.document_id,
+                "source": document.source,
+                "records": records,
+                "record_count": len(records),
+            }
+        )
+
+    return {
+        "documents": document_payloads,
+        "document_count": len(document_payloads),
+        "record_count": record_count,
+        "cache": bank.cache_metadata(),
+    }
+
+
+def _format_batch_table(payload: dict[str, Any]) -> str:
+    rows = []
+    for document in payload["documents"]:
+        for record in document["records"]:
+            rows.append(
+                [
+                    _table_cell(document["document_id"]),
+                    *[_table_cell(record[column]) for column in RECORD_COLUMNS],
+                ]
+            )
+    if not rows:
+        return "No matches."
+
+    widths = [
+        max(len(BATCH_RECORD_COLUMNS[index]), *(len(row[index]) for row in rows))
+        for index in range(len(BATCH_RECORD_COLUMNS))
+    ]
+    header = "  ".join(column.ljust(widths[index]) for index, column in enumerate(BATCH_RECORD_COLUMNS))
+    separator = "  ".join("-" * widths[index] for index in range(len(BATCH_RECORD_COLUMNS)))
+    body = "\n".join("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)) for row in rows)
+    return f"{header}\n{separator}\n{body}"
+
+
+def _echo_batch_payload(payload: dict[str, Any], output_format: str) -> None:
+    normalized_format = _normalize_output_format(output_format)
+    if normalized_format == "json":
+        typer.echo(json.dumps(payload, ensure_ascii=False))
+        return
+
+    if normalized_format == "jsonl":
+        for document in payload["documents"]:
+            typer.echo(json.dumps(document, ensure_ascii=False))
+        return
+
+    typer.echo(_format_batch_table(payload))
 
 
 def _compiled_regex_payload(entity: str, entity_config: dict[str, Any], regex: Any) -> dict[str, Any]:
@@ -1182,6 +1353,56 @@ def extract(
     )
     records = _extract_records(pattern_config, selected_entity, document_source, word_boundaries=word_boundaries)
     _echo_records(records, output_format)
+
+
+@app.command("extract-batch")
+def extract_batch(
+    ctx: typer.Context,
+    documents: list[Path] | None = typer.Argument(None, help="Explicit document paths to scan in order."),
+    entity: str | None = typer.Option(None, "--entity", "-e", help="Detector entity name, unless --all is used."),
+    all_entities: bool = typer.Option(False, "--all", help="Extract all configured detector entities."),
+    manifest: Path | None = typer.Option(None, "--manifest", help="UTF-8 file listing one document path per line."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read one batch document from standard input."),
+    inline_patterns: list[str] | None = typer.Option(
+        None,
+        "--pattern",
+        help="Inline detector for --entity as NAME=REGEX. May be repeated.",
+    ),
+    inline_detectors: list[str] | None = typer.Option(
+        None,
+        "--detector",
+        help="Inline detector as ENTITY:NAME=REGEX. May be repeated.",
+    ),
+    output_format: str = typer.Option(
+        "json",
+        "--format",
+        "-f",
+        help="Output format: json, jsonl, or table.",
+    ),
+    word_boundaries: bool = typer.Option(
+        False,
+        "--word-boundaries",
+        help="Add regex word boundaries around configured detector patterns.",
+    ),
+    config: Path | None = _config_option(),
+) -> None:
+    """Extract configured named entities from multiple explicit documents."""
+    selected_entity = _resolve_batch_entity(entity, all_entities=all_entities)
+    config_path = _command_config_path(ctx, config)
+    pattern_config = _load_extraction_config(
+        ctx,
+        config_path,
+        config,
+        inline_patterns=inline_patterns or [],
+        inline_detectors=inline_detectors or [],
+        selected_entity=selected_entity,
+    )
+    bank = _compile_config_bank(pattern_config, selected_entity, word_boundaries=word_boundaries)
+    payload = _batch_payload(
+        bank,
+        _batch_documents(documents or [], read_stdin=read_stdin, manifest=manifest),
+    )
+    _echo_batch_payload(payload, output_format)
 
 
 @app.command("test")

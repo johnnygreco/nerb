@@ -14,7 +14,9 @@ from nerb import (
     NERB,
     Bank,
     apply_bank_patches,
+    bank_cache_info,
     benchmark_bank,
+    clear_bank_cache,
     clear_compiled_bank_cache,
     diff_banks,
     eval_bank,
@@ -116,6 +118,7 @@ def test_help_shows_command_structure():
         "benchmark-bank",
         "regress-bank",
         "extract",
+        "extract-batch",
         "test",
         "compile",
         "doctor",
@@ -420,6 +423,58 @@ def test_extract_all_json_matches_api_for_fixture_config(test_data_path, prog_ro
 
     assert result.exit_code == 0
     assert _json_records(result.output) == expected_records
+
+
+def test_extract_batch_json_compiles_once_and_preserves_document_order(monkeypatch, tmp_path):
+    monkeypatch.setenv(DEFAULT_CONFIG_ENV_VAR, str(tmp_path / "missing-default.yaml"))
+    first_document = tmp_path / "first.txt"
+    second_document = tmp_path / "second.txt"
+    manifest = tmp_path / "manifest.txt"
+    first_document.write_text("Rush played rock.", encoding="utf-8")
+    second_document.write_text("Pink Floyd played rock.", encoding="utf-8")
+    manifest.write_text(f"{second_document.name}\n", encoding="utf-8")
+    command = [
+        "extract-batch",
+        str(first_document),
+        "--manifest",
+        str(manifest),
+        "--all",
+        "--detector",
+        "ARTIST:Rush=Rush",
+        "--detector",
+        r"ARTIST:Pink Floyd=Pink\sFloyd",
+        "--detector",
+        "GENRE:Rock=rock",
+        "--format",
+        "json",
+    ]
+
+    clear_bank_cache()
+    first_result = runner.invoke(app, command)
+    second_result = runner.invoke(app, command)
+
+    assert first_result.exit_code == 0
+    first_payload = json.loads(first_result.output)
+    assert first_payload["document_count"] == 2
+    assert first_payload["record_count"] == 4
+    assert first_payload["cache"]["hit"] is False
+    assert first_payload["cache"]["key"]["schema_version"] == 1
+    assert first_payload["cache"]["key"]["compile_options"] == {"match_mode": "entity_independent"}
+    assert [document["document_id"] for document in first_payload["documents"]] == [
+        str(first_document),
+        str(second_document),
+    ]
+    assert first_payload["documents"][0]["records"][0]["string"] == "Rush"
+    assert first_payload["documents"][1]["records"][0]["string"] == "Pink Floyd"
+    assert first_payload["documents"][1]["records"][1]["string"] == "rock"
+
+    assert second_result.exit_code == 0
+    second_payload = json.loads(second_result.output)
+    assert second_payload["cache"]["hit"] is True
+    assert second_payload["cache"]["key"] == first_payload["cache"]["key"]
+    assert bank_cache_info()["size"] == 1
+    assert bank_cache_info()["misses"] == 1
+    assert bank_cache_info()["hits"] == 1
 
 
 def test_extract_uses_default_config_path_from_env(monkeypatch, tmp_path):

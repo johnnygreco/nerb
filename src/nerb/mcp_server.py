@@ -40,6 +40,8 @@ from .config import (
 from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
 from .engine import Bank
+from .engine import bank_cache_info as _bank_cache_info
+from .engine import clear_bank_cache as _clear_bank_cache
 from .evals import eval_bank as _eval_bank
 from .extraction import ExtractionError
 from .extraction import (
@@ -368,24 +370,40 @@ def _ensure_configured_patterns(pattern_config: PatternConfig, source: str) -> N
         _raise_tool_error(f"No detector patterns are configured in {source}.")
 
 
-def _extract_records(
+def _compile_config_bank(
+    pattern_config: PatternConfig,
+    selected_entity: str | None,
+    *,
+    word_boundaries: bool,
+) -> Bank:
+    try:
+        return Bank.from_config(
+            pattern_config,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+        )
+    except ValueError as exc:
+        _raise_tool_error(f"Could not compile detectors with the Rust engine: {exc}")
+
+
+def _scan_records(bank: Bank, source: str | bytes) -> list[dict[str, Any]]:
+    try:
+        if isinstance(source, bytes):
+            return bank.scan_bytes(source)
+        return bank.scan_text(source)
+    except ValueError as exc:
+        _raise_tool_error(f"Could not scan document with the Rust engine: {exc}")
+
+
+def _extract_records_with_cache(
     pattern_config: PatternConfig,
     selected_entity: str | None,
     source: str | bytes,
     *,
     word_boundaries: bool,
-) -> list[dict[str, Any]]:
-    try:
-        bank = Bank.from_config(
-            pattern_config,
-            selected_entity=selected_entity,
-            word_boundaries=word_boundaries,
-        )
-        if isinstance(source, bytes):
-            return bank.scan_bytes(source)
-        return bank.scan_text(source)
-    except ValueError as exc:
-        _raise_tool_error(f"Could not compile or scan detectors with the Rust engine: {exc}")
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    bank = _compile_config_bank(pattern_config, selected_entity, word_boundaries=word_boundaries)
+    return _scan_records(bank, source), bank.cache_metadata()
 
 
 def _detector_records(pattern_config: PatternConfig, selected_entity: str | None = None) -> list[dict[str, str]]:
@@ -422,6 +440,19 @@ def load_config_tool(config_path: str) -> dict[str, Any]:
     """Load and validate a detector YAML config file. Reads only the provided config_path."""
     path, pattern_config = _load_tool_config(config_path)
     return {"path": str(path), "config": pattern_config, **_config_summary(pattern_config)}
+
+
+@mcp.tool()
+def engine_cache_info() -> dict[str, Any]:
+    """Return process-local Rust Bank cache diagnostics."""
+    return _bank_cache_info()
+
+
+@mcp.tool()
+def clear_engine_cache() -> dict[str, Any]:
+    """Clear the process-local Rust Bank cache and return the empty diagnostics."""
+    _clear_bank_cache()
+    return {"cleared": True, "cache": _bank_cache_info()}
 
 
 @mcp.tool()
@@ -488,13 +519,19 @@ def extract_entity(
     path, pattern_config = _load_tool_config(config_path)
     _ensure_entity(pattern_config, entity, f"config at {path}")
     document_source, source = _read_text_source(text, file_path)
-    records = _extract_records(pattern_config, entity, document_source, word_boundaries=word_boundaries)
+    records, cache = _extract_records_with_cache(
+        pattern_config,
+        entity,
+        document_source,
+        word_boundaries=word_boundaries,
+    )
     return {
         "config_path": str(path),
         "entity": entity,
         "source": source,
         "records": records,
         "record_count": len(records),
+        "cache": cache,
     }
 
 
@@ -509,12 +546,18 @@ def extract_all_entities(
     path, pattern_config = _load_tool_config(config_path)
     _ensure_configured_patterns(pattern_config, f"config at {path}")
     document_source, source = _read_text_source(text, file_path)
-    records = _extract_records(pattern_config, None, document_source, word_boundaries=word_boundaries)
+    records, cache = _extract_records_with_cache(
+        pattern_config,
+        None,
+        document_source,
+        word_boundaries=word_boundaries,
+    )
     return {
         "config_path": str(path),
         "source": source,
         "records": records,
         "record_count": len(records),
+        "cache": cache,
     }
 
 
@@ -541,12 +584,18 @@ def extract_inline(
         _ensure_entity(pattern_config, entity, "inline detector definitions")
 
     document_source, source = _read_text_source(text, file_path)
-    records = _extract_records(pattern_config, entity, document_source, word_boundaries=word_boundaries)
+    records, cache = _extract_records_with_cache(
+        pattern_config,
+        entity,
+        document_source,
+        word_boundaries=word_boundaries,
+    )
     return {
         "entity": entity,
         "source": source,
         "records": records,
         "record_count": len(records),
+        "cache": cache,
     }
 
 

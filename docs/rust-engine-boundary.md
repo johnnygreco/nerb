@@ -256,3 +256,58 @@ uv run nerb extract --all --text "Rush played rock." \
   {"entity": "GENRE", "canonical_name": "Rock", "surface_name": "Rock", "string": "rock", "start": 12, "end": 16, "offset_unit": "byte"}
 ]
 ```
+
+## Compiled Bank Cache And Batch Extraction
+
+The public Python wrapper caches compiled native `Bank` objects in process. The cache key is semantic rather than
+path-based:
+
+```python
+from nerb import Bank, bank_cache_info, clear_bank_cache
+
+clear_bank_cache()
+first = Bank.from_config({"ARTIST": {"Rush": "Rush"}})
+second = Bank.from_config({"ARTIST": {"Rush": "Rush"}})
+
+assert first.cache_metadata()["hit"] is False
+assert second.cache_metadata()["hit"] is True
+print(second.cache_metadata()["key"])
+print(bank_cache_info())
+```
+
+Example key shape:
+
+```json
+{
+  "bank_hash": "sha256:...",
+  "schema_version": 1,
+  "semantic_version": "0.0.5",
+  "engine_name": "nerb_engine",
+  "engine_version": "0.0.5",
+  "canonical_engine": "rust-regex-meta",
+  "compile_options": {"match_mode": "entity_independent"},
+  "target_triple": "x86_64-linux-gnu",
+  "platform": "linux-x86_64",
+  "pointer_width": 64,
+  "endian": "little"
+}
+```
+
+`use_cache=False` bypasses lookup and insertion for callers that need isolated compilation. `clear_bank_cache()` clears
+only this process. The cache does not serialize matcher state, write engine artifacts, or add a disk cache.
+
+The config-backed MCP extraction tools return the same per-extraction cache metadata and expose `engine_cache_info` plus
+`clear_engine_cache` for process-local diagnostics.
+
+Batch CLI extraction compiles once and scans many explicit documents:
+
+```shell
+uv run nerb extract-batch doc-a.txt doc-b.txt --entity ARTIST --config detectors.yaml --format json
+uv run nerb extract-batch --manifest docs.txt --all --config detectors.yaml --format jsonl
+uv run nerb extract-batch --stdin --entity ARTIST --config detectors.yaml --format table
+```
+
+The JSON output includes top-level `cache` metadata and document payloads in input order. Manifest files are UTF-8 text
+files with one explicit path per nonblank line; relative paths resolve against the manifest file's parent directory.
+Recursive walking, gitignore discovery, Rayon batch parallelism, and serialized DFA or engine-payload caches remain out
+of scope for this slice.

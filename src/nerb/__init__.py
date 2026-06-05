@@ -18,7 +18,7 @@ from .config import (
     validate_regex_flags,
 )
 from .diff import diff_banks
-from .engine import Bank
+from .engine import Bank, bank_cache_info, clear_bank_cache
 from .engines import clear_compiled_bank_cache, compiled_bank_cache_info
 from .evals import eval_bank
 from .extraction import (
@@ -71,8 +71,10 @@ __all__ = [
     "add_entity_pattern",
     "apply_bank_patches",
     "bank_stats",
+    "bank_cache_info",
     "canonicalize_bank",
     "clear_compiled_bank_cache",
+    "clear_bank_cache",
     "compiled_bank_cache_info",
     "diff_banks",
     "extract_batch",
