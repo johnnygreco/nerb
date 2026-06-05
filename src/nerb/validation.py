@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 import signal
 import threading
 import time
 import unicodedata
-import warnings
-from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,9 +17,7 @@ from .diagnostics import (
     DIAGNOSTIC_INFO,
     DIAGNOSTIC_WARNING,
     ENGINE_UNSUPPORTED,
-    REGEX_CAPTURE_CONFLICT,
     REGEX_COMPILE_ERROR,
-    REGEX_COMPOSE_COMPILE_ERROR,
     REGEX_EXPENSIVE_PROBE,
     REGEX_EXPENSIVE_STATIC,
     REGEX_LITERAL_CANDIDATE,
@@ -35,15 +32,15 @@ from .diagnostics import (
 from .schema import REGEX_FLAG_ORDER, validate_bank_schema
 
 VALIDATION_LEVELS = ("basic", "standard", "deep")
-PYTHON_RE_ENGINE = "python_re"
-PYTHON_RE_FLAGS = {
+VALIDATION_ENGINE = "nerb_engine"
+REGEX_FLAGS = {
     "ASCII": re.ASCII,
     "IGNORECASE": re.IGNORECASE,
     "MULTILINE": re.MULTILINE,
     "DOTALL": re.DOTALL,
     "VERBOSE": re.VERBOSE,
 }
-PYTHON_RE_SCOPED_FLAGS = {
+REGEX_SCOPED_FLAGS = {
     "ASCII": "a",
     "IGNORECASE": "i",
     "MULTILINE": "m",
@@ -100,21 +97,21 @@ def _unique_flags(*flag_sets: Any) -> tuple[str, ...]:
         if not isinstance(flag_set, Sequence) or isinstance(flag_set, (str, bytes)):
             continue
         for flag in flag_set:
-            if isinstance(flag, str) and flag in PYTHON_RE_FLAGS and flag not in seen:
+            if isinstance(flag, str) and flag in REGEX_FLAGS and flag not in seen:
                 seen.add(flag)
                 flags.append(flag)
     return tuple(sorted(flags, key=REGEX_FLAG_ORDER.index))
 
 
-def _python_re_flags(flags: Sequence[str]) -> int:
+def _regex_flag_bits(flags: Sequence[str]) -> int:
     compiled_flags = 0
     for flag in flags:
-        compiled_flags |= PYTHON_RE_FLAGS[flag]
+        compiled_flags |= REGEX_FLAGS[flag]
     return compiled_flags
 
 
 def _scoped_pattern(pattern: str, flags: Sequence[str]) -> str:
-    scoped_flags = "".join(PYTHON_RE_SCOPED_FLAGS[flag] for flag in flags if flag in PYTHON_RE_SCOPED_FLAGS)
+    scoped_flags = "".join(REGEX_SCOPED_FLAGS[flag] for flag in flags if flag in REGEX_SCOPED_FLAGS)
     if not scoped_flags:
         return pattern
     return f"(?{scoped_flags}:{pattern})"
@@ -157,7 +154,7 @@ def _iter_regex_patterns(bank: Mapping[str, Any]) -> Iterable[RegexPattern]:
 
 
 def _compile_regex(pattern: RegexPattern, value: str | None = None) -> re.Pattern[str]:
-    return re.compile(pattern.value if value is None else value, _python_re_flags(pattern.flags))
+    return re.compile(pattern.value if value is None else value, _regex_flag_bits(pattern.flags))
 
 
 def _standalone_compile(pattern: RegexPattern) -> tuple[re.Pattern[str] | None, Diagnostic | None]:
@@ -168,7 +165,7 @@ def _standalone_compile(pattern: RegexPattern) -> tuple[re.Pattern[str] | None, 
             DIAGNOSTIC_ERROR,
             REGEX_COMPILE_ERROR,
             pattern.path,
-            f"Regex pattern failed to compile with Python re: {exc}.",
+            f"Regex pattern failed to compile for validation: {exc}.",
             metadata={"entity_id": pattern.entity_id, "name_id": pattern.name_id, "pattern_id": pattern.pattern_id},
         )
 
@@ -496,108 +493,27 @@ def _runtime_probe_diagnostics(
     return []
 
 
-def _internal_group_name(pattern: RegexPattern) -> str:
-    return f"nerb__{pattern.entity_id}__{pattern.name_id}__{pattern.pattern_id}"
+def _rust_engine_diagnostics(bank: Mapping[str, Any]) -> list[Diagnostic]:
+    from .engine import Bank
 
-
-def _generated_group_prefix(pattern: RegexPattern) -> str:
-    return f"nerb_ug__{pattern.entity_id}__{pattern.name_id}__{pattern.pattern_id}__"
-
-
-def _rewritten_scoped_pattern(pattern: RegexPattern) -> str:
-    from .python_re_engine import _rewrite_numeric_backrefs
-
-    rewritten, _ = _rewrite_numeric_backrefs(pattern.value, _generated_group_prefix(pattern))
-    return _scoped_pattern(rewritten, pattern.flags)
-
-
-def _capture_conflict_diagnostics(
-    patterns: Sequence[RegexPattern],
-    compiled_by_path: Mapping[str, re.Pattern[str]],
-) -> list[Diagnostic]:
-    diagnostics: list[Diagnostic] = []
-    internal_group_names_by_entity: defaultdict[str, set[str]] = defaultdict(set)
-    for pattern in patterns:
-        internal_group_names_by_entity[pattern.entity_id].add(_internal_group_name(pattern))
-
-    first_user_group_path_by_entity: defaultdict[str, dict[str, str]] = defaultdict(dict)
-    duplicate_user_groups_by_entity: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
-
-    for pattern in patterns:
-        compiled = compiled_by_path.get(pattern.path)
-        if compiled is None:
-            continue
-        for group_name in sorted(compiled.groupindex):
-            if group_name in internal_group_names_by_entity[pattern.entity_id]:
-                diagnostics.append(
-                    diagnostic(
-                        DIAGNOSTIC_ERROR,
-                        REGEX_CAPTURE_CONFLICT,
-                        pattern.path,
-                        f"User capture group {group_name!r} conflicts with a NERB internal identity group.",
-                        suggested_fix="Rename the user capture group.",
-                        metadata={"group_name": group_name},
-                    )
-                )
-            first_user_group_path = first_user_group_path_by_entity[pattern.entity_id]
-            previous_path = first_user_group_path.setdefault(group_name, pattern.path)
-            if previous_path != pattern.path:
-                duplicate_user_groups_by_entity[(pattern.entity_id, group_name)].append(pattern.path)
-
-    for (entity_id, group_name), paths in sorted(duplicate_user_groups_by_entity.items()):
-        for path in sorted(set(paths)):
-            diagnostics.append(
-                diagnostic(
-                    DIAGNOSTIC_ERROR,
-                    REGEX_CAPTURE_CONFLICT,
-                    path,
-                    f"User capture group {group_name!r} is duplicated within the composed entity shard.",
-                    suggested_fix="Use unique capture group names within each entity.",
-                    metadata={"entity_id": entity_id, "group_name": group_name},
-                )
+    try:
+        Bank.from_source_bytes(
+            json.dumps(bank, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            ),
+            format_hint="json",
+            use_cache=False,
+        )
+    except (TypeError, ValueError) as exc:
+        return [
+            diagnostic(
+                DIAGNOSTIC_ERROR,
+                "engine.compile_error",
+                "",
+                f"Rust engine failed to compile the bank: {exc}.",
             )
-    return diagnostics
-
-
-def _composed_compile_diagnostics(
-    patterns: Sequence[RegexPattern],
-    compiled_by_path: Mapping[str, re.Pattern[str]],
-) -> list[Diagnostic]:
-    diagnostics = _capture_conflict_diagnostics(patterns, compiled_by_path)
-    if not patterns:
-        return diagnostics
-
-    entity_patterns: defaultdict[str, list[RegexPattern]] = defaultdict(list)
-    for pattern in patterns:
-        if pattern.path in compiled_by_path:
-            entity_patterns[pattern.entity_id].append(pattern)
-
-    for entity_id, shard_patterns in sorted(entity_patterns.items()):
-        if not shard_patterns:
-            continue
-
-        alternatives = [
-            (f"(?:(?=(?:{_rewritten_scoped_pattern(pattern)})(?P<{_internal_group_name(pattern)}>))|)")
-            for pattern in shard_patterns
         ]
-        shard = "".join(alternatives)
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("error", DeprecationWarning)
-                re.compile(shard)
-        except (DeprecationWarning, re.error) as exc:
-            diagnostics.append(
-                diagnostic(
-                    DIAGNOSTIC_ERROR,
-                    REGEX_COMPOSE_COMPILE_ERROR,
-                    _json_pointer(["entities", entity_id]),
-                    f"Python re entity shard failed to compile after NERB wrapping: {exc}.",
-                    suggested_fix="Use regex_flags for global flags and unique capture group names per entity shard.",
-                    metadata={"entity_id": entity_id},
-                )
-            )
-
-    return diagnostics
+    return []
 
 
 def _eval_ref_count(bank: Mapping[str, Any]) -> int:
@@ -632,24 +548,21 @@ def _runtime_validation(
         "engine": engine,
         "compatible": True,
         "regex_patterns": 0,
-        "composed_shards": 0,
     }
-    if engine != PYTHON_RE_ENGINE:
+    if engine != VALIDATION_ENGINE:
         diagnostics.append(
             diagnostic(
                 DIAGNOSTIC_ERROR,
                 ENGINE_UNSUPPORTED,
                 "",
-                f"Validation engine {engine!r} is not supported; expected 'python_re'.",
+                f"Validation engine {engine!r} is not supported; expected {VALIDATION_ENGINE!r}.",
             )
         )
         engine_compatibility["compatible"] = False
         return diagnostics, engine_compatibility
 
-    compiled_by_path: dict[str, re.Pattern[str]] = {}
     regex_patterns = list(_iter_regex_patterns(bank))
     engine_compatibility["regex_patterns"] = len(regex_patterns)
-    engine_compatibility["composed_shards"] = len({pattern.entity_id for pattern in regex_patterns})
     engine_compatibility["runtime_probes"] = {
         "enabled": level in {"standard", "deep"},
         "max_per_regex": 25 if level == "deep" else 5 if level == "standard" else 0,
@@ -673,7 +586,6 @@ def _runtime_validation(
             continue
         if compiled is None:
             continue
-        compiled_by_path[pattern.path] = compiled
 
         if compiled.search("") is not None:
             diagnostics.append(
@@ -690,8 +602,7 @@ def _runtime_validation(
             diagnostics.extend(_static_risk_diagnostics(pattern, strict=strict))
             diagnostics.extend(_runtime_probe_diagnostics(pattern, compiled, level=level, strict=strict))
 
-    if level in {"standard", "deep"}:
-        diagnostics.extend(_composed_compile_diagnostics(regex_patterns, compiled_by_path))
+    diagnostics.extend(_rust_engine_diagnostics(bank))
 
     engine_compatibility["compatible"] = not has_errors(diagnostics)
     return diagnostics, engine_compatibility
@@ -701,7 +612,7 @@ def validate_bank(
     bank: Any,
     *,
     level: str = "standard",
-    engine: str = PYTHON_RE_ENGINE,
+    engine: str = VALIDATION_ENGINE,
     base_path: str | Path | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:

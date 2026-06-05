@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from nerb import (
     Bank,
-    clear_compiled_bank_cache,
+    clear_bank_cache,
     load_config,
     save_config,
 )
@@ -202,29 +202,29 @@ def test_json_bank_mcp_extraction_and_reports_match_helpers(tmp_path, test_data_
     document_path.write_text(text, encoding="utf-8")
     documents = [{"document_id": "email_0", "text": text}]
 
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     text_result = extract_text(text, bank_path=str(bank_path))
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_text = extract_text_helper(bank, text)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     file_result = extract_file(str(document_path), bank=bank)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_file = extract_file_helper(bank, document_path)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     batch_result = extract_batch(documents, bank=bank)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_batch = extract_batch_helper(bank, documents)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     report_result = extract_report(bank=bank, text=text)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_report = extract_report_helper(bank, text)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     file_report_result = extract_report(bank_path=str(bank_path), file_path=str(document_path))
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_file_report = extract_report_file_helper(bank, document_path)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     report_batch_result = extract_report_batch(documents, bank=bank)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_report_batch = extract_report_batch_helper(bank, documents)
 
     assert text_result == expected_text

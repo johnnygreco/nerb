@@ -143,7 +143,7 @@ def _hash_canonical_bank(canonical_bank: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
-def bank_stats(bank: Mapping[str, Any], *, include_engine: bool = False, engine: str = "python_re") -> dict[str, Any]:
+def bank_stats(bank: Mapping[str, Any], *, include_engine: bool = False, engine: str = "nerb_engine") -> dict[str, Any]:
     """Return structural bank counts without compiling patterns or running extraction."""
     totals = {"entities": 0, "names": 0, "patterns": 0}
     active_totals = {"entities": 0, "names": 0, "patterns": 0}

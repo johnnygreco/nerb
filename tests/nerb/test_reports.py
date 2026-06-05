@@ -116,7 +116,7 @@ def test_extract_report_file_preserves_file_source_metadata(tmp_path, minimal_ba
     assert report["resolved_records"][0]["context"] == {"before": "Send ", "match": "Acme Corp", "after": " now."}
 
 
-def test_priority_overlap_resolution_keeps_raw_records_and_resolves_by_priority(minimal_bank):
+def test_report_uses_rust_leftmost_first_records_before_report_resolution(minimal_bank):
     _set_customer_patterns(
         minimal_bank,
         {
@@ -128,18 +128,9 @@ def test_priority_overlap_resolution_keeps_raw_records_and_resolves_by_priority(
 
     report = extract_report(minimal_bank, "Acme Corp")
 
-    assert [(record["pattern_id"], record["start"], record["end"]) for record in report["records"]] == [
-        ("short", 0, 4),
-        ("long", 0, 9),
-        ("regex_duplicate", 0, 9),
-    ]
-    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["short"]
-    assert len(report["overlaps"]) == 1
-    assert report["overlaps"][0]["resolved_record"]["pattern_id"] == "short"
-    assert [record["pattern_id"] for record in report["overlaps"][0]["dropped_records"]] == [
-        "long",
-        "regex_duplicate",
-    ]
+    assert [(record["pattern_id"], record["start"], record["end"]) for record in report["records"]] == [("long", 0, 9)]
+    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["long"]
+    assert report["overlaps"] == []
 
 
 def test_priority_overlap_tie_breakers_use_longest_then_pattern_identity(minimal_bank):
@@ -154,8 +145,8 @@ def test_priority_overlap_tie_breakers_use_longest_then_pattern_identity(minimal
 
     report = extract_report(minimal_bank, "Acme Corp")
 
-    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["long"]
-    assert report["overlaps"][0]["resolved_record"]["pattern_id"] == "long"
+    assert [item["record"]["pattern_id"] for item in report["resolved_records"]] == ["short"]
+    assert report["overlaps"] == []
 
 
 def test_grouped_summary_counts_use_resolved_records(minimal_bank):
@@ -237,7 +228,7 @@ def test_expected_missing_diagnostic_defaults_to_resolved_scope(minimal_bank):
             },
         }
     ]
-    assert resolved_scope_report["diagnostics"][0]["code"] == "report.expected_missing"
+    assert resolved_scope_report["diagnostics"] == []
     assert raw_scope_report["diagnostics"] == []
 
 

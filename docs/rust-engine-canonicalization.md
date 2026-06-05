@@ -137,9 +137,9 @@ it should be revisited before release hardening or any dependency-deny policy.
 
 ## Deferred Fields
 
-This slice intentionally does not implement scanner APIs, compiled engine caches, serialized engine artifacts, or public
-record projection. It also does not preserve the current Python regex-builder object model.
+The Rust-backed `Bank` API now implements scanner APIs, process-local compiled-bank caching, and public record
+projection. It does not preserve the removed Python regex-builder object model.
 
-The canonical JSON emitted in this slice contains the engine-ready detector identity and regex fields. Existing JSON-bank
-status, descriptions, eval references, metadata, and richer literal authoring settings remain Python control-plane fields
-until later engine wiring decides which of them must cross the native boundary for scanning or projection.
+The canonical JSON contains the engine-ready detector identity and regex fields. JSON-bank status, descriptions, eval
+references, metadata, and richer literal authoring settings remain Python control-plane fields unless Rust scanning needs
+them for matching or projection.

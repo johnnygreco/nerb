@@ -27,7 +27,7 @@ def apply_bank_patches(
     patches: Sequence[dict[str, Any]],
     *,
     level: str = "standard",
-    engine: str = "python_re",
+    engine: str = "nerb_engine",
     base_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Apply RFC 6902 JSON Patch operations and validate the candidate bank."""

@@ -65,16 +65,9 @@ def _validate_regex_flag_bits(flags: int) -> None:
 
 
 def _validate_detector_name(entity: str, name: str) -> str:
-    """Validate a pattern name as the regex group name NERB will build."""
-    group_name = name.replace(" ", "_")
-    try:
-        re.compile(f"(?P<{group_name}>x)")
-    except re.error as exc:
-        raise ConfigError(
-            f"Pattern name {name!r} for entity {entity!r} is not a valid regex group name after "
-            "spaces are converted to underscores."
-        ) from exc
-    return group_name
+    """Validate a detector name accepted by Rust-backed config extraction."""
+    del entity
+    return name
 
 
 def _validate_regex_pattern(entity: str, name: str, pattern: str, flags: re.RegexFlag) -> None:
@@ -193,7 +186,6 @@ def validate_pattern_config(config: Any) -> PatternConfig:
         raw_flags = entity_config.get(FLAGS_KEY, 0)
         regex_flags = validate_regex_flags(raw_flags)
         validated_entity: dict[str, Any] = {}
-        group_names: dict[str, str] = {}
         pattern_count = 0
         for name, pattern in entity_config.items():
             if not isinstance(name, str) or not name:
@@ -206,13 +198,7 @@ def validate_pattern_config(config: Any) -> PatternConfig:
             if not isinstance(pattern, str):
                 raise ConfigError(f"Pattern {name!r} for entity {entity!r} must be a regex string.")
 
-            group_name = _validate_detector_name(entity, name)
-            previous_name = group_names.setdefault(group_name, name)
-            if previous_name != name:
-                raise ConfigError(
-                    f"Pattern names {previous_name!r} and {name!r} for entity {entity!r} both compile to "
-                    f"regex group {group_name!r}."
-                )
+            _validate_detector_name(entity, name)
             _validate_regex_pattern(entity, name, pattern, regex_flags)
             validated_entity[name] = pattern
             pattern_count += 1

@@ -25,9 +25,7 @@ EVAL_REF_UNSUPPORTED = "eval.ref_unsupported"
 METADATA_LARGE = "metadata.large"
 METADATA_TOO_LARGE = "metadata.too_large"
 PATCH_INVALID = "patch.invalid"
-REGEX_CAPTURE_CONFLICT = "regex.capture_conflict"
 REGEX_COMPILE_ERROR = "regex.compile_error"
-REGEX_COMPOSE_COMPILE_ERROR = "regex.compose_compile_error"
 REGEX_EXPENSIVE_PROBE = "regex.expensive_probe"
 REGEX_EXPENSIVE_STATIC = "regex.expensive_static"
 REGEX_LITERAL_CANDIDATE = "regex.literal_candidate"
@@ -58,9 +56,7 @@ __all__ = [
     "METADATA_LARGE",
     "METADATA_TOO_LARGE",
     "PATCH_INVALID",
-    "REGEX_CAPTURE_CONFLICT",
     "REGEX_COMPILE_ERROR",
-    "REGEX_COMPOSE_COMPILE_ERROR",
     "REGEX_EXPENSIVE_PROBE",
     "REGEX_EXPENSIVE_STATIC",
     "REGEX_LITERAL_CANDIDATE",

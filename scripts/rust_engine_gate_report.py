@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
-from nerb import NERB, Bank, __version__, bank_cache_info, clear_bank_cache, extract_named_entities_records
+from nerb import Bank, __version__, bank_cache_info, clear_bank_cache
 
 MEMORY_BUDGET_KIB = 64 * 1024
 MEMORY_ABSOLUTE_BUDGET_KIB = 256 * 1024
@@ -135,7 +135,7 @@ def _conformance_summary() -> dict[str, Any]:
         "decision_record": "docs/decisions/0001-rust-engine-semantics.md",
         "known_decisions": [
             "ASCII flag lowering for UTF-8-safe native scanning is deferred and explicitly rejected.",
-            "Python oracle underscore-name loss is documented as an oracle divergence, not a Rust target.",
+            "Detector names with underscores are preserved by the Rust record contract.",
             "global_leftmost remains internal because it drops cross-entity overlap.",
             "raw all_overlaps remains a measured prototype because dense output amplification is high.",
         ],
@@ -151,13 +151,9 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
         "iterations": iterations,
         "target_bytes": target_bytes,
         "pass_criteria": {
-            "records_equal": "Python oracle projection and Rust projection must match exactly.",
+            "native_public_records_equal": "Native raw-match projection and public Bank records must match exactly.",
             "count_stable": "Repeated measured scan/project counts must be stable.",
             "cache_hit_verified": "Public Bank cache must miss cold and hit warm for the same source/options.",
-            "rust_scan_project_not_slower_than_python": (
-                "Rust entity_independent scan/project median must be less than or equal to the Python oracle "
-                "scan/project median for each workload, including the small-bank floor."
-            ),
             "rust_thresholds": (
                 "Each workload also enforces checked-in Rust raw-scan ceilings, Rust scan/project ceilings, and "
                 "Rust scan/project bytes-per-second floors."
@@ -178,7 +174,6 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
     thresholds = WORKLOAD_THRESHOLDS[workload["id"]]
 
     native_engine = importlib.import_module("nerb._engine")
-    python_extractor = NERB(dict(pattern_config))
     rust_entity_bank = native_engine.Bank.from_source_bytes(source, format_hint="jsonl")
     rust_all_overlaps_bank = native_engine.Bank.from_source_bytes(
         source,
@@ -194,27 +189,25 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
 
     source_parse = _measure(lambda: _parse_jsonl_source(source), iterations)
     document_encode = _measure(lambda: text.encode("utf-8"), iterations)
-    python_compile = _measure_seconds(lambda: NERB(dict(pattern_config)), iterations)
-    python_scan_project, python_scan_records = _measure_with_result(
-        lambda: extract_named_entities_records(python_extractor, text),
-        iterations,
-    )
     rust_entity_compile = _measure_seconds(
         lambda: native_engine.Bank.from_source_bytes(source, format_hint="jsonl"),
         iterations,
     )
     rust_public_cache_lookup = _measure_public_bank_cache_lookup(source, iterations)
     rust_entity_scan = _measure_raw(lambda: rust_entity_bank.scan_bytes(text_bytes), iterations)
+    rust_native_scan_project, native_records = _measure_with_result(
+        lambda: _project_native_scan_records(rust_entity_bank, text_bytes),
+        iterations,
+    )
     rust_entity_scan_project, rust_records = _measure_with_result(lambda: public_bank.scan_text(text), iterations)
     rust_all_overlaps_scan = _measure_raw(lambda: rust_all_overlaps_bank.scan_bytes(text_bytes), iterations)
     rust_global_scan = _measure_raw(lambda: rust_global_bank.scan_bytes(text_bytes), iterations)
 
-    python_records = _project_python_records(python_scan_records, text)
     json_output = _measure(lambda: json.dumps(rust_records, separators=(",", ":")), iterations)
     criteria = _workload_pass_criteria(
-        records_equal=python_records == rust_records,
+        native_public_records_equal=native_records == rust_records,
         text_bytes=len(text_bytes),
-        python_scan_project=python_scan_project,
+        rust_native_scan_project=rust_native_scan_project,
         rust_entity_scan=rust_entity_scan,
         rust_entity_scan_project=rust_entity_scan_project,
         rust_all_overlaps_scan=rust_all_overlaps_scan,
@@ -228,14 +221,13 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
         "entity_count": len(pattern_config),
         "text_bytes": len(text_bytes),
         "record_count": len(rust_records),
-        "python_rust_records_equal": python_records == rust_records,
+        "native_public_records_equal": native_records == rust_records,
         "thresholds": thresholds,
         "measurements": {
             "source_parse_jsonl": source_parse,
             "document_utf8_encode": document_encode,
-            "python_re_compile": python_compile,
-            "python_re_scan_project": python_scan_project,
             "rust_entity_independent_compile": rust_entity_compile,
+            "rust_native_scan_project": rust_native_scan_project,
             "rust_public_bank_cache_lookup": rust_public_cache_lookup,
             "rust_entity_independent_scan_raw": rust_entity_scan,
             "rust_entity_independent_scan_project": rust_entity_scan_project,
@@ -249,12 +241,12 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
                 "validation, and matcher construction."
             ),
             "rust_public_bank_cache_lookup": "Reports one cold compile/cache miss followed by warm cache lookups.",
-            "rust_entity_independent_scan_project": "Includes Rust raw scan plus Python record projection and sorting.",
+            "rust_entity_independent_scan_project": "Includes Rust raw scan plus public wrapper record projection.",
             "json_output": "Measures JSON serialization of the already projected Rust records.",
         },
         "criteria": criteria,
-        "speedup_ratio_python_scan_project_to_rust_scan_project": _ratio(
-            python_scan_project["median_seconds"],
+        "native_to_public_scan_project_ratio": _ratio(
+            rust_native_scan_project["median_seconds"],
             rust_entity_scan_project["median_seconds"],
         ),
         "rust_scan_project_bytes_per_second": _bytes_per_second(
@@ -495,9 +487,9 @@ def _pattern_count(pattern_config: Mapping[str, Mapping[str, Any]]) -> int:
 
 def _workload_pass_criteria(
     *,
-    records_equal: bool,
+    native_public_records_equal: bool,
     text_bytes: int,
-    python_scan_project: Mapping[str, Any],
+    rust_native_scan_project: Mapping[str, Any],
     rust_entity_scan: Mapping[str, Any],
     rust_entity_scan_project: Mapping[str, Any],
     rust_all_overlaps_scan: Mapping[str, Any],
@@ -506,16 +498,13 @@ def _workload_pass_criteria(
     thresholds: Mapping[str, float],
 ) -> dict[str, bool]:
     return {
-        "records_equal": records_equal,
-        "python_scan_project_count_stable": python_scan_project["count_stable"] is True,
+        "native_public_records_equal": native_public_records_equal,
+        "rust_native_scan_project_count_stable": rust_native_scan_project["count_stable"] is True,
         "rust_entity_scan_raw_count_stable": rust_entity_scan["count_stable"] is True,
         "rust_entity_scan_project_count_stable": rust_entity_scan_project["count_stable"] is True,
         "rust_all_overlaps_scan_raw_count_stable": rust_all_overlaps_scan["count_stable"] is True,
         "rust_global_leftmost_scan_raw_count_stable": rust_global_scan["count_stable"] is True,
         "cache_hit_verified": rust_public_cache_lookup["cache_hit_verified"] is True,
-        "rust_scan_project_not_slower_than_python": (
-            rust_entity_scan_project["median_seconds"] <= python_scan_project["median_seconds"]
-        ),
         "rust_scan_project_under_ceiling": (
             rust_entity_scan_project["median_seconds"] <= thresholds["rust_scan_project_seconds_ceiling"]
         ),
@@ -783,17 +772,20 @@ def _repeat_to_size(seed: str, target_bytes: int) -> str:
     return encoded.decode("utf-8", errors="ignore")
 
 
-def _project_python_records(records: list[dict[str, Any]], text: str) -> list[dict[str, Any]]:
+def _project_native_scan_records(bank: Any, text_bytes: bytes) -> list[dict[str, Any]]:
+    metadata = bank.metadata()
+    detectors = {detector["detector_index"]: detector for detector in metadata["detectors"]}
+    raw = bank.scan_bytes(text_bytes)
     projected: list[dict[str, Any]] = []
-    for record in records:
-        start = len(text[: int(record["start"])].encode("utf-8"))
-        end = len(text[: int(record["end"])].encode("utf-8"))
+    for index in range(len(raw)):
+        detector_index, start, end = raw[index]
+        detector = detectors[detector_index]
         projected.append(
             {
-                "entity": record["entity"],
-                "canonical_name": record["name"],
-                "surface_name": record["name"],
-                "string": record["string"],
+                "entity": detector["entity"],
+                "canonical_name": detector["canonical_name"],
+                "surface_name": detector["surface_name"],
+                "string": text_bytes[start:end].decode("utf-8"),
                 "start": start,
                 "end": end,
                 "offset_unit": "byte",

@@ -19,25 +19,18 @@ from .config import (
 )
 from .diff import diff_banks
 from .engine import Bank, bank_cache_info, clear_bank_cache
-from .engines import clear_compiled_bank_cache, compiled_bank_cache_info
 from .evals import eval_bank
 from .extraction import (
     ExtractionError,
     explain_match,
     extract_batch,
     extract_file,
-    extract_named_entities,
-    extract_named_entities_records,
-    extract_named_entity,
-    extract_named_entity_records,
     extract_report,
     extract_report_batch,
     extract_report_file,
     extract_text,
 )
-from .named_entities import NamedEntity, NamedEntityList
 from .patches import BankPatchError, apply_bank_patches
-from .regex_builder import NERB
 from .schema import BANK_SCHEMA, ID_PATTERN, REGEX_FLAG_ORDER, SCHEMA_VERSION, validate_bank_schema
 from .validation import validate_bank
 
@@ -62,9 +55,6 @@ __all__ = [
     "DEFAULT_CONFIG_ENV_VAR",
     "DEFAULT_CONFIG_FILENAME",
     "FLAGS_KEY",
-    "NERB",
-    "NamedEntity",
-    "NamedEntityList",
     "PatternConfig",
     "ExtractionError",
     "__version__",
@@ -73,19 +63,13 @@ __all__ = [
     "bank_stats",
     "bank_cache_info",
     "canonicalize_bank",
-    "clear_compiled_bank_cache",
     "clear_bank_cache",
-    "compiled_bank_cache_info",
     "diff_banks",
     "extract_batch",
     "extract_file",
     "extract_report",
     "extract_report_batch",
     "extract_report_file",
-    "extract_named_entities",
-    "extract_named_entities_records",
-    "extract_named_entity",
-    "extract_named_entity_records",
     "extract_text",
     "eval_bank",
     "explain_match",

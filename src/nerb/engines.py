@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, cast
 
-from .bank import _hash_canonical_bank, canonicalize_bank
+from .bank import canonicalize_bank, hash_bank
 from .diagnostics import Diagnostic, has_errors
-from .records import MatchRecord, PatternIdentity, record_sort_key
+from .engine import Bank
+from .records import MatchRecord, record_sort_key
 from .schema import STATUS_VALUES, validate_bank_schema
 
 DEFAULT_INCLUDE_STATUSES = ("active",)
-DEFAULT_ENGINE_NAME = "python_re"
+DEFAULT_ENGINE_NAME = "nerb_engine"
 DEFAULT_MAX_TEXT_BYTES = 10 * 1024 * 1024
 DEFAULT_MAX_BATCH_DOCUMENTS = 100
 DEFAULT_MAX_BATCH_TEXT_BYTES = 25 * 1024 * 1024
@@ -26,13 +27,7 @@ __all__ = [
     "DEFAULT_MAX_TEXT_BYTES",
     "DEFAULT_TEXT_BYTES",
     "CompiledBank",
-    "CompiledBankCacheKey",
-    "EnginePattern",
     "ExtractionError",
-    "Matcher",
-    "clear_compiled_bank_cache",
-    "compile_bank",
-    "compiled_bank_cache_info",
     "resolve_extraction_options",
 ]
 
@@ -49,64 +44,6 @@ class ExtractionError(ValueError):
         self.diagnostics = diagnostics or []
 
 
-class Matcher(Protocol):
-    name: str
-    version: str
-
-    def finditer(self, text: str) -> list[MatchRecord]:
-        """Return raw extraction records for text."""
-
-
-@dataclass(frozen=True)
-class EnginePattern:
-    identity: PatternIdentity
-    value: str
-    regex_flags: tuple[str, ...] = ()
-    case_sensitive: bool = True
-    normalize_whitespace: bool = False
-    left_boundary: str = "none"
-    right_boundary: str = "none"
-
-
-@dataclass(frozen=True)
-class CompiledBankCacheKey:
-    bank_hash: str
-    engine_name: str
-    engine_version: str
-    include_statuses: tuple[str, ...]
-    engine_options: str
-    normalization: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "bank_hash": self.bank_hash,
-            "engine_name": self.engine_name,
-            "engine_version": self.engine_version,
-            "include_statuses": list(self.include_statuses),
-            "engine_options": json.loads(self.engine_options),
-            "normalization": self.normalization,
-        }
-
-
-@dataclass(frozen=True)
-class CompiledBank:
-    bank: dict[str, Any]
-    bank_hash: str
-    normalization: str
-    include_statuses: tuple[str, ...]
-    engine_name: str
-    engine_version: str
-    matchers: tuple[Matcher, ...]
-    cache_key: CompiledBankCacheKey
-
-    def finditer(self, text: str) -> list[MatchRecord]:
-        records: list[MatchRecord] = []
-        for matcher in self.matchers:
-            records.extend(matcher.finditer(text))
-        records.sort(key=record_sort_key)
-        return records
-
-
 @dataclass(frozen=True)
 class ResolvedExtractionOptions:
     include_statuses: tuple[str, ...]
@@ -117,9 +54,36 @@ class ResolvedExtractionOptions:
     max_batch_text_bytes: int
 
 
-_COMPILED_BANK_CACHE: dict[CompiledBankCacheKey, CompiledBank] = {}
-_CACHE_HITS = 0
-_CACHE_MISSES = 0
+@dataclass(frozen=True)
+class _DetectorIdentity:
+    entity_id: str
+    name_id: str
+    pattern_id: str
+    pattern_kind: str
+    canonical_name: str
+
+
+@dataclass(frozen=True)
+class CompiledBank:
+    bank: dict[str, Any]
+    extractable_bank: dict[str, Any] | None
+    bank_hash: str
+    normalization: str
+    include_statuses: tuple[str, ...]
+    engine_name: str
+    engine_version: str
+    engine_options: dict[str, Any]
+    native_bank: Bank | None
+    cache_metadata: dict[str, Any]
+    detector_index: Mapping[tuple[str, str, str], _DetectorIdentity]
+
+    def finditer(self, text: str) -> list[MatchRecord]:
+        if self.native_bank is None:
+            return []
+
+        records = [_enrich_json_bank_record(record, self.detector_index) for record in self.native_bank.scan_text(text)]
+        records.sort(key=record_sort_key)
+        return records
 
 
 def resolve_extraction_options(options: Mapping[str, Any] | None) -> ResolvedExtractionOptions:
@@ -141,6 +105,9 @@ def resolve_extraction_options(options: Mapping[str, Any] | None) -> ResolvedExt
     statuses = tuple(sorted(set(status_values)))
 
     engine = str(options.get("engine", DEFAULT_ENGINE_NAME))
+    if engine != DEFAULT_ENGINE_NAME:
+        raise ExtractionError(f"Extraction engine must be {DEFAULT_ENGINE_NAME!r}.")
+
     engine_options = options.get("engine_options", {})
     if not isinstance(engine_options, Mapping):
         raise ExtractionError("Extraction option engine_options must be an object.")
@@ -155,52 +122,24 @@ def resolve_extraction_options(options: Mapping[str, Any] | None) -> ResolvedExt
     )
 
 
-def _positive_int_option(options: Mapping[str, Any], key: str, default: int) -> int:
-    value = options.get(key, default)
-    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
-        raise ExtractionError(f"Extraction option {key} must be a positive integer.")
-    return value
-
-
 def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None = None) -> tuple[CompiledBank, bool]:
-    global _CACHE_HITS, _CACHE_MISSES
-
     resolved = resolve_extraction_options(options)
-    if resolved.engine != DEFAULT_ENGINE_NAME:
-        raise ExtractionError("Extraction engine must be 'python_re' for this milestone.")
-
-    try:
-        canonical_bank = canonicalize_bank(bank)
-        bank_hash = _hash_canonical_bank(canonical_bank)
-    except TypeError as exc:
-        schema_result = validate_bank_schema(bank)
-        diagnostics = schema_result["diagnostics"]
-        if has_errors(diagnostics):
-            raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics) from exc
-        raise
-    normalization = str(canonical_bank.get("unicode_normalization", "none"))
-
-    from .literal_engine import LiteralMatcher
-    from .python_re_engine import PythonReEngine
-
-    engine_options = _canonical_options(resolved.engine_options)
-    cache_key = CompiledBankCacheKey(
-        bank_hash=bank_hash,
-        engine_name=PythonReEngine.name,
-        engine_version=PythonReEngine.version,
-        include_statuses=resolved.include_statuses,
-        engine_options=engine_options,
-        normalization=normalization,
-    )
-    cached = _COMPILED_BANK_CACHE.get(cache_key)
-    if cached is not None:
-        _CACHE_HITS += 1
-        return cached, True
 
     schema_result = validate_bank_schema(bank)
     diagnostics = schema_result["diagnostics"]
     if has_errors(diagnostics):
         raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics)
+
+    try:
+        canonical_bank = canonicalize_bank(bank)
+    except TypeError as exc:
+        raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics) from exc
+
+    if canonical_bank.get("status") not in resolved.include_statuses:
+        raise ExtractionError(
+            f"Bank status {canonical_bank.get('status')!r} is not included in extraction statuses "
+            f"{list(resolved.include_statuses)!r}."
+        )
 
     from .validation import validate_bank
 
@@ -209,34 +148,61 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
     if has_errors(validation_diagnostics):
         raise ExtractionError("Bank failed runtime validation and cannot be extracted.", validation_diagnostics)
 
-    regex_patterns, literal_patterns = _eligible_patterns(canonical_bank, resolved.include_statuses)
+    extractable_bank = _filter_extractable_bank(canonical_bank, resolved.include_statuses)
+    if extractable_bank is None:
+        compiled = CompiledBank(
+            bank=canonical_bank,
+            extractable_bank=None,
+            bank_hash=hash_bank(canonical_bank),
+            normalization=str(canonical_bank.get("unicode_normalization", "none")),
+            include_statuses=resolved.include_statuses,
+            engine_name=DEFAULT_ENGINE_NAME,
+            engine_version="uncompiled",
+            engine_options=resolved.engine_options,
+            native_bank=None,
+            cache_metadata={"enabled": False, "hit": False, "key": None},
+            detector_index={},
+        )
+        return compiled, False
+
+    compile_options_json = _canonical_options(resolved.engine_options)
+    try:
+        native_bank = Bank.from_source_bytes(
+            _json_source(extractable_bank),
+            format_hint="json",
+            compile_options_json=compile_options_json,
+        )
+    except ValueError as exc:
+        raise ExtractionError(f"Bank failed Rust engine validation and cannot be extracted: {exc}.") from exc
+
+    cache_metadata = native_bank.cache_metadata()
+    cache_key = cache_metadata.get("key") if isinstance(cache_metadata, Mapping) else None
+    engine_version = "unknown"
+    if isinstance(cache_key, Mapping) and isinstance(cache_key.get("engine_version"), str):
+        engine_version = cache_key["engine_version"]
+
+    metadata = native_bank.metadata()
     compiled = CompiledBank(
         bank=canonical_bank,
-        bank_hash=bank_hash,
-        normalization=normalization,
+        extractable_bank=extractable_bank,
+        bank_hash=str(metadata["bank_hash"]),
+        normalization=str(canonical_bank.get("unicode_normalization", "none")),
         include_statuses=resolved.include_statuses,
-        engine_name=PythonReEngine.name,
-        engine_version=PythonReEngine.version,
-        matchers=(
-            PythonReEngine(regex_patterns, normalization=normalization),
-            LiteralMatcher(literal_patterns, normalization=normalization),
-        ),
-        cache_key=cache_key,
+        engine_name=str(metadata["engine"]),
+        engine_version=engine_version,
+        engine_options=resolved.engine_options,
+        native_bank=native_bank,
+        cache_metadata=cache_metadata,
+        detector_index=_json_bank_detector_index(extractable_bank),
     )
-    _COMPILED_BANK_CACHE[cache_key] = compiled
-    _CACHE_MISSES += 1
-    return compiled, False
+    return compiled, bool(cache_metadata.get("hit"))
 
 
-def clear_compiled_bank_cache() -> None:
-    global _CACHE_HITS, _CACHE_MISSES
-    _COMPILED_BANK_CACHE.clear()
-    _CACHE_HITS = 0
-    _CACHE_MISSES = 0
-
-
-def compiled_bank_cache_info() -> dict[str, Any]:
-    return {"size": len(_COMPILED_BANK_CACHE), "hits": _CACHE_HITS, "misses": _CACHE_MISSES}
+def _positive_int_option(options: Mapping[str, Any], key: str, default: int) -> int:
+    value = options.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ExtractionError(f"Extraction option {key} must be a positive integer.")
+    return value
 
 
 def _canonical_options(options: Mapping[str, Any]) -> str:
@@ -246,27 +212,25 @@ def _canonical_options(options: Mapping[str, Any]) -> str:
         raise ExtractionError("Extraction option engine_options must be JSON-compatible.") from exc
 
 
-def _eligible_patterns(
-    bank: Mapping[str, Any],
-    include_statuses: tuple[str, ...],
-) -> tuple[tuple[EnginePattern, ...], tuple[EnginePattern, ...]]:
-    regex_patterns: list[EnginePattern] = []
-    literal_patterns: list[EnginePattern] = []
-    root_flags = bank.get("default_regex_flags", [])
+def _json_source(bank: Mapping[str, Any]) -> bytes:
+    return json.dumps(bank, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
 
-    if bank.get("status") not in include_statuses:
-        return (), ()
+
+def _filter_extractable_bank(bank: Mapping[str, Any], include_statuses: tuple[str, ...]) -> dict[str, Any] | None:
+    filtered = dict(bank)
+    filtered_entities: dict[str, Any] = {}
 
     entities = bank.get("entities", {})
     if not isinstance(entities, Mapping):
-        return (), ()
+        return None
 
     for entity_id, entity in entities.items():
         if not isinstance(entity_id, str) or not isinstance(entity, Mapping):
             continue
         if entity.get("status") not in include_statuses:
             continue
-        entity_flags = entity.get("regex_flags", [])
+
+        filtered_names: dict[str, Any] = {}
         names = entity.get("names", {})
         if not isinstance(names, Mapping):
             continue
@@ -275,50 +239,93 @@ def _eligible_patterns(
                 continue
             if name.get("status") not in include_statuses:
                 continue
+
+            filtered_patterns: dict[str, Any] = {}
             patterns = name.get("patterns", {})
             if not isinstance(patterns, Mapping):
                 continue
             for pattern_id, pattern in patterns.items():
                 if not isinstance(pattern_id, str) or not isinstance(pattern, Mapping):
                     continue
-                if pattern.get("status") not in include_statuses:
-                    continue
-                kind = pattern.get("kind")
-                if kind not in {"literal", "regex"} or not isinstance(pattern.get("value"), str):
-                    continue
-                engine_pattern = EnginePattern(
-                    identity=PatternIdentity(
-                        entity_id=entity_id,
-                        name_id=name_id,
-                        pattern_id=pattern_id,
-                        pattern_kind=kind,
-                        canonical_name=str(name.get("canonical", "")),
-                    ),
-                    value=pattern["value"],
-                    regex_flags=_unique_flags(root_flags, entity_flags, pattern.get("regex_flags", [])),
-                    case_sensitive=bool(pattern.get("case_sensitive", True)),
-                    normalize_whitespace=bool(pattern.get("normalize_whitespace", False)),
-                    left_boundary=str(pattern.get("left_boundary", "none")),
-                    right_boundary=str(pattern.get("right_boundary", "none")),
-                )
-                if kind == "regex":
-                    regex_patterns.append(engine_pattern)
-                else:
-                    literal_patterns.append(engine_pattern)
+                if pattern.get("status") in include_statuses:
+                    filtered_patterns[pattern_id] = dict(pattern)
 
-    return tuple(regex_patterns), tuple(literal_patterns)
+            if filtered_patterns:
+                filtered_name = dict(name)
+                filtered_name["patterns"] = filtered_patterns
+                filtered_names[name_id] = filtered_name
+
+        if filtered_names:
+            filtered_entity = dict(entity)
+            filtered_entity["names"] = filtered_names
+            filtered_entities[entity_id] = filtered_entity
+
+    if not filtered_entities:
+        return None
+
+    filtered["entities"] = filtered_entities
+    return filtered
 
 
-def _unique_flags(*flag_sets: Any) -> tuple[str, ...]:
-    from .schema import REGEX_FLAG_ORDER
+def _json_bank_detector_index(bank: Mapping[str, Any]) -> dict[tuple[str, str, str], _DetectorIdentity]:
+    index: dict[tuple[str, str, str], _DetectorIdentity] = {}
+    entities = bank.get("entities", {})
+    if not isinstance(entities, Mapping):
+        return index
 
-    seen: set[str] = set()
-    flags: list[str] = []
-    for flag_set in flag_sets:
-        if not isinstance(flag_set, Sequence) or isinstance(flag_set, (str, bytes)):
+    for entity_id, entity in sorted(entities.items()):
+        if not isinstance(entity_id, str) or not isinstance(entity, Mapping):
             continue
-        for flag in flag_set:
-            if isinstance(flag, str) and flag in REGEX_FLAG_ORDER and flag not in seen:
-                seen.add(flag)
-                flags.append(flag)
-    return tuple(sorted(flags, key=REGEX_FLAG_ORDER.index))
+        entity_map = cast(Mapping[str, Any], entity)
+        names = entity_map.get("names", {})
+        if not isinstance(names, Mapping):
+            continue
+        for name_id, name in sorted(names.items()):
+            if not isinstance(name_id, str) or not isinstance(name, Mapping):
+                continue
+            name_map = cast(Mapping[str, Any], name)
+            canonical_name = str(name_map.get("canonical", ""))
+            patterns = name_map.get("patterns", {})
+            if not isinstance(patterns, Mapping):
+                continue
+            for pattern_id, pattern in sorted(patterns.items()):
+                if not isinstance(pattern_id, str) or not isinstance(pattern, Mapping):
+                    continue
+                pattern_map = cast(Mapping[str, Any], pattern)
+                pattern_kind = str(pattern_map.get("kind", ""))
+                surface_name = str(pattern_map.get("value")) if pattern_kind == "literal" else pattern_id
+                index[(entity_id, canonical_name, surface_name)] = _DetectorIdentity(
+                    entity_id=entity_id,
+                    name_id=name_id,
+                    pattern_id=pattern_id,
+                    pattern_kind=pattern_kind,
+                    canonical_name=canonical_name,
+                )
+
+    return index
+
+
+def _enrich_json_bank_record(
+    record: Mapping[str, Any],
+    detector_index: Mapping[tuple[str, str, str], _DetectorIdentity],
+) -> MatchRecord:
+    key = (
+        str(record["entity"]),
+        str(record["canonical_name"]),
+        str(record["surface_name"]),
+    )
+    identity = detector_index.get(key)
+    if identity is None:
+        raise ExtractionError(
+            f"Rust engine record could not be mapped back to JSON-bank detector metadata: {key[0]}/{key[1]}/{key[2]}."
+        )
+
+    return {
+        **dict(record),
+        "entity_id": identity.entity_id,
+        "name_id": identity.name_id,
+        "name": identity.canonical_name,
+        "pattern_id": identity.pattern_id,
+        "pattern_kind": identity.pattern_kind,
+        "captures": {},
+    }

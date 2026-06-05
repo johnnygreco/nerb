@@ -337,7 +337,7 @@ The full stress command exited with status `124` after the 180-second cap and di
 
 ## Recorded Results
 
-| Workload | Names | Patterns | Matcher Shards | Cold Compile | Warm Cache Lookup | Target Warm Extraction | Notes |
+| Workload | Names | Patterns | Engine Profile | Cold Compile | Warm Cache Lookup | Target Warm Extraction | Notes |
 | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
 | Target exact literals | 10,000 | 100,000 literal | literal: 64 | 24.657s | 0.750s | 0.032s | Cache hit verified; 48 target records stable over 2 iterations. |
 | Target mixed | 10,000 | 95,000 literal / 5,000 regex | literal: 64, regex: 32 | 26.461s | 0.777s | 1.266s | Regex shard scanning dominates warm extraction. |
@@ -345,7 +345,7 @@ The full stress command exited with status `124` after the 180-second cap and di
 | Full stress cap exact literals | 100,000 | 1,000,000 literal | intended literal: 128 | >180s | not reached | not reached | Timed out before payload. |
 
 The target exact-literal run is inside the V1 target tier. The full stress tier is not practical as a routine local or
-CI check with the current Python implementation.
+CI check.
 
 ## Bottlenecks
 

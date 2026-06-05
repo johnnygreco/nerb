@@ -604,7 +604,7 @@ def validate_bank(
     bank: Any | None = None,
     bank_path: str | None = None,
     level: str = "standard",
-    engine: str = "python_re",
+    engine: str = "nerb_engine",
     base_path: str | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
@@ -636,7 +636,7 @@ def apply_bank_patches(
     patches: Any | None = None,
     patch_path: str | None = None,
     level: str = "standard",
-    engine: str = "python_re",
+    engine: str = "nerb_engine",
     base_path: str | None = None,
 ) -> dict[str, Any]:
     """Apply explicit JSON Patch operations to a JSON bank and validate the candidate."""
@@ -689,7 +689,7 @@ def bank_stats(
     bank: Any | None = None,
     bank_path: str | None = None,
     include_engine: bool = False,
-    engine: str = "python_re",
+    engine: str = "nerb_engine",
 ) -> dict[str, Any]:
     """Return JSON-bank structural counts without compiling patterns."""
     bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path, raw=True)

@@ -11,13 +11,11 @@ from click.exceptions import Exit
 from typer.testing import CliRunner
 
 from nerb import (
-    NERB,
     Bank,
     apply_bank_patches,
     bank_cache_info,
     benchmark_bank,
     clear_bank_cache,
-    clear_compiled_bank_cache,
     diff_banks,
     eval_bank,
     load_config,
@@ -120,7 +118,6 @@ def test_help_shows_command_structure():
         "extract",
         "extract-batch",
         "test",
-        "compile",
         "doctor",
         "init",
         "add",
@@ -228,17 +225,17 @@ def test_json_bank_extraction_commands_match_helpers(tmp_path, test_data_path):
     document_path = tmp_path / "email.txt"
     document_path.write_text(text, encoding="utf-8")
 
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     text_result = runner.invoke(app, ["extract-text", "--bank", str(bank_path), "--text", text])
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_text = extract_json_text(bank, text)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     file_result = runner.invoke(app, ["extract-file", "--bank", str(bank_path), "--file", str(document_path)])
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_file = extract_json_file(bank, document_path)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     report_result = runner.invoke(app, ["extract-report", "--bank", str(bank_path), "--file", str(document_path)])
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_report = extract_json_report_file(bank, document_path)
 
     assert text_result.exit_code == 0
@@ -271,13 +268,13 @@ def test_json_bank_cli_stdin_extraction_commands_keep_text_inputs(test_data_path
     bank = _load_json(bank_path)
     text = "Send this to Acme Corp today."
 
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     text_result = runner.invoke(app, ["extract-text", "--bank", str(bank_path), "--stdin"], input=text)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     expected_text = extract_json_text(bank, text)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
     report_result = runner.invoke(app, ["extract-report", "--bank", str(bank_path), "--stdin"], input=text)
-    clear_compiled_bank_cache()
+    clear_bank_cache()
 
     assert text_result.exit_code == 0
     assert report_result.exit_code == 0
@@ -944,26 +941,6 @@ def test_test_saved_detector_reports_unknown_entity_and_pattern(tmp_path):
     assert str(config_path) in result.output
 
 
-def test_compile_outputs_compiled_regex_for_entity(tmp_path):
-    config_path = save_config({"ARTIST": {"Pink Floyd": r"Pink\sFloyd", "Rush": "Rush"}}, tmp_path / "entities.yaml")
-
-    result = runner.invoke(app, ["compile", "ARTIST", "--config", str(config_path)])
-
-    assert result.exit_code == 0
-    assert result.output.strip() == r"(?P<Pink_Floyd>Pink\sFloyd)|(?P<Rush>Rush)"
-
-    result = runner.invoke(app, ["compile", "ARTIST", "--config", str(config_path), "--format", "json"])
-
-    assert result.exit_code == 0
-    payload = json.loads(result.output)
-    assert payload["entity"] == "ARTIST"
-    assert payload["pattern"] == r"(?P<Pink_Floyd>Pink\sFloyd)|(?P<Rush>Rush)"
-    assert payload["groups"] == [
-        {"name": "Pink Floyd", "group": "Pink_Floyd", "index": 1},
-        {"name": "Rush", "group": "Rush", "index": 2},
-    ]
-
-
 def test_doctor_reports_valid_and_invalid_config_json(tmp_path):
     config_path = save_config({"ARTIST": {"Pink Floyd": r"Pink\sFloyd"}}, tmp_path / "entities.yaml")
 
@@ -988,16 +965,16 @@ def test_doctor_reports_valid_and_invalid_config_json(tmp_path):
     assert "not a valid regex pattern" in payload["diagnostics"][0]["message"]
 
 
-def test_doctor_reports_duplicate_compiled_group_names(tmp_path):
+def test_doctor_accepts_names_that_only_differ_by_spaces_and_underscores(tmp_path):
     config_path = tmp_path / "entities.yaml"
     config_path.write_text("ARTIST:\n  Pink Floyd: Pink\\sFloyd\n  Pink_Floyd: Pink_Floyd\n", encoding="utf-8")
 
     result = runner.invoke(app, ["doctor", "--config", str(config_path), "--format", "json"])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0
     payload = json.loads(result.output)
-    diagnostic_codes = {diagnostic["code"] for diagnostic in payload["diagnostics"]}
-    assert "duplicate_group_name" in diagnostic_codes
+    assert payload["valid"] is True
+    assert payload["diagnostics"] == []
 
 
 def test_init_creates_config_and_refuses_existing_file(tmp_path):
@@ -1024,7 +1001,7 @@ def test_init_force_overwrites_existing_config(tmp_path):
     assert load_config(config_path) == {}
 
 
-def test_add_creates_config_that_nerb_can_load(tmp_path):
+def test_add_creates_config_that_bank_can_load(tmp_path):
     config_path = tmp_path / "entities.yaml"
 
     result = runner.invoke(
@@ -1034,9 +1011,19 @@ def test_add_creates_config_that_nerb_can_load(tmp_path):
 
     assert result.exit_code == 0
     assert load_config(config_path) == {"ARTIST": {"Pink Floyd": r"Pink\sFloyd"}}
-    nerb = NERB(config_path)
-    assert nerb.entity_list == ["ARTIST"]
-    assert nerb.ARTIST.pattern == r"(?P<Pink_Floyd>Pink\sFloyd)"
+    bank = Bank.from_config(load_config(config_path))
+    assert bank.metadata()["entity_count"] == 1
+    assert bank.scan_text("Pink Floyd") == [
+        {
+            "entity": "ARTIST",
+            "canonical_name": "Pink Floyd",
+            "surface_name": "Pink Floyd",
+            "string": "Pink Floyd",
+            "start": 0,
+            "end": 10,
+            "offset_unit": "byte",
+        }
+    ]
 
 
 def test_add_uses_default_config_path_from_env(monkeypatch, tmp_path):

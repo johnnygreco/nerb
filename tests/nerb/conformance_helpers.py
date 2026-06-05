@@ -4,21 +4,17 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from nerb import NERB, extract_named_entities_records
-
 PlannedRecord = dict[str, int | str]
 
 
 @dataclass(frozen=True)
-class PythonOracleConformanceCase:
+class RustConformanceCase:
     case_id: str
     pattern_config: dict[str, dict[str, Any]]
     text: str
     expected_records: tuple[PlannedRecord, ...]
     tags: frozenset[str]
     add_word_boundaries: bool = False
-    python_oracle_expected_records: tuple[PlannedRecord, ...] | None = None
-    known_divergences: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -49,37 +45,6 @@ def planned_record_sort_key(record: Mapping[str, Any]) -> tuple[int, int, str, s
     )
 
 
-def project_python_oracle_record(text: str, record: Mapping[str, Any]) -> PlannedRecord:
-    start, end = utf8_byte_span(text, int(record["start"]), int(record["end"]))
-    name = str(record["name"])
-    return {
-        "entity": str(record["entity"]),
-        "canonical_name": name,
-        "surface_name": name,
-        "string": str(record["string"]),
-        "start": start,
-        "end": end,
-        "offset_unit": "byte",
-    }
-
-
-def project_python_oracle_records(text: str, records: Sequence[Mapping[str, Any]]) -> list[PlannedRecord]:
-    projected = [project_python_oracle_record(text, record) for record in records]
-    projected.sort(key=planned_record_sort_key)
-    return projected
-
-
-def project_python_oracle_case_records(case: PythonOracleConformanceCase) -> list[PlannedRecord]:
-    extractor = NERB(case.pattern_config, add_word_boundaries=case.add_word_boundaries)
-    records = extract_named_entities_records(extractor, case.text)
-    return project_python_oracle_records(case.text, records)
-
-
-def expected_python_oracle_records(case: PythonOracleConformanceCase) -> tuple[PlannedRecord, ...]:
-    override = case.python_oracle_expected_records
-    return override if override is not None else case.expected_records
-
-
 def assert_planned_records_equal(actual: Sequence[Mapping[str, Any]], expected: Sequence[Mapping[str, Any]]) -> None:
     actual_records = list(actual)
     expected_records = list(expected)
@@ -88,8 +53,8 @@ def assert_planned_records_equal(actual: Sequence[Mapping[str, Any]], expected: 
     assert actual_records == expected_records
 
 
-PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
-    PythonOracleConformanceCase(
+RUST_CONFORMANCE_CASES: tuple[RustConformanceCase, ...] = (
+    RustConformanceCase(
         case_id="non_ascii_byte_offsets",
         pattern_config={"ARTIST": {"Pink Floyd": r"Pink\sFloyd"}},
         text="Caf\u00e9 Pink Floyd",
@@ -106,7 +71,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"offsets", "non_ascii"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="cross_entity_overlap",
         pattern_config={"PERSON": {"Sam": "Sam"}, "PROJECT": {"Samba": "Samba"}},
         text="Samba ships",
@@ -132,7 +97,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"overlap", "cross_entity"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="nickname_inside_project",
         pattern_config={"PERSON": {"JD": "JD"}, "PROJECT": {"JD 42": "JD-42"}},
         text="JD-42 launched",
@@ -158,7 +123,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"overlap", "nickname_inside_project"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="within_entity_leftmost_source_order_short_first",
         pattern_config={"PERSON": {"Sam": "Sam", "Samba": "Samba"}},
         text="Samba ships",
@@ -175,7 +140,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"overlap", "within_entity_leftmost_first"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="within_entity_leftmost_source_order_long_first",
         pattern_config={"PERSON": {"Samba": "Samba", "Sam": "Sam"}},
         text="Samba ships",
@@ -192,7 +157,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"overlap", "within_entity_leftmost_first"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="ordered_alternation_short_first",
         pattern_config={"PERSON": {"Samwise Short Preferred": "Sam|Samwise"}},
         text="Samwise arrived",
@@ -209,7 +174,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"ordered_alternation", "within_pattern_leftmost_first"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="ordered_alternation_long_first",
         pattern_config={"PERSON": {"Samwise Long Preferred": "Samwise|Sam"}},
         text="Samwise arrived",
@@ -226,8 +191,8 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"ordered_alternation", "within_pattern_leftmost_first"}),
     ),
-    PythonOracleConformanceCase(
-        case_id="underscore_name_python_oracle_divergence",
+    RustConformanceCase(
+        case_id="underscore_names_preserved",
         pattern_config={"CODE": {"Foo_Bar": "Foo_Bar"}},
         text="Foo_Bar",
         expected_records=(
@@ -241,21 +206,9 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
                 "offset_unit": "byte",
             },
         ),
-        python_oracle_expected_records=(
-            {
-                "entity": "CODE",
-                "canonical_name": "Foo Bar",
-                "surface_name": "Foo Bar",
-                "string": "Foo_Bar",
-                "start": 0,
-                "end": 7,
-                "offset_unit": "byte",
-            },
-        ),
         tags=frozenset({"underscore_names"}),
-        known_divergences=("python_oracle_name_underscore_loss",),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="word_boundaries",
         pattern_config={"TERM": {"AI": "AI"}},
         text="AIM AI",
@@ -273,7 +226,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         tags=frozenset({"word_boundaries"}),
         add_word_boundaries=True,
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="unicode_word_boundaries",
         pattern_config={"TERM": {"AI": "AI"}},
         text="\u00e9AI AI",
@@ -291,7 +244,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         tags=frozenset({"word_boundaries", "unicode_word_boundaries"}),
         add_word_boundaries=True,
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="entity_flag_ignorecase",
         pattern_config={"GENRE": {"_flags": "IGNORECASE", "Jazz": "jazz"}},
         text="JaZz",
@@ -308,7 +261,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"flags", "flag_IGNORECASE"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="entity_flag_multiline",
         pattern_config={"CUSTOMER": {"_flags": "MULTILINE", "Acme": "^Acme"}},
         text="skip\nAcme",
@@ -325,7 +278,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"flags", "flag_MULTILINE"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="entity_flag_dotall",
         pattern_config={"CODE": {"_flags": "DOTALL", "A through Z": "A.*Z"}},
         text="A\nZ",
@@ -342,7 +295,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"flags", "flag_DOTALL"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="entity_flag_verbose",
         pattern_config={"CUSTOMER": {"_flags": "VERBOSE", "Acme": "A C M E"}},
         text="ACME",
@@ -359,7 +312,7 @@ PYTHON_ORACLE_CONFORMANCE_CASES: tuple[PythonOracleConformanceCase, ...] = (
         ),
         tags=frozenset({"flags", "flag_VERBOSE"}),
     ),
-    PythonOracleConformanceCase(
+    RustConformanceCase(
         case_id="entity_flag_ascii",
         pattern_config={"CODE": {"_flags": "ASCII", "ASCII word": r"\b\w\b"}},
         text="\u00e9 A",
@@ -393,7 +346,7 @@ RUST_REGEX_PROFILE_FIXTURES: tuple[RustRegexProfileFixture, ...] = (
         category="unsupported_lookaround",
         expected_rust_status="reject",
         current_python_status="accepted_with_static_warning",
-        reason="Lookaround is valid Python re syntax but rejected by the default Rust regex profile.",
+        reason="Lookaround is rejected by the default Rust regex profile.",
     ),
     RustRegexProfileFixture(
         case_id="nested_quantifier_redos",
