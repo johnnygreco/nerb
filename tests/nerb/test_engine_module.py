@@ -144,3 +144,22 @@ def test_public_bank_compile_options_reject_non_finite_constants():
             format_hint="json",
             compile_options_json='{"match_mode":NaN}',
         )
+
+
+@pytest.mark.parametrize("raw_options", ['{"word_boundaries":"bad"}', '{"word_boundaries":{}}'])
+def test_public_bank_config_word_boundary_option_must_be_boolean_before_override(raw_options):
+    with pytest.raises(ValueError, match='field "word_boundaries" must be a boolean'):
+        nerb.Bank.from_config(
+            {"CODE": {"A": "A"}},
+            compile_options_json=raw_options,
+            word_boundaries=True,
+        )
+
+
+def test_public_bank_config_word_boundary_option_rejects_non_finite_before_override():
+    with pytest.raises(ValueError, match="non-finite value"):
+        nerb.Bank.from_config(
+            {"CODE": {"A": "A"}},
+            compile_options_json='{"word_boundaries":1e999}',
+            word_boundaries=True,
+        )

@@ -241,8 +241,10 @@ engine_cache_info
 clear_engine_cache
 ```
 
-MCP tools accept explicit bank objects or explicit bank paths, depending on the tool. File reads are limited to explicit
-bank, document, patch, and eval paths.
+JSON-bank MCP tools accept explicit bank objects or explicit bank paths, depending on the tool. Rust/config-backed tools
+accept explicit config paths, provided inline detector definitions, and explicit document paths or text. File reads are
+limited to explicit bank, config, document, patch, and eval paths; config writes are limited to the explicit
+`config_path` passed by the client.
 
 ## YAML Detector Configs
 

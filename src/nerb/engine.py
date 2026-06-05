@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 import sys
 import sysconfig
 from collections.abc import Mapping
@@ -320,11 +321,13 @@ def _canonical_compile_options_json(compile_options_json: str | None) -> str:
 
 
 def _load_compile_options_json(compile_options_json: str) -> Any:
-    return json.loads(
+    options = json.loads(
         compile_options_json,
         object_pairs_hook=_reject_duplicate_json_object_keys,
         parse_constant=_reject_non_finite_json_constant,
     )
+    _reject_non_finite_json_values(options)
+    return options
 
 
 def _reject_duplicate_json_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -338,6 +341,17 @@ def _reject_duplicate_json_object_keys(pairs: list[tuple[str, Any]]) -> dict[str
 
 def _reject_non_finite_json_constant(constant: str) -> None:
     raise ValueError(f"compile_options_json must not contain non-finite value {constant}.")
+
+
+def _reject_non_finite_json_values(value: Any) -> None:
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"compile_options_json must not contain non-finite value {value}.")
+    if isinstance(value, dict):
+        for child_value in value.values():
+            _reject_non_finite_json_values(child_value)
+    if isinstance(value, list):
+        for child_value in value:
+            _reject_non_finite_json_values(child_value)
 
 
 def _config_to_jsonl_source(
@@ -385,6 +399,8 @@ def _compile_options_with_word_boundaries(compile_options_json: str | None, enab
         if not isinstance(options_value, dict):
             raise ValueError("compile_options_json must decode to a JSON object.")
         options = dict(options_value)
+    if "word_boundaries" in options and not isinstance(options["word_boundaries"], bool):
+        raise ValueError('compile_options_json field "word_boundaries" must be a boolean.')
 
     options["word_boundaries"] = True
     return json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
