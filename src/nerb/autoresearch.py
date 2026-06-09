@@ -433,6 +433,7 @@ def _run_candidate_command(command: Sequence[str], *, timeout_seconds: float, cw
             stderr=subprocess.PIPE,
             **_candidate_process_group_kwargs(),
         )
+        process_group_id = _candidate_process_group_id(process)
     except OSError as exc:
         return ProcessResult(
             tuple(command),
@@ -460,11 +461,11 @@ def _run_candidate_command(command: Sequence[str], *, timeout_seconds: float, cw
     exit_code: int | None
     try:
         exit_code = process.wait(timeout=timeout_seconds)
-        _terminate_process_group(process)
+        _terminate_process_group(process, process_group_id)
     except subprocess.TimeoutExpired:
         timed_out = True
         exit_code = None
-        _terminate_process_group(process)
+        _terminate_process_group(process, process_group_id)
     _join_output_threads((stdout_thread, stderr_thread))
 
     return ProcessResult(
@@ -527,38 +528,56 @@ def _candidate_process_group_kwargs() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
-def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
+def _candidate_process_group_id(process: subprocess.Popen[Any]) -> int | None:
+    if os.name == "nt":
+        return None
+    try:
+        return os.getpgid(process.pid)
+    except OSError:
+        return process.pid
+
+
+def _terminate_process_group(process: subprocess.Popen[Any], process_group_id: int | None) -> None:
     if os.name == "nt":
         _terminate_windows_process_tree(process)
     else:
-        _terminate_posix_process_group(process)
+        _terminate_posix_process_group(process, process_group_id)
 
 
-def _terminate_posix_process_group(process: subprocess.Popen[Any]) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except OSError:
-        if process.poll() is None:
-            process.terminate()
-    if process.poll() is None:
+def _terminate_posix_process_group(process: subprocess.Popen[Any], process_group_id: int | None) -> None:
+    if process_group_id is None:
+        if process.poll() is not None:
+            return
+        process.terminate()
         try:
             process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
             return
         except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            return
+    if not _signal_process_group(process_group_id, signal.SIGTERM):
+        return
+    if process.poll() is None:
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
             pass
     else:
         time.sleep(PROCESS_TERMINATION_GRACE_SECONDS)
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except OSError:
-        if process.poll() is None:
-            process.kill()
+    _signal_process_group(process_group_id, signal.SIGKILL)
     if process.poll() is None:
         process.wait()
+
+
+def _signal_process_group(process_group_id: int, signal_number: int) -> bool:
+    try:
+        os.killpg(process_group_id, signal_number)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    return True
 
 
 def _terminate_windows_process_tree(process: subprocess.Popen[Any]) -> None:

@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 
+import nerb.autoresearch as autoresearch
 from nerb.autoresearch import PROCESS_OUTPUT_TAIL_CHARS, append_result_jsonl, run_autoresearch, score_candidate
 
 
@@ -590,6 +591,49 @@ def test_run_autoresearch_timeout_kills_candidate_process_group(tmp_path: Path) 
         candidate_command=[sys.executable, ".nerb/spawn_late_writer.py"],
     )
     time.sleep(0.7)
+
+    assert result["decision"] == {"value": "discard", "reason": "timeout"}
+    assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cleanup regression")
+def test_run_autoresearch_timeout_kills_sigterm_ignoring_child(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setattr(autoresearch, "PROCESS_TERMINATION_GRACE_SECONDS", 0.1)
+    _init_repo(tmp_path)
+    engine_path = tmp_path / "src/nerb/engine.py"
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    writer_path = tmp_path / ".nerb/spawn_sigterm_ignoring_writer.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        "subprocess.Popen([\n"
+        "    sys.executable,\n"
+        "    '-c',\n"
+        '    "import signal; import time; from pathlib import Path; "\n'
+        '    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "\n'
+        '    "time.sleep(0.3); "\n'
+        "    \"Path('src/nerb/engine.py').write_text('LATE = 1\\\\n', encoding='utf-8')\",\n"
+        "], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=tmp_path / ".nerb/candidate/benchmark.json",
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="sigterm ignoring child timeout",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        timeout_seconds=0.1,
+        candidate_command=[sys.executable, ".nerb/spawn_sigterm_ignoring_writer.py"],
+    )
+    time.sleep(0.5)
 
     assert result["decision"] == {"value": "discard", "reason": "timeout"}
     assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
