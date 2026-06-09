@@ -109,5 +109,7 @@ Use these when the task matches:
 
 - `.agents/skills/nerb-cli-config/SKILL.md`: CLI commands and detector config behavior.
 - `.agents/skills/nerb-extraction-surfaces/SKILL.md`: extraction behavior, records, and public extraction surfaces.
+- `.agents/skills/nerb-large-source-bank-building/SKILL.md`: large-corpus entity-bank construction workflow,
+  guardrails, evals, and benchmark/regression use.
 - `.agents/skills/nerb-mcp-tools/SKILL.md`: MCP tool implementation and launch/test workflow.
 - `.agents/skills/nerb-release-publishing/SKILL.md`: release, build, and publishing workflow changes.
