@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import platform
@@ -58,6 +59,13 @@ class ProcessResult:
     skip_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class FileFingerprint:
+    exists: bool
+    size: int | None
+    sha256: str | None
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
     result = run_autoresearch(
@@ -112,6 +120,7 @@ def run_autoresearch(
     started = time.perf_counter()
     pre_changed_paths = _git_changed_paths(repo, checkpoint_ref)
     pre_path_gate = _path_gate(pre_changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
+    pre_candidate_fingerprint = _file_fingerprint(candidate_path)
     if pre_path_gate["passed"]:
         process = (
             _run_candidate_command(candidate_command, timeout_seconds=timeout_seconds, cwd=repo)
@@ -120,6 +129,7 @@ def run_autoresearch(
         )
         changed_paths = _git_changed_paths(repo, checkpoint_ref)
         post_path_gate = _path_gate(changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
+        post_candidate_fingerprint = _file_fingerprint(candidate_path)
     else:
         process = ProcessResult(
             tuple(candidate_command or ()),
@@ -133,7 +143,14 @@ def run_autoresearch(
         )
         changed_paths = pre_changed_paths
         post_path_gate = pre_path_gate
+        post_candidate_fingerprint = pre_candidate_fingerprint
     path_gate = _combined_path_gate(pre_path_gate, post_path_gate)
+    candidate_output_gate = _candidate_output_gate(
+        pre_candidate_fingerprint,
+        post_candidate_fingerprint,
+        process=process,
+        command_was_required=candidate_command is not None,
+    )
 
     score_payload: dict[str, Any] | None = None
     decision = {"value": "discard", "reason": "candidate evaluator did not complete successfully"}
@@ -146,6 +163,12 @@ def run_autoresearch(
         decision = {"value": "discard", "reason": "timeout"}
     elif not path_gate["passed"]:
         decision = {"value": "discard", "reason": "changed files outside the editable experiment surface"}
+    elif not candidate_output_gate["passed"]:
+        decision = {"value": "discard", "reason": "candidate benchmark JSON was not freshly written"}
+        error = {
+            "type": "StaleCandidateBenchmark",
+            "message": str(candidate_output_gate["reason"]),
+        }
     else:
         baseline, candidate, score_payload, decision, error = _load_score_and_decide(
             baseline_path,
@@ -167,6 +190,7 @@ def run_autoresearch(
         frozen_paths=frozen_paths,
         changed_paths=changed_paths,
         path_gate=path_gate,
+        candidate_output_gate=candidate_output_gate,
         process=process,
         score_payload=score_payload,
         baseline=baseline,
@@ -181,6 +205,7 @@ def run_autoresearch(
         checkpoint_ref,
         result["decision"],
         changed_paths=changed_paths,
+        cleanup_allowed=pre_path_gate["passed"],
         apply=apply_git_decision,
     )
     append_result_jsonl(results_path, result)
@@ -304,6 +329,7 @@ def _result_payload(
     frozen_paths: Sequence[str],
     changed_paths: Sequence[str],
     path_gate: Mapping[str, Any],
+    candidate_output_gate: Mapping[str, Any],
     process: ProcessResult,
     score_payload: Mapping[str, Any] | None,
     baseline: Mapping[str, Any] | None,
@@ -326,6 +352,7 @@ def _result_payload(
             "editable_paths": list(editable_paths),
             "frozen_paths": list(frozen_paths),
             "path_gate": dict(path_gate),
+            "candidate_output_gate": dict(candidate_output_gate),
         },
         "evaluator": {
             "baseline_benchmark_json": str(baseline_benchmark_json),
@@ -380,6 +407,15 @@ def _run_candidate_command(command: Sequence[str], *, timeout_seconds: float, cw
             _tail(exc.stdout or ""),
             _tail(exc.stderr or ""),
         )
+    except OSError as exc:
+        return ProcessResult(
+            tuple(command),
+            127,
+            False,
+            time.perf_counter() - started,
+            "",
+            str(exc),
+        )
     return ProcessResult(
         tuple(command),
         completed.returncode,
@@ -396,12 +432,20 @@ def _apply_git_decision(
     decision: Mapping[str, str],
     *,
     changed_paths: Sequence[str],
+    cleanup_allowed: bool,
     apply: bool,
 ) -> dict[str, Any]:
     if not apply:
         return {"apply_requested": False, "applied": False, "action": "none"}
     if decision.get("value") == "keep":
         return {"apply_requested": True, "applied": False, "action": "keep"}
+    if not cleanup_allowed:
+        return {
+            "apply_requested": True,
+            "applied": False,
+            "action": "blocked",
+            "reason": "pre-command path gate failed; cleanup requires manual review",
+        }
     _git(["reset", "--hard", checkpoint_ref], repo_root)
     if changed_paths:
         _git(["clean", "-fd", "--", *changed_paths], repo_root)
@@ -475,6 +519,76 @@ def _combined_path_gate(pre_gate: Mapping[str, Any], post_gate: Mapping[str, Any
         "pre": dict(pre_gate),
         "post": dict(post_gate),
     }
+
+
+def _candidate_output_gate(
+    before: FileFingerprint,
+    after: FileFingerprint,
+    *,
+    process: ProcessResult,
+    command_was_required: bool,
+) -> dict[str, Any]:
+    before_payload = _fingerprint_payload(before)
+    after_payload = _fingerprint_payload(after)
+    if not command_was_required:
+        return {
+            "passed": True,
+            "reason": "existing candidate benchmark JSON scoring mode",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    if process.skipped:
+        return {
+            "passed": False,
+            "reason": process.skip_reason or "candidate command skipped",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    if process.timed_out or process.exit_code not in (None, 0):
+        return {
+            "passed": True,
+            "reason": "fresh candidate output not required after timeout or nonzero exit",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    if not after.exists:
+        return {
+            "passed": False,
+            "reason": "candidate benchmark JSON was not written",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    if before.exists and before.sha256 == after.sha256:
+        return {
+            "passed": False,
+            "reason": "candidate benchmark JSON did not change during evaluator run",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    return {
+        "passed": True,
+        "reason": "candidate benchmark JSON was freshly written",
+        "before": before_payload,
+        "after": after_payload,
+    }
+
+
+def _file_fingerprint(path: Path) -> FileFingerprint:
+    if not path.exists() or not path.is_file():
+        return FileFingerprint(False, None, None)
+    return FileFingerprint(True, path.stat().st_size, _file_sha256(path))
+
+
+def _fingerprint_payload(fingerprint: FileFingerprint) -> dict[str, Any]:
+    return {"exists": fingerprint.exists, "size": fingerprint.size, "sha256": fingerprint.sha256}
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
 
 
 def _string_list(value: Any) -> list[str]:

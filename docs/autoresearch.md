@@ -120,6 +120,7 @@ an experiment branch with result logs and benchmark artifacts under ignored `.ne
 Each result is one compact JSON object per line. The schema version is `nerb.autoresearch_result.v1`. Rows include:
 
 - commit, checkpoint ref, changed paths, editable paths, frozen paths, and path-gate result
+- candidate benchmark output freshness fingerprints when a candidate command is required
 - evaluator baseline/candidate paths, bank hashes, and artifact hashes
 - process command, exit code, timeout flag, elapsed seconds, and stdout/stderr tails
 - primary score, timing metrics, gate status, and memory/size metadata
