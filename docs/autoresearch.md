@@ -46,7 +46,13 @@ By default, the harness allows construction-related source edits in:
 - `src/nerb/records.py`
 - `rust/Cargo.lock`
 - `rust/Cargo.toml`
-- `rust/src/*.rs` files used by bank construction and matching
+- `rust/src/bank.rs`
+- `rust/src/engine.rs`
+- `rust/src/flags.rs`
+- `rust/src/formats.rs`
+- `rust/src/ids.rs`
+- `rust/src/lib.rs`
+- `rust/src/match_buffer.rs`
 
 It freezes evaluator and large-source guidance files:
 
@@ -58,8 +64,9 @@ It freezes evaluator and large-source guidance files:
 - `docs/enron-benchmark.md`
 - `.agents/skills/nerb-large-source-bank-building`
 
-Pass repeated `--editable-path` or `--frozen-path` values when an issue deliberately changes the boundary. If an
-experiment touches a frozen file or a file outside the editable surface, the result is logged and discarded.
+Pass repeated `--editable-path` or `--frozen-path` values when an issue deliberately changes the boundary, including
+other Rust source files. If an experiment touches a frozen file or a file outside the editable surface, the result is
+logged and discarded.
 
 ## Scoring And Decisions
 
@@ -78,8 +85,14 @@ score improvements are logged as `discard`.
 
 ## Running One Experiment
 
-First create a baseline benchmark JSON under `.nerb/`. Then let an agent make one bounded change on an experiment
-branch. Score it with:
+First create a baseline benchmark JSON under `.nerb/`. Before the agent edits anything, capture the current previous-best
+commit:
+
+```shell
+CHECKPOINT=$(git rev-parse HEAD)
+```
+
+Then let the agent make one bounded, uncommitted change on an experiment branch. Score it with:
 
 ```shell
 uv run python scripts/nerb_autoresearch.py \
@@ -87,7 +100,7 @@ uv run python scripts/nerb_autoresearch.py \
   --candidate-benchmark-json .nerb/enron-benchmark/autoresearch-candidate/benchmark.json \
   --results-jsonl .nerb/autoresearch/results.jsonl \
   --description "try construction optimization idea" \
-  --checkpoint-ref HEAD \
+  --checkpoint-ref "$CHECKPOINT" \
   --timeout-seconds 1800 \
   --min-improvement-ratio 0.01 \
   --candidate-command uv run python scripts/enron_bank_build_benchmark.py \
@@ -109,6 +122,8 @@ uv run python scripts/nerb_autoresearch.py \
 
 Put `--candidate-command` last; all remaining arguments belong to the evaluator command.
 The executable requires `--candidate-command` so a normal keep/discard decision is tied to a fresh evaluator run.
+Passing `--checkpoint-ref HEAD` is safe only when `HEAD` is still the previous-best commit. If a candidate was already
+committed, pass the prior SHA instead so path gating and discard cleanup compare against the correct baseline.
 
 By default the harness is dry-run safe: it logs the keep/discard decision but does not mutate git state. To make
 non-improving or failed experiments reset to the previous best commit, pass `--apply-git-decision`. This can run

@@ -4,10 +4,13 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, cast
 
-from nerb.autoresearch import append_result_jsonl, run_autoresearch, score_candidate
+import pytest
+
+from nerb.autoresearch import PROCESS_OUTPUT_TAIL_CHARS, append_result_jsonl, run_autoresearch, score_candidate
 
 
 def _benchmark_payload(
@@ -122,6 +125,25 @@ def test_score_candidate_discards_inconsistent_top_level_gate() -> None:
 
     assert score["gate"]["passed"] is False
     assert score["gate"]["evaluator_passed"] is False
+    assert decision["value"] == "discard"
+
+
+def test_score_candidate_discards_unconfigured_performance_gate() -> None:
+    unconfigured = _benchmark_payload(cold_compile_seconds=8.0)
+    gate = cast(dict[str, Any], unconfigured["gate"])
+    performance = cast(dict[str, Any], gate["performance"])
+    performance["configured"] = False
+    performance["checks"] = []
+
+    score, decision = score_candidate(
+        _benchmark_payload(cold_compile_seconds=10.0),
+        unconfigured,
+        min_improvement_ratio=0.05,
+    )
+
+    assert score["gate"]["passed"] is False
+    assert score["gate"]["performance_configured"] is False
+    assert score["gate"]["performance_passed"] is True
     assert decision["value"] == "discard"
 
 
@@ -502,6 +524,110 @@ def test_run_autoresearch_logs_missing_candidate_executable_and_applies_cleanup(
     assert "definitely-not-a-real-nerb-command" in result["process"]["stderr_tail"]
     assert row["decision"]["reason"] == "crash"
     assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
+
+
+def test_run_autoresearch_logs_timeout_row(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    results_path = tmp_path / ".nerb/autoresearch/results.jsonl"
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=tmp_path / ".nerb/candidate/benchmark.json",
+        results_jsonl=results_path,
+        description="timeout",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        timeout_seconds=0.1,
+        candidate_command=[
+            sys.executable,
+            "-c",
+            "import sys, time; sys.stdout.write('started'); sys.stdout.flush(); time.sleep(10)",
+        ],
+    )
+
+    row = _jsonl_rows(results_path)[0]
+    assert result["decision"] == {"value": "discard", "reason": "timeout"}
+    assert result["process"]["timed_out"] is True
+    assert result["process"]["stdout_tail"] == "started"
+    assert row["decision"]["reason"] == "timeout"
+    assert row["process"]["timed_out"] is True
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cleanup regression")
+def test_run_autoresearch_timeout_kills_candidate_process_group(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    engine_path = tmp_path / "src/nerb/engine.py"
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    writer_path = tmp_path / ".nerb/spawn_late_writer.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        "subprocess.Popen([\n"
+        "    sys.executable,\n"
+        "    '-c',\n"
+        '    "import time; from pathlib import Path; time.sleep(0.4); "\n'
+        "    \"Path('src/nerb/engine.py').write_text('LATE = 1\\\\n', encoding='utf-8')\",\n"
+        "], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "time.sleep(10)\n",
+        encoding="utf-8",
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=tmp_path / ".nerb/candidate/benchmark.json",
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="process tree timeout",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        timeout_seconds=0.1,
+        candidate_command=[sys.executable, ".nerb/spawn_late_writer.py"],
+    )
+    time.sleep(0.7)
+
+    assert result["decision"] == {"value": "discard", "reason": "timeout"}
+    assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
+
+
+def test_run_autoresearch_caps_candidate_output_tails(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
+    writer_path = tmp_path / ".nerb/noisy_candidate.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        "sys.stdout.write('a' * 6000)\n"
+        "sys.stderr.write('b' * 6000)\n"
+        "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
+        "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="noisy candidate",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        candidate_command=[sys.executable, ".nerb/noisy_candidate.py"],
+    )
+
+    assert result["decision"]["value"] == "keep"
+    assert result["process"]["stdout_tail"] == "a" * PROCESS_OUTPUT_TAIL_CHARS
+    assert result["process"]["stderr_tail"] == "b" * PROCESS_OUTPUT_TAIL_CHARS
 
 
 def test_script_runs_candidate_command_and_logs_result(tmp_path: Path) -> None:

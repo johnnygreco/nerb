@@ -4,14 +4,18 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import platform
+import signal
 import subprocess
+import threading
 import time
+from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 AUTORESEARCH_RESULT_SCHEMA_VERSION = "nerb.autoresearch_result.v1"
 DEFAULT_RESULTS_JSONL = Path(".nerb/autoresearch/results.jsonl")
@@ -20,6 +24,11 @@ DEFAULT_MIN_IMPROVEMENT_RATIO = 0.01
 DEFAULT_MAX_CANONICAL_JSON_BYTES_RATIO = 1.05
 DEFAULT_MAX_EXTRACTABLE_JSON_BYTES_RATIO = 1.05
 PRIMARY_SCORE_FIELD = "benchmark.summary.cold_compile_seconds"
+PROCESS_OUTPUT_TAIL_BYTES = 64 * 1024
+PROCESS_OUTPUT_TAIL_CHARS = 4_000
+PROCESS_OUTPUT_READ_CHUNK_BYTES = 8 * 1024
+PROCESS_TERMINATION_GRACE_SECONDS = 1.0
+PROCESS_OUTPUT_THREAD_JOIN_SECONDS = 1.0
 
 DEFAULT_EDITABLE_PATHS = (
     "src/nerb/bank.py",
@@ -284,12 +293,14 @@ def score_candidate(
     gate = _gate_payload(candidate)
     evaluator_passed = _nested_bool(gate, ("evaluator", "passed"))
     quality_passed = _nested_bool(gate, ("quality", "passed"))
+    performance_configured = _nested_bool(gate, ("performance", "configured"))
     performance_passed = _nested_bool(gate, ("performance", "passed"))
     gate_passed = (
         gate.get("configured") is True
         and gate.get("passed") is True
         and evaluator_passed
         and quality_passed
+        and performance_configured
         and performance_passed
     )
     size_checks = _size_checks(
@@ -316,6 +327,7 @@ def score_candidate(
             "passed": gate_passed,
             "evaluator_passed": evaluator_passed,
             "quality_passed": quality_passed,
+            "performance_configured": performance_configured,
             "performance_passed": performance_passed,
         },
         "size": {"passed": size_passed, "checks": size_checks},
@@ -411,25 +423,15 @@ def _result_payload(
 
 def _run_candidate_command(command: Sequence[str], *, timeout_seconds: float, cwd: Path) -> ProcessResult:
     started = time.perf_counter()
+    stdout_tail = _BoundedOutputTail(PROCESS_OUTPUT_TAIL_BYTES)
+    stderr_tail = _BoundedOutputTail(PROCESS_OUTPUT_TAIL_BYTES)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(command),
             cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return ProcessResult(
-            tuple(command),
-            None,
-            True,
-            time.perf_counter() - started,
-            _tail(exc.stdout or ""),
-            _tail(exc.stderr or ""),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **_candidate_process_group_kwargs(),
         )
     except OSError as exc:
         return ProcessResult(
@@ -440,14 +442,134 @@ def _run_candidate_command(command: Sequence[str], *, timeout_seconds: float, cw
             "",
             str(exc),
         )
+
+    stdout_thread = threading.Thread(
+        target=_drain_stream_tail,
+        args=(process.stdout, stdout_tail),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_drain_stream_tail,
+        args=(process.stderr, stderr_tail),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    timed_out = False
+    exit_code: int | None
+    try:
+        exit_code = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        exit_code = None
+        _terminate_process_tree(process)
+    _join_output_threads((stdout_thread, stderr_thread))
+
     return ProcessResult(
         tuple(command),
-        completed.returncode,
-        False,
+        exit_code,
+        timed_out,
         time.perf_counter() - started,
-        _tail(completed.stdout),
-        _tail(completed.stderr),
+        stdout_tail.text(),
+        stderr_tail.text(),
     )
+
+
+class _BoundedOutputTail:
+    def __init__(self, max_bytes: int) -> None:
+        self._max_bytes = max_bytes
+        self._chunks: deque[bytes] = deque()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def append(self, chunk: bytes) -> None:
+        if not chunk or self._max_bytes <= 0:
+            return
+        if len(chunk) > self._max_bytes:
+            chunk = chunk[-self._max_bytes :]
+        with self._lock:
+            self._chunks.append(chunk)
+            self._size += len(chunk)
+            while self._size > self._max_bytes:
+                first = self._chunks[0]
+                excess = self._size - self._max_bytes
+                if len(first) <= excess:
+                    self._chunks.popleft()
+                    self._size -= len(first)
+                else:
+                    self._chunks[0] = first[excess:]
+                    self._size -= excess
+
+    def text(self) -> str:
+        with self._lock:
+            data = b"".join(self._chunks)
+        return _tail(data, max_chars=PROCESS_OUTPUT_TAIL_CHARS)
+
+
+def _drain_stream_tail(stream: BinaryIO | None, tail: _BoundedOutputTail) -> None:
+    if stream is None:
+        return
+    with stream:
+        for chunk in iter(lambda: stream.read(PROCESS_OUTPUT_READ_CHUNK_BYTES), b""):
+            tail.append(chunk)
+
+
+def _join_output_threads(threads: Sequence[threading.Thread]) -> None:
+    for thread in threads:
+        thread.join(PROCESS_OUTPUT_THREAD_JOIN_SECONDS)
+
+
+def _candidate_process_group_kwargs() -> dict[str, Any]:
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        _terminate_windows_process_tree(process)
+    else:
+        _terminate_posix_process_group(process)
+
+
+def _terminate_posix_process_group(process: subprocess.Popen[Any]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.terminate()
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        process.kill()
+    process.wait()
+
+
+def _terminate_windows_process_tree(process: subprocess.Popen[Any]) -> None:
+    try:
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        process.kill()
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def _apply_git_decision(
