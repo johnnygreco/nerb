@@ -139,6 +139,7 @@ dependencies = [
 name = "nerb_engine"
 version = "0.0.6"
 dependencies = [
+ "aho-corasick",
  "pyo3",
  "regex-automata",
  "regex-syntax",

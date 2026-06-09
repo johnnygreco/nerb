@@ -54,7 +54,7 @@ pub struct CanonicalPattern {
     pub flags: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct NativeBank {
     canonical: CanonicalBank,
     canonical_json: Vec<u8>,

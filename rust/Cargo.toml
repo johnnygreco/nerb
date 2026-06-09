@@ -11,6 +11,7 @@ name = "nerb_engine"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+aho-corasick = "1.1.4"
 pyo3 = { version = "0.27", features = ["extension-module"] }
 regex-automata = "0.4.14"
 regex-syntax = "0.8"
