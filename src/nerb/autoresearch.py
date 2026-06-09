@@ -54,6 +54,8 @@ class ProcessResult:
     elapsed_seconds: float
     stdout_tail: str
     stderr_tail: str
+    skipped: bool = False
+    skip_reason: str | None = None
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -97,6 +99,9 @@ def run_autoresearch(
     apply_git_decision: bool = False,
 ) -> dict[str, Any]:
     repo = repo_root.expanduser().resolve()
+    baseline_path = _resolve_repo_path(repo, baseline_benchmark_json)
+    candidate_path = _resolve_repo_path(repo, candidate_benchmark_json)
+    results_path = _resolve_repo_path(repo, results_jsonl)
     _validate_positive_number(timeout_seconds, "timeout_seconds")
     _validate_nonnegative_ratio(min_improvement_ratio, "min_improvement_ratio")
     if max_canonical_json_bytes_ratio is not None:
@@ -105,30 +110,47 @@ def run_autoresearch(
         _validate_positive_number(max_extractable_json_bytes_ratio, "max_extractable_json_bytes_ratio")
 
     started = time.perf_counter()
-    process = (
-        _run_candidate_command(candidate_command, timeout_seconds=timeout_seconds, cwd=repo)
-        if candidate_command is not None
-        else ProcessResult((), 0, False, 0.0, "", "")
-    )
-    changed_paths = _git_changed_paths(repo, checkpoint_ref)
-    path_gate = _path_gate(changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
+    pre_changed_paths = _git_changed_paths(repo, checkpoint_ref)
+    pre_path_gate = _path_gate(pre_changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
+    if pre_path_gate["passed"]:
+        process = (
+            _run_candidate_command(candidate_command, timeout_seconds=timeout_seconds, cwd=repo)
+            if candidate_command is not None
+            else ProcessResult((), 0, False, 0.0, "", "")
+        )
+        changed_paths = _git_changed_paths(repo, checkpoint_ref)
+        post_path_gate = _path_gate(changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
+    else:
+        process = ProcessResult(
+            tuple(candidate_command or ()),
+            None,
+            False,
+            0.0,
+            "",
+            "",
+            skipped=True,
+            skip_reason="pre-command path gate failed",
+        )
+        changed_paths = pre_changed_paths
+        post_path_gate = pre_path_gate
+    path_gate = _combined_path_gate(pre_path_gate, post_path_gate)
 
     score_payload: dict[str, Any] | None = None
     decision = {"value": "discard", "reason": "candidate evaluator did not complete successfully"}
     baseline: Mapping[str, Any] | None = None
     candidate: Mapping[str, Any] | None = None
-    if process.timed_out:
+    error: dict[str, str] | None = None
+    if not pre_path_gate["passed"]:
+        decision = {"value": "discard", "reason": "pre-command path gate failed"}
+    elif process.timed_out:
         decision = {"value": "discard", "reason": "timeout"}
-    elif process.exit_code != 0:
-        decision = {"value": "discard", "reason": "crash"}
     elif not path_gate["passed"]:
         decision = {"value": "discard", "reason": "changed files outside the editable experiment surface"}
     else:
-        baseline = _load_json_object(baseline_benchmark_json)
-        candidate = _load_json_object(candidate_benchmark_json)
-        score_payload, decision = score_candidate(
-            baseline,
-            candidate,
+        baseline, candidate, score_payload, decision, error = _load_score_and_decide(
+            baseline_path,
+            candidate_path,
+            process,
             min_improvement_ratio=min_improvement_ratio,
             max_canonical_json_bytes_ratio=max_canonical_json_bytes_ratio,
             max_extractable_json_bytes_ratio=max_extractable_json_bytes_ratio,
@@ -136,9 +158,9 @@ def run_autoresearch(
 
     result = _result_payload(
         description=description,
-        baseline_benchmark_json=baseline_benchmark_json,
-        candidate_benchmark_json=candidate_benchmark_json,
-        results_jsonl=results_jsonl,
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=results_path,
         repo_root=repo,
         checkpoint_ref=checkpoint_ref,
         editable_paths=editable_paths,
@@ -150,6 +172,7 @@ def run_autoresearch(
         baseline=baseline,
         candidate=candidate,
         decision=decision,
+        error=error,
         elapsed_seconds=time.perf_counter() - started,
         apply_git_decision=apply_git_decision,
     )
@@ -160,8 +183,47 @@ def run_autoresearch(
         changed_paths=changed_paths,
         apply=apply_git_decision,
     )
-    append_result_jsonl(results_jsonl, result)
+    append_result_jsonl(results_path, result)
     return result
+
+
+def _load_score_and_decide(
+    baseline_path: Path,
+    candidate_path: Path,
+    process: ProcessResult,
+    *,
+    min_improvement_ratio: float,
+    max_canonical_json_bytes_ratio: float | None,
+    max_extractable_json_bytes_ratio: float | None,
+) -> tuple[
+    Mapping[str, Any] | None, Mapping[str, Any] | None, dict[str, Any] | None, dict[str, str], dict[str, str] | None
+]:
+    try:
+        baseline = _load_json_object(baseline_path)
+        candidate = _load_json_object(candidate_path)
+        score_payload, decision = score_candidate(
+            baseline,
+            candidate,
+            min_improvement_ratio=min_improvement_ratio,
+            max_canonical_json_bytes_ratio=max_canonical_json_bytes_ratio,
+            max_extractable_json_bytes_ratio=max_extractable_json_bytes_ratio,
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        reason = "crash" if process.exit_code not in (None, 0) else "benchmark result could not be scored"
+        return None, None, None, {"value": "discard", "reason": reason}, _error_payload(exc)
+
+    if process.exit_code not in (None, 0):
+        gate = _gate_payload(candidate)
+        if gate.get("configured") is True and gate.get("passed") is False:
+            return baseline, candidate, score_payload, decision, None
+        return (
+            baseline,
+            candidate,
+            score_payload,
+            {"value": "discard", "reason": "candidate command exited nonzero after writing benchmark JSON"},
+            None,
+        )
+    return baseline, candidate, score_payload, decision, None
 
 
 def score_candidate(
@@ -247,6 +309,7 @@ def _result_payload(
     baseline: Mapping[str, Any] | None,
     candidate: Mapping[str, Any] | None,
     decision: Mapping[str, str],
+    error: Mapping[str, str] | None,
     elapsed_seconds: float,
     apply_git_decision: bool,
 ) -> dict[str, Any]:
@@ -276,12 +339,15 @@ def _result_payload(
             "command": list(process.command),
             "exit_code": process.exit_code,
             "timed_out": process.timed_out,
+            "skipped": process.skipped,
+            "skip_reason": process.skip_reason,
             "elapsed_seconds": _seconds(process.elapsed_seconds),
             "stdout_tail": process.stdout_tail,
             "stderr_tail": process.stderr_tail,
         },
         "score": dict(score_payload or {}),
         "decision": dict(decision),
+        "error": dict(error or {}),
         "git": {"apply_requested": apply_git_decision, "applied": False, "action": "none"},
         "environment": {
             "python": platform.python_version(),
@@ -395,6 +461,28 @@ def _path_gate(
     }
 
 
+def _combined_path_gate(pre_gate: Mapping[str, Any], post_gate: Mapping[str, Any]) -> dict[str, Any]:
+    frozen_touched = sorted(
+        set(_string_list(pre_gate.get("frozen_touched")) + _string_list(post_gate.get("frozen_touched")))
+    )
+    outside_editable = sorted(
+        set(_string_list(pre_gate.get("outside_editable")) + _string_list(post_gate.get("outside_editable")))
+    )
+    return {
+        "passed": pre_gate.get("passed") is True and post_gate.get("passed") is True,
+        "frozen_touched": frozen_touched,
+        "outside_editable": outside_editable,
+        "pre": dict(pre_gate),
+        "post": dict(post_gate),
+    }
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def _path_matches_any(path: str, roots: Sequence[str]) -> bool:
     return any(path == root or path.startswith(f"{root}/") for root in roots)
 
@@ -412,6 +500,17 @@ def _load_json_object(path: Path) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"Benchmark JSON must be an object: {path}.")
     return value
+
+
+def _resolve_repo_path(repo_root: Path, path: Path) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_absolute():
+        return expanded
+    return repo_root / expanded
+
+
+def _error_payload(exc: BaseException) -> dict[str, str]:
+    return {"type": type(exc).__name__, "message": str(exc)}
 
 
 def _gate_payload(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -580,8 +679,8 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--apply-git-decision", action="store_true")
     parser.add_argument("--candidate-command", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(argv)
-    if parsed.candidate_command == []:
-        parsed.candidate_command = None
+    if not parsed.candidate_command:
+        parser.error("--candidate-command is required and must include at least one command token")
     return parsed
 
 

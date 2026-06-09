@@ -108,6 +108,7 @@ uv run python scripts/nerb_autoresearch.py \
 ```
 
 Put `--candidate-command` last; all remaining arguments belong to the evaluator command.
+The executable requires `--candidate-command` so a normal keep/discard decision is tied to a fresh evaluator run.
 
 By default the harness is dry-run safe: it logs the keep/discard decision but does not mutate git state. To make
 non-improving or failed experiments reset to the previous best commit, pass `--apply-git-decision`. This can run

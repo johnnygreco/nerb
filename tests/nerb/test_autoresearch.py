@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -148,6 +149,7 @@ def test_run_autoresearch_keeps_improvement_in_dry_run_fixture_repo(tmp_path: Pa
 def test_run_autoresearch_discards_when_frozen_file_changes(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     (tmp_path / "src/nerb/enron_benchmark.py").write_text("changed evaluator\n", encoding="utf-8")
+    marker_path = tmp_path / "ran.txt"
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
     candidate_path = _write_json(
         tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8)
@@ -163,10 +165,96 @@ def test_run_autoresearch_discards_when_frozen_file_changes(tmp_path: Path) -> N
         editable_paths=("src/nerb/engine.py",),
         frozen_paths=("src/nerb/enron_benchmark.py",),
         min_improvement_ratio=0.05,
+        candidate_command=[
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('ran.txt').write_text('yes')",
+        ],
     )
 
     assert result["decision"]["value"] == "discard"
+    assert result["process"]["skipped"] is True
     assert result["repo"]["path_gate"]["frozen_touched"] == ["src/nerb/enron_benchmark.py"]
+    assert not marker_path.exists()
+
+
+def test_run_autoresearch_resolves_relative_paths_against_repo_root(tmp_path: Path, monkeypatch: Any) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "src/nerb/engine.py").write_text("BEST = 2\n", encoding="utf-8")
+    _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    _write_json(tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8))
+    outside_cwd = tmp_path.parent
+    monkeypatch.chdir(outside_cwd)
+
+    result = run_autoresearch(
+        baseline_benchmark_json=Path(".nerb/baseline/benchmark.json"),
+        candidate_benchmark_json=Path(".nerb/candidate/benchmark.json"),
+        results_jsonl=Path(".nerb/autoresearch/results.jsonl"),
+        description="relative paths",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        min_improvement_ratio=0.05,
+    )
+
+    assert result["decision"]["value"] == "keep"
+    assert (tmp_path / ".nerb/autoresearch/results.jsonl").exists()
+    assert not (outside_cwd / ".nerb/autoresearch/results.jsonl").exists()
+
+
+def test_run_autoresearch_scores_parseable_gate_failure_from_nonzero_command(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = _write_json(
+        tmp_path / ".nerb/candidate/benchmark.json",
+        _benchmark_payload(cold_compile_seconds=8, gate_passed=False),
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="gate failure",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        candidate_command=[sys.executable, "-c", "import sys; sys.exit(1)"],
+    )
+
+    assert result["process"]["exit_code"] == 1
+    assert result["decision"]["reason"] == "evaluator, quality, or configured performance gate failed"
+    assert result["score"]["gate"]["passed"] is False
+
+
+def test_run_autoresearch_logs_and_resets_malformed_candidate_json(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    engine_path = tmp_path / "src/nerb/engine.py"
+    engine_path.write_text("BEST = 9\n", encoding="utf-8")
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
+    candidate_path.parent.mkdir(parents=True)
+    candidate_path.write_text("{not-json", encoding="utf-8")
+    results_path = tmp_path / ".nerb/autoresearch/results.jsonl"
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=results_path,
+        description="malformed candidate",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        apply_git_decision=True,
+    )
+
+    row = _jsonl_rows(results_path)[0]
+    assert result["decision"] == {"value": "discard", "reason": "benchmark result could not be scored"}
+    assert result["error"]["type"] == "JSONDecodeError"
+    assert row["decision"]["reason"] == "benchmark result could not be scored"
+    assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
 
 
 def test_run_autoresearch_apply_git_decision_resets_failed_candidate(tmp_path: Path) -> None:
@@ -222,3 +310,63 @@ def test_run_autoresearch_classifies_candidate_command_crash(tmp_path: Path) -> 
     assert result["decision"] == {"value": "discard", "reason": "crash"}
     assert result["process"]["exit_code"] == 7
     assert result["process"]["stderr_tail"] == "candidate failed"
+    assert result["error"]
+
+
+def test_script_runs_candidate_command_and_logs_result(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    (tmp_path / "src/nerb/engine.py").write_text("BEST = 2\n", encoding="utf-8")
+    _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    writer_path = tmp_path / ".nerb/write_candidate.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
+        "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    src_path = str(repo_root / "src")
+    env["PYTHONPATH"] = src_path + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(repo_root / "scripts/nerb_autoresearch.py"),
+            "--baseline-benchmark-json",
+            ".nerb/baseline/benchmark.json",
+            "--candidate-benchmark-json",
+            ".nerb/candidate/benchmark.json",
+            "--results-jsonl",
+            ".nerb/autoresearch/results.jsonl",
+            "--description",
+            "script smoke",
+            "--repo-root",
+            str(tmp_path),
+            "--checkpoint-ref",
+            "HEAD",
+            "--editable-path",
+            "src/nerb/engine.py",
+            "--frozen-path",
+            "src/nerb/enron_benchmark.py",
+            "--min-improvement-ratio",
+            "0.05",
+            "--candidate-command",
+            sys.executable,
+            ".nerb/write_candidate.py",
+        ],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["decision"]["value"] == "keep"
+    assert output["score"]["primary"]["ratio"] == 0.8
+    assert _jsonl_rows(tmp_path / ".nerb/autoresearch/results.jsonl")[0]["decision"]["value"] == "keep"
