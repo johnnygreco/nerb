@@ -120,6 +120,13 @@ def run_autoresearch(
     started = time.perf_counter()
     pre_changed_paths = _git_changed_paths(repo, checkpoint_ref)
     pre_path_gate = _path_gate(pre_changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
+    baseline: Mapping[str, Any] | None = None
+    baseline_error: dict[str, str] | None = None
+    try:
+        baseline = _load_json_object(baseline_path)
+    except (OSError, TypeError, ValueError) as exc:
+        baseline_error = _error_payload(exc)
+    pre_baseline_fingerprint = _file_fingerprint(baseline_path)
     pre_candidate_fingerprint = _file_fingerprint(candidate_path)
     if pre_path_gate["passed"]:
         process = (
@@ -129,6 +136,7 @@ def run_autoresearch(
         )
         changed_paths = _git_changed_paths(repo, checkpoint_ref)
         post_path_gate = _path_gate(changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
+        post_baseline_fingerprint = _file_fingerprint(baseline_path)
         post_candidate_fingerprint = _file_fingerprint(candidate_path)
     else:
         process = ProcessResult(
@@ -143,8 +151,10 @@ def run_autoresearch(
         )
         changed_paths = pre_changed_paths
         post_path_gate = pre_path_gate
+        post_baseline_fingerprint = pre_baseline_fingerprint
         post_candidate_fingerprint = pre_candidate_fingerprint
     path_gate = _combined_path_gate(pre_path_gate, post_path_gate)
+    baseline_gate = _baseline_immutability_gate(pre_baseline_fingerprint, post_baseline_fingerprint)
     candidate_output_gate = _candidate_output_gate(
         pre_candidate_fingerprint,
         post_candidate_fingerprint,
@@ -154,15 +164,22 @@ def run_autoresearch(
 
     score_payload: dict[str, Any] | None = None
     decision = {"value": "discard", "reason": "candidate evaluator did not complete successfully"}
-    baseline: Mapping[str, Any] | None = None
     candidate: Mapping[str, Any] | None = None
-    error: dict[str, str] | None = None
+    error: dict[str, str] | None = baseline_error
     if not pre_path_gate["passed"]:
         decision = {"value": "discard", "reason": "pre-command path gate failed"}
+    elif baseline is None:
+        decision = {"value": "discard", "reason": "baseline benchmark JSON could not be loaded"}
     elif process.timed_out:
         decision = {"value": "discard", "reason": "timeout"}
     elif not path_gate["passed"]:
         decision = {"value": "discard", "reason": "changed files outside the editable experiment surface"}
+    elif not baseline_gate["passed"]:
+        decision = {"value": "discard", "reason": "baseline benchmark JSON changed during candidate run"}
+        error = {
+            "type": "BaselineBenchmarkChanged",
+            "message": str(baseline_gate["reason"]),
+        }
     elif not candidate_output_gate["passed"]:
         decision = {"value": "discard", "reason": "candidate benchmark JSON was not freshly written"}
         error = {
@@ -170,8 +187,8 @@ def run_autoresearch(
             "message": str(candidate_output_gate["reason"]),
         }
     else:
-        baseline, candidate, score_payload, decision, error = _load_score_and_decide(
-            baseline_path,
+        candidate, score_payload, decision, error = _load_score_and_decide(
+            baseline,
             candidate_path,
             process,
             min_improvement_ratio=min_improvement_ratio,
@@ -190,6 +207,7 @@ def run_autoresearch(
         frozen_paths=frozen_paths,
         changed_paths=changed_paths,
         path_gate=path_gate,
+        baseline_gate=baseline_gate,
         candidate_output_gate=candidate_output_gate,
         process=process,
         score_payload=score_payload,
@@ -213,18 +231,15 @@ def run_autoresearch(
 
 
 def _load_score_and_decide(
-    baseline_path: Path,
+    baseline: Mapping[str, Any],
     candidate_path: Path,
     process: ProcessResult,
     *,
     min_improvement_ratio: float,
     max_canonical_json_bytes_ratio: float | None,
     max_extractable_json_bytes_ratio: float | None,
-) -> tuple[
-    Mapping[str, Any] | None, Mapping[str, Any] | None, dict[str, Any] | None, dict[str, str], dict[str, str] | None
-]:
+) -> tuple[Mapping[str, Any] | None, dict[str, Any] | None, dict[str, str], dict[str, str] | None]:
     try:
-        baseline = _load_json_object(baseline_path)
         candidate = _load_json_object(candidate_path)
         score_payload, decision = score_candidate(
             baseline,
@@ -235,20 +250,19 @@ def _load_score_and_decide(
         )
     except (OSError, TypeError, ValueError) as exc:
         reason = "crash" if process.exit_code not in (None, 0) else "benchmark result could not be scored"
-        return None, None, None, {"value": "discard", "reason": reason}, _error_payload(exc)
+        return None, None, {"value": "discard", "reason": reason}, _error_payload(exc)
 
     if process.exit_code not in (None, 0):
         gate = _gate_payload(candidate)
         if gate.get("configured") is True and gate.get("passed") is False:
-            return baseline, candidate, score_payload, decision, None
+            return candidate, score_payload, decision, None
         return (
-            baseline,
             candidate,
             score_payload,
             {"value": "discard", "reason": "candidate command exited nonzero after writing benchmark JSON"},
             None,
         )
-    return baseline, candidate, score_payload, decision, None
+    return candidate, score_payload, decision, None
 
 
 def score_candidate(
@@ -329,6 +343,7 @@ def _result_payload(
     frozen_paths: Sequence[str],
     changed_paths: Sequence[str],
     path_gate: Mapping[str, Any],
+    baseline_gate: Mapping[str, Any],
     candidate_output_gate: Mapping[str, Any],
     process: ProcessResult,
     score_payload: Mapping[str, Any] | None,
@@ -352,6 +367,7 @@ def _result_payload(
             "editable_paths": list(editable_paths),
             "frozen_paths": list(frozen_paths),
             "path_gate": dict(path_gate),
+            "baseline_gate": dict(baseline_gate),
             "candidate_output_gate": dict(candidate_output_gate),
         },
         "evaluator": {
@@ -544,10 +560,24 @@ def _candidate_output_gate(
             "before": before_payload,
             "after": after_payload,
         }
-    if process.timed_out or process.exit_code not in (None, 0):
+    if process.timed_out:
         return {
             "passed": True,
-            "reason": "fresh candidate output not required after timeout or nonzero exit",
+            "reason": "fresh candidate output not required after timeout",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    if process.exit_code not in (None, 0):
+        if before.exists and after.exists and before.sha256 == after.sha256:
+            return {
+                "passed": False,
+                "reason": "candidate benchmark JSON did not change during failed evaluator run",
+                "before": before_payload,
+                "after": after_payload,
+            }
+        return {
+            "passed": True,
+            "reason": "fresh candidate output not required unless stale output exists after nonzero exit",
             "before": before_payload,
             "after": after_payload,
         }
@@ -568,6 +598,31 @@ def _candidate_output_gate(
     return {
         "passed": True,
         "reason": "candidate benchmark JSON was freshly written",
+        "before": before_payload,
+        "after": after_payload,
+    }
+
+
+def _baseline_immutability_gate(before: FileFingerprint, after: FileFingerprint) -> dict[str, Any]:
+    before_payload = _fingerprint_payload(before)
+    after_payload = _fingerprint_payload(after)
+    if not before.exists:
+        return {
+            "passed": False,
+            "reason": "baseline benchmark JSON was not present before candidate run",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    if before.sha256 != after.sha256:
+        return {
+            "passed": False,
+            "reason": "baseline benchmark JSON changed during candidate run",
+            "before": before_payload,
+            "after": after_payload,
+        }
+    return {
+        "passed": True,
+        "reason": "baseline benchmark JSON was unchanged",
         "before": before_payload,
         "after": after_payload,
     }

@@ -210,9 +210,18 @@ def test_run_autoresearch_resolves_relative_paths_against_repo_root(tmp_path: Pa
 def test_run_autoresearch_scores_parseable_gate_failure_from_nonzero_command(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
-    candidate_path = _write_json(
-        tmp_path / ".nerb/candidate/benchmark.json",
-        _benchmark_payload(cold_compile_seconds=8, gate_passed=False),
+    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
+    writer_path = tmp_path / ".nerb/write_failed_gate.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import json\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8, gate_passed=False))!r}\n"
+        "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
+        "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n"
+        "sys.exit(1)\n",
+        encoding="utf-8",
     )
 
     result = run_autoresearch(
@@ -224,12 +233,70 @@ def test_run_autoresearch_scores_parseable_gate_failure_from_nonzero_command(tmp
         checkpoint_ref="HEAD",
         editable_paths=("src/nerb/engine.py",),
         frozen_paths=(),
-        candidate_command=[sys.executable, "-c", "import sys; sys.exit(1)"],
+        candidate_command=[sys.executable, ".nerb/write_failed_gate.py"],
     )
 
     assert result["process"]["exit_code"] == 1
     assert result["decision"]["reason"] == "evaluator, quality, or configured performance gate failed"
     assert result["score"]["gate"]["passed"] is False
+
+
+def test_run_autoresearch_discards_stale_candidate_json_after_nonzero_command(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = _write_json(
+        tmp_path / ".nerb/candidate/benchmark.json",
+        _benchmark_payload(cold_compile_seconds=8, gate_passed=False),
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="stale failed gate",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        candidate_command=[sys.executable, "-c", "import sys; sys.exit(1)"],
+    )
+
+    assert result["decision"] == {"value": "discard", "reason": "candidate benchmark JSON was not freshly written"}
+    assert result["score"] == {}
+
+
+def test_run_autoresearch_discards_when_baseline_changes_during_candidate_run(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
+    writer_path = tmp_path / ".nerb/write_candidate_and_mutate_baseline.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        f"candidate = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        f"baseline = {json.dumps(_benchmark_payload(cold_compile_seconds=100))!r}\n"
+        "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
+        "Path('.nerb/candidate/benchmark.json').write_text(candidate, encoding='utf-8')\n"
+        "Path('.nerb/baseline/benchmark.json').write_text(baseline, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="mutated baseline",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        candidate_command=[sys.executable, ".nerb/write_candidate_and_mutate_baseline.py"],
+    )
+
+    assert result["decision"] == {"value": "discard", "reason": "baseline benchmark JSON changed during candidate run"}
+    assert result["error"]["type"] == "BaselineBenchmarkChanged"
+    assert result["repo"]["baseline_gate"]["passed"] is False
 
 
 def test_run_autoresearch_discards_stale_candidate_json_after_successful_command(tmp_path: Path) -> None:
