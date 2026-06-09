@@ -658,7 +658,9 @@ def test_run_autoresearch_kills_candidate_process_group_after_parent_exit(tmp_pa
         "subprocess.Popen([\n"
         "    sys.executable,\n"
         "    '-c',\n"
-        '    "import time; from pathlib import Path; time.sleep(0.4); "\n'
+        '    "import signal; import time; from pathlib import Path; "\n'
+        '    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "\n'
+        '    "time.sleep(0.4); "\n'
         "    \"Path('src/nerb/engine.py').write_text('LATE = 1\\\\n', encoding='utf-8')\",\n"
         "], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n",
         encoding="utf-8",

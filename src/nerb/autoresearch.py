@@ -461,11 +461,11 @@ def _run_candidate_command(command: Sequence[str], *, timeout_seconds: float, cw
     exit_code: int | None
     try:
         exit_code = process.wait(timeout=timeout_seconds)
-        _terminate_process_group(process, process_group_id)
+        _terminate_process_group(process, process_group_id, allow_grace=False)
     except subprocess.TimeoutExpired:
         timed_out = True
         exit_code = None
-        _terminate_process_group(process, process_group_id)
+        _terminate_process_group(process, process_group_id, allow_grace=True)
     _join_output_threads((stdout_thread, stderr_thread))
 
     return ProcessResult(
@@ -537,14 +537,24 @@ def _candidate_process_group_id(process: subprocess.Popen[Any]) -> int | None:
         return process.pid
 
 
-def _terminate_process_group(process: subprocess.Popen[Any], process_group_id: int | None) -> None:
+def _terminate_process_group(
+    process: subprocess.Popen[Any],
+    process_group_id: int | None,
+    *,
+    allow_grace: bool,
+) -> None:
     if os.name == "nt":
         _terminate_windows_process_tree(process)
     else:
-        _terminate_posix_process_group(process, process_group_id)
+        _terminate_posix_process_group(process, process_group_id, allow_grace=allow_grace)
 
 
-def _terminate_posix_process_group(process: subprocess.Popen[Any], process_group_id: int | None) -> None:
+def _terminate_posix_process_group(
+    process: subprocess.Popen[Any],
+    process_group_id: int | None,
+    *,
+    allow_grace: bool,
+) -> None:
     if process_group_id is None:
         if process.poll() is not None:
             return
@@ -558,13 +568,11 @@ def _terminate_posix_process_group(process: subprocess.Popen[Any], process_group
             return
     if not _signal_process_group(process_group_id, signal.SIGTERM):
         return
-    if process.poll() is None:
+    if allow_grace and process.poll() is None:
         try:
             process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
             pass
-    else:
-        time.sleep(PROCESS_TERMINATION_GRACE_SECONDS)
     _signal_process_group(process_group_id, signal.SIGKILL)
     if process.poll() is None:
         process.wait()
