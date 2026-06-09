@@ -22,7 +22,7 @@ def _benchmark_payload(
     canonical_json_bytes: int = 100,
     extractable_json_bytes: int = 80,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema_version": "nerb.enron_benchmark.v1",
         "elapsed_seconds": 1.0,
         "bank": {
@@ -30,11 +30,25 @@ def _benchmark_payload(
             "stats": {"active_totals": {"entities": 2, "names": 5, "patterns": 7}},
         },
         "manifest": {
+            "dataset": {
+                "id": "fixture/enron",
+                "split": "train",
+                "revision": "fixture",
+                "row_limit": None,
+            },
+            "sampling": {
+                "seed": "fixture-seed",
+                "sample_fraction": 1.0,
+                "test_fraction": 0.35,
+                "max_body_chars": 1_000,
+                "benchmark_documents": 5,
+                "quality_documents": 5,
+            },
             "artifact_hashes": {
                 "train": "sha256:train",
                 "test": "sha256:test",
                 "bank": "sha256:bank-artifact",
-            }
+            },
         },
         "quality": {
             "test": {
@@ -52,6 +66,12 @@ def _benchmark_payload(
             }
         },
         "benchmark": {
+            "options": {
+                "benchmark_iterations": 1,
+                "max_batch_documents": 100,
+                "max_batch_text_bytes": 67_108_864,
+                "stress_multiplier": 2,
+            },
             "summary": {
                 "cold_compile_seconds": cold_compile_seconds,
                 "warm_cached_compile_seconds": 0.05,
@@ -64,15 +84,27 @@ def _benchmark_payload(
                     "native_source_bytes": extractable_json_bytes,
                 }
             },
-        },
-        "gate": {
-            "configured": True,
-            "passed": gate_passed,
-            "evaluator": {"passed": gate_passed, "checks": []},
-            "quality": {"passed": gate_passed, "checks": []},
-            "performance": {"configured": True, "passed": gate_passed, "checks": []},
+            "tiers": {
+                "baseline": {"document_count": 2, "bytes": 200, "iterations": 1},
+                "target": {"document_count": 5, "bytes": 500, "iterations": 1},
+                "stress": {"document_count": 5, "bytes": 1000, "iterations": 1},
+            },
         },
     }
+    fingerprint = autoresearch._evaluator_fingerprint(payload)
+    payload["gate"] = {
+        "configured": True,
+        "passed": gate_passed,
+        "evaluator": {
+            "passed": gate_passed,
+            "baseline": fingerprint,
+            "candidate": fingerprint,
+            "checks": [],
+        },
+        "quality": {"passed": gate_passed, "checks": []},
+        "performance": {"configured": True, "passed": gate_passed, "checks": []},
+    }
+    return payload
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -165,6 +197,30 @@ def test_score_candidate_discards_unconfigured_performance_gate() -> None:
     assert decision["value"] == "discard"
 
 
+def test_score_candidate_discards_mismatched_evaluator_context() -> None:
+    candidate = _benchmark_payload(cold_compile_seconds=8.0, test_f1=0.9)
+    manifest = cast(dict[str, Any], candidate["manifest"])
+    artifact_hashes = cast(dict[str, Any], manifest["artifact_hashes"])
+    artifact_hashes["test"] = "sha256:different-test"
+
+    score, decision = score_candidate(
+        _benchmark_payload(cold_compile_seconds=10.0),
+        candidate,
+        min_improvement_ratio=0.05,
+    )
+
+    assert decision == {
+        "value": "discard",
+        "reason": "candidate evaluator context does not match baseline benchmark",
+    }
+    assert score["evaluator"]["passed"] is False
+    assert {check["name"] for check in score["evaluator"]["checks"]} == {
+        "benchmark_fingerprint",
+        "gate_baseline_fingerprint",
+        "gate_candidate_fingerprint",
+    }
+
+
 def test_append_result_jsonl_writes_one_compact_json_object_per_line(tmp_path: Path) -> None:
     log_path = tmp_path / "results.jsonl"
 
@@ -201,6 +257,51 @@ def test_run_autoresearch_keeps_improvement_in_dry_run_fixture_repo(tmp_path: Pa
     assert result["repo"]["changed_paths"] == ["src/nerb/engine.py"]
     assert (tmp_path / "src/nerb/engine.py").read_text(encoding="utf-8") == "BEST = 2\n"
     assert _jsonl_rows(results_path)[0]["decision"]["value"] == "keep"
+
+
+def test_run_autoresearch_promotes_kept_benchmark_for_next_experiment(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    baseline_path = _write_json(tmp_path / ".nerb/best/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
+    _write_json(candidate_path, _benchmark_payload(cold_compile_seconds=8, test_f1=0.9))
+    results_path = tmp_path / ".nerb/autoresearch/results.jsonl"
+
+    first = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=results_path,
+        description="first improvement",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        min_improvement_ratio=0.0,
+        promote_kept_benchmark=True,
+    )
+    _write_json(candidate_path, _benchmark_payload(cold_compile_seconds=8, test_f1=0.85))
+    second = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=results_path,
+        description="loses to promoted best",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        min_improvement_ratio=0.0,
+        promote_kept_benchmark=True,
+    )
+
+    promoted = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert first["decision"]["value"] == "keep"
+    assert first["best_benchmark"]["action"] == "promote-candidate-benchmark"
+    assert promoted["quality"]["test"]["f1"] == 0.9
+    assert second["decision"] == {
+        "value": "discard",
+        "reason": "candidate did not improve the primary held-out F1 score enough",
+    }
+    assert second["best_benchmark"]["action"] == "skipped-discard"
+    assert [row["decision"]["value"] for row in _jsonl_rows(results_path)] == ["keep", "discard"]
 
 
 def test_run_autoresearch_discards_when_frozen_file_changes(tmp_path: Path) -> None:

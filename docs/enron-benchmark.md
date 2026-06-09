@@ -116,9 +116,10 @@ and printing `benchmark.json`. Threshold flags require `--baseline-benchmark-jso
 ## Autoresearch Loop
 
 Use `docs/autoresearch.md` and `scripts/nerb_autoresearch.py` when running repeated construction optimization
-experiments. The harness treats this benchmark command as the frozen evaluator, appends aggregate-only JSONL result rows,
-and can keep or discard a candidate based on score, gate status, timeout/crash behavior, and an explicit editable-file
-surface.
+experiments. The harness treats this benchmark command as the frozen evaluator, appends JSONL result rows under ignored
+`.nerb/` paths with aggregate scores plus bounded process output tails, and can keep or discard a candidate based on
+score, gate status, timeout/crash behavior, and an explicit editable-file surface. Do not commit unredacted result logs
+from private-corpus runs.
 
 ## Hero Image Direction
 

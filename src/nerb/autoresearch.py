@@ -6,6 +6,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import signal
 import subprocess
 import threading
@@ -31,6 +32,7 @@ PROCESS_TERMINATION_GRACE_SECONDS = 1.0
 PROCESS_OUTPUT_THREAD_JOIN_SECONDS = 1.0
 
 DEFAULT_EDITABLE_PATHS = (
+    "src/nerb/enron_bank_builder.py",
     "src/nerb/bank.py",
     "src/nerb/engine.py",
     "src/nerb/engines.py",
@@ -92,6 +94,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         editable_paths=args.editable_paths or DEFAULT_EDITABLE_PATHS,
         frozen_paths=args.frozen_paths or DEFAULT_FROZEN_PATHS,
         apply_git_decision=args.apply_git_decision,
+        promote_kept_benchmark=args.promote_kept_benchmark,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
     if result["decision"]["value"] != "keep":
@@ -114,6 +117,7 @@ def run_autoresearch(
     editable_paths: Sequence[str] = DEFAULT_EDITABLE_PATHS,
     frozen_paths: Sequence[str] = DEFAULT_FROZEN_PATHS,
     apply_git_decision: bool = False,
+    promote_kept_benchmark: bool = False,
 ) -> dict[str, Any]:
     repo = repo_root.expanduser().resolve()
     baseline_path = _resolve_repo_path(repo, baseline_benchmark_json)
@@ -236,6 +240,12 @@ def run_autoresearch(
         cleanup_allowed=pre_path_gate["passed"],
         apply=apply_git_decision,
     )
+    result["best_benchmark"] = _promote_kept_benchmark(
+        baseline_path,
+        candidate_path,
+        result["decision"],
+        promote=promote_kept_benchmark,
+    )
     append_result_jsonl(results_path, result)
     return result
 
@@ -291,6 +301,8 @@ def score_candidate(
     required_score = _minimum_higher_score(baseline_score, min_improvement_ratio)
 
     gate = _gate_payload(candidate)
+    baseline_fingerprint, candidate_fingerprint, evaluator_checks = _evaluator_context_checks(baseline, candidate, gate)
+    evaluator_context_passed = all(check["passed"] for check in evaluator_checks)
     evaluator_passed = _nested_bool(gate, ("evaluator", "passed"))
     quality_passed = _nested_bool(gate, ("quality", "passed"))
     performance_configured = _nested_bool(gate, ("performance", "configured"))
@@ -330,10 +342,18 @@ def score_candidate(
             "performance_configured": performance_configured,
             "performance_passed": performance_passed,
         },
+        "evaluator": {
+            "passed": evaluator_context_passed,
+            "baseline": baseline_fingerprint,
+            "candidate": candidate_fingerprint,
+            "checks": evaluator_checks,
+        },
         "size": {"passed": size_passed, "checks": size_checks},
         "timings": _timing_summary(candidate),
         "memory_size": _size_summary(candidate),
     }
+    if not evaluator_context_passed:
+        return score, {"value": "discard", "reason": "candidate evaluator context does not match baseline benchmark"}
     if not gate_passed:
         return score, {"value": "discard", "reason": "evaluator, quality, or configured performance gate failed"}
     if not size_passed:
@@ -636,6 +656,50 @@ def _apply_git_decision(
     }
 
 
+def _promote_kept_benchmark(
+    baseline_path: Path,
+    candidate_path: Path,
+    decision: Mapping[str, str],
+    *,
+    promote: bool,
+) -> dict[str, Any]:
+    if not promote:
+        return {"promote_requested": False, "applied": False, "action": "none"}
+    if decision.get("value") != "keep":
+        return {"promote_requested": True, "applied": False, "action": "skipped-discard"}
+    if baseline_path == candidate_path:
+        return {
+            "promote_requested": True,
+            "applied": False,
+            "action": "blocked",
+            "reason": "baseline and candidate benchmark paths are identical",
+        }
+    before = _file_fingerprint(baseline_path)
+    candidate = _file_fingerprint(candidate_path)
+    if not candidate.exists:
+        return {
+            "promote_requested": True,
+            "applied": False,
+            "action": "blocked",
+            "reason": "candidate benchmark JSON does not exist",
+            "before": _fingerprint_payload(before),
+            "candidate": _fingerprint_payload(candidate),
+        }
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(candidate_path, baseline_path)
+    after = _file_fingerprint(baseline_path)
+    return {
+        "promote_requested": True,
+        "applied": True,
+        "action": "promote-candidate-benchmark",
+        "baseline_benchmark_json": str(baseline_path),
+        "candidate_benchmark_json": str(candidate_path),
+        "before": _fingerprint_payload(before),
+        "after": _fingerprint_payload(after),
+        "candidate": _fingerprint_payload(candidate),
+    }
+
+
 def _git_changed_paths(repo_root: Path, checkpoint_ref: str) -> list[str]:
     tracked = _git(["diff", "--name-only", checkpoint_ref, "--"], repo_root)
     untracked = _git(["ls-files", "--others", "--exclude-standard"], repo_root)
@@ -851,6 +915,75 @@ def _gate_payload(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
     return gate
 
 
+def _evaluator_context_checks(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    gate: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
+    baseline_fingerprint = _evaluator_fingerprint(baseline)
+    candidate_fingerprint = _evaluator_fingerprint(candidate)
+    gate_evaluator = gate.get("evaluator")
+    if not isinstance(gate_evaluator, Mapping):
+        gate_evaluator = {}
+    gate_baseline = gate_evaluator.get("baseline")
+    gate_candidate = gate_evaluator.get("candidate")
+    checks = [
+        _boolean_check(
+            "benchmark_fingerprint",
+            candidate_fingerprint == baseline_fingerprint,
+            "candidate benchmark must use the same dataset split, sampling artifacts, and benchmark options as "
+            "baseline",
+        ),
+        _boolean_check(
+            "gate_baseline_fingerprint",
+            gate_baseline == baseline_fingerprint,
+            "candidate gate must record the same baseline evaluator fingerprint",
+        ),
+        _boolean_check(
+            "gate_candidate_fingerprint",
+            gate_candidate == candidate_fingerprint,
+            "candidate gate must record the same candidate evaluator fingerprint",
+        ),
+    ]
+    return baseline_fingerprint, candidate_fingerprint, checks
+
+
+def _evaluator_fingerprint(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": payload.get("schema_version"),
+        "dataset": {
+            "id": _path_get(payload, ("manifest", "dataset", "id")),
+            "split": _path_get(payload, ("manifest", "dataset", "split")),
+            "revision": _path_get(payload, ("manifest", "dataset", "revision")),
+            "row_limit": _path_get(payload, ("manifest", "dataset", "row_limit")),
+        },
+        "sampling": _path_get(payload, ("manifest", "sampling")),
+        "train_artifact_hash": _path_get(payload, ("manifest", "artifact_hashes", "train")),
+        "test_artifact_hash": _path_get(payload, ("manifest", "artifact_hashes", "test")),
+        "benchmark_options": _path_get(payload, ("benchmark", "options")),
+        "quality_documents": _path_get(payload, ("manifest", "sampling", "quality_documents")),
+        "benchmark_tiers": {
+            tier: {
+                "document_count": _path_get(payload, ("benchmark", "tiers", tier, "document_count")),
+                "bytes": _path_get(payload, ("benchmark", "tiers", tier, "bytes")),
+                "iterations": _path_get(payload, ("benchmark", "tiers", tier, "iterations")),
+            }
+            for tier in ("baseline", "target", "stress")
+        },
+    }
+
+
+def _boolean_check(name: str, actual: bool, description: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "actual": actual,
+        "operator": "==",
+        "threshold": True,
+        "passed": actual is True,
+        "description": description,
+    }
+
+
 def _size_checks(
     baseline: Mapping[str, Any],
     candidate: Mapping[str, Any],
@@ -1031,6 +1164,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--editable-path", dest="editable_paths", action="append", default=[])
     parser.add_argument("--frozen-path", dest="frozen_paths", action="append", default=[])
     parser.add_argument("--apply-git-decision", action="store_true")
+    parser.add_argument("--promote-kept-benchmark", action="store_true")
     parser.add_argument("--candidate-command", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(argv)
     if not parsed.candidate_command:

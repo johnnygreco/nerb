@@ -659,14 +659,14 @@
             "true_positive": 7781
           },
           "email_domain": {
-            "f1": 0.613423959,
-            "false_negative": 12033,
-            "false_positive": 252,
-            "gold_count": 21780,
-            "precision": 0.97479748,
+            "f1": 0.651927059,
+            "false_negative": 10183,
+            "false_positive": 239,
+            "gold_count": 19943,
+            "precision": 0.97609761,
             "predicted_count": 9999,
-            "recall": 0.447520661,
-            "true_positive": 9747
+            "recall": 0.489394775,
+            "true_positive": 9760
           }
         },
         "document_count": 1000,
@@ -675,16 +675,16 @@
           "email_address": 7807,
           "email_domain": 9999
         },
-        "f1": 0.696689058,
-        "false_negative": 14984,
-        "false_positive": 278,
-        "gold_count": 32512,
+        "f1": 0.723623688,
+        "false_negative": 13134,
+        "false_positive": 265,
+        "gold_count": 30675,
         "metric_scope": "exact span/entity/surface micro-average over prepared documents",
-        "precision": 0.984387285,
+        "precision": 0.985117376,
         "predicted_count": 17806,
-        "recall": 0.539124016,
+        "recall": 0.571833741,
         "record_count": 17806,
-        "true_positive": 17528
+        "true_positive": 17541
       },
       "train": {
         "by_entity": {
@@ -699,14 +699,14 @@
             "true_positive": 6475
           },
           "email_domain": {
-            "f1": 0.632268703,
-            "false_negative": 8226,
-            "false_positive": 248,
-            "gold_count": 15511,
-            "precision": 0.967078189,
+            "f1": 0.669571999,
+            "false_negative": 6968,
+            "false_positive": 235,
+            "gold_count": 14266,
+            "precision": 0.968803929,
             "predicted_count": 7533,
-            "recall": 0.469666688,
-            "true_positive": 7285
+            "recall": 0.511565961,
+            "true_positive": 7298
           }
         },
         "document_count": 1000,
@@ -715,16 +715,16 @@
           "email_address": 6511,
           "email_domain": 7533
         },
-        "f1": 0.732908999,
-        "false_negative": 9745,
-        "false_positive": 284,
-        "gold_count": 23505,
+        "f1": 0.758759365,
+        "false_negative": 8487,
+        "false_positive": 271,
+        "gold_count": 22260,
         "metric_scope": "exact span/entity/surface micro-average over prepared documents",
-        "precision": 0.979777841,
+        "precision": 0.980703503,
         "predicted_count": 14044,
-        "recall": 0.58540736,
+        "recall": 0.618733154,
         "record_count": 14044,
-        "true_positive": 13760
+        "true_positive": 13773
       }
     },
     "quality_document_limit": 1000,
@@ -1218,59 +1218,64 @@
   "scale": {
     "cases": [
       {
-        "canonical_json_bytes": 370076,
-        "cold_compile_seconds": 0.104663375,
+        "canonical_json_bytes": 376296,
+        "cold_compile_seconds": 0.133043583,
         "entities": 1000,
         "names": 1000,
         "patterns": 1000,
-        "source_bytes": 370076,
-        "target_bytes": 4889,
-        "target_bytes_per_second": 1817641.05,
-        "target_records": 2890,
-        "warm_cached_compile_seconds": 0.084837792
+        "source_bytes": 376296,
+        "target_bytes": 7999,
+        "target_bytes_per_second": 5510220.666,
+        "target_records": 1000,
+        "target_tokens": 1000,
+        "warm_cached_compile_seconds": 0.084574958
       },
       {
-        "canonical_json_bytes": 3727078,
-        "cold_compile_seconds": 1.120211875,
+        "canonical_json_bytes": 3769298,
+        "cold_compile_seconds": 1.364965167,
         "entities": 10000,
         "names": 10000,
         "patterns": 10000,
-        "source_bytes": 3727078,
-        "target_bytes": 10889,
-        "target_bytes_per_second": 881462.517,
-        "target_records": 6890,
-        "warm_cached_compile_seconds": 0.858063417
+        "source_bytes": 3769298,
+        "target_bytes": 15999,
+        "target_bytes_per_second": 1594770.262,
+        "target_records": 2000,
+        "target_tokens": 2000,
+        "warm_cached_compile_seconds": 0.907163458
       },
       {
-        "canonical_json_bytes": 18767078,
-        "cold_compile_seconds": 6.0697765,
+        "canonical_json_bytes": 18889298,
+        "cold_compile_seconds": 7.363082542,
         "entities": 50000,
         "names": 50000,
         "patterns": 50000,
-        "source_bytes": 18767078,
-        "target_bytes": 10889,
-        "target_bytes_per_second": 274481.755,
-        "target_records": 6890,
-        "warm_cached_compile_seconds": 4.707575541
+        "source_bytes": 18889298,
+        "target_bytes": 15999,
+        "target_bytes_per_second": 370083.444,
+        "target_records": 2000,
+        "target_tokens": 2000,
+        "warm_cached_compile_seconds": 4.656261875
       },
       {
-        "canonical_json_bytes": 37567080,
-        "cold_compile_seconds": 12.206478125,
+        "canonical_json_bytes": 37789300,
+        "cold_compile_seconds": 14.885037833,
         "entities": 100000,
         "names": 100000,
         "patterns": 100000,
-        "source_bytes": 37567080,
-        "target_bytes": 10889,
-        "target_bytes_per_second": 145657.87,
-        "target_records": 6890,
-        "warm_cached_compile_seconds": 9.495680958
+        "source_bytes": 37789300,
+        "target_bytes": 15999,
+        "target_bytes_per_second": 184655.337,
+        "target_records": 2000,
+        "target_tokens": 2000,
+        "warm_cached_compile_seconds": 10.113641209
       }
     ],
-    "description": "Measured deterministic compact JSON banks with one literal pattern per entity.",
+    "description": "Measured deterministic compact JSON banks with one fixed-width, word-bounded literal pattern per entity and a target scan document capped at 2,000 tokens.",
     "limits": {
       "max_entities": 100000,
       "max_patterns": 100000,
-      "max_source_bytes": 67108864
+      "max_source_bytes": 67108864,
+      "target_token_cap": 2000
     }
   },
   "schema_version": "nerb.hero_measurements.v1"

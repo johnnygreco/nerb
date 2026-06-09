@@ -12,6 +12,7 @@ from nerb.enron_benchmark import (
     BANK_TIMESTAMP,
     DEFAULT_MAX_BASELINE_BENCHMARK_BYTES,
     PrepOptions,
+    _gold_span_keys,
     _load_json_mapping,
     _parse_args,
     clean_email_text,
@@ -64,6 +65,18 @@ def test_clean_email_text_removes_headers_quotes_controls_and_reply_tail() -> No
     )
 
     assert clean_email_text(raw) == "Hello team,\n\nPlease review."
+
+
+def test_gold_span_keys_require_alphabetic_domain_tld() -> None:
+    text = "Use version 1.2 on 2026.06.09, skip IP 10.20.30.40, email a@example.com, and visit research.example.org."
+
+    spans = _gold_span_keys({"document_id": "doc", "text": text})
+    surfaces = {(entity, text[start:end], normalized) for _document_id, entity, start, end, normalized in spans}
+
+    assert ("email_address", "a@example.com", "a@example.com") in surfaces
+    assert ("email_domain", "example.com", "example.com") in surfaces
+    assert ("email_domain", "research.example.org", "research.example.org") in surfaces
+    assert all(surface not in {"1.2", "2026.06.09", "10.20.30.40"} for _entity, surface, _normalized in surfaces)
 
 
 def test_prepare_enron_benchmark_writes_deterministic_manifest_and_valid_bank(tmp_path: Path) -> None:

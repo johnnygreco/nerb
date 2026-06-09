@@ -105,6 +105,10 @@ def test_public_bank_scan_path_rejects_invalid_utf8(tmp_path):
         bank.scan_path(document_path)
 
 
+def test_public_bank_source_path_limit_matches_native_scale_limit():
+    assert engine_module.DEFAULT_MAX_BANK_SOURCE_BYTES == 64 * 1024 * 1024
+
+
 def test_public_bank_from_path_rejects_oversized_source_before_read(monkeypatch, tmp_path):
     monkeypatch.setattr(engine_module, "DEFAULT_MAX_BANK_SOURCE_BYTES", 4)
     bank_path = tmp_path / "bank.json"

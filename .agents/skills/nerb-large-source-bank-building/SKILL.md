@@ -72,6 +72,8 @@ For detailed checklists, read `references/build-checklist.md` only when planning
    - Keep a result log with bank hash, artifact hashes, metrics, command lines, and the decision to keep or discard.
    - For Enron-backed goal work, use `docs/enron-benchmark.md` and `scripts/enron_bank_build_benchmark.py` for the
      frozen benchmark/gate contract.
+   - When using the autoresearch loop, keep `src/nerb/enron_benchmark.py` frozen and make bank-construction changes in
+     `src/nerb/enron_bank_builder.py` or another explicitly editable experiment surface.
 
 8. Leave a handoff another agent can use.
    - Summarize entity classes, split policy, artifact locations, eval coverage, known false positives, and next candidate

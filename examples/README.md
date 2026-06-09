@@ -47,6 +47,7 @@ Those assets include aggregate measurement JSON plus PNG figures for Enron exact
 entities, and the autoresearch held-out-F1 objective. See `docs/hero-images.md`.
 
 The scale figures are generated from deterministic synthetic JSON banks rather than committed large fixtures. They show
-how warm extraction and process-local bank caching behave on a mostly-literal synthetic workload as an agent cache grows
-from 1,000 to 10,000 active patterns and from 50 KB to 300 KB of scanned text. The numbers are local illustrative
-measurements, so use them to compare runs on the same machine rather than as portable package-wide performance claims.
+how compile time, warm extraction, and process-local bank caching behave on a mostly-literal synthetic workload as an
+agent cache grows from 1,000 to 100,000 active patterns. The hero scale scan uses a capped generated target document, so
+the numbers are local illustrative measurements for comparing runs on the same machine rather than portable package-wide
+performance claims.

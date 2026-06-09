@@ -8,7 +8,8 @@ Committed assets live under `examples/artifacts/hero-images/`:
 
 - `enron-quality-performance.png`: Enron split size, exact-span NER precision/recall/F1, confusion counts, and
   construction/extraction measurements.
-- `scale-100k-entities.png`: measured synthetic scale run from 1,000 to 100,000 entities, names, and patterns.
+- `scale-100k-entities.png`: measured synthetic scale run from 1,000 to 100,000 entities, names, and patterns with a
+  fixed capped scan workload.
 - `autoresearch-objective.png`: the intended keep/discard scoring shape with held-out F1 as the primary metric and
   compile/size/path checks as gates.
 - `hero_measurements.json`: aggregate measurement data used to render the images. It contains no raw Enron text,
@@ -36,7 +37,9 @@ files stay ignored. Only the aggregate measurement JSON and rendered plots shoul
 - 5,500 active names and 5,500 active patterns across the two Enron email entity classes.
 - Exact-span held-out quality measured on the first 1,000 prepared test documents.
 
-`scale-100k-entities.png` uses deterministic compact JSON banks with one active literal pattern per entity. The cap
+`scale-100k-entities.png` uses deterministic compact JSON banks with one active fixed-width, word-bounded literal pattern
+per entity. The target scan document is capped at 2,000 generated tokens so the plot shows compile, cache, and source-size
+behavior across 1,000 to 100,000 entities without turning the hero generator into a long-running stress test. The cap
 changes needed for the 100,000-entity measurement are part of the source: native bank source bytes now allow 64 MiB, and
 the Rust entity-count limit now allows 100,000 entities while the existing 100,000-pattern cap remains in force.
 

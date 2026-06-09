@@ -16,6 +16,7 @@ DEFAULT_ENRON_ARTIFACT_DIR = Path(".nerb/enron-benchmark/issue-89-candidate")
 DEFAULT_AUTORESEARCH_RESULTS_JSONL = Path(".nerb/autoresearch/f1-results.jsonl")
 CREATED_AT = "2026-06-09T00:00:00Z"
 SCALE_ENTITY_COUNTS = (1_000, 10_000, 50_000, 100_000)
+SCALE_TARGET_TOKEN_CAP = 2_000
 
 
 def main() -> None:
@@ -139,8 +140,8 @@ def _measure_scale(entity_counts: Sequence[int]) -> dict[str, Any]:
     cases: list[dict[str, Any]] = []
     for entity_count in entity_counts:
         bank = _compact_entity_bank(entity_count)
-        token_count = min(entity_count, 2_000)
-        document = " ".join(f"v{index}" for index in range(token_count))
+        token_count = min(entity_count, SCALE_TARGET_TOKEN_CAP)
+        document = " ".join(_scale_value(index, entity_count) for index in range(token_count))
         benchmark = benchmark_bank(
             bank,
             documents={
@@ -155,24 +156,27 @@ def _measure_scale(entity_counts: Sequence[int]) -> dict[str, Any]:
                 "entities": entity_count,
                 "names": benchmark["bank"]["stats"]["active_totals"]["names"],
                 "patterns": benchmark["bank"]["stats"]["active_totals"]["patterns"],
-                "source_bytes": benchmark["benchmark"]["bank"]["size"]["native_source_bytes"]
-                if "benchmark" in benchmark
-                else benchmark["bank"]["size"]["native_source_bytes"],
+                "source_bytes": benchmark["bank"]["size"]["native_source_bytes"],
                 "canonical_json_bytes": benchmark["bank"]["size"]["canonical_json_bytes"],
                 "cold_compile_seconds": benchmark["summary"]["cold_compile_seconds"],
                 "warm_cached_compile_seconds": benchmark["summary"]["warm_cached_compile_seconds"],
+                "target_tokens": token_count,
                 "target_bytes": benchmark["tiers"]["target"]["bytes"],
                 "target_records": benchmark["tiers"]["target"]["record_count"],
                 "target_bytes_per_second": benchmark["summary"]["target_bytes_per_second"],
             }
         )
     return {
-        "description": "Measured deterministic compact JSON banks with one literal pattern per entity.",
+        "description": (
+            "Measured deterministic compact JSON banks with one fixed-width, word-bounded literal pattern per entity "
+            f"and a target scan document capped at {SCALE_TARGET_TOKEN_CAP:,} tokens."
+        ),
         "cases": cases,
         "limits": {
             "max_source_bytes": 64 * 1024 * 1024,
             "max_entities": 100_000,
             "max_patterns": 100_000,
+            "target_token_cap": SCALE_TARGET_TOKEN_CAP,
         },
     }
 
@@ -181,7 +185,7 @@ def _compact_entity_bank(entity_count: int) -> dict[str, Any]:
     entities: dict[str, Any] = {}
     for index in range(entity_count):
         entity_id = f"e{index}"
-        value = f"v{index}"
+        value = _scale_value(index, entity_count)
         entities[entity_id] = {
             "description": "",
             "status": "active",
@@ -200,8 +204,8 @@ def _compact_entity_bank(entity_count: int) -> dict[str, Any]:
                             "priority": 0,
                             "case_sensitive": True,
                             "normalize_whitespace": False,
-                            "left_boundary": "none",
-                            "right_boundary": "none",
+                            "left_boundary": "word",
+                            "right_boundary": "word",
                             "metadata": {},
                         }
                     },
@@ -224,6 +228,11 @@ def _compact_entity_bank(entity_count: int) -> dict[str, Any]:
         "entities": entities,
         "metadata": {"source": "examples.generate_benchmark_hero_images"},
     }
+
+
+def _scale_value(index: int, entity_count: int) -> str:
+    width = max(6, len(str(entity_count - 1)))
+    return f"v{index:0{width}d}"
 
 
 def _autoresearch_objective_measurement(results_jsonl: Path) -> dict[str, Any]:
@@ -353,7 +362,7 @@ def _render_scale_100k(plt: Any, measurement: Mapping[str, Any], path: Path) -> 
     _figure_title(
         fig,
         "Scale Measurements To 100,000 Entities",
-        "Compact JSON banks with one literal pattern per entity; source and native limits raised to cover this scale.",
+        "Fixed-width literal banks at 1k-100k entities; target scan text is capped while compile/source size scale.",
     )
     series = [
         ("Cold compile seconds", [case["cold_compile_seconds"] for case in cases], "#2563eb", "Seconds"),

@@ -41,6 +41,7 @@ under ignored `.nerb/` paths.
 
 By default, the harness allows construction-related source edits in:
 
+- `src/nerb/enron_bank_builder.py`
 - `src/nerb/bank.py`
 - `src/nerb/engine.py`
 - `src/nerb/engines.py`
@@ -80,17 +81,19 @@ A candidate is kept only when all of these are true:
 - the candidate command exits successfully within the timeout
 - no frozen or out-of-surface files changed relative to the resolved `--checkpoint-ref` SHA
 - the candidate benchmark JSON has configured gates and `gate.passed == true`
+- the candidate evaluator fingerprint independently matches the baseline dataset, split artifacts, sampling, and benchmark
+  tier sizes
 - evaluator, held-out quality, and configured performance gates pass
 - canonical and extractable JSON byte sizes stay within configured ratios
-- the primary held-out F1 score improves over the baseline by at least `--min-improvement-ratio`
+- the primary held-out F1 score improves over the current-best baseline by at least `--min-improvement-ratio`
 
 Crashes, timeouts, evaluator fingerprint mismatches, held-out F1/precision/recall regressions, size ceiling failures,
-and insufficient score improvements are logged as `discard`.
+and insufficient score improvements against the current best are logged as `discard`.
 
 ## Running One Experiment
 
-First create a baseline benchmark JSON under `.nerb/`. Before the agent edits anything, capture the current previous-best
-commit:
+First create a current-best benchmark JSON under `.nerb/`. Before the agent edits anything, capture the current
+previous-best commit:
 
 ```shell
 CHECKPOINT=$(git rev-parse HEAD)
@@ -107,6 +110,7 @@ uv run python scripts/nerb_autoresearch.py \
   --checkpoint-ref "$CHECKPOINT" \
   --timeout-seconds 1800 \
   --min-improvement-ratio 0.01 \
+  --promote-kept-benchmark \
   --candidate-command uv run python scripts/enron_bank_build_benchmark.py \
     --input-jsonl tests/data/enron_sample.jsonl \
     --output-dir .nerb/enron-benchmark/autoresearch-candidate \
@@ -130,9 +134,14 @@ The executable requires `--candidate-command` so a normal keep/discard decision 
 Passing `--checkpoint-ref HEAD` is safe only when `HEAD` is still the previous-best commit. If a candidate was already
 committed, pass the prior SHA instead so path gating and discard cleanup compare against the correct baseline.
 
-By default the harness is dry-run safe: it logs the keep/discard decision but does not mutate git state. To make
-non-improving or failed experiments reset to the previous best commit, pass `--apply-git-decision`. This can run
-`git reset --hard <resolved-checkpoint-sha>` plus `git clean -fd` for the changed experiment paths on discard. The
+By default the harness is dry-run safe: it logs the keep/discard decision but does not mutate git state or benchmark
+artifacts. Pass `--promote-kept-benchmark` when the baseline path is an ignored current-best artifact and a kept
+candidate should become the next comparison target. This copies the candidate `benchmark.json` over the baseline
+`benchmark.json` only after scoring succeeds, so the next run must beat the best kept candidate rather than the original
+starting point.
+
+To make non-improving or failed experiments reset to the previous best commit, also pass `--apply-git-decision`. This can
+run `git reset --hard <resolved-checkpoint-sha>` plus `git clean -fd` for the changed experiment paths on discard. The
 checkpoint ref is resolved once before the candidate command runs, so a command that moves `HEAD` cannot change the
 comparison or cleanup target. Use it only on an experiment branch with result logs and benchmark artifacts under ignored
 `.nerb/` paths.
@@ -145,9 +154,9 @@ Each result is one compact JSON object per line. The schema version is `nerb.aut
 - candidate benchmark output freshness fingerprints when a candidate command is required
 - evaluator baseline/candidate paths, bank hashes, and artifact hashes
 - process command, exit code, timeout flag, elapsed seconds, and stdout/stderr tails
-- primary score, timing metrics, gate status, and memory/size metadata
+- independently recomputed evaluator fingerprints, primary score, timing metrics, gate status, and memory/size metadata
 - decision value and reason
-- optional git action applied by the harness
+- optional git action and current-best benchmark promotion applied by the harness
 
 See `examples/artifacts/autoresearch/results.jsonl` for a redacted fixture-shaped row.
 

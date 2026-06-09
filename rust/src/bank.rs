@@ -1302,6 +1302,25 @@ GENRE:
     }
 
     #[test]
+    fn rejects_more_than_max_entities() {
+        let mut candidates = Vec::with_capacity(MAX_ENTITIES + 1);
+        for index in 0..=MAX_ENTITIES {
+            candidates.push(PatternCandidate {
+                entity: format!("entity_{index}"),
+                canonical_name: "Name".to_string(),
+                surface_name: "Name".to_string(),
+                regex: "Name".to_string(),
+                flags: Vec::new(),
+                priority: None,
+            });
+        }
+
+        let error = build_canonical_bank(defaults(false), candidates).unwrap_err();
+
+        assert!(error.to_string().contains("entity count 100001 exceeds limit 100000"));
+    }
+
+    #[test]
     fn current_json_bank_rejects_kind_specific_pattern_fields() {
         let literal_with_regex_flags = current_bank_source_with_pattern(serde_json::json!({
             "kind": "literal",
