@@ -595,6 +595,48 @@ def test_run_autoresearch_timeout_kills_candidate_process_group(tmp_path: Path) 
     assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group cleanup regression")
+def test_run_autoresearch_kills_candidate_process_group_after_parent_exit(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    engine_path = tmp_path / "src/nerb/engine.py"
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
+    writer_path = tmp_path / ".nerb/write_candidate_spawn_late_writer.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import json\n"
+        "import subprocess\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
+        "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n"
+        "subprocess.Popen([\n"
+        "    sys.executable,\n"
+        "    '-c',\n"
+        '    "import time; from pathlib import Path; time.sleep(0.4); "\n'
+        "    \"Path('src/nerb/engine.py').write_text('LATE = 1\\\\n', encoding='utf-8')\",\n"
+        "], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n",
+        encoding="utf-8",
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="parent exits before child",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=(),
+        candidate_command=[sys.executable, ".nerb/write_candidate_spawn_late_writer.py"],
+    )
+    time.sleep(0.7)
+
+    assert result["decision"]["value"] == "keep"
+    assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
+
+
 def test_run_autoresearch_caps_candidate_output_tails(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))

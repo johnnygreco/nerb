@@ -460,10 +460,11 @@ def _run_candidate_command(command: Sequence[str], *, timeout_seconds: float, cw
     exit_code: int | None
     try:
         exit_code = process.wait(timeout=timeout_seconds)
+        _terminate_process_group(process)
     except subprocess.TimeoutExpired:
         timed_out = True
         exit_code = None
-        _terminate_process_tree(process)
+        _terminate_process_group(process)
     _join_output_threads((stdout_thread, stderr_thread))
 
     return ProcessResult(
@@ -526,9 +527,7 @@ def _candidate_process_group_kwargs() -> dict[str, Any]:
     return {"start_new_session": True}
 
 
-def _terminate_process_tree(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
-        return
+def _terminate_process_group(process: subprocess.Popen[Any]) -> None:
     if os.name == "nt":
         _terminate_windows_process_tree(process)
     else:
@@ -541,19 +540,25 @@ def _terminate_posix_process_group(process: subprocess.Popen[Any]) -> None:
     except ProcessLookupError:
         return
     except OSError:
-        process.terminate()
-    try:
-        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
+        if process.poll() is None:
+            process.terminate()
+    if process.poll() is None:
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        time.sleep(PROCESS_TERMINATION_GRACE_SECONDS)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         return
     except OSError:
-        process.kill()
-    process.wait()
+        if process.poll() is None:
+            process.kill()
+    if process.poll() is None:
+        process.wait()
 
 
 def _terminate_windows_process_tree(process: subprocess.Popen[Any]) -> None:

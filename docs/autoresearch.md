@@ -65,8 +65,8 @@ It freezes evaluator and large-source guidance files:
 - `.agents/skills/nerb-large-source-bank-building`
 
 Pass repeated `--editable-path` or `--frozen-path` values when an issue deliberately changes the boundary, including
-other Rust source files. If an experiment touches a frozen file or a file outside the editable surface, the result is
-logged and discarded.
+other Rust source files. Any custom values replace that default list, so pass the full intended boundary. If an experiment
+touches a frozen file or a file outside the editable surface, the result is logged and discarded.
 
 ## Scoring And Decisions
 
