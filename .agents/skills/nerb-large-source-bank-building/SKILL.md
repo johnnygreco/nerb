@@ -16,7 +16,8 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 - Build for measured utility, not maximal coverage. A smaller bank with clear evals is better than a giant brittle bank.
 - Treat the corpus as evidence, not as the taxonomy owner. User goals decide which entity classes matter.
 - Keep raw or sensitive corpora out of git. Commit scripts, schemas, tiny fixtures, aggregate metrics, and redacted examples.
-- Freeze data prep and held-out evals before claiming benchmark or quality improvements.
+- Freeze data prep and held-out evals before claiming benchmark or quality improvements; report precision, recall, and F1
+  when train/test labels exist.
 - Separate evaluator changes from bank or engine changes. If both must change, say so explicitly in the PR/tracker.
 
 ## Workflow
@@ -34,6 +35,7 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 3. Create reproducible private artifacts.
    - Clean obvious transport noise, quoted/replied boilerplate, control characters, empty fields, and pathological records.
    - Create deterministic train/test or train/validation/test splits before candidate tuning.
+   - Preserve or derive gold labels needed for exact-span precision, recall, and F1 when the source supports it.
    - Store large or sensitive generated corpora under ignored paths such as `.nerb/`.
 
 4. Seed the bank conservatively.
@@ -55,7 +57,7 @@ For detailed checklists, read `references/build-checklist.md` only when planning
      ```shell
      uv run nerb extract-report --bank path/to/bank.json --file path/to/document.txt
      ```
-   - Run evals when the bank has eval refs:
+   - Run evals when the bank has eval refs or train/test labels:
      ```shell
      uv run nerb eval-bank --bank path/to/bank.json
      ```
@@ -83,7 +85,7 @@ Strict:
 - provenance, source revisions, split seeds, artifact hashes
 - privacy boundaries and ignored output locations
 - validation before extraction or benchmarking
-- held-out quality checks before performance claims
+- held-out precision/recall/F1 checks before performance claims
 - regression evidence before merging bank or construction changes
 
 Flexible:

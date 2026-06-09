@@ -1,0 +1,1277 @@
+{
+  "autoresearch": {
+    "baseline": {
+      "cold_compile_seconds": 0.001047958,
+      "f1": 0.418604651,
+      "precision": 0.818181818,
+      "recall": 0.28125,
+      "target_bytes_per_second": 24110217.161
+    },
+    "candidate": {
+      "cold_compile_seconds": 0.001589792,
+      "f1": 0.716981132,
+      "precision": 0.904761905,
+      "recall": 0.59375,
+      "target_bytes_per_second": 16383699.41
+    },
+    "decision": {
+      "reason": "candidate improved the primary held-out F1 score",
+      "value": "keep"
+    },
+    "gates": {
+      "path": true,
+      "performance": true,
+      "quality": true,
+      "size": true
+    },
+    "lower_is_better": false,
+    "primary_metric": "quality.test.f1",
+    "result_log": ".nerb/autoresearch/f1-results.jsonl"
+  },
+  "created_at": "2026-06-09T00:00:00Z",
+  "enron": {
+    "artifact_dir": ".nerb/enron-benchmark/issue-89-candidate",
+    "artifact_hashes": {
+      "bank": "sha256:cb81ad399bc5ab98379bc09e90c3eeef24263c5b5c0150bc9f3c4f287ec55970",
+      "test": "sha256:19ce6b665ce728078dd97a74249d9520e03f75b9a62f02f699da95a58844268e",
+      "train": "sha256:df3749f77ef5c6a43667f45ba89df378a8ad7ccd0ff9aa2c7a9158e9d96b57bf"
+    },
+    "bank": {
+      "hash": "sha256:77625730cdd60b8aceb29b5bb46049ab4e9c4d90383bdd68c7de0e5890ffa669",
+      "size": {
+        "canonical_json_bytes": 2172947,
+        "extractable_json_bytes": 2172947,
+        "native_source_bytes": 2172947
+      },
+      "stats": {
+        "active_totals": {
+          "entities": 2,
+          "names": 5500,
+          "patterns": 5500
+        },
+        "by_kind": {
+          "literal": 5500,
+          "regex": 0
+        },
+        "by_status": {
+          "active": {
+            "entities": 2,
+            "names": 5500,
+            "patterns": 5500
+          },
+          "deprecated": {
+            "entities": 0,
+            "names": 0,
+            "patterns": 0
+          },
+          "draft": {
+            "entities": 0,
+            "names": 0,
+            "patterns": 0
+          },
+          "inactive": {
+            "entities": 0,
+            "names": 0,
+            "patterns": 0
+          }
+        },
+        "totals": {
+          "entities": 2,
+          "names": 5500,
+          "patterns": 5500
+        }
+      }
+    },
+    "benchmark_summary": {
+      "benchmark_profile_id": null,
+      "cache_hit_verified": true,
+      "cold_compile_seconds": 0.483014,
+      "document_count": 110,
+      "extraction_iterations": 3,
+      "profile": "mostly_literal",
+      "record_count": 1296,
+      "target_bytes_per_second": 982131.867,
+      "target_documents_per_second": 651.29,
+      "target_records_per_second": 7880.606,
+      "tier_count": 3,
+      "warm_cached_compile_seconds": 0.402620042
+    },
+    "compile": {
+      "cache": {
+        "after_cold": {
+          "hits": 0,
+          "keys": [
+            {
+              "bank_hash": "sha256:b2375ba581faf1202fc9b5c666f25e8e2693ad0fa3a8026ad25d6eb8ac9f9768",
+              "canonical_engine": "rust-regex-meta",
+              "compile_options": {
+                "match_mode": "entity_independent"
+              },
+              "endian": "little",
+              "engine_name": "nerb_engine",
+              "engine_version": "0.0.6",
+              "platform": "macosx-11.0-arm64",
+              "pointer_width": 64,
+              "schema_version": 1,
+              "semantic_version": "0.0.6",
+              "target_triple": "darwin"
+            }
+          ],
+          "max_entries": 128,
+          "max_source_keys": 256,
+          "misses": 1,
+          "size": 1,
+          "source_key_count": 1
+        },
+        "after_reset": {
+          "hits": 0,
+          "keys": [],
+          "max_entries": 128,
+          "max_source_keys": 256,
+          "misses": 0,
+          "size": 0,
+          "source_key_count": 0
+        },
+        "after_warm": {
+          "hits": 1,
+          "keys": [
+            {
+              "bank_hash": "sha256:b2375ba581faf1202fc9b5c666f25e8e2693ad0fa3a8026ad25d6eb8ac9f9768",
+              "canonical_engine": "rust-regex-meta",
+              "compile_options": {
+                "match_mode": "entity_independent"
+              },
+              "endian": "little",
+              "engine_name": "nerb_engine",
+              "engine_version": "0.0.6",
+              "platform": "macosx-11.0-arm64",
+              "pointer_width": 64,
+              "schema_version": 1,
+              "semantic_version": "0.0.6",
+              "target_triple": "darwin"
+            }
+          ],
+          "max_entries": 128,
+          "max_source_keys": 256,
+          "misses": 1,
+          "size": 1,
+          "source_key_count": 1
+        },
+        "before_reset": {
+          "hits": 0,
+          "keys": [],
+          "max_entries": 128,
+          "max_source_keys": 256,
+          "misses": 0,
+          "size": 0,
+          "source_key_count": 0
+        },
+        "cold_hit": false,
+        "warm_hit": true
+      },
+      "cold": {
+        "native": {
+          "cache": {
+            "enabled": true,
+            "hit": false,
+            "hit_level": null,
+            "key": {
+              "bank_hash": "sha256:b2375ba581faf1202fc9b5c666f25e8e2693ad0fa3a8026ad25d6eb8ac9f9768",
+              "canonical_engine": "rust-regex-meta",
+              "compile_options": {
+                "match_mode": "entity_independent"
+              },
+              "endian": "little",
+              "engine_name": "nerb_engine",
+              "engine_version": "0.0.6",
+              "platform": "macosx-11.0-arm64",
+              "pointer_width": 64,
+              "schema_version": 1,
+              "semantic_version": "0.0.6",
+              "target_triple": "darwin"
+            }
+          },
+          "schema_version": "nerb.bank_source_compile_report.v1",
+          "source": {
+            "format_hint": "json",
+            "source_size_bytes": 2172947,
+            "use_cache": true
+          },
+          "stages": {
+            "cache_insert_or_reuse": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 7.083e-06
+            },
+            "cache_key_from_metadata": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001693333
+            },
+            "cache_lookup": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 2.833e-06
+            },
+            "compile_options_normalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 1.6625e-05
+            },
+            "native_compile": {
+              "available": true,
+              "exclusive": false,
+              "includes": [
+                "rust_source_parse",
+                "rust_canonicalization",
+                "stable_hash",
+                "matcher_compile"
+              ],
+              "note": "Native Rust compile is exposed as one inclusive call by the current engine API.",
+              "seconds": 0.117359625
+            },
+            "native_engine_import": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 4.834e-06
+            },
+            "source_bytes_copy": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 8.33e-07
+            },
+            "source_cache_key": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000745125
+            }
+          }
+        },
+        "schema_version": "nerb.json_bank_compile_report.v1",
+        "source": {
+          "bank_stats": {
+            "active_totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            },
+            "by_kind": {
+              "literal": 5500,
+              "regex": 0
+            },
+            "by_status": {
+              "active": {
+                "entities": 2,
+                "names": 5500,
+                "patterns": 5500
+              },
+              "deprecated": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "draft": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "inactive": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              }
+            },
+            "totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            }
+          },
+          "canonical_bank_hash": "sha256:77625730cdd60b8aceb29b5bb46049ab4e9c4d90383bdd68c7de0e5890ffa669",
+          "canonical_json_bytes": 2172947,
+          "extractable_json_bytes": 2172947,
+          "extractable_stats": {
+            "active_totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            },
+            "by_kind": {
+              "literal": 5500,
+              "regex": 0
+            },
+            "by_status": {
+              "active": {
+                "entities": 2,
+                "names": 5500,
+                "patterns": 5500
+              },
+              "deprecated": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "draft": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "inactive": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              }
+            },
+            "totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            }
+          }
+        },
+        "stages": {
+          "canonical_json_serialization": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.008645167
+          },
+          "compile_options_json": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 3.209e-06
+          },
+          "detector_index": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.0059435
+          },
+          "extractable_bank_filter": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.00322925
+          },
+          "extractable_json_serialization": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.008512292
+          },
+          "metadata_projection": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 2.666e-06
+          },
+          "native_bank_from_source": {
+            "available": true,
+            "exclusive": false,
+            "includes": [
+              "python_cache_lookup",
+              "rust_source_parse",
+              "rust_canonicalization",
+              "stable_hash",
+              "matcher_compile"
+            ],
+            "note": "Includes the Python Bank cache wrapper and one native Rust construction call.",
+            "seconds": 0.119864916
+          },
+          "options_resolution": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 1.325e-05
+          },
+          "python_canonicalize": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.021883333
+          },
+          "runtime_validation": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.006266
+          },
+          "schema_validation": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.301082375
+          },
+          "stable_hash": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.000671792
+          },
+          "status_gate": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 7.92e-07
+          }
+        }
+      },
+      "cold_seconds": 0.483014,
+      "warm": {
+        "native": {
+          "cache": {
+            "enabled": true,
+            "hit": true,
+            "hit_level": "source_key",
+            "key": {
+              "bank_hash": "sha256:b2375ba581faf1202fc9b5c666f25e8e2693ad0fa3a8026ad25d6eb8ac9f9768",
+              "canonical_engine": "rust-regex-meta",
+              "compile_options": {
+                "match_mode": "entity_independent"
+              },
+              "endian": "little",
+              "engine_name": "nerb_engine",
+              "engine_version": "0.0.6",
+              "platform": "macosx-11.0-arm64",
+              "pointer_width": 64,
+              "schema_version": 1,
+              "semantic_version": "0.0.6",
+              "target_triple": "darwin"
+            }
+          },
+          "schema_version": "nerb.bank_source_compile_report.v1",
+          "source": {
+            "format_hint": "json",
+            "source_size_bytes": 2172947,
+            "use_cache": true
+          },
+          "stages": {
+            "cache_lookup": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 7.792e-06
+            },
+            "compile_options_normalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 1.8584e-05
+            },
+            "native_compile": {
+              "available": false,
+              "exclusive": null,
+              "note": "source-cache hit reused a compiled bank",
+              "seconds": null
+            },
+            "native_engine_import": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 5.084e-06
+            },
+            "source_bytes_copy": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 1e-06
+            },
+            "source_cache_key": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000696042
+            }
+          }
+        },
+        "schema_version": "nerb.json_bank_compile_report.v1",
+        "source": {
+          "bank_stats": {
+            "active_totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            },
+            "by_kind": {
+              "literal": 5500,
+              "regex": 0
+            },
+            "by_status": {
+              "active": {
+                "entities": 2,
+                "names": 5500,
+                "patterns": 5500
+              },
+              "deprecated": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "draft": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "inactive": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              }
+            },
+            "totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            }
+          },
+          "canonical_bank_hash": "sha256:77625730cdd60b8aceb29b5bb46049ab4e9c4d90383bdd68c7de0e5890ffa669",
+          "canonical_json_bytes": 2172947,
+          "extractable_json_bytes": 2172947,
+          "extractable_stats": {
+            "active_totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            },
+            "by_kind": {
+              "literal": 5500,
+              "regex": 0
+            },
+            "by_status": {
+              "active": {
+                "entities": 2,
+                "names": 5500,
+                "patterns": 5500
+              },
+              "deprecated": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "draft": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              },
+              "inactive": {
+                "entities": 0,
+                "names": 0,
+                "patterns": 0
+              }
+            },
+            "totals": {
+              "entities": 2,
+              "names": 5500,
+              "patterns": 5500
+            }
+          }
+        },
+        "stages": {
+          "canonical_json_serialization": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.008497
+          },
+          "compile_options_json": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 3.125e-06
+          },
+          "detector_index": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.005370125
+          },
+          "extractable_bank_filter": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.003427042
+          },
+          "extractable_json_serialization": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.03625875
+          },
+          "metadata_projection": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 2.916e-06
+          },
+          "native_bank_from_source": {
+            "available": true,
+            "exclusive": false,
+            "includes": [
+              "native_engine_import",
+              "source_bytes_copy",
+              "compile_options_normalize",
+              "source_cache_key",
+              "cache_lookup"
+            ],
+            "note": "Source-cache hit reused a compiled bank; Rust construction was skipped.",
+            "seconds": 0.000742917
+          },
+          "options_resolution": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 9.792e-06
+          },
+          "python_canonicalize": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.021509042
+          },
+          "runtime_validation": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.006922208
+          },
+          "schema_validation": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.312240041
+          },
+          "stable_hash": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 0.000671875
+          },
+          "status_gate": {
+            "available": true,
+            "exclusive": true,
+            "seconds": 7.08e-07
+          }
+        }
+      },
+      "warm_cached_compile_seconds": 0.402620042
+    },
+    "dataset": {
+      "id": "corbt/enron-emails",
+      "input_jsonl": null,
+      "revision": "cfc06c758093d90993abce1a43668fb7357258a6",
+      "row_limit": null,
+      "split": "train"
+    },
+    "prep_summary": {
+      "dropped_duplicate_body": 187286,
+      "dropped_duplicate_message_id": 0,
+      "dropped_empty_text": 0,
+      "dropped_sample_fraction": 164935,
+      "input_records": 517401,
+      "selected_records": 165180,
+      "test_records": 32984,
+      "train_records": 132196
+    },
+    "quality": {
+      "test": {
+        "by_entity": {
+          "email_address": {
+            "f1": 0.839419602,
+            "false_negative": 2951,
+            "false_positive": 26,
+            "gold_count": 10732,
+            "precision": 0.996669655,
+            "predicted_count": 7807,
+            "recall": 0.725027954,
+            "true_positive": 7781
+          },
+          "email_domain": {
+            "f1": 0.613423959,
+            "false_negative": 12033,
+            "false_positive": 252,
+            "gold_count": 21780,
+            "precision": 0.97479748,
+            "predicted_count": 9999,
+            "recall": 0.447520661,
+            "true_positive": 9747
+          }
+        },
+        "document_count": 1000,
+        "documents_with_records": 990,
+        "entity_counts": {
+          "email_address": 7807,
+          "email_domain": 9999
+        },
+        "f1": 0.696689058,
+        "false_negative": 14984,
+        "false_positive": 278,
+        "gold_count": 32512,
+        "metric_scope": "exact span/entity/surface micro-average over prepared documents",
+        "precision": 0.984387285,
+        "predicted_count": 17806,
+        "recall": 0.539124016,
+        "record_count": 17806,
+        "true_positive": 17528
+      },
+      "train": {
+        "by_entity": {
+          "email_address": {
+            "f1": 0.892795588,
+            "false_negative": 1519,
+            "false_positive": 36,
+            "gold_count": 7994,
+            "precision": 0.994470895,
+            "predicted_count": 6511,
+            "recall": 0.809982487,
+            "true_positive": 6475
+          },
+          "email_domain": {
+            "f1": 0.632268703,
+            "false_negative": 8226,
+            "false_positive": 248,
+            "gold_count": 15511,
+            "precision": 0.967078189,
+            "predicted_count": 7533,
+            "recall": 0.469666688,
+            "true_positive": 7285
+          }
+        },
+        "document_count": 1000,
+        "documents_with_records": 991,
+        "entity_counts": {
+          "email_address": 6511,
+          "email_domain": 7533
+        },
+        "f1": 0.732908999,
+        "false_negative": 9745,
+        "false_positive": 284,
+        "gold_count": 23505,
+        "metric_scope": "exact span/entity/surface micro-average over prepared documents",
+        "precision": 0.979777841,
+        "predicted_count": 14044,
+        "recall": 0.58540736,
+        "record_count": 14044,
+        "true_positive": 13760
+      }
+    },
+    "quality_document_limit": 1000,
+    "sampling": {
+      "max_body_chars": 20000,
+      "sample_fraction": 0.5,
+      "seed": "nerb-enron-v1",
+      "test_fraction": 0.2
+    },
+    "target_tier": {
+      "bytes": 75399,
+      "document_count": 50,
+      "documents": [
+        {
+          "document_id": "doc_e5fc003540d284c8",
+          "record_count": 14,
+          "source": {
+            "bytes": 4682,
+            "length": 4682,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_4ddcb52fa539a230",
+          "record_count": 8,
+          "source": {
+            "bytes": 262,
+            "length": 262,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_79f18bfb38fd99e1",
+          "record_count": 14,
+          "source": {
+            "bytes": 4682,
+            "length": 4682,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_fb829a5b537aaf2f",
+          "record_count": 14,
+          "source": {
+            "bytes": 622,
+            "length": 622,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_ab1cf4bf53f38796",
+          "record_count": 25,
+          "source": {
+            "bytes": 7548,
+            "length": 7548,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_eddf912072b7c918",
+          "record_count": 6,
+          "source": {
+            "bytes": 206,
+            "length": 206,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_5e0e7242f0d33380",
+          "record_count": 8,
+          "source": {
+            "bytes": 233,
+            "length": 233,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_17a96a4ec37c2344",
+          "record_count": 6,
+          "source": {
+            "bytes": 495,
+            "length": 495,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_d2d12dd008cacf26",
+          "record_count": 8,
+          "source": {
+            "bytes": 1688,
+            "length": 1688,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_50e8727569dd464a",
+          "record_count": 25,
+          "source": {
+            "bytes": 723,
+            "length": 723,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_42c1aee42c4a8d47",
+          "record_count": 8,
+          "source": {
+            "bytes": 806,
+            "length": 806,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_552cceb17e32fb9a",
+          "record_count": 12,
+          "source": {
+            "bytes": 390,
+            "length": 390,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_b4461f2d615b7707",
+          "record_count": 8,
+          "source": {
+            "bytes": 463,
+            "length": 463,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_3aa031cda92a405d",
+          "record_count": 8,
+          "source": {
+            "bytes": 3128,
+            "length": 3128,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_14c220684519e0a3",
+          "record_count": 6,
+          "source": {
+            "bytes": 223,
+            "length": 223,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_466e79ca6ba6fdbc",
+          "record_count": 8,
+          "source": {
+            "bytes": 177,
+            "length": 177,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_d13f7d069884cb3d",
+          "record_count": 60,
+          "source": {
+            "bytes": 2381,
+            "length": 2381,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_8bd100483dfa4036",
+          "record_count": 6,
+          "source": {
+            "bytes": 390,
+            "length": 390,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_223e6f074108ce26",
+          "record_count": 8,
+          "source": {
+            "bytes": 340,
+            "length": 340,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_af8a0e44d5b79e7b",
+          "record_count": 6,
+          "source": {
+            "bytes": 166,
+            "length": 166,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_df33fc692598b636",
+          "record_count": 12,
+          "source": {
+            "bytes": 447,
+            "length": 447,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_d6db8bc71414127d",
+          "record_count": 20,
+          "source": {
+            "bytes": 387,
+            "length": 387,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_819a0bccfb791127",
+          "record_count": 8,
+          "source": {
+            "bytes": 6554,
+            "length": 6554,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_35c7f73fd1cff380",
+          "record_count": 10,
+          "source": {
+            "bytes": 5982,
+            "length": 5982,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_97648d6823fc001f",
+          "record_count": 8,
+          "source": {
+            "bytes": 262,
+            "length": 262,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_efcd25e327494679",
+          "record_count": 12,
+          "source": {
+            "bytes": 918,
+            "length": 918,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_73a716d7ae1605d7",
+          "record_count": 8,
+          "source": {
+            "bytes": 376,
+            "length": 376,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_59b534b9ad1e5db0",
+          "record_count": 16,
+          "source": {
+            "bytes": 1388,
+            "length": 1388,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_79671a0c1ad8798b",
+          "record_count": 6,
+          "source": {
+            "bytes": 562,
+            "length": 562,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_f1cc6f5be9b27bff",
+          "record_count": 16,
+          "source": {
+            "bytes": 445,
+            "length": 445,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_ee271d40ec016856",
+          "record_count": 8,
+          "source": {
+            "bytes": 459,
+            "length": 459,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_dc4a8a8f5c4207ca",
+          "record_count": 6,
+          "source": {
+            "bytes": 673,
+            "length": 673,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_12d82c2a8026a3af",
+          "record_count": 6,
+          "source": {
+            "bytes": 265,
+            "length": 265,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_1fd4a254118366bf",
+          "record_count": 6,
+          "source": {
+            "bytes": 686,
+            "length": 686,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_1003250d532680f2",
+          "record_count": 8,
+          "source": {
+            "bytes": 528,
+            "length": 528,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_db92c0ff7203cfcd",
+          "record_count": 16,
+          "source": {
+            "bytes": 1388,
+            "length": 1388,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_de4e25b054ba5cb8",
+          "record_count": 12,
+          "source": {
+            "bytes": 1907,
+            "length": 1907,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_d39726f6f728000d",
+          "record_count": 54,
+          "source": {
+            "bytes": 872,
+            "length": 872,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_25e6e06ef4d68725",
+          "record_count": 12,
+          "source": {
+            "bytes": 806,
+            "length": 806,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_04a7aad50ff60aed",
+          "record_count": 8,
+          "source": {
+            "bytes": 265,
+            "length": 265,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_03b23288f09e190f",
+          "record_count": 12,
+          "source": {
+            "bytes": 2293,
+            "length": 2293,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_0e08a626083b997f",
+          "record_count": 8,
+          "source": {
+            "bytes": 1265,
+            "length": 1265,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_ecc9fff361235f79",
+          "record_count": 6,
+          "source": {
+            "bytes": 529,
+            "length": 529,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_46f4d86c9acffa90",
+          "record_count": 10,
+          "source": {
+            "bytes": 619,
+            "length": 619,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_62924015392c7bc5",
+          "record_count": 8,
+          "source": {
+            "bytes": 1006,
+            "length": 1006,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_7009b8e8fefe8b35",
+          "record_count": 8,
+          "source": {
+            "bytes": 214,
+            "length": 214,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_af3d1d4e6b256638",
+          "record_count": 6,
+          "source": {
+            "bytes": 1211,
+            "length": 1211,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_5c21835f65248d5f",
+          "record_count": 6,
+          "source": {
+            "bytes": 2050,
+            "length": 2050,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_0821a66d955dc531",
+          "record_count": 23,
+          "source": {
+            "bytes": 11182,
+            "length": 11182,
+            "type": "text"
+          }
+        },
+        {
+          "document_id": "doc_00c545bd6f6dccd1",
+          "record_count": 8,
+          "source": {
+            "bytes": 255,
+            "length": 255,
+            "type": "text"
+          }
+        }
+      ],
+      "documents_with_records": 50,
+      "iterations": 3,
+      "record_count": 605,
+      "record_count_stable": true,
+      "record_counts_by_run": [
+        605,
+        605,
+        605
+      ],
+      "size": {
+        "average_bytes": 1507.98,
+        "max_bytes": 11182,
+        "min_bytes": 166
+      },
+      "stages": {
+        "document_prepare_seconds": 5.0208e-05,
+        "scan_project_sort_seconds": 0.23031225
+      },
+      "throughput": {
+        "bytes_per_second": 982131.867,
+        "documents_per_second": 651.29,
+        "records_per_second": 7880.606
+      },
+      "warm_extraction_seconds": 0.23031225
+    }
+  },
+  "scale": {
+    "cases": [
+      {
+        "canonical_json_bytes": 370076,
+        "cold_compile_seconds": 0.104663375,
+        "entities": 1000,
+        "names": 1000,
+        "patterns": 1000,
+        "source_bytes": 370076,
+        "target_bytes": 4889,
+        "target_bytes_per_second": 1817641.05,
+        "target_records": 2890,
+        "warm_cached_compile_seconds": 0.084837792
+      },
+      {
+        "canonical_json_bytes": 3727078,
+        "cold_compile_seconds": 1.120211875,
+        "entities": 10000,
+        "names": 10000,
+        "patterns": 10000,
+        "source_bytes": 3727078,
+        "target_bytes": 10889,
+        "target_bytes_per_second": 881462.517,
+        "target_records": 6890,
+        "warm_cached_compile_seconds": 0.858063417
+      },
+      {
+        "canonical_json_bytes": 18767078,
+        "cold_compile_seconds": 6.0697765,
+        "entities": 50000,
+        "names": 50000,
+        "patterns": 50000,
+        "source_bytes": 18767078,
+        "target_bytes": 10889,
+        "target_bytes_per_second": 274481.755,
+        "target_records": 6890,
+        "warm_cached_compile_seconds": 4.707575541
+      },
+      {
+        "canonical_json_bytes": 37567080,
+        "cold_compile_seconds": 12.206478125,
+        "entities": 100000,
+        "names": 100000,
+        "patterns": 100000,
+        "source_bytes": 37567080,
+        "target_bytes": 10889,
+        "target_bytes_per_second": 145657.87,
+        "target_records": 6890,
+        "warm_cached_compile_seconds": 9.495680958
+      }
+    ],
+    "description": "Measured deterministic compact JSON banks with one literal pattern per entity.",
+    "limits": {
+      "max_entities": 100000,
+      "max_patterns": 100000,
+      "max_source_bytes": 67108864
+    }
+  },
+  "schema_version": "nerb.hero_measurements.v1"
+}

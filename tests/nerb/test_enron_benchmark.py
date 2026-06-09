@@ -42,6 +42,7 @@ def _options(input_jsonl: Path, output_dir: Path, *, created_at: str = "2026-06-
         min_address_count=1,
         min_domain_count=1,
         benchmark_documents=5,
+        quality_documents=5,
         benchmark_iterations=1,
         created_at=created_at,
         baseline_benchmark_json=None,
@@ -93,6 +94,13 @@ def test_prepare_enron_benchmark_writes_deterministic_manifest_and_valid_bank(tm
     assert first["bank"]["schema_valid"] is True
     assert first["bank"]["stats"]["active_totals"]["patterns"] > 0
     assert first["quality"]["test"]["documents_with_records"] > 0
+    assert first["quality"]["test"]["precision"] == 1.0
+    assert first["quality"]["test"]["recall"] == 1.0
+    assert first["quality"]["test"]["f1"] == 1.0
+    assert first["quality"]["test"]["true_positive"] == first["quality"]["test"]["gold_count"]
+    assert first["quality"]["test"]["false_positive"] == 0
+    assert first["quality"]["test"]["false_negative"] == 0
+    assert first["summary"]["test_f1"] == first["quality"]["test"]["f1"]
     assert first["benchmark"]["summary"]["cache_hit_verified"] is True
     assert first["benchmark"]["environment"]["python"]
     assert first["benchmark"]["environment"]["executable_name"]
@@ -150,13 +158,10 @@ def test_prepare_enron_benchmark_compares_against_stored_baseline_gate(tmp_path:
     assert candidate["gate"]["configured"] is True
     assert candidate["gate"]["passed"] is True
     assert candidate["gate"]["evaluator"]["passed"] is True
-    assert (
-        candidate["gate"]["evaluator"]["candidate"]["bank_artifact_hash"]
-        == baseline["manifest"]["artifact_hashes"]["bank"]
-    )
     assert {check["name"] for check in candidate["gate"]["quality"]["checks"]} == {
-        "test_record_count_absolute_delta",
-        "test_entity_counts",
+        "test_f1_delta",
+        "test_precision_delta",
+        "test_recall_delta",
     }
     assert {check["name"] for check in candidate["gate"]["performance"]["checks"]} == {
         "cold_compile_seconds_ratio",
@@ -164,19 +169,19 @@ def test_prepare_enron_benchmark_compares_against_stored_baseline_gate(tmp_path:
         "target_bytes_per_second_ratio",
     }
 
-    lost_records_baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    lost_records_baseline["quality"]["test"]["record_count"] += 1
-    lost_records_path = tmp_path / "lost-records-baseline.json"
-    lost_records_path.write_text(json.dumps(lost_records_baseline), encoding="utf-8")
-
-    lost_records = prepare_enron_benchmark(
-        replace(_options(input_jsonl, tmp_path / "lost-records-candidate"), baseline_benchmark_json=lost_records_path)
+    lower_quality = prepare_enron_benchmark(
+        replace(
+            _options(input_jsonl, tmp_path / "lower-quality-candidate"),
+            baseline_benchmark_json=baseline_path,
+            max_addresses=1,
+            max_domains=1,
+        )
     )
 
-    assert lost_records["gate"]["passed"] is False
-    assert lost_records["gate"]["evaluator"]["passed"] is True
-    assert lost_records["gate"]["quality"]["checks"][0]["actual"] == 1
-    assert lost_records["gate"]["quality"]["checks"][0]["metadata"]["delta"] == -1
+    assert lower_quality["gate"]["passed"] is False
+    assert lower_quality["gate"]["evaluator"]["passed"] is True
+    assert lower_quality["gate"]["quality"]["checks"][0]["name"] == "test_f1_delta"
+    assert lower_quality["gate"]["quality"]["checks"][0]["actual"] < 0
 
     non_numeric_metric_baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     non_numeric_metric_baseline["benchmark"]["summary"]["cold_compile_seconds"] = "inf"
@@ -310,10 +315,6 @@ def test_main_exits_nonzero_when_configured_gate_fails(tmp_path: Path, capsys: p
     ]
     input_jsonl = _write_jsonl(tmp_path / "fixture.jsonl", rows)
     baseline = prepare_enron_benchmark(_options(input_jsonl, tmp_path / "baseline"))
-    failed_baseline = json.loads(Path(baseline["paths"]["benchmark"]).read_text(encoding="utf-8"))
-    failed_baseline["quality"]["test"]["record_count"] += 1
-    failed_baseline_path = tmp_path / "failed-baseline.json"
-    failed_baseline_path.write_text(json.dumps(failed_baseline), encoding="utf-8")
 
     with pytest.raises(SystemExit) as exc_info:
         main(
@@ -336,10 +337,16 @@ def test_main_exits_nonzero_when_configured_gate_fails(tmp_path: Path, capsys: p
                 "1",
                 "--benchmark-documents",
                 "5",
+                "--quality-documents",
+                "5",
                 "--benchmark-iterations",
                 "1",
                 "--baseline-benchmark-json",
-                str(failed_baseline_path),
+                str(baseline["paths"]["benchmark"]),
+                "--max-addresses",
+                "1",
+                "--max-domains",
+                "1",
             ]
         )
 
@@ -509,6 +516,7 @@ def test_prepare_enron_benchmark_requires_huggingface_revision(tmp_path: Path) -
         min_address_count=1,
         min_domain_count=1,
         benchmark_documents=1,
+        quality_documents=1,
         benchmark_iterations=1,
         created_at=BANK_TIMESTAMP,
         baseline_benchmark_json=None,

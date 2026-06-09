@@ -23,6 +23,7 @@ uv run --with datasets==5.0.0 scripts/enron_bank_build_benchmark.py \
   --seed nerb-enron-v1 \
   --created-at 2026-06-09T00:00:00Z \
   --benchmark-documents 50 \
+  --quality-documents 1000 \
   --benchmark-iterations 3
 ```
 
@@ -45,6 +46,7 @@ uv run python scripts/enron_bank_build_benchmark.py \
   --min-address-count 1 \
   --min-domain-count 1 \
   --benchmark-documents 5 \
+  --quality-documents 5 \
   --benchmark-iterations 1
 ```
 
@@ -57,10 +59,12 @@ The output directory contains:
 - `train.jsonl` and `test.jsonl`: cleaned local documents with mined address/domain metadata.
 - `bank.json`: baseline JSON bank mined from the training split.
 - `manifest.json`: provenance, sampling settings, prep counts, artifact hashes, bank stats, and environment metadata.
-- `benchmark.json`: manifest plus `benchmark_bank` output and aggregate train/test extraction summaries.
+- `benchmark.json`: manifest plus `benchmark_bank` output and aggregate train/test exact-span NER metrics.
 
 The benchmark JSON intentionally stores aggregate counts and NERB benchmark document summaries, not raw extracted record
-strings.
+strings. Quality metrics include precision, recall, F1, true positives, false positives, false negatives, gold span
+count, predicted span count, and per-entity metric summaries. `--benchmark-documents` controls the small document sample
+used for timing tiers; `--quality-documents` controls the train/test document sample used for exact-span NER metrics.
 
 ## Stage Semantics
 
@@ -94,6 +98,7 @@ uv run python scripts/enron_bank_build_benchmark.py \
   --min-address-count 1 \
   --min-domain-count 1 \
   --benchmark-documents 5 \
+  --quality-documents 5 \
   --benchmark-iterations 1 \
   --baseline-benchmark-json .nerb/enron-benchmark/baseline/benchmark.json \
   --max-cold-compile-seconds-ratio 1.05 \
@@ -102,10 +107,11 @@ uv run python scripts/enron_bank_build_benchmark.py \
 ```
 
 The gate first checks an evaluator fingerprint: dataset id/revision, sampling settings, train/test artifact hashes,
-generated bank artifact hash, candidate limits, benchmark options, and benchmark tier sizes. If the fingerprint differs,
-the gate fails before interpreting quality or performance ratios. This keeps benchmark/evaluator changes separate from
-optimizer changes. When a stored-baseline gate is configured and fails, the command exits nonzero after writing and
-printing `benchmark.json`. Threshold flags require `--baseline-benchmark-json`; threshold-only commands are rejected.
+benchmark options, quality-document count, and benchmark tier sizes. If the fingerprint differs, the gate fails before
+interpreting quality or performance ratios. This keeps benchmark/evaluator changes separate from optimizer changes while
+still allowing the candidate bank to change. The quality gate requires held-out F1, precision, and recall to stay at or
+above the stored baseline. When a stored-baseline gate is configured and fails, the command exits nonzero after writing
+and printing `benchmark.json`. Threshold flags require `--baseline-benchmark-json`; threshold-only commands are rejected.
 
 ## Autoresearch Loop
 
@@ -116,6 +122,5 @@ surface.
 
 ## Hero Image Direction
 
-Use `docs/hero-images.md` for benchmark-grounded hero concepts and committed preview assets. The visuals represent the
-Enron corpus, entity banks, and autoresearch loop as abstract aggregate systems; they intentionally avoid raw email text,
-personal data, screenshots, and unsupported in-image performance claims.
+Use `docs/hero-images.md` for benchmark-grounded plot assets. The committed visuals are generated from aggregate
+measurement JSON and intentionally avoid raw email text, personal data, screenshots, and unsupported claims.

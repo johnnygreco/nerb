@@ -26,6 +26,7 @@ uv run python scripts/enron_bank_build_benchmark.py \
   --min-address-count 1 \
   --min-domain-count 1 \
   --benchmark-documents 5 \
+  --quality-documents 5 \
   --benchmark-iterations 1 \
   --baseline-benchmark-json .nerb/enron-benchmark/autoresearch-baseline/benchmark.json \
   --max-cold-compile-seconds-ratio 1.05 \
@@ -70,18 +71,21 @@ touches a frozen file or a file outside the editable surface, the result is logg
 
 ## Scoring And Decisions
 
-The primary scalar score is `benchmark.summary.cold_compile_seconds`; lower is better. A candidate is kept only when all
-of these are true:
+The primary scalar score is `quality.test.f1`; higher is better. The Enron evaluator computes exact-span NER precision,
+recall, and F1 against prepared train/test documents. Compile time, throughput, size, and path checks remain gates and
+context; they are not the reward.
+
+A candidate is kept only when all of these are true:
 
 - the candidate command exits successfully within the timeout
 - no frozen or out-of-surface files changed relative to the resolved `--checkpoint-ref` SHA
 - the candidate benchmark JSON has configured gates and `gate.passed == true`
 - evaluator, held-out quality, and configured performance gates pass
 - canonical and extractable JSON byte sizes stay within configured ratios
-- the primary score improves over the baseline by at least `--min-improvement-ratio`
+- the primary held-out F1 score improves over the baseline by at least `--min-improvement-ratio`
 
-Crashes, timeouts, evaluator fingerprint mismatches, held-out quality changes, size ceiling failures, and insufficient
-score improvements are logged as `discard`.
+Crashes, timeouts, evaluator fingerprint mismatches, held-out F1/precision/recall regressions, size ceiling failures,
+and insufficient score improvements are logged as `discard`.
 
 ## Running One Experiment
 
@@ -113,6 +117,7 @@ uv run python scripts/nerb_autoresearch.py \
     --min-address-count 1 \
     --min-domain-count 1 \
     --benchmark-documents 5 \
+    --quality-documents 5 \
     --benchmark-iterations 1 \
     --baseline-benchmark-json .nerb/enron-benchmark/autoresearch-baseline/benchmark.json \
     --max-cold-compile-seconds-ratio 1.05 \

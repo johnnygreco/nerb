@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CANONICAL_SCHEMA: u32 = 1;
 const ENGINE_NAME: &str = "rust-regex-meta";
-const MAX_ENTITIES: usize = 10_000;
+const MAX_ENTITIES: usize = 100_000;
 const MAX_PATTERNS: usize = 100_000;
 const MAX_PATTERNS_PER_ENTITY: usize = 50_000;
 const MAX_PATTERN_BYTES: usize = 10_000;

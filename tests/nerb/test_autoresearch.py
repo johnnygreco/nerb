@@ -17,6 +17,7 @@ from nerb.autoresearch import PROCESS_OUTPUT_TAIL_CHARS, append_result_jsonl, ru
 def _benchmark_payload(
     *,
     cold_compile_seconds: float,
+    test_f1: float = 0.8,
     gate_passed: bool = True,
     canonical_json_bytes: int = 100,
     extractable_json_bytes: int = 80,
@@ -35,7 +36,21 @@ def _benchmark_payload(
                 "bank": "sha256:bank-artifact",
             }
         },
-        "quality": {"test": {"record_count": 5, "entity_counts": {"email_address": 3, "email_domain": 2}}},
+        "quality": {
+            "test": {
+                "record_count": 5,
+                "entity_counts": {"email_address": 3, "email_domain": 2},
+                "gold_count": 5,
+                "predicted_count": 5,
+                "true_positive": 4,
+                "false_positive": 1,
+                "false_negative": 1,
+                "precision": test_f1,
+                "recall": test_f1,
+                "f1": test_f1,
+                "by_entity": {},
+            }
+        },
         "benchmark": {
             "summary": {
                 "cold_compile_seconds": cold_compile_seconds,
@@ -84,12 +99,14 @@ def _jsonl_rows(path: Path) -> list[dict[str, Any]]:
 def test_score_candidate_keeps_clear_improvement() -> None:
     score, decision = score_candidate(
         _benchmark_payload(cold_compile_seconds=10.0),
-        _benchmark_payload(cold_compile_seconds=8.0),
+        _benchmark_payload(cold_compile_seconds=8.0, test_f1=0.9),
         min_improvement_ratio=0.05,
     )
 
-    assert decision == {"value": "keep", "reason": "candidate improved the primary construction score"}
-    assert score["primary"]["ratio"] == 0.8
+    assert decision == {"value": "keep", "reason": "candidate improved the primary held-out F1 score"}
+    assert score["primary"]["field"] == "quality.test.f1"
+    assert score["primary"]["ratio"] == 1.125
+    assert score["primary"]["lower_is_better"] is False
     assert score["gate"]["passed"] is True
     assert score["size"]["passed"] is True
 
@@ -97,23 +114,23 @@ def test_score_candidate_keeps_clear_improvement() -> None:
 def test_score_candidate_discards_gate_failure_and_small_improvement() -> None:
     _score, gate_decision = score_candidate(
         _benchmark_payload(cold_compile_seconds=10.0),
-        _benchmark_payload(cold_compile_seconds=8.0, gate_passed=False),
+        _benchmark_payload(cold_compile_seconds=8.0, test_f1=0.9, gate_passed=False),
         min_improvement_ratio=0.05,
     )
     _score, slow_decision = score_candidate(
         _benchmark_payload(cold_compile_seconds=10.0),
-        _benchmark_payload(cold_compile_seconds=9.7),
+        _benchmark_payload(cold_compile_seconds=8.0, test_f1=0.83),
         min_improvement_ratio=0.05,
     )
 
     assert gate_decision["value"] == "discard"
     assert gate_decision["reason"] == "evaluator, quality, or configured performance gate failed"
     assert slow_decision["value"] == "discard"
-    assert slow_decision["reason"] == "candidate did not improve the primary construction score enough"
+    assert slow_decision["reason"] == "candidate did not improve the primary held-out F1 score enough"
 
 
 def test_score_candidate_discards_inconsistent_top_level_gate() -> None:
-    inconsistent = _benchmark_payload(cold_compile_seconds=8.0)
+    inconsistent = _benchmark_payload(cold_compile_seconds=8.0, test_f1=0.9)
     gate = cast(dict[str, Any], inconsistent["gate"])
     evaluator = cast(dict[str, Any], gate["evaluator"])
     evaluator["passed"] = False
@@ -130,7 +147,7 @@ def test_score_candidate_discards_inconsistent_top_level_gate() -> None:
 
 
 def test_score_candidate_discards_unconfigured_performance_gate() -> None:
-    unconfigured = _benchmark_payload(cold_compile_seconds=8.0)
+    unconfigured = _benchmark_payload(cold_compile_seconds=8.0, test_f1=0.9)
     gate = cast(dict[str, Any], unconfigured["gate"])
     performance = cast(dict[str, Any], gate["performance"])
     performance["configured"] = False
@@ -163,7 +180,7 @@ def test_run_autoresearch_keeps_improvement_in_dry_run_fixture_repo(tmp_path: Pa
     (tmp_path / "src/nerb/engine.py").write_text("BEST = 2\n", encoding="utf-8")
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
     candidate_path = _write_json(
-        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8)
+        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8, test_f1=0.9)
     )
     results_path = tmp_path / ".nerb/autoresearch/results.jsonl"
 
@@ -193,7 +210,7 @@ def test_run_autoresearch_discards_when_frozen_file_changes(tmp_path: Path) -> N
     frozen_path = tmp_path / "src/nerb/enron_benchmark.py"
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
     candidate_path = _write_json(
-        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8)
+        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8, test_f1=0.9)
     )
 
     result = run_autoresearch(
@@ -226,7 +243,7 @@ def test_run_autoresearch_resolves_relative_paths_against_repo_root(tmp_path: Pa
     _init_repo(tmp_path)
     (tmp_path / "src/nerb/engine.py").write_text("BEST = 2\n", encoding="utf-8")
     _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
-    _write_json(tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8))
+    _write_json(tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8, test_f1=0.9))
     outside_cwd = tmp_path.parent
     monkeypatch.chdir(outside_cwd)
 
@@ -257,7 +274,7 @@ def test_run_autoresearch_scores_parseable_gate_failure_from_nonzero_command(tmp
         "import json\n"
         "import sys\n"
         "from pathlib import Path\n"
-        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8, gate_passed=False))!r}\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8, test_f1=0.9, gate_passed=False))!r}\n"
         "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
         "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n"
         "sys.exit(1)\n",
@@ -286,7 +303,7 @@ def test_run_autoresearch_discards_stale_candidate_json_after_nonzero_command(tm
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
     candidate_path = _write_json(
         tmp_path / ".nerb/candidate/benchmark.json",
-        _benchmark_payload(cold_compile_seconds=8, gate_passed=False),
+        _benchmark_payload(cold_compile_seconds=8, test_f1=0.9, gate_passed=False),
     )
 
     result = run_autoresearch(
@@ -314,7 +331,7 @@ def test_run_autoresearch_discards_when_baseline_changes_during_candidate_run(tm
     writer_path.write_text(
         "import json\n"
         "from pathlib import Path\n"
-        f"candidate = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        f"candidate = {json.dumps(_benchmark_payload(cold_compile_seconds=8, test_f1=0.9))!r}\n"
         f"baseline = {json.dumps(_benchmark_payload(cold_compile_seconds=100))!r}\n"
         "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
         "Path('.nerb/candidate/benchmark.json').write_text(candidate, encoding='utf-8')\n"
@@ -360,7 +377,7 @@ def test_run_autoresearch_uses_immutable_checkpoint_ref_when_command_moves_head(
         "import json\n"
         "import subprocess\n"
         "from pathlib import Path\n"
-        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8, test_f1=0.9))!r}\n"
         "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
         "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n"
         "Path('src/nerb/enron_benchmark.py').write_text('changed evaluator\\n', encoding='utf-8')\n"
@@ -393,7 +410,7 @@ def test_run_autoresearch_discards_stale_candidate_json_after_successful_command
     _init_repo(tmp_path)
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
     candidate_path = _write_json(
-        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8)
+        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=8, test_f1=0.9)
     )
 
     result = run_autoresearch(
@@ -450,7 +467,7 @@ def test_run_autoresearch_apply_git_decision_resets_failed_candidate(tmp_path: P
     scratch_path.write_text("temporary experiment file\n", encoding="utf-8")
     baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
     candidate_path = _write_json(
-        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=9.8)
+        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=9.8, test_f1=0.82)
     )
 
     result = run_autoresearch(
@@ -652,7 +669,7 @@ def test_run_autoresearch_kills_candidate_process_group_after_parent_exit(tmp_pa
         "import subprocess\n"
         "import sys\n"
         "from pathlib import Path\n"
-        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8, test_f1=0.9))!r}\n"
         "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
         "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n"
         "subprocess.Popen([\n"
@@ -693,7 +710,7 @@ def test_run_autoresearch_caps_candidate_output_tails(tmp_path: Path) -> None:
         "import json\n"
         "import sys\n"
         "from pathlib import Path\n"
-        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8, test_f1=0.9))!r}\n"
         "sys.stdout.write('a' * 6000)\n"
         "sys.stderr.write('b' * 6000)\n"
         "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
@@ -727,7 +744,7 @@ def test_script_runs_candidate_command_and_logs_result(tmp_path: Path) -> None:
     writer_path.write_text(
         "import json\n"
         "from pathlib import Path\n"
-        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8, test_f1=0.9))!r}\n"
         "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
         "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n",
         encoding="utf-8",
@@ -773,5 +790,5 @@ def test_script_runs_candidate_command_and_logs_result(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     output = json.loads(completed.stdout)
     assert output["decision"]["value"] == "keep"
-    assert output["score"]["primary"]["ratio"] == 0.8
+    assert output["score"]["primary"]["ratio"] == 1.125
     assert _jsonl_rows(tmp_path / ".nerb/autoresearch/results.jsonl")[0]["decision"]["value"] == "keep"

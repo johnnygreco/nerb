@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fmt;
 
-const MAX_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_JSONL_ROWS: usize = 100_000;
 const MAX_JSONL_LINE_BYTES: usize = 256 * 1024;
 const MAX_CONTAINER_DEPTH: usize = 128;

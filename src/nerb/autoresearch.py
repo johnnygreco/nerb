@@ -23,7 +23,7 @@ DEFAULT_TIMEOUT_SECONDS = 30 * 60
 DEFAULT_MIN_IMPROVEMENT_RATIO = 0.01
 DEFAULT_MAX_CANONICAL_JSON_BYTES_RATIO = 1.05
 DEFAULT_MAX_EXTRACTABLE_JSON_BYTES_RATIO = 1.05
-PRIMARY_SCORE_FIELD = "benchmark.summary.cold_compile_seconds"
+PRIMARY_SCORE_FIELD = "quality.test.f1"
 PROCESS_OUTPUT_TAIL_BYTES = 64 * 1024
 PROCESS_OUTPUT_TAIL_CHARS = 4_000
 PROCESS_OUTPUT_READ_CHUNK_BYTES = 8 * 1024
@@ -284,11 +284,11 @@ def score_candidate(
     max_extractable_json_bytes_ratio: float | None = DEFAULT_MAX_EXTRACTABLE_JSON_BYTES_RATIO,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     _validate_nonnegative_ratio(min_improvement_ratio, "min_improvement_ratio")
-    baseline_score = _required_positive_number(baseline, ("benchmark", "summary", "cold_compile_seconds"))
-    candidate_score = _required_positive_number(candidate, ("benchmark", "summary", "cold_compile_seconds"))
-    ratio = _ratio(candidate_score, baseline_score)
-    improvement_ratio = round(1.0 - ratio, 6)
-    required_score = round(baseline_score * (1.0 - min_improvement_ratio), 9)
+    baseline_score = _required_unit_metric(baseline, ("quality", "test", "f1"))
+    candidate_score = _required_unit_metric(candidate, ("quality", "test", "f1"))
+    ratio = _optional_ratio(candidate_score, baseline_score)
+    improvement_ratio = _higher_is_better_improvement_ratio(candidate_score, baseline_score)
+    required_score = _minimum_higher_score(baseline_score, min_improvement_ratio)
 
     gate = _gate_payload(candidate)
     evaluator_passed = _nested_bool(gate, ("evaluator", "passed"))
@@ -314,13 +314,13 @@ def score_candidate(
     score = {
         "primary": {
             "field": PRIMARY_SCORE_FIELD,
-            "lower_is_better": True,
+            "lower_is_better": False,
             "baseline": baseline_score,
             "candidate": candidate_score,
             "ratio": ratio,
             "improvement_ratio": improvement_ratio,
             "min_improvement_ratio": min_improvement_ratio,
-            "required_candidate_max": required_score,
+            "required_candidate_min": required_score,
         },
         "gate": {
             "configured": gate.get("configured") is True,
@@ -338,9 +338,9 @@ def score_candidate(
         return score, {"value": "discard", "reason": "evaluator, quality, or configured performance gate failed"}
     if not size_passed:
         return score, {"value": "discard", "reason": "memory or size ceiling failed"}
-    if candidate_score <= required_score:
-        return score, {"value": "keep", "reason": "candidate improved the primary construction score"}
-    return score, {"value": "discard", "reason": "candidate did not improve the primary construction score enough"}
+    if candidate_score >= required_score:
+        return score, {"value": "keep", "reason": "candidate improved the primary held-out F1 score"}
+    return score, {"value": "discard", "reason": "candidate did not improve the primary held-out F1 score enough"}
 
 
 def append_result_jsonl(path: Path, payload: Mapping[str, Any]) -> None:
@@ -919,6 +919,15 @@ def _required_positive_number(payload: Mapping[str, Any], path: Sequence[str]) -
     return number
 
 
+def _required_unit_metric(payload: Mapping[str, Any], path: Sequence[str]) -> float:
+    value = _path_get(payload, path)
+    number = _finite_number(value)
+    if number is None or number < 0 or number > 1:
+        dotted = ".".join(path)
+        raise ValueError(f"Benchmark field {dotted} must be a finite number from 0 to 1.")
+    return number
+
+
 def _path_get(payload: Mapping[str, Any], path: Sequence[str]) -> Any:
     current: Any = payload
     for key in path:
@@ -942,6 +951,20 @@ def _optional_ratio(candidate_value: Any, baseline_value: Any) -> float | None:
 
 def _ratio(candidate_number: float, baseline_number: float) -> float:
     return round(candidate_number / baseline_number, 6)
+
+
+def _higher_is_better_improvement_ratio(candidate_number: float, baseline_number: float) -> float | None:
+    if baseline_number <= 0:
+        if candidate_number <= 0:
+            return 0.0
+        return None
+    return round((candidate_number / baseline_number) - 1.0, 6)
+
+
+def _minimum_higher_score(baseline_number: float, min_improvement_ratio: float) -> float:
+    if baseline_number <= 0:
+        return 0.0 if min_improvement_ratio == 0 else min_improvement_ratio
+    return round(baseline_number * (1.0 + min_improvement_ratio), 9)
 
 
 def _finite_number(value: Any) -> float | None:
