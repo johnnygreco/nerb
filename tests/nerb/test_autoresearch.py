@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from nerb.autoresearch import append_result_jsonl, run_autoresearch, score_candidate
 
@@ -106,6 +106,23 @@ def test_score_candidate_discards_gate_failure_and_small_improvement() -> None:
     assert gate_decision["reason"] == "evaluator, quality, or configured performance gate failed"
     assert slow_decision["value"] == "discard"
     assert slow_decision["reason"] == "candidate did not improve the primary construction score enough"
+
+
+def test_score_candidate_discards_inconsistent_top_level_gate() -> None:
+    inconsistent = _benchmark_payload(cold_compile_seconds=8.0)
+    gate = cast(dict[str, Any], inconsistent["gate"])
+    evaluator = cast(dict[str, Any], gate["evaluator"])
+    evaluator["passed"] = False
+
+    score, decision = score_candidate(
+        _benchmark_payload(cold_compile_seconds=10.0),
+        inconsistent,
+        min_improvement_ratio=0.05,
+    )
+
+    assert score["gate"]["passed"] is False
+    assert score["gate"]["evaluator_passed"] is False
+    assert decision["value"] == "discard"
 
 
 def test_append_result_jsonl_writes_one_compact_json_object_per_line(tmp_path: Path) -> None:
@@ -297,6 +314,56 @@ def test_run_autoresearch_discards_when_baseline_changes_during_candidate_run(tm
     assert result["decision"] == {"value": "discard", "reason": "baseline benchmark JSON changed during candidate run"}
     assert result["error"]["type"] == "BaselineBenchmarkChanged"
     assert result["repo"]["baseline_gate"]["passed"] is False
+
+
+def test_run_autoresearch_uses_immutable_checkpoint_ref_when_command_moves_head(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    frozen_path = tmp_path / "src/nerb/enron_benchmark.py"
+    frozen_path.write_text("clean evaluator\n", encoding="utf-8")
+    subprocess.run(["git", "add", "src/nerb/enron_benchmark.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-m", "add evaluator"], cwd=tmp_path, check=True, capture_output=True)
+    checkpoint_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
+    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
+    writer_path = tmp_path / ".nerb/write_candidate_commit_frozen.py"
+    writer_path.parent.mkdir(parents=True, exist_ok=True)
+    writer_path.write_text(
+        "import json\n"
+        "import subprocess\n"
+        "from pathlib import Path\n"
+        f"payload = {json.dumps(_benchmark_payload(cold_compile_seconds=8))!r}\n"
+        "Path('.nerb/candidate').mkdir(parents=True, exist_ok=True)\n"
+        "Path('.nerb/candidate/benchmark.json').write_text(payload, encoding='utf-8')\n"
+        "Path('src/nerb/enron_benchmark.py').write_text('changed evaluator\\n', encoding='utf-8')\n"
+        "subprocess.run(['git', 'add', 'src/nerb/enron_benchmark.py'], check=True)\n"
+        "subprocess.run(['git', 'commit', '-m', 'move head'], check=True, capture_output=True)\n",
+        encoding="utf-8",
+    )
+
+    result = run_autoresearch(
+        baseline_benchmark_json=baseline_path,
+        candidate_benchmark_json=candidate_path,
+        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
+        description="head moves",
+        repo_root=tmp_path,
+        checkpoint_ref="HEAD",
+        editable_paths=("src/nerb/engine.py",),
+        frozen_paths=("src/nerb/enron_benchmark.py",),
+        candidate_command=[sys.executable, ".nerb/write_candidate_commit_frozen.py"],
+    )
+
+    assert result["decision"] == {
+        "value": "discard",
+        "reason": "changed files outside the editable experiment surface",
+    }
+    assert result["repo"]["checkpoint_ref"] == checkpoint_sha
+    assert result["repo"]["path_gate"]["frozen_touched"] == ["src/nerb/enron_benchmark.py"]
 
 
 def test_run_autoresearch_discards_stale_candidate_json_after_successful_command(tmp_path: Path) -> None:

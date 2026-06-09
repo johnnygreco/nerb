@@ -116,9 +116,10 @@ def run_autoresearch(
         _validate_positive_number(max_canonical_json_bytes_ratio, "max_canonical_json_bytes_ratio")
     if max_extractable_json_bytes_ratio is not None:
         _validate_positive_number(max_extractable_json_bytes_ratio, "max_extractable_json_bytes_ratio")
+    checkpoint_sha = _git(["rev-parse", checkpoint_ref], repo).strip()
 
     started = time.perf_counter()
-    pre_changed_paths = _git_changed_paths(repo, checkpoint_ref)
+    pre_changed_paths = _git_changed_paths(repo, checkpoint_sha)
     pre_path_gate = _path_gate(pre_changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
     baseline: Mapping[str, Any] | None = None
     baseline_error: dict[str, str] | None = None
@@ -134,7 +135,7 @@ def run_autoresearch(
             if candidate_command is not None
             else ProcessResult((), 0, False, 0.0, "", "")
         )
-        changed_paths = _git_changed_paths(repo, checkpoint_ref)
+        changed_paths = _git_changed_paths(repo, checkpoint_sha)
         post_path_gate = _path_gate(changed_paths, editable_paths=editable_paths, frozen_paths=frozen_paths)
         post_baseline_fingerprint = _file_fingerprint(baseline_path)
         post_candidate_fingerprint = _file_fingerprint(candidate_path)
@@ -202,7 +203,7 @@ def run_autoresearch(
         candidate_benchmark_json=candidate_path,
         results_jsonl=results_path,
         repo_root=repo,
-        checkpoint_ref=checkpoint_ref,
+        checkpoint_ref=checkpoint_sha,
         editable_paths=editable_paths,
         frozen_paths=frozen_paths,
         changed_paths=changed_paths,
@@ -220,7 +221,7 @@ def run_autoresearch(
     )
     result["git"] = _apply_git_decision(
         repo,
-        checkpoint_ref,
+        checkpoint_sha,
         result["decision"],
         changed_paths=changed_paths,
         cleanup_allowed=pre_path_gate["passed"],
@@ -281,9 +282,16 @@ def score_candidate(
     required_score = round(baseline_score * (1.0 - min_improvement_ratio), 9)
 
     gate = _gate_payload(candidate)
-    gate_passed = gate.get("configured") is True and gate.get("passed") is True
     evaluator_passed = _nested_bool(gate, ("evaluator", "passed"))
     quality_passed = _nested_bool(gate, ("quality", "passed"))
+    performance_passed = _nested_bool(gate, ("performance", "passed"))
+    gate_passed = (
+        gate.get("configured") is True
+        and gate.get("passed") is True
+        and evaluator_passed
+        and quality_passed
+        and performance_passed
+    )
     size_checks = _size_checks(
         baseline,
         candidate,
@@ -308,7 +316,7 @@ def score_candidate(
             "passed": gate_passed,
             "evaluator_passed": evaluator_passed,
             "quality_passed": quality_passed,
-            "performance_passed": _nested_bool(gate, ("performance", "passed")),
+            "performance_passed": performance_passed,
         },
         "size": {"passed": size_passed, "checks": size_checks},
         "timings": _timing_summary(candidate),

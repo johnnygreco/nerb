@@ -67,9 +67,9 @@ The primary scalar score is `benchmark.summary.cold_compile_seconds`; lower is b
 of these are true:
 
 - the candidate command exits successfully within the timeout
-- no frozen or out-of-surface files changed relative to `--checkpoint-ref`
+- no frozen or out-of-surface files changed relative to the resolved `--checkpoint-ref` SHA
 - the candidate benchmark JSON has configured gates and `gate.passed == true`
-- evaluator and held-out quality gates pass
+- evaluator, held-out quality, and configured performance gates pass
 - canonical and extractable JSON byte sizes stay within configured ratios
 - the primary score improves over the baseline by at least `--min-improvement-ratio`
 
@@ -112,8 +112,10 @@ The executable requires `--candidate-command` so a normal keep/discard decision 
 
 By default the harness is dry-run safe: it logs the keep/discard decision but does not mutate git state. To make
 non-improving or failed experiments reset to the previous best commit, pass `--apply-git-decision`. This can run
-`git reset --hard <checkpoint-ref>` plus `git clean -fd` for the changed experiment paths on discard, so use it only on
-an experiment branch with result logs and benchmark artifacts under ignored `.nerb/` paths.
+`git reset --hard <resolved-checkpoint-sha>` plus `git clean -fd` for the changed experiment paths on discard. The
+checkpoint ref is resolved once before the candidate command runs, so a command that moves `HEAD` cannot change the
+comparison or cleanup target. Use it only on an experiment branch with result logs and benchmark artifacts under ignored
+`.nerb/` paths.
 
 ## Result Log
 
