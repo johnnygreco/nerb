@@ -27,13 +27,15 @@ To refresh the committed artifacts, run the same command with `--output-dir exam
 - `figures/ner_detection_*.png`: detection images built from actual NERB records.
 - `figures/scale_*.png`: the main speed-at-scale numerical demonstration.
 - `figures/benchmark_*.png`: small domain-bank timing figures.
-- `hero-images/*.jpg`: generated hero-background previews documented in `docs/hero-images.md`.
 
 The banks are intentionally small but domain-specific:
 
 - `security_ops.json`: incident tickets, CVEs, cloud services, severities, and runbooks.
 - `revenue_ops.json`: accounts, products, commercial artifacts, regions, and account health.
 - `compliance_ops.json`: audit frameworks, controls, evidence artifacts, systems, and data boundaries.
+
+Additional committed assets include `artifacts/hero-images/*.jpg`, generated from the prompts and provenance in
+`docs/hero-images.md`. They are not refreshed by `generate_showcase.py`.
 
 The scale figures are generated from deterministic synthetic JSON banks rather than committed large fixtures. They show
 how warm extraction and process-local bank caching behave on a mostly-literal synthetic workload as an agent cache grows
