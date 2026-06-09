@@ -43,7 +43,7 @@ sections that match the current corpus and goal.
 - Keep held-out documents separate from candidate discovery prompts and ad hoc debugging.
 - Include negative or no-match cases for ambiguous classes.
 - Ensure eval refs are local, deterministic, and safe to commit; otherwise store private eval artifacts under ignored paths.
-- Use exact record-count/entity-count checks when evaluating a frozen benchmark.
+- Use standard held-out NER metrics for quality: exact-span precision, recall, and F1, plus per-entity breakdowns.
 - Do not report an optimization win if the evaluator, split, or bank-generation rules changed in the same comparison.
 
 ## NERB Checks

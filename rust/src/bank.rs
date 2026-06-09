@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 const CANONICAL_SCHEMA: u32 = 1;
 const ENGINE_NAME: &str = "rust-regex-meta";
-const MAX_ENTITIES: usize = 10_000;
+const MAX_ENTITIES: usize = 100_000;
 const MAX_PATTERNS: usize = 100_000;
 const MAX_PATTERNS_PER_ENTITY: usize = 50_000;
 const MAX_PATTERN_BYTES: usize = 10_000;
@@ -1299,6 +1299,25 @@ GENRE:
         let error = NativeBank::from_source_bytes(source, Some("jsonl"), None).unwrap_err();
 
         assert!(error.to_string().contains("duplicate logical detector"));
+    }
+
+    #[test]
+    fn rejects_more_than_max_entities() {
+        let mut candidates = Vec::with_capacity(MAX_ENTITIES + 1);
+        for index in 0..=MAX_ENTITIES {
+            candidates.push(PatternCandidate {
+                entity: format!("entity_{index}"),
+                canonical_name: "Name".to_string(),
+                surface_name: "Name".to_string(),
+                regex: "Name".to_string(),
+                flags: Vec::new(),
+                priority: None,
+            });
+        }
+
+        let error = build_canonical_bank(defaults(false), candidates).unwrap_err();
+
+        assert!(error.to_string().contains("entity count 100001 exceeds limit 100000"));
     }
 
     #[test]

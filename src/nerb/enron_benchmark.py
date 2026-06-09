@@ -20,6 +20,7 @@ from typing import Any, TextIO, cast
 
 from .bank import bank_stats, hash_bank
 from .benchmarks import benchmark_bank
+from .enron_bank_builder import build_enron_entity_bank
 from .extraction import extract_batch
 from .schema import validate_bank_schema
 
@@ -35,11 +36,19 @@ DEFAULT_MAX_BODY_CHARS = 20_000
 DEFAULT_MAX_ADDRESSES = 5_000
 DEFAULT_MAX_DOMAINS = 500
 DEFAULT_BENCHMARK_DOCUMENTS = 50
+DEFAULT_QUALITY_DOCUMENTS = 1_000
 DEFAULT_BENCHMARK_ITERATIONS = 3
 DEFAULT_MAX_BASELINE_BENCHMARK_BYTES = 64 * 1024 * 1024
 BANK_TIMESTAMP = "2026-06-09T00:00:00Z"
 
 EMAIL_RE = re.compile(r"(?i)^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}$")
+EMAIL_SPAN_RE = re.compile(r"(?i)[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}")
+DOMAIN_SPAN_RE = re.compile(
+    r"(?i)(?:(?<=@)|(?<![a-z0-9.-]))"
+    r"([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+    r"\.[a-z]{2,63})"
+    r"(?![a-z0-9-])"
+)
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 HEADER_LINE_RE = re.compile(r"(?i)^(message-id|date|from|to|cc|bcc|subject|x-[a-z0-9-]+):\s+")
 ORIGINAL_MESSAGE_RE = re.compile(r"(?i)^[-_\s]*(original message|forwarded by|forwarded message)[-_\s]*$")
@@ -75,6 +84,7 @@ class PrepOptions:
     min_address_count: int
     min_domain_count: int
     benchmark_documents: int
+    quality_documents: int
     benchmark_iterations: int
     created_at: str
     baseline_benchmark_json: Path | None
@@ -123,6 +133,8 @@ def prepare_enron_benchmark(options: PrepOptions) -> dict[str, Any]:
 
     train_documents = _load_benchmark_documents(paths["train"], options.benchmark_documents)
     test_documents = _load_benchmark_documents(paths["test"], options.benchmark_documents)
+    train_quality_documents = _load_benchmark_documents(paths["train"], options.quality_documents)
+    test_quality_documents = _load_benchmark_documents(paths["test"], options.quality_documents)
     if not train_documents:
         raise ValueError("Enron benchmark prep produced no training documents.")
     if not test_documents:
@@ -132,7 +144,7 @@ def prepare_enron_benchmark(options: PrepOptions) -> dict[str, Any]:
         )
 
     extraction_options = {
-        "max_batch_documents": max(100, len(train_documents), len(test_documents)),
+        "max_batch_documents": max(100, len(train_documents), len(test_documents), options.quality_documents),
         "max_batch_text_bytes": 64 * 1024 * 1024,
     }
     benchmark_options = {
@@ -147,8 +159,8 @@ def prepare_enron_benchmark(options: PrepOptions) -> dict[str, Any]:
     }
     benchmark = benchmark_bank(bank, documents=documents, options=benchmark_options)
     quality = {
-        "train": _quality_summary(bank, train_documents, extraction_options),
-        "test": _quality_summary(bank, test_documents, extraction_options),
+        "train": _quality_summary(bank, train_quality_documents, extraction_options),
+        "test": _quality_summary(bank, test_quality_documents, extraction_options),
     }
 
     manifest = _manifest(options, paths, prep_summary, bank, run_started_at=run_started_at)
@@ -181,6 +193,9 @@ def prepare_enron_benchmark(options: PrepOptions) -> dict[str, Any]:
             "warm_cached_compile_seconds": benchmark["summary"]["warm_cached_compile_seconds"],
             "test_record_count": quality["test"]["record_count"],
             "test_documents_with_records": quality["test"]["documents_with_records"],
+            "test_precision": quality["test"]["precision"],
+            "test_recall": quality["test"]["recall"],
+            "test_f1": quality["test"]["f1"],
         },
     }
     result["gate"] = _benchmark_gate(result, options)
@@ -211,56 +226,6 @@ def clean_email_text(value: Any, *, max_chars: int = DEFAULT_MAX_BODY_CHARS) -> 
     if len(cleaned) > max_chars:
         return cleaned[:max_chars].rstrip()
     return cleaned
-
-
-def build_enron_entity_bank(
-    address_counts: Counter[str],
-    domain_counts: Counter[str],
-    *,
-    max_addresses: int = DEFAULT_MAX_ADDRESSES,
-    max_domains: int = DEFAULT_MAX_DOMAINS,
-    min_address_count: int = 2,
-    min_domain_count: int = 2,
-    created_at: str = BANK_TIMESTAMP,
-) -> dict[str, Any]:
-    addresses = _top_items(address_counts, max_items=max_addresses, min_count=min_address_count)
-    domains = _top_items(domain_counts, max_items=max_domains, min_count=min_domain_count)
-    entities: dict[str, Any] = {}
-    if addresses:
-        entities["email_address"] = _literal_entity(
-            "Email addresses mined from training-set message headers and bodies.",
-            addresses,
-            pattern_description="Exact email address literal.",
-        )
-    if domains:
-        entities["email_domain"] = _literal_entity(
-            "Email domains mined from training-set message headers and bodies.",
-            domains,
-            pattern_description="Exact email domain literal.",
-        )
-    if not entities:
-        raise ValueError("Cannot build Enron entity bank because no eligible addresses or domains were mined.")
-
-    return {
-        "schema_version": "nerb.bank.v1",
-        "id": "enron_corpus_entities",
-        "name": "Enron Corpus Entities",
-        "description": "Deterministic entity bank mined from the Enron email training split for NERB benchmarking.",
-        "version": "2026.06.09",
-        "status": "active",
-        "created_at": created_at,
-        "updated_at": created_at,
-        "unicode_normalization": "none",
-        "default_regex_flags": ["IGNORECASE"],
-        "entities": entities,
-        "metadata": {
-            "source": "nerb.enron_benchmark.build_enron_entity_bank",
-            "address_candidates": len(addresses),
-            "domain_candidates": len(domains),
-            "min_address_count": min_address_count,
-            "min_domain_count": min_domain_count,
-        },
-    }
 
 
 def iter_jsonl_rows(path: Path) -> Iterator[Mapping[str, Any]]:
@@ -453,43 +418,6 @@ def _prepared_record_payload(record: PreparedRecord) -> dict[str, Any]:
     }
 
 
-def _literal_entity(description: str, values: Sequence[str], *, pattern_description: str) -> dict[str, Any]:
-    names: dict[str, Any] = {}
-    for priority, value in enumerate(values):
-        name_id = _id_from_value(value)
-        names[name_id] = {
-            "canonical": value,
-            "description": "Corpus-mined literal.",
-            "status": "active",
-            "patterns": {
-                "primary": {
-                    "kind": "literal",
-                    "value": value,
-                    "description": pattern_description,
-                    "status": "active",
-                    "priority": priority,
-                    "case_sensitive": False,
-                    "normalize_whitespace": False,
-                    "left_boundary": "none",
-                    "right_boundary": "none",
-                    "metadata": {},
-                }
-            },
-            "metadata": {},
-        }
-    return {"description": description, "status": "active", "regex_flags": [], "names": names, "metadata": {}}
-
-
-def _top_items(counts: Counter[str], *, max_items: int, min_count: int) -> list[str]:
-    candidates = [item for item, count in counts.items() if count >= min_count]
-    candidates.sort(key=lambda item: (-counts[item], item))
-    return candidates[:max_items]
-
-
-def _id_from_value(value: str) -> str:
-    return "v_" + _hash_text(value)[:16]
-
-
 def _load_benchmark_documents(path: Path, limit: int) -> list[dict[str, str]]:
     documents: list[dict[str, str]] = []
     for row in iter_jsonl_rows(path):
@@ -513,15 +441,131 @@ def _quality_summary(
             "record_count": 0,
             "documents_with_records": 0,
             "entity_counts": {},
+            **_span_metric_summary(set(), set()),
         }
     response = extract_batch(bank, cast(Sequence[Mapping[str, Any]], documents), options=options)
     entity_counts: Counter[str] = Counter(str(record["entity_id"]) for record in response["records"])
+    gold_spans = set().union(*(_gold_span_keys(document) for document in documents))
+    predicted_spans = _predicted_span_keys(response["records"])
     return {
         "document_count": response["summary"]["document_count"],
         "record_count": response["summary"]["record_count"],
         "documents_with_records": response["summary"]["documents_with_records"],
         "entity_counts": dict(sorted(entity_counts.items())),
+        **_span_metric_summary(gold_spans, predicted_spans),
     }
+
+
+SpanKey = tuple[str, str, int, int, str]
+
+
+def _gold_span_keys(document: Mapping[str, str]) -> set[SpanKey]:
+    document_id = document.get("document_id")
+    text = document.get("text")
+    if not isinstance(document_id, str) or not isinstance(text, str):
+        return set()
+    offsets = _byte_offsets(text)
+    spans: set[SpanKey] = set()
+    for match in EMAIL_SPAN_RE.finditer(text):
+        normalized = _normalize_address(match.group(0))
+        if normalized is None:
+            continue
+        spans.add(
+            (
+                document_id,
+                "email_address",
+                offsets[match.start()],
+                offsets[match.end()],
+                normalized,
+            )
+        )
+    for match in DOMAIN_SPAN_RE.finditer(text):
+        raw_domain = match.group(1)
+        spans.add(
+            (
+                document_id,
+                "email_domain",
+                offsets[match.start(1)],
+                offsets[match.end(1)],
+                raw_domain.lower(),
+            )
+        )
+    return spans
+
+
+def _predicted_span_keys(records: Sequence[Mapping[str, Any]]) -> set[SpanKey]:
+    spans: set[SpanKey] = set()
+    for record in records:
+        document_id = record.get("document_id")
+        entity_id = record.get("entity_id")
+        start = record.get("start")
+        end = record.get("end")
+        string = record.get("string")
+        if (
+            isinstance(document_id, str)
+            and isinstance(entity_id, str)
+            and isinstance(start, int)
+            and isinstance(end, int)
+            and isinstance(string, str)
+        ):
+            spans.add((document_id, entity_id, start, end, string.lower()))
+    return spans
+
+
+def _span_metric_summary(gold_spans: set[SpanKey], predicted_spans: set[SpanKey]) -> dict[str, Any]:
+    true_positive_spans = gold_spans & predicted_spans
+    false_positive_spans = predicted_spans - gold_spans
+    false_negative_spans = gold_spans - predicted_spans
+    summary = _classification_metrics(
+        true_positive=len(true_positive_spans),
+        false_positive=len(false_positive_spans),
+        false_negative=len(false_negative_spans),
+    )
+    entity_ids = sorted({span[1] for span in gold_spans | predicted_spans})
+    by_entity = {
+        entity_id: {
+            **_classification_metrics(
+                true_positive=sum(1 for span in true_positive_spans if span[1] == entity_id),
+                false_positive=sum(1 for span in false_positive_spans if span[1] == entity_id),
+                false_negative=sum(1 for span in false_negative_spans if span[1] == entity_id),
+            ),
+            "gold_count": sum(1 for span in gold_spans if span[1] == entity_id),
+            "predicted_count": sum(1 for span in predicted_spans if span[1] == entity_id),
+        }
+        for entity_id in entity_ids
+    }
+    return {
+        **summary,
+        "gold_count": len(gold_spans),
+        "predicted_count": len(predicted_spans),
+        "by_entity": by_entity,
+        "metric_scope": "exact span/entity/surface micro-average over prepared documents",
+    }
+
+
+def _classification_metrics(*, true_positive: int, false_positive: int, false_negative: int) -> dict[str, Any]:
+    precision_denominator = true_positive + false_positive
+    recall_denominator = true_positive + false_negative
+    precision = true_positive / precision_denominator if precision_denominator else 0.0
+    recall = true_positive / recall_denominator if recall_denominator else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "true_positive": true_positive,
+        "false_positive": false_positive,
+        "false_negative": false_negative,
+        "precision": _metric(precision),
+        "recall": _metric(recall),
+        "f1": _metric(f1),
+    }
+
+
+def _byte_offsets(text: str) -> list[int]:
+    offsets = [0]
+    total = 0
+    for character in text:
+        total += len(character.encode("utf-8"))
+        offsets.append(total)
+    return offsets
 
 
 def _manifest(
@@ -553,6 +597,8 @@ def _manifest(
             "sample_fraction": options.sample_fraction,
             "test_fraction": options.test_fraction,
             "max_body_chars": options.max_body_chars,
+            "benchmark_documents": options.benchmark_documents,
+            "quality_documents": options.quality_documents,
         },
         "candidate_limits": {
             "max_addresses": options.max_addresses,
@@ -640,21 +686,21 @@ def _compare_enron_benchmark_gate(
             },
         }
 
-    test_record_count_delta = int(candidate["quality"]["test"]["record_count"]) - int(
-        baseline["quality"]["test"]["record_count"]
-    )
     quality_checks = [
-        _numeric_gate_check(
-            "test_record_count_absolute_delta",
-            abs(test_record_count_delta),
-            "<=",
-            0,
-            metadata={"delta": test_record_count_delta},
+        _quality_metric_delta_check(
+            "test_f1_delta",
+            baseline["quality"]["test"]["f1"],
+            candidate["quality"]["test"]["f1"],
         ),
-        _boolean_gate_check(
-            "test_entity_counts",
-            candidate["quality"]["test"]["entity_counts"] == baseline["quality"]["test"]["entity_counts"],
-            "candidate held-out entity counts must match the baseline when the evaluator is frozen",
+        _quality_metric_delta_check(
+            "test_precision_delta",
+            baseline["quality"]["test"]["precision"],
+            candidate["quality"]["test"]["precision"],
+        ),
+        _quality_metric_delta_check(
+            "test_recall_delta",
+            baseline["quality"]["test"]["recall"],
+            candidate["quality"]["test"]["recall"],
         ),
     ]
     quality_passed = all(check["passed"] for check in quality_checks)
@@ -734,11 +780,10 @@ def _evaluator_fingerprint(payload: Mapping[str, Any]) -> dict[str, Any]:
             "row_limit": dataset.get("row_limit"),
         },
         "sampling": manifest.get("sampling"),
-        "candidate_limits": manifest.get("candidate_limits"),
         "train_artifact_hash": artifact_hashes.get("train"),
         "test_artifact_hash": artifact_hashes.get("test"),
-        "bank_artifact_hash": artifact_hashes.get("bank"),
         "benchmark_options": benchmark.get("options"),
+        "quality_documents": manifest.get("sampling", {}).get("quality_documents"),
         "benchmark_tiers": {
             tier: {
                 "document_count": tiers[tier]["document_count"],
@@ -781,6 +826,8 @@ def _validate_baseline_benchmark_payload(payload: Mapping[str, Any], path: Path)
         _baseline_field(payload, field_path, path)
     _baseline_nonnegative_int(payload, ("quality", "test", "record_count"), path)
     _baseline_entity_counts(payload, ("quality", "test", "entity_counts"), path)
+    for metric_name in ("precision", "recall", "f1"):
+        _baseline_unit_metric(payload, ("quality", "test", metric_name), path)
 
 
 def _baseline_field(payload: Mapping[str, Any], field_path: tuple[str, ...], path: Path) -> Any:
@@ -824,6 +871,15 @@ def _baseline_entity_counts(
             )
         counts[entity] = count
     return counts
+
+
+def _baseline_unit_metric(payload: Mapping[str, Any], field_path: tuple[str, ...], path: Path) -> float:
+    value = _baseline_field(payload, field_path, path)
+    number = _finite_json_number(value)
+    if number is None or number < 0 or number > 1:
+        dotted = ".".join(field_path)
+        raise ValueError(f"Benchmark baseline JSON {str(path)!r} field {dotted} must be a finite number from 0 to 1.")
+    return number
 
 
 def _boolean_gate_check(name: str, actual: bool, description: str) -> dict[str, Any]:
@@ -871,6 +927,25 @@ def _numeric_gate_check(
     if metadata is not None:
         check["metadata"] = dict(metadata)
     return check
+
+
+def _quality_metric_delta_check(name: str, baseline_value: Any, candidate_value: Any) -> dict[str, Any]:
+    baseline_number = _finite_json_number(baseline_value)
+    candidate_number = _finite_json_number(candidate_value)
+    delta = None
+    if baseline_number is not None and candidate_number is not None:
+        delta = _metric(candidate_number - baseline_number)
+    return _numeric_gate_check(
+        name,
+        delta,
+        ">=",
+        0,
+        metadata={
+            "baseline": baseline_number,
+            "candidate": candidate_number,
+            "description": "candidate held-out exact-span metric must not regress against the stored baseline",
+        },
+    )
 
 
 def _ratio(candidate_value: Any, baseline_value: Any) -> float | None:
@@ -1067,6 +1142,10 @@ def _seconds(value: float) -> float:
     return round(value, 9)
 
 
+def _metric(value: float) -> float:
+    return round(value, 9)
+
+
 def _parse_args(argv: Sequence[str] | None) -> PrepOptions:
     parser = argparse.ArgumentParser(
         description="Prepare a local Enron-derived NERB entity-bank benchmark and run its baseline measurements.",
@@ -1087,6 +1166,7 @@ def _parse_args(argv: Sequence[str] | None) -> PrepOptions:
     parser.add_argument("--min-address-count", type=_positive_int, default=2)
     parser.add_argument("--min-domain-count", type=_positive_int, default=2)
     parser.add_argument("--benchmark-documents", type=_positive_int, default=DEFAULT_BENCHMARK_DOCUMENTS)
+    parser.add_argument("--quality-documents", type=_positive_int, default=DEFAULT_QUALITY_DOCUMENTS)
     parser.add_argument("--benchmark-iterations", type=_positive_int, default=DEFAULT_BENCHMARK_ITERATIONS)
     parser.add_argument(
         "--baseline-benchmark-json",
@@ -1141,6 +1221,7 @@ def _parse_args(argv: Sequence[str] | None) -> PrepOptions:
         min_address_count=parsed.min_address_count,
         min_domain_count=parsed.min_domain_count,
         benchmark_documents=parsed.benchmark_documents,
+        quality_documents=parsed.quality_documents,
         benchmark_iterations=parsed.benchmark_iterations,
         created_at=parsed.created_at,
         baseline_benchmark_json=parsed.baseline_benchmark_json,
