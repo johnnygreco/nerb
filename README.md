@@ -179,6 +179,13 @@ The final Rust engine gate covers conformance, dense memory, mode strategy, whee
 synthetic medium bank with 1,000 entities. See [`docs/performance.md`](docs/performance.md) and
 [`docs/rust-engine-gates.md`](docs/rust-engine-gates.md) for reproducible benchmark and release-gate evidence.
 
+For large-source bank construction, see the Enron-backed benchmark guide in
+[`docs/enron-benchmark.md`](docs/enron-benchmark.md), the measured optimization harness in
+[`docs/autoresearch.md`](docs/autoresearch.md), and the benchmark-grounded visual direction in
+[`docs/hero-images.md`](docs/hero-images.md). Agent workflows can also use the reusable
+[`nerb-large-source-bank-building`](.agents/skills/nerb-large-source-bank-building/SKILL.md) skill for corpus profiling,
+taxonomy design, privacy-safe artifacts, eval integrity, and handoff guidance.
+
 ## Development
 
 ```shell
