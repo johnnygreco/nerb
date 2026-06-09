@@ -113,3 +113,9 @@ Use `docs/autoresearch.md` and `scripts/nerb_autoresearch.py` when running repea
 experiments. The harness treats this benchmark command as the frozen evaluator, appends aggregate-only JSONL result rows,
 and can keep or discard a candidate based on score, gate status, timeout/crash behavior, and an explicit editable-file
 surface.
+
+## Hero Image Direction
+
+Use `docs/hero-images.md` for benchmark-grounded hero concepts and committed preview assets. The visuals represent the
+Enron corpus, entity banks, and autoresearch loop as abstract aggregate systems; they intentionally avoid raw email text,
+personal data, screenshots, and unsupported in-image performance claims.

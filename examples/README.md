@@ -27,6 +27,7 @@ To refresh the committed artifacts, run the same command with `--output-dir exam
 - `figures/ner_detection_*.png`: detection images built from actual NERB records.
 - `figures/scale_*.png`: the main speed-at-scale numerical demonstration.
 - `figures/benchmark_*.png`: small domain-bank timing figures.
+- `hero-images/*.jpg`: generated hero-background previews documented in `docs/hero-images.md`.
 
 The banks are intentionally small but domain-specific:
 
