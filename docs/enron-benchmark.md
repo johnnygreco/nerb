@@ -106,3 +106,10 @@ generated bank artifact hash, candidate limits, benchmark options, and benchmark
 the gate fails before interpreting quality or performance ratios. This keeps benchmark/evaluator changes separate from
 optimizer changes. When a stored-baseline gate is configured and fails, the command exits nonzero after writing and
 printing `benchmark.json`. Threshold flags require `--baseline-benchmark-json`; threshold-only commands are rejected.
+
+## Autoresearch Loop
+
+Use `docs/autoresearch.md` and `scripts/nerb_autoresearch.py` when running repeated construction optimization
+experiments. The harness treats this benchmark command as the frozen evaluator, appends aggregate-only JSONL result rows,
+and can keep or discard a candidate based on score, gate status, timeout/crash behavior, and an explicit editable-file
+surface.
