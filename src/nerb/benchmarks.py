@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
+import platform
 import re
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -11,7 +14,7 @@ from .bank import bank_stats, canonicalize_bank, hash_bank
 from .diagnostics import REGEX_EXPENSIVE_PROBE, REGEX_EXPENSIVE_STATIC, Diagnostic
 from .diff import diff_banks
 from .engine import bank_cache_info, clear_bank_cache
-from .engines import CompiledBank, ExtractionError, compile_bank
+from .engines import CompiledBank, ExtractionError, compile_bank_with_report
 from .evals import eval_bank
 from .extraction import _prepare_batch_documents
 from .records import record_sort_key
@@ -207,6 +210,7 @@ def benchmark_bank(
             "hash": hash_bank(canonical_bank),
             "stats": bank_stats(canonical_bank),
             "profile": profile,
+            "size": _bank_size_profile(compile_report),
         },
         "engine": {
             "name": compiled.engine_name,
@@ -232,6 +236,7 @@ def benchmark_bank(
         "compile": compile_report,
         "tiers": tiers,
         "summary": _benchmark_summary(tiers, compile_report, profile, benchmark_options),
+        "environment": _benchmark_environment(),
         "diagnostics": _benchmark_diagnostics(validation),
     }
 
@@ -362,7 +367,16 @@ def _smoke_gate_manifest() -> dict[str, Any]:
         "threshold_status": "deferred_until_native_engine_modes",
         "required_profiles": list(BENCHMARK_PROFILE_IDS),
         "required_tiers": list(BENCHMARK_TIERS),
-        "required_result_sections": ["bank", "engine", "options", "stages", "compile", "tiers", "summary"],
+        "required_result_sections": [
+            "bank",
+            "engine",
+            "options",
+            "stages",
+            "compile",
+            "tiers",
+            "summary",
+            "environment",
+        ],
         "requires_cache_hit_verified": True,
         "requires_stable_record_counts": True,
     }
@@ -569,7 +583,7 @@ def _optional_float_option(options: Mapping[str, Any], key: str) -> float | None
     value = options.get(key)
     if value is None:
         return None
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
         raise ExtractionError(f"Regression gate option {key} must be a positive number.")
     return float(value)
 
@@ -762,19 +776,21 @@ def _measure_compile(
     after_reset = bank_cache_info()
 
     cold_start = time.perf_counter()
-    cold_compiled, cold_cache_hit = compile_bank(bank, options=options)
+    cold_compiled, cold_cache_hit, cold_report = compile_bank_with_report(bank, options=options)
     cold_seconds = time.perf_counter() - cold_start
     after_cold = bank_cache_info()
 
     warm_start = time.perf_counter()
-    warm_compiled, warm_cache_hit = compile_bank(bank, options=options)
+    warm_compiled, warm_cache_hit, warm_report = compile_bank_with_report(bank, options=options)
     warm_seconds = time.perf_counter() - warm_start
     after_warm = bank_cache_info()
 
     return (
         {
             "cold_seconds": _seconds(cold_seconds),
-            "warm_cache_lookup_seconds": _seconds(warm_seconds),
+            "warm_cached_compile_seconds": _seconds(warm_seconds),
+            "cold": cold_report,
+            "warm": warm_report,
             "cache": {
                 "before_reset": before_reset,
                 "after_reset": after_reset,
@@ -912,9 +928,38 @@ def _benchmark_stages(
             ],
             "note": "Rust Bank compile timing is inclusive; do not sum it with sibling stage timings.",
             "cold_seconds": compile_report["cold_seconds"],
-            "warm_cache_lookup_seconds": compile_report["warm_cache_lookup_seconds"],
+            "warm_cached_compile_seconds": compile_report["warm_cached_compile_seconds"],
             "cache_hit_verified": compile_report["cache"]["cold_hit"] is False
             and compile_report["cache"]["warm_hit"] is True,
+        },
+        "compile_construction": {
+            "exclusive": False,
+            "note": (
+                "Cold and warm compile reports come from compile_bank. They include a second schema/canonicalization "
+                "pass after benchmark preflight, so do not sum them with the top-level canonicalize/validation stages."
+            ),
+            "cold": compile_report["cold"]["stages"],
+            "warm": compile_report["warm"]["stages"],
+            "native_cold": _native_stage_report(compile_report["cold"]),
+            "native_warm": _native_stage_report(compile_report["warm"]),
+            "unavailable_native_stages": [
+                {
+                    "name": "rust_source_parse",
+                    "reason": "included in native_compile; the current Rust API exposes one construction call",
+                },
+                {
+                    "name": "rust_canonicalization",
+                    "reason": "included in native_compile; the current Rust API exposes one construction call",
+                },
+                {
+                    "name": "stable_hash",
+                    "reason": "included in native_compile; Python-side stable_hash is measured separately",
+                },
+                {
+                    "name": "matcher_compile",
+                    "reason": "included in native_compile; the current Rust API exposes one construction call",
+                },
+            ],
         },
         "document_prepare": {
             "seconds_by_tier": tier_prepare_seconds,
@@ -943,6 +988,16 @@ def _matcher_profiles(compiled: CompiledBank) -> list[dict[str, Any]]:
     ]
 
 
+def _native_stage_report(compile_detail: Mapping[str, Any]) -> Mapping[str, Any]:
+    native = compile_detail.get("native")
+    if not isinstance(native, Mapping):
+        return {}
+    stages = native.get("stages")
+    if not isinstance(stages, Mapping):
+        return {}
+    return stages
+
+
 def _benchmark_summary(
     tiers: Mapping[str, Mapping[str, Any]],
     compile_report: Mapping[str, Any],
@@ -961,9 +1016,29 @@ def _benchmark_summary(
         and compile_report["cache"]["warm_hit"] is True,
         "profile": profile["profile"],
         "cold_compile_seconds": compile_report["cold_seconds"],
+        "warm_cached_compile_seconds": compile_report["warm_cached_compile_seconds"],
         "target_documents_per_second": target_throughput["documents_per_second"],
         "target_bytes_per_second": target_throughput["bytes_per_second"],
         "target_records_per_second": target_throughput["records_per_second"],
+    }
+
+
+def _bank_size_profile(compile_report: Mapping[str, Any]) -> dict[str, Any]:
+    source = compile_report["cold"]["source"]
+    return {
+        "canonical_json_bytes": source.get("canonical_json_bytes"),
+        "extractable_json_bytes": source.get("extractable_json_bytes"),
+        "native_source_bytes": source.get("extractable_json_bytes"),
+    }
+
+
+def _benchmark_environment() -> dict[str, Any]:
+    return {
+        "python": platform.python_version(),
+        "python_implementation": platform.python_implementation(),
+        "platform": platform.platform(),
+        "processor": platform.processor(),
+        "executable_name": Path(sys.executable).name,
     }
 
 
@@ -1043,9 +1118,13 @@ def _performance_delta(old_benchmark: Mapping[str, Any], new_benchmark: Mapping[
     return {
         "cold_compile_seconds_delta": _difference(new_compile["cold_seconds"], old_compile["cold_seconds"]),
         "cold_compile_seconds_ratio": _ratio(new_compile["cold_seconds"], old_compile["cold_seconds"]),
-        "warm_cache_lookup_seconds_delta": _difference(
-            new_compile["warm_cache_lookup_seconds"],
-            old_compile["warm_cache_lookup_seconds"],
+        "warm_cached_compile_seconds_delta": _difference(
+            new_compile["warm_cached_compile_seconds"],
+            old_compile["warm_cached_compile_seconds"],
+        ),
+        "warm_cached_compile_seconds_ratio": _ratio(
+            new_compile["warm_cached_compile_seconds"],
+            old_compile["warm_cached_compile_seconds"],
         ),
         "target_bytes_per_second_delta": tiers["target"]["bytes_per_second_delta"],
         "target_bytes_per_second_ratio": tiers["target"]["bytes_per_second_ratio"],
@@ -1138,6 +1217,16 @@ def _regression_gates(deltas: Mapping[str, Any], options: Mapping[str, Any]) -> 
                 performance_delta["cold_compile_seconds_ratio"],
                 "<=",
                 max_cold_compile_ratio,
+            )
+        )
+    max_warm_cached_compile_ratio = _optional_float_option(options, "max_warm_cached_compile_seconds_ratio")
+    if max_warm_cached_compile_ratio is not None:
+        performance_checks.append(
+            _gate_check(
+                "warm_cached_compile_seconds_ratio",
+                performance_delta["warm_cached_compile_seconds_ratio"],
+                "<=",
+                max_warm_cached_compile_ratio,
             )
         )
     min_target_bytes_ratio = _optional_float_option(options, "min_target_bytes_per_second_ratio")

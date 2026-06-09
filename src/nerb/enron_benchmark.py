@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import platform
 import re
@@ -23,6 +24,7 @@ from .extraction import extract_batch
 from .schema import validate_bank_schema
 
 ARTIFACT_SCHEMA_VERSION = "nerb.enron_benchmark.v1"
+GATE_SCHEMA_VERSION = "nerb.enron_benchmark_gate.v1"
 DEFAULT_DATASET_ID = "corbt/enron-emails"
 DEFAULT_SPLIT = "train"
 DEFAULT_OUTPUT_DIR = ".nerb/enron-benchmark/baseline"
@@ -34,6 +36,7 @@ DEFAULT_MAX_ADDRESSES = 5_000
 DEFAULT_MAX_DOMAINS = 500
 DEFAULT_BENCHMARK_DOCUMENTS = 50
 DEFAULT_BENCHMARK_ITERATIONS = 3
+DEFAULT_MAX_BASELINE_BENCHMARK_BYTES = 64 * 1024 * 1024
 BANK_TIMESTAMP = "2026-06-09T00:00:00Z"
 
 EMAIL_RE = re.compile(r"(?i)^[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+\.[a-z]{2,}$")
@@ -74,12 +77,19 @@ class PrepOptions:
     benchmark_documents: int
     benchmark_iterations: int
     created_at: str
+    baseline_benchmark_json: Path | None
+    max_cold_compile_seconds_ratio: float | None
+    max_warm_cached_compile_seconds_ratio: float | None
+    min_target_bytes_per_second_ratio: float | None
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     options = _parse_args(argv)
     result = prepare_enron_benchmark(options)
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
+    gate = result.get("gate")
+    if isinstance(gate, Mapping) and gate.get("configured") is True and gate.get("passed") is not True:
+        raise SystemExit(1)
 
 
 def prepare_enron_benchmark(options: PrepOptions) -> dict[str, Any]:
@@ -158,6 +168,7 @@ def prepare_enron_benchmark(options: PrepOptions) -> dict[str, Any]:
         },
         "quality": quality,
         "benchmark": benchmark,
+        "gate": _unconfigured_gate(),
         "summary": {
             "selected_records": prep_summary["selected_records"],
             "train_records": prep_summary["train_records"],
@@ -167,10 +178,12 @@ def prepare_enron_benchmark(options: PrepOptions) -> dict[str, Any]:
             "bank_patterns": bank_stats(bank)["active_totals"]["patterns"],
             "cold_compile_seconds": benchmark["summary"]["cold_compile_seconds"],
             "target_bytes_per_second": benchmark["summary"]["target_bytes_per_second"],
+            "warm_cached_compile_seconds": benchmark["summary"]["warm_cached_compile_seconds"],
             "test_record_count": quality["test"]["record_count"],
             "test_documents_with_records": quality["test"]["documents_with_records"],
         },
     }
+    result["gate"] = _benchmark_gate(result, options)
     _write_json(paths["benchmark"], result)
     return result
 
@@ -549,14 +562,335 @@ def _manifest(
         },
         "prep_summary": dict(prep_summary),
         "artifact_hashes": artifact_hashes,
+        "artifact_sizes": {
+            key: path.stat().st_size
+            for key, path in paths.items()
+            if key in {"train", "test", "bank"} and path.exists()
+        },
         "bank_hash": hash_bank(bank),
         "bank_stats": bank_stats(bank),
         "environment": {
             "python": platform.python_version(),
+            "python_implementation": platform.python_implementation(),
             "platform": platform.platform(),
-            "executable": sys.executable,
+            "executable_name": Path(sys.executable).name,
         },
     }
+
+
+def _benchmark_gate(result: Mapping[str, Any], options: PrepOptions) -> dict[str, Any]:
+    if options.baseline_benchmark_json is None:
+        return _unconfigured_gate()
+    baseline = _load_json_mapping(options.baseline_benchmark_json)
+    _validate_baseline_benchmark_payload(baseline, options.baseline_benchmark_json)
+    return _compare_enron_benchmark_gate(baseline, result, options)
+
+
+def _unconfigured_gate() -> dict[str, Any]:
+    return {
+        "schema_version": GATE_SCHEMA_VERSION,
+        "configured": False,
+        "passed": None,
+        "baseline_path": None,
+        "evaluator": {"passed": None, "checks": []},
+        "quality": {"passed": None, "checks": []},
+        "performance": {"configured": False, "passed": None, "checks": []},
+    }
+
+
+def _compare_enron_benchmark_gate(
+    baseline: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    options: PrepOptions,
+) -> dict[str, Any]:
+    baseline_fingerprint = _evaluator_fingerprint(baseline)
+    candidate_fingerprint = _evaluator_fingerprint(candidate)
+    evaluator_checks = [
+        _boolean_gate_check(
+            "evaluator_fingerprint",
+            candidate_fingerprint == baseline_fingerprint,
+            "candidate run must use the same dataset split, sampling artifacts, and benchmark options as baseline",
+        )
+    ]
+    evaluator_passed = all(check["passed"] for check in evaluator_checks)
+    if not evaluator_passed:
+        return {
+            "schema_version": GATE_SCHEMA_VERSION,
+            "configured": True,
+            "passed": False,
+            "baseline_path": str(options.baseline_benchmark_json),
+            "evaluator": {
+                "passed": False,
+                "baseline": baseline_fingerprint,
+                "candidate": candidate_fingerprint,
+                "checks": evaluator_checks,
+            },
+            "quality": {
+                "passed": None,
+                "skipped": True,
+                "reason": "evaluator fingerprint mismatch",
+                "checks": [],
+            },
+            "performance": {
+                "configured": _performance_gate_configured(options),
+                "passed": None,
+                "skipped": True,
+                "reason": "evaluator fingerprint mismatch",
+                "checks": [],
+            },
+        }
+
+    test_record_count_delta = int(candidate["quality"]["test"]["record_count"]) - int(
+        baseline["quality"]["test"]["record_count"]
+    )
+    quality_checks = [
+        _numeric_gate_check(
+            "test_record_count_absolute_delta",
+            abs(test_record_count_delta),
+            "<=",
+            0,
+            metadata={"delta": test_record_count_delta},
+        ),
+        _boolean_gate_check(
+            "test_entity_counts",
+            candidate["quality"]["test"]["entity_counts"] == baseline["quality"]["test"]["entity_counts"],
+            "candidate held-out entity counts must match the baseline when the evaluator is frozen",
+        ),
+    ]
+    quality_passed = all(check["passed"] for check in quality_checks)
+
+    performance_checks: list[dict[str, Any]] = []
+    if options.max_cold_compile_seconds_ratio is not None:
+        performance_checks.append(
+            _numeric_gate_check(
+                "cold_compile_seconds_ratio",
+                _ratio(
+                    candidate["benchmark"]["summary"]["cold_compile_seconds"],
+                    baseline["benchmark"]["summary"]["cold_compile_seconds"],
+                ),
+                "<=",
+                options.max_cold_compile_seconds_ratio,
+            )
+        )
+    if options.max_warm_cached_compile_seconds_ratio is not None:
+        performance_checks.append(
+            _numeric_gate_check(
+                "warm_cached_compile_seconds_ratio",
+                _ratio(
+                    candidate["benchmark"]["summary"]["warm_cached_compile_seconds"],
+                    baseline["benchmark"]["summary"]["warm_cached_compile_seconds"],
+                ),
+                "<=",
+                options.max_warm_cached_compile_seconds_ratio,
+            )
+        )
+    if options.min_target_bytes_per_second_ratio is not None:
+        performance_checks.append(
+            _numeric_gate_check(
+                "target_bytes_per_second_ratio",
+                _ratio(
+                    candidate["benchmark"]["summary"]["target_bytes_per_second"],
+                    baseline["benchmark"]["summary"]["target_bytes_per_second"],
+                ),
+                ">=",
+                options.min_target_bytes_per_second_ratio,
+            )
+        )
+    performance_configured = bool(performance_checks)
+    performance_passed = all(check["passed"] for check in performance_checks)
+
+    return {
+        "schema_version": GATE_SCHEMA_VERSION,
+        "configured": True,
+        "passed": evaluator_passed and quality_passed and performance_passed,
+        "baseline_path": str(options.baseline_benchmark_json),
+        "evaluator": {
+            "passed": evaluator_passed,
+            "baseline": baseline_fingerprint,
+            "candidate": candidate_fingerprint,
+            "checks": evaluator_checks,
+        },
+        "quality": {"passed": quality_passed, "checks": quality_checks},
+        "performance": {
+            "configured": performance_configured,
+            "passed": performance_passed,
+            "checks": performance_checks,
+        },
+    }
+
+
+def _evaluator_fingerprint(payload: Mapping[str, Any]) -> dict[str, Any]:
+    manifest = cast(Mapping[str, Any], payload["manifest"])
+    dataset = cast(Mapping[str, Any], manifest["dataset"])
+    artifact_hashes = cast(Mapping[str, Any], manifest["artifact_hashes"])
+    benchmark = cast(Mapping[str, Any], payload["benchmark"])
+    tiers = cast(Mapping[str, Any], benchmark["tiers"])
+    return {
+        "schema_version": payload.get("schema_version"),
+        "dataset": {
+            "id": dataset.get("id"),
+            "split": dataset.get("split"),
+            "revision": dataset.get("revision"),
+            "row_limit": dataset.get("row_limit"),
+        },
+        "sampling": manifest.get("sampling"),
+        "candidate_limits": manifest.get("candidate_limits"),
+        "train_artifact_hash": artifact_hashes.get("train"),
+        "test_artifact_hash": artifact_hashes.get("test"),
+        "bank_artifact_hash": artifact_hashes.get("bank"),
+        "benchmark_options": benchmark.get("options"),
+        "benchmark_tiers": {
+            tier: {
+                "document_count": tiers[tier]["document_count"],
+                "bytes": tiers[tier]["bytes"],
+                "iterations": tiers[tier]["iterations"],
+            }
+            for tier in ("baseline", "target", "stress")
+        },
+    }
+
+
+def _validate_baseline_benchmark_payload(payload: Mapping[str, Any], path: Path) -> None:
+    _baseline_mapping(payload, ("manifest", "dataset"), path)
+    _baseline_mapping(payload, ("manifest", "artifact_hashes"), path)
+    _baseline_mapping(payload, ("benchmark", "summary"), path)
+    _baseline_mapping(payload, ("benchmark", "tiers", "baseline"), path)
+    _baseline_mapping(payload, ("benchmark", "tiers", "target"), path)
+    _baseline_mapping(payload, ("benchmark", "tiers", "stress"), path)
+    _baseline_mapping(payload, ("quality", "test"), path)
+
+    required_paths = (
+        ("schema_version",),
+        ("manifest", "sampling"),
+        ("manifest", "candidate_limits"),
+        ("benchmark", "options"),
+        ("benchmark", "summary", "cold_compile_seconds"),
+        ("benchmark", "summary", "warm_cached_compile_seconds"),
+        ("benchmark", "summary", "target_bytes_per_second"),
+        ("benchmark", "tiers", "baseline", "document_count"),
+        ("benchmark", "tiers", "baseline", "bytes"),
+        ("benchmark", "tiers", "baseline", "iterations"),
+        ("benchmark", "tiers", "target", "document_count"),
+        ("benchmark", "tiers", "target", "bytes"),
+        ("benchmark", "tiers", "target", "iterations"),
+        ("benchmark", "tiers", "stress", "document_count"),
+        ("benchmark", "tiers", "stress", "bytes"),
+        ("benchmark", "tiers", "stress", "iterations"),
+    )
+    for field_path in required_paths:
+        _baseline_field(payload, field_path, path)
+    _baseline_nonnegative_int(payload, ("quality", "test", "record_count"), path)
+    _baseline_entity_counts(payload, ("quality", "test", "entity_counts"), path)
+
+
+def _baseline_field(payload: Mapping[str, Any], field_path: tuple[str, ...], path: Path) -> Any:
+    current: Any = payload
+    for field in field_path:
+        if not isinstance(current, Mapping) or field not in current:
+            dotted = ".".join(field_path)
+            raise ValueError(f"Benchmark baseline JSON {str(path)!r} is missing required field {dotted}.")
+        current = current[field]
+    return current
+
+
+def _baseline_mapping(payload: Mapping[str, Any], field_path: tuple[str, ...], path: Path) -> Mapping[str, Any]:
+    value = _baseline_field(payload, field_path, path)
+    if not isinstance(value, Mapping):
+        dotted = ".".join(field_path)
+        raise ValueError(f"Benchmark baseline JSON {str(path)!r} field {dotted} must be an object.")
+    return value
+
+
+def _baseline_nonnegative_int(payload: Mapping[str, Any], field_path: tuple[str, ...], path: Path) -> int:
+    value = _baseline_field(payload, field_path, path)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        dotted = ".".join(field_path)
+        raise ValueError(f"Benchmark baseline JSON {str(path)!r} field {dotted} must be a nonnegative integer.")
+    return value
+
+
+def _baseline_entity_counts(
+    payload: Mapping[str, Any],
+    field_path: tuple[str, ...],
+    path: Path,
+) -> dict[str, int]:
+    value = _baseline_mapping(payload, field_path, path)
+    counts: dict[str, int] = {}
+    for entity, count in value.items():
+        if not isinstance(entity, str) or not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            dotted = ".".join(field_path)
+            raise ValueError(
+                f"Benchmark baseline JSON {str(path)!r} field {dotted} must map entity names to nonnegative integers."
+            )
+        counts[entity] = count
+    return counts
+
+
+def _boolean_gate_check(name: str, actual: bool, description: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "actual": actual,
+        "operator": "==",
+        "threshold": True,
+        "passed": actual is True,
+        "description": description,
+    }
+
+
+def _performance_gate_configured(options: PrepOptions) -> bool:
+    return (
+        options.max_cold_compile_seconds_ratio is not None
+        or options.max_warm_cached_compile_seconds_ratio is not None
+        or options.min_target_bytes_per_second_ratio is not None
+    )
+
+
+def _numeric_gate_check(
+    name: str,
+    actual: float | int | None,
+    operator: str,
+    threshold: float | int,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    if actual is None:
+        passed = False
+    elif operator == "<=":
+        passed = actual <= threshold
+    elif operator == ">=":
+        passed = actual >= threshold
+    else:
+        raise ValueError(f"Unsupported benchmark gate operator: {operator}.")
+    check: dict[str, Any] = {
+        "name": name,
+        "actual": actual,
+        "operator": operator,
+        "threshold": threshold,
+        "passed": passed,
+    }
+    if metadata is not None:
+        check["metadata"] = dict(metadata)
+    return check
+
+
+def _ratio(candidate_value: Any, baseline_value: Any) -> float | None:
+    candidate_number = _finite_json_number(candidate_value)
+    baseline_number = _finite_json_number(baseline_value)
+    if candidate_number is None or baseline_number is None or candidate_number <= 0 or baseline_number <= 0:
+        return None
+    return round(candidate_number / baseline_number, 6)
+
+
+def _finite_json_number(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 def _include_sample(document_id: str, seed: str, sample_fraction: float) -> bool:
@@ -573,12 +907,12 @@ def _stable_unit_interval(value: str) -> float:
 
 
 def _write_jsonl_record(file: TextIO, payload: Mapping[str, Any]) -> None:
-    file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+    file.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n")
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     with _open_private_text(path) as file:
-        file.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        file.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n")
 
 
 def _prepare_output_dir(path: Path) -> Path:
@@ -612,6 +946,18 @@ def _open_private_text(path: Path) -> TextIO:
 def _validate_source_options(options: PrepOptions) -> None:
     if options.input_jsonl is None and not options.dataset_revision:
         raise ValueError("Hugging Face Enron benchmark runs require --dataset-revision for reproducibility.")
+    for field in (
+        "max_cold_compile_seconds_ratio",
+        "max_warm_cached_compile_seconds_ratio",
+        "min_target_bytes_per_second_ratio",
+    ):
+        value = getattr(options, field)
+        if value is not None:
+            parsed = _finite_json_number(value)
+            if parsed is None or parsed <= 0:
+                raise ValueError(f"Benchmark gate threshold {field} must be a finite positive number.")
+    if options.baseline_benchmark_json is None and _performance_gate_configured(options):
+        raise ValueError("Benchmark gate thresholds require --baseline-benchmark-json.")
 
 
 def _hash_text(value: str) -> str:
@@ -626,6 +972,65 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _load_json_mapping(path: Path) -> Mapping[str, Any]:
+    benchmark_path = path.expanduser()
+    if benchmark_path.is_symlink():
+        raise ValueError(f"Benchmark baseline JSON path must not be a symlink: {benchmark_path}.")
+    try:
+        metadata = benchmark_path.stat()
+    except OSError as exc:
+        raise OSError(f"Could not inspect benchmark baseline JSON {str(benchmark_path)!r}: {exc}") from exc
+    if not S_ISREG(metadata.st_mode):
+        raise ValueError(f"Benchmark baseline JSON path must be a regular file: {benchmark_path}.")
+    if metadata.st_size > DEFAULT_MAX_BASELINE_BENCHMARK_BYTES:
+        raise ValueError(
+            f"Benchmark baseline JSON {str(benchmark_path)!r} exceeds the configured limit of "
+            f"{DEFAULT_MAX_BASELINE_BENCHMARK_BYTES} bytes."
+        )
+    try:
+        with benchmark_path.open("rb") as file:
+            payload = file.read(DEFAULT_MAX_BASELINE_BENCHMARK_BYTES + 1)
+    except OSError as exc:
+        raise OSError(f"Could not read benchmark baseline JSON {str(benchmark_path)!r}: {exc}") from exc
+    if len(payload) > DEFAULT_MAX_BASELINE_BENCHMARK_BYTES:
+        raise ValueError(
+            f"Benchmark baseline JSON {str(benchmark_path)!r} exceeds the configured limit of "
+            f"{DEFAULT_MAX_BASELINE_BENCHMARK_BYTES} bytes."
+        )
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            parse_constant=_reject_non_finite_json_constant,
+            parse_float=_finite_json_float,
+            object_pairs_hook=_reject_duplicate_json_object_keys,
+        )
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Benchmark baseline JSON must be UTF-8 encoded: {benchmark_path}.") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Benchmark baseline JSON must be an object: {path}.")
+    return value
+
+
+def _reject_non_finite_json_constant(constant: str) -> None:
+    raise ValueError(f"Benchmark baseline JSON must not contain non-finite value {constant}.")
+
+
+def _finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"Benchmark baseline JSON must not contain non-finite value {value}.")
+    return parsed
+
+
+def _reject_duplicate_json_object_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"Benchmark baseline JSON must not contain duplicate key {key!r}.")
+        value[key] = item
+    return value
+
+
 def _optional_string(value: Any) -> str | None:
     if value is None:
         return None
@@ -637,6 +1042,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a finite positive number")
     return parsed
 
 
@@ -677,11 +1089,41 @@ def _parse_args(argv: Sequence[str] | None) -> PrepOptions:
     parser.add_argument("--benchmark-documents", type=_positive_int, default=DEFAULT_BENCHMARK_DOCUMENTS)
     parser.add_argument("--benchmark-iterations", type=_positive_int, default=DEFAULT_BENCHMARK_ITERATIONS)
     parser.add_argument(
+        "--baseline-benchmark-json",
+        type=Path,
+        default=None,
+        help="Stored Enron benchmark.json to compare this candidate run against.",
+    )
+    parser.add_argument(
+        "--max-cold-compile-seconds-ratio",
+        type=_positive_float,
+        default=None,
+        help="Fail the gate if candidate cold compile seconds exceed this baseline ratio.",
+    )
+    parser.add_argument(
+        "--max-warm-cached-compile-seconds-ratio",
+        type=_positive_float,
+        default=None,
+        help="Fail the gate if candidate warm cached compile seconds exceed this baseline ratio.",
+    )
+    parser.add_argument(
+        "--min-target-bytes-per-second-ratio",
+        type=_positive_float,
+        default=None,
+        help="Fail the gate if candidate target throughput falls below this baseline ratio.",
+    )
+    parser.add_argument(
         "--created-at",
         default=BANK_TIMESTAMP,
         help="Deterministic timestamp written into generated bank metadata.",
     )
     parsed = parser.parse_args(argv)
+    if parsed.baseline_benchmark_json is None and (
+        parsed.max_cold_compile_seconds_ratio is not None
+        or parsed.max_warm_cached_compile_seconds_ratio is not None
+        or parsed.min_target_bytes_per_second_ratio is not None
+    ):
+        parser.error("benchmark gate thresholds require --baseline-benchmark-json")
     dataset_id = parsed.dataset or ("local-jsonl" if parsed.input_jsonl is not None else DEFAULT_DATASET_ID)
     return PrepOptions(
         output_dir=parsed.output_dir,
@@ -701,4 +1143,8 @@ def _parse_args(argv: Sequence[str] | None) -> PrepOptions:
         benchmark_documents=parsed.benchmark_documents,
         benchmark_iterations=parsed.benchmark_iterations,
         created_at=parsed.created_at,
+        baseline_benchmark_json=parsed.baseline_benchmark_json,
+        max_cold_compile_seconds_ratio=parsed.max_cold_compile_seconds_ratio,
+        max_warm_cached_compile_seconds_ratio=parsed.max_warm_cached_compile_seconds_ratio,
+        min_target_bytes_per_second_ratio=parsed.min_target_bytes_per_second_ratio,
     )

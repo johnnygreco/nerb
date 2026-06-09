@@ -15,6 +15,7 @@ from nerb import (
     extract_file,
     extract_text,
 )
+from nerb.engines import compile_bank, compile_bank_with_report
 
 
 @pytest.fixture
@@ -455,6 +456,33 @@ def test_extraction_runtime_validation_does_not_do_a_separate_rust_compile(monke
     monkeypatch.setattr(validation, "_rust_engine_diagnostics", fail_if_called)
 
     assert extract_text(minimal_bank, "Acme Corp")["records"][0]["string"] == "Acme Corp"
+
+
+def test_reported_compile_matches_lean_compile_path(minimal_bank):
+    text = "Send this to Acme Corp today."
+
+    clear_bank_cache()
+    lean, lean_hit = compile_bank(minimal_bank)
+    lean_records = lean.finditer(text)
+
+    clear_bank_cache()
+    reported, reported_hit, report = compile_bank_with_report(minimal_bank)
+    reported_records = reported.finditer(text)
+
+    assert lean_hit is False
+    assert reported_hit is False
+    assert reported.bank == lean.bank
+    assert reported.extractable_bank == lean.extractable_bank
+    assert reported.bank_hash == lean.bank_hash
+    assert reported.normalization == lean.normalization
+    assert reported.include_statuses == lean.include_statuses
+    assert reported.engine_name == lean.engine_name
+    assert reported.engine_version == lean.engine_version
+    assert reported.engine_options == lean.engine_options
+    assert reported.cache_metadata["key"] == lean.cache_metadata["key"]
+    assert reported.detector_index == lean.detector_index
+    assert reported_records == lean_records
+    assert report["native"]["cache"]["key"] == lean.cache_metadata["key"]
 
 
 def test_rust_bank_cache_key_dimensions_are_exposed(minimal_bank):

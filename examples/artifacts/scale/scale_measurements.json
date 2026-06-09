@@ -90,8 +90,464 @@
           "cold_hit": false,
           "warm_hit": true
         },
-        "cold_seconds": 0.074649125,
-        "warm_cache_lookup_seconds": 0.054932291
+        "cold": {
+          "native": {
+            "cache": {
+              "enabled": true,
+              "hit": false,
+              "hit_level": null,
+              "key": {
+                "bank_hash": "sha256:2e75c2d984f71e739ed9a8357da8ff4398f58bc10bca8e2fa6ec2947324e0377",
+                "canonical_engine": "rust-regex-meta",
+                "compile_options": {
+                  "match_mode": "entity_independent"
+                },
+                "endian": "little",
+                "engine_name": "nerb_engine",
+                "engine_version": "0.0.6",
+                "platform": "macosx-11.0-arm64",
+                "pointer_width": 64,
+                "schema_version": 1,
+                "semantic_version": "0.0.6",
+                "target_triple": "darwin"
+              }
+            },
+            "schema_version": "nerb.bank_source_compile_report.v1",
+            "source": {
+              "format_hint": "json",
+              "source_size_bytes": 317976,
+              "use_cache": true
+            },
+            "stages": {
+              "cache_insert_or_reuse": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 2.458e-06
+              },
+              "cache_key_from_metadata": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.000398042
+              },
+              "cache_lookup": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 1.417e-06
+              },
+              "compile_options_normalize": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 8.292e-06
+              },
+              "native_compile": {
+                "available": true,
+                "exclusive": false,
+                "includes": [
+                  "rust_source_parse",
+                  "rust_canonicalization",
+                  "stable_hash",
+                  "matcher_compile"
+                ],
+                "note": "Native Rust compile is exposed as one inclusive call by the current engine API.",
+                "seconds": 0.015954958
+              },
+              "native_engine_import": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 2.625e-06
+              },
+              "source_bytes_copy": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 3.75e-07
+              },
+              "source_cache_key": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.000136
+              }
+            }
+          },
+          "schema_version": "nerb.json_bank_compile_report.v1",
+          "source": {
+            "bank_stats": {
+              "active_totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              },
+              "by_kind": {
+                "literal": 750,
+                "regex": 250
+              },
+              "by_status": {
+                "active": {
+                  "entities": 16,
+                  "names": 250,
+                  "patterns": 1000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              }
+            },
+            "canonical_bank_hash": "sha256:9d480f471c273f5103286c52652f9f05dce1bb3f422f011a7ca5478fbd9ceee4",
+            "canonical_json_bytes": 317976,
+            "extractable_json_bytes": 317976,
+            "extractable_stats": {
+              "active_totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              },
+              "by_kind": {
+                "literal": 750,
+                "regex": 250
+              },
+              "by_status": {
+                "active": {
+                  "entities": 16,
+                  "names": 250,
+                  "patterns": 1000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              }
+            }
+          },
+          "stages": {
+            "canonical_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001107875
+            },
+            "compile_options_json": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 1.792e-06
+            },
+            "detector_index": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000682416
+            },
+            "extractable_bank_filter": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000219958
+            },
+            "extractable_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001049667
+            },
+            "metadata_projection": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000198875
+            },
+            "native_bank_from_source": {
+              "available": true,
+              "exclusive": false,
+              "includes": [
+                "python_cache_lookup",
+                "rust_source_parse",
+                "rust_canonicalization",
+                "stable_hash",
+                "matcher_compile"
+              ],
+              "note": "Includes the Python Bank cache wrapper and one native Rust construction call.",
+              "seconds": 0.016518042
+            },
+            "options_resolution": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 8.542e-06
+            },
+            "python_canonicalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.002832416
+            },
+            "runtime_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001095958
+            },
+            "schema_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.049224209
+            },
+            "stable_hash": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000105459
+            },
+            "status_gate": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 1.67e-07
+            }
+          }
+        },
+        "cold_seconds": 0.073645708,
+        "warm": {
+          "native": {
+            "cache": {
+              "enabled": true,
+              "hit": true,
+              "hit_level": "source_key",
+              "key": {
+                "bank_hash": "sha256:2e75c2d984f71e739ed9a8357da8ff4398f58bc10bca8e2fa6ec2947324e0377",
+                "canonical_engine": "rust-regex-meta",
+                "compile_options": {
+                  "match_mode": "entity_independent"
+                },
+                "endian": "little",
+                "engine_name": "nerb_engine",
+                "engine_version": "0.0.6",
+                "platform": "macosx-11.0-arm64",
+                "pointer_width": 64,
+                "schema_version": 1,
+                "semantic_version": "0.0.6",
+                "target_triple": "darwin"
+              }
+            },
+            "schema_version": "nerb.bank_source_compile_report.v1",
+            "source": {
+              "format_hint": "json",
+              "source_size_bytes": 317976,
+              "use_cache": true
+            },
+            "stages": {
+              "cache_lookup": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 3.292e-06
+              },
+              "compile_options_normalize": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 5.375e-06
+              },
+              "native_compile": {
+                "available": false,
+                "exclusive": null,
+                "note": "source-cache hit reused a compiled bank",
+                "seconds": null
+              },
+              "native_engine_import": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 1.542e-06
+              },
+              "source_bytes_copy": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 3.33e-07
+              },
+              "source_cache_key": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.000117458
+              }
+            }
+          },
+          "schema_version": "nerb.json_bank_compile_report.v1",
+          "source": {
+            "bank_stats": {
+              "active_totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              },
+              "by_kind": {
+                "literal": 750,
+                "regex": 250
+              },
+              "by_status": {
+                "active": {
+                  "entities": 16,
+                  "names": 250,
+                  "patterns": 1000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              }
+            },
+            "canonical_bank_hash": "sha256:9d480f471c273f5103286c52652f9f05dce1bb3f422f011a7ca5478fbd9ceee4",
+            "canonical_json_bytes": 317976,
+            "extractable_json_bytes": 317976,
+            "extractable_stats": {
+              "active_totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              },
+              "by_kind": {
+                "literal": 750,
+                "regex": 250
+              },
+              "by_status": {
+                "active": {
+                  "entities": 16,
+                  "names": 250,
+                  "patterns": 1000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 16,
+                "names": 250,
+                "patterns": 1000
+              }
+            }
+          },
+          "stages": {
+            "canonical_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001114125
+            },
+            "compile_options_json": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 1.75e-06
+            },
+            "detector_index": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000693875
+            },
+            "extractable_bank_filter": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000220833
+            },
+            "extractable_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001076667
+            },
+            "metadata_projection": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000198458
+            },
+            "native_bank_from_source": {
+              "available": true,
+              "exclusive": false,
+              "includes": [
+                "native_engine_import",
+                "source_bytes_copy",
+                "compile_options_normalize",
+                "source_cache_key",
+                "cache_lookup"
+              ],
+              "note": "Source-cache hit reused a compiled bank; Rust construction was skipped.",
+              "seconds": 0.000133792
+            },
+            "options_resolution": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 4.792e-06
+            },
+            "python_canonicalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.002780542
+            },
+            "runtime_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001365958
+            },
+            "schema_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.048715
+            },
+            "stable_hash": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000106375
+            },
+            "status_gate": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 1.66e-07
+            }
+          }
+        },
+        "warm_cached_compile_seconds": 0.056972083
       },
       "document_bytes": 49983,
       "engine": {
@@ -125,9 +581,9 @@
       "record_count": 1136,
       "records_per_kb": 23.273,
       "throughput": {
-        "bytes_per_second": 10623097.154,
-        "documents_per_second": 212.534,
-        "records_per_second": 241438.857
+        "bytes_per_second": 10679747.088,
+        "documents_per_second": 213.668,
+        "records_per_second": 242726.381
       }
     },
     {
@@ -220,8 +676,464 @@
           "cold_hit": false,
           "warm_hit": true
         },
-        "cold_seconds": 0.284942792,
-        "warm_cache_lookup_seconds": 0.217348584
+        "cold": {
+          "native": {
+            "cache": {
+              "enabled": true,
+              "hit": false,
+              "hit_level": null,
+              "key": {
+                "bank_hash": "sha256:2611fe010a2e5aac02408d69db38b0f24c43b96e44df1e85d0073ca2b38db6b8",
+                "canonical_engine": "rust-regex-meta",
+                "compile_options": {
+                  "match_mode": "entity_independent"
+                },
+                "endian": "little",
+                "engine_name": "nerb_engine",
+                "engine_version": "0.0.6",
+                "platform": "macosx-11.0-arm64",
+                "pointer_width": 64,
+                "schema_version": 1,
+                "semantic_version": "0.0.6",
+                "target_triple": "darwin"
+              }
+            },
+            "schema_version": "nerb.bank_source_compile_report.v1",
+            "source": {
+              "format_hint": "json",
+              "source_size_bytes": 1270428,
+              "use_cache": true
+            },
+            "stages": {
+              "cache_insert_or_reuse": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 4.791e-06
+              },
+              "cache_key_from_metadata": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.001324667
+              },
+              "cache_lookup": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 2.541e-06
+              },
+              "compile_options_normalize": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 1.2167e-05
+              },
+              "native_compile": {
+                "available": true,
+                "exclusive": false,
+                "includes": [
+                  "rust_source_parse",
+                  "rust_canonicalization",
+                  "stable_hash",
+                  "matcher_compile"
+                ],
+                "note": "Native Rust compile is exposed as one inclusive call by the current engine API.",
+                "seconds": 0.064493833
+              },
+              "native_engine_import": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 4.208e-06
+              },
+              "source_bytes_copy": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 6.67e-07
+              },
+              "source_cache_key": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.000478875
+              }
+            }
+          },
+          "schema_version": "nerb.json_bank_compile_report.v1",
+          "source": {
+            "bank_stats": {
+              "active_totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              },
+              "by_kind": {
+                "literal": 3000,
+                "regex": 1000
+              },
+              "by_status": {
+                "active": {
+                  "entities": 64,
+                  "names": 1000,
+                  "patterns": 4000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              }
+            },
+            "canonical_bank_hash": "sha256:9b266ec1d94c34f990e49b3e82e9679932920d78d9e8b62171a20996f942e256",
+            "canonical_json_bytes": 1270428,
+            "extractable_json_bytes": 1270428,
+            "extractable_stats": {
+              "active_totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              },
+              "by_kind": {
+                "literal": 3000,
+                "regex": 1000
+              },
+              "by_status": {
+                "active": {
+                  "entities": 64,
+                  "names": 1000,
+                  "patterns": 4000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              }
+            }
+          },
+          "stages": {
+            "canonical_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.004497292
+            },
+            "compile_options_json": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 2.541e-06
+            },
+            "detector_index": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.003374166
+            },
+            "extractable_bank_filter": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001063584
+            },
+            "extractable_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.004358959
+            },
+            "metadata_projection": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000766958
+            },
+            "native_bank_from_source": {
+              "available": true,
+              "exclusive": false,
+              "includes": [
+                "python_cache_lookup",
+                "rust_source_parse",
+                "rust_canonicalization",
+                "stable_hash",
+                "matcher_compile"
+              ],
+              "note": "Includes the Python Bank cache wrapper and one native Rust construction call.",
+              "seconds": 0.066347541
+            },
+            "options_resolution": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 9.5e-06
+            },
+            "python_canonicalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.011238
+            },
+            "runtime_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.00480525
+            },
+            "schema_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.198467166
+            },
+            "stable_hash": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000392041
+            },
+            "status_gate": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 3.75e-07
+            }
+          }
+        },
+        "cold_seconds": 0.297710375,
+        "warm": {
+          "native": {
+            "cache": {
+              "enabled": true,
+              "hit": true,
+              "hit_level": "source_key",
+              "key": {
+                "bank_hash": "sha256:2611fe010a2e5aac02408d69db38b0f24c43b96e44df1e85d0073ca2b38db6b8",
+                "canonical_engine": "rust-regex-meta",
+                "compile_options": {
+                  "match_mode": "entity_independent"
+                },
+                "endian": "little",
+                "engine_name": "nerb_engine",
+                "engine_version": "0.0.6",
+                "platform": "macosx-11.0-arm64",
+                "pointer_width": 64,
+                "schema_version": 1,
+                "semantic_version": "0.0.6",
+                "target_triple": "darwin"
+              }
+            },
+            "schema_version": "nerb.bank_source_compile_report.v1",
+            "source": {
+              "format_hint": "json",
+              "source_size_bytes": 1270428,
+              "use_cache": true
+            },
+            "stages": {
+              "cache_lookup": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 5.666e-06
+              },
+              "compile_options_normalize": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 1.0333e-05
+              },
+              "native_compile": {
+                "available": false,
+                "exclusive": null,
+                "note": "source-cache hit reused a compiled bank",
+                "seconds": null
+              },
+              "native_engine_import": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 4.75e-06
+              },
+              "source_bytes_copy": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 4.58e-07
+              },
+              "source_cache_key": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.000428042
+              }
+            }
+          },
+          "schema_version": "nerb.json_bank_compile_report.v1",
+          "source": {
+            "bank_stats": {
+              "active_totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              },
+              "by_kind": {
+                "literal": 3000,
+                "regex": 1000
+              },
+              "by_status": {
+                "active": {
+                  "entities": 64,
+                  "names": 1000,
+                  "patterns": 4000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              }
+            },
+            "canonical_bank_hash": "sha256:9b266ec1d94c34f990e49b3e82e9679932920d78d9e8b62171a20996f942e256",
+            "canonical_json_bytes": 1270428,
+            "extractable_json_bytes": 1270428,
+            "extractable_stats": {
+              "active_totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              },
+              "by_kind": {
+                "literal": 3000,
+                "regex": 1000
+              },
+              "by_status": {
+                "active": {
+                  "entities": 64,
+                  "names": 1000,
+                  "patterns": 4000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 64,
+                "names": 1000,
+                "patterns": 4000
+              }
+            }
+          },
+          "stages": {
+            "canonical_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.0043355
+            },
+            "compile_options_json": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 2.166e-06
+            },
+            "detector_index": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.002820125
+            },
+            "extractable_bank_filter": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.001015917
+            },
+            "extractable_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.0042185
+            },
+            "metadata_projection": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000775875
+            },
+            "native_bank_from_source": {
+              "available": true,
+              "exclusive": false,
+              "includes": [
+                "native_engine_import",
+                "source_bytes_copy",
+                "compile_options_normalize",
+                "source_cache_key",
+                "cache_lookup"
+              ],
+              "note": "Source-cache hit reused a compiled bank; Rust construction was skipped.",
+              "seconds": 0.000458708
+            },
+            "options_resolution": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 7.125e-06
+            },
+            "python_canonicalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.010940417
+            },
+            "runtime_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.005095667
+            },
+            "schema_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.198343333
+            },
+            "stable_hash": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000392792
+            },
+            "status_gate": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 8.4e-08
+            }
+          }
+        },
+        "warm_cached_compile_seconds": 0.230795333
       },
       "document_bytes": 149995,
       "engine": {
@@ -255,9 +1167,9 @@
       "record_count": 3409,
       "records_per_kb": 23.273,
       "throughput": {
-        "bytes_per_second": 8692905.622,
-        "documents_per_second": 57.955,
-        "records_per_second": 197567.354
+        "bytes_per_second": 8586793.388,
+        "documents_per_second": 57.247,
+        "records_per_second": 195155.696
       }
     },
     {
@@ -350,8 +1262,464 @@
           "cold_hit": false,
           "warm_hit": true
         },
-        "cold_seconds": 0.716237583,
-        "warm_cache_lookup_seconds": 0.559980375
+        "cold": {
+          "native": {
+            "cache": {
+              "enabled": true,
+              "hit": false,
+              "hit_level": null,
+              "key": {
+                "bank_hash": "sha256:519d3f5ac8487933d290861ffd39a711ce4d709432502b71c3fac856771844dd",
+                "canonical_engine": "rust-regex-meta",
+                "compile_options": {
+                  "match_mode": "entity_independent"
+                },
+                "endian": "little",
+                "engine_name": "nerb_engine",
+                "engine_version": "0.0.6",
+                "platform": "macosx-11.0-arm64",
+                "pointer_width": 64,
+                "schema_version": 1,
+                "semantic_version": "0.0.6",
+                "target_triple": "darwin"
+              }
+            },
+            "schema_version": "nerb.bank_source_compile_report.v1",
+            "source": {
+              "format_hint": "json",
+              "source_size_bytes": 3171368,
+              "use_cache": true
+            },
+            "stages": {
+              "cache_insert_or_reuse": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 6.084e-06
+              },
+              "cache_key_from_metadata": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.003456709
+              },
+              "cache_lookup": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 2.917e-06
+              },
+              "compile_options_normalize": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 1.2208e-05
+              },
+              "native_compile": {
+                "available": true,
+                "exclusive": false,
+                "includes": [
+                  "rust_source_parse",
+                  "rust_canonicalization",
+                  "stable_hash",
+                  "matcher_compile"
+                ],
+                "note": "Native Rust compile is exposed as one inclusive call by the current engine API.",
+                "seconds": 0.160100375
+              },
+              "native_engine_import": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 4.959e-06
+              },
+              "source_bytes_copy": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 6.25e-07
+              },
+              "source_cache_key": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.001045958
+              }
+            }
+          },
+          "schema_version": "nerb.json_bank_compile_report.v1",
+          "source": {
+            "bank_stats": {
+              "active_totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              },
+              "by_kind": {
+                "literal": 7500,
+                "regex": 2500
+              },
+              "by_status": {
+                "active": {
+                  "entities": 128,
+                  "names": 2500,
+                  "patterns": 10000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              }
+            },
+            "canonical_bank_hash": "sha256:0e6ba54a8cf5bdee9d2831e4a8933bab43e385987561f5af7a3ff12217623876",
+            "canonical_json_bytes": 3171368,
+            "extractable_json_bytes": 3171368,
+            "extractable_stats": {
+              "active_totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              },
+              "by_kind": {
+                "literal": 7500,
+                "regex": 2500
+              },
+              "by_status": {
+                "active": {
+                  "entities": 128,
+                  "names": 2500,
+                  "patterns": 10000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              }
+            }
+          },
+          "stages": {
+            "canonical_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.010741625
+            },
+            "compile_options_json": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 3.916e-06
+            },
+            "detector_index": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.007892333
+            },
+            "extractable_bank_filter": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.003197375
+            },
+            "extractable_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.010629541
+            },
+            "metadata_projection": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.002265583
+            },
+            "native_bank_from_source": {
+              "available": true,
+              "exclusive": false,
+              "includes": [
+                "python_cache_lookup",
+                "rust_source_parse",
+                "rust_canonicalization",
+                "stable_hash",
+                "matcher_compile"
+              ],
+              "note": "Includes the Python Bank cache wrapper and one native Rust construction call.",
+              "seconds": 0.164652959
+            },
+            "options_resolution": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 9.541e-06
+            },
+            "python_canonicalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.027256375
+            },
+            "runtime_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.013681041
+            },
+            "schema_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.5064425
+            },
+            "stable_hash": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000967333
+            },
+            "status_gate": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 4.2e-08
+            }
+          }
+        },
+        "cold_seconds": 0.753685375,
+        "warm": {
+          "native": {
+            "cache": {
+              "enabled": true,
+              "hit": true,
+              "hit_level": "source_key",
+              "key": {
+                "bank_hash": "sha256:519d3f5ac8487933d290861ffd39a711ce4d709432502b71c3fac856771844dd",
+                "canonical_engine": "rust-regex-meta",
+                "compile_options": {
+                  "match_mode": "entity_independent"
+                },
+                "endian": "little",
+                "engine_name": "nerb_engine",
+                "engine_version": "0.0.6",
+                "platform": "macosx-11.0-arm64",
+                "pointer_width": 64,
+                "schema_version": 1,
+                "semantic_version": "0.0.6",
+                "target_triple": "darwin"
+              }
+            },
+            "schema_version": "nerb.bank_source_compile_report.v1",
+            "source": {
+              "format_hint": "json",
+              "source_size_bytes": 3171368,
+              "use_cache": true
+            },
+            "stages": {
+              "cache_lookup": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 5.458e-06
+              },
+              "compile_options_normalize": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 1.025e-05
+              },
+              "native_compile": {
+                "available": false,
+                "exclusive": null,
+                "note": "source-cache hit reused a compiled bank",
+                "seconds": null
+              },
+              "native_engine_import": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 4.458e-06
+              },
+              "source_bytes_copy": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 7.09e-07
+              },
+              "source_cache_key": {
+                "available": true,
+                "exclusive": true,
+                "seconds": 0.001005833
+              }
+            }
+          },
+          "schema_version": "nerb.json_bank_compile_report.v1",
+          "source": {
+            "bank_stats": {
+              "active_totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              },
+              "by_kind": {
+                "literal": 7500,
+                "regex": 2500
+              },
+              "by_status": {
+                "active": {
+                  "entities": 128,
+                  "names": 2500,
+                  "patterns": 10000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              }
+            },
+            "canonical_bank_hash": "sha256:0e6ba54a8cf5bdee9d2831e4a8933bab43e385987561f5af7a3ff12217623876",
+            "canonical_json_bytes": 3171368,
+            "extractable_json_bytes": 3171368,
+            "extractable_stats": {
+              "active_totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              },
+              "by_kind": {
+                "literal": 7500,
+                "regex": 2500
+              },
+              "by_status": {
+                "active": {
+                  "entities": 128,
+                  "names": 2500,
+                  "patterns": 10000
+                },
+                "deprecated": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "draft": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                },
+                "inactive": {
+                  "entities": 0,
+                  "names": 0,
+                  "patterns": 0
+                }
+              },
+              "totals": {
+                "entities": 128,
+                "names": 2500,
+                "patterns": 10000
+              }
+            }
+          },
+          "stages": {
+            "canonical_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.010666292
+            },
+            "compile_options_json": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 3.958e-06
+            },
+            "detector_index": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.007214583
+            },
+            "extractable_bank_filter": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.002760833
+            },
+            "extractable_json_serialization": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.010542792
+            },
+            "metadata_projection": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.002303709
+            },
+            "native_bank_from_source": {
+              "available": true,
+              "exclusive": false,
+              "includes": [
+                "native_engine_import",
+                "source_bytes_copy",
+                "compile_options_normalize",
+                "source_cache_key",
+                "cache_lookup"
+              ],
+              "note": "Source-cache hit reused a compiled bank; Rust construction was skipped.",
+              "seconds": 0.0010385
+            },
+            "options_resolution": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 8.291e-06
+            },
+            "python_canonicalize": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.027430708
+            },
+            "runtime_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.014765125
+            },
+            "schema_validation": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.498156584
+            },
+            "stable_hash": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 0.000977875
+            },
+            "status_gate": {
+              "available": true,
+              "exclusive": true,
+              "seconds": 5e-07
+            }
+          }
+        },
+        "warm_cached_compile_seconds": 0.58183725
       },
       "document_bytes": 299991,
       "engine": {
@@ -385,9 +1753,9 @@
       "record_count": 6818,
       "records_per_kb": 23.273,
       "throughput": {
-        "bytes_per_second": 6918216.01,
-        "documents_per_second": 23.061,
-        "records_per_second": 157232.706
+        "bytes_per_second": 6153766.69,
+        "documents_per_second": 20.513,
+        "records_per_second": 139858.8
       }
     }
   ],

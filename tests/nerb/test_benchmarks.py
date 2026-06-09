@@ -7,7 +7,13 @@ from typing import Any
 
 import pytest
 
-from nerb import benchmark_bank, benchmark_fixture_profiles, make_benchmark_fixture_profile, regress_bank
+from nerb import (
+    ExtractionError,
+    benchmark_bank,
+    benchmark_fixture_profiles,
+    make_benchmark_fixture_profile,
+    regress_bank,
+)
 from nerb.benchmarks import BENCHMARK_PROFILE_IDS, make_synthetic_bank
 from nerb.diagnostics import EVAL_POSITIVE_FAILED
 
@@ -104,7 +110,16 @@ def test_benchmark_bank_reports_cache_compile_and_deterministic_tier_counts(mini
 
     assert first["compile"]["cache"]["cold_hit"] is False
     assert first["compile"]["cache"]["warm_hit"] is True
+    assert first["compile"]["cold"]["source"]["canonical_json_bytes"] > 0
+    assert first["compile"]["cold"]["source"]["extractable_json_bytes"] > 0
+    assert first["compile"]["cold"]["native"]["cache"]["hit"] is False
+    assert first["compile"]["warm"]["native"]["cache"]["hit"] is True
     assert first["summary"]["cache_hit_verified"] is True
+    assert first["summary"]["warm_cached_compile_seconds"] == first["compile"]["warm_cached_compile_seconds"]
+    assert first["environment"]["python"]
+    assert first["environment"]["executable_name"]
+    assert "executable" not in first["environment"]
+    assert first["bank"]["size"]["canonical_json_bytes"] == first["compile"]["cold"]["source"]["canonical_json_bytes"]
     assert first["stages"]["compile_cache"]["cache_hit_verified"] is True
     assert first["stages"]["compile_cache"]["exclusive"] is False
     assert first["stages"]["compile_cache"]["includes"] == [
@@ -117,6 +132,11 @@ def test_benchmark_bank_reports_cache_compile_and_deterministic_tier_counts(mini
     assert first["stages"]["input_parse"]["available"] is False
     assert first["stages"]["input_parse"]["seconds"] is None
     assert first["stages"]["input_parse"]["note"]
+    assert first["stages"]["compile_construction"]["cold"]["schema_validation"]["available"] is True
+    assert first["stages"]["compile_construction"]["native_warm"]["native_compile"]["available"] is False
+    assert "matcher_compile" in first["compile"]["cold"]["stages"]["native_bank_from_source"]["includes"]
+    assert "matcher_compile" not in first["compile"]["warm"]["stages"]["native_bank_from_source"]["includes"]
+    assert "Rust construction was skipped" in first["compile"]["warm"]["stages"]["native_bank_from_source"]["note"]
     assert set(first["tiers"]) == {"baseline", "target", "stress"}
     assert all(tier["record_count_stable"] is True for tier in first["tiers"].values())
     assert all(
@@ -140,7 +160,16 @@ def test_benchmark_fixture_profiles_manifest_is_json_compatible_and_explicit():
         "threshold_status": "deferred_until_native_engine_modes",
         "required_profiles": list(BENCHMARK_PROFILE_IDS),
         "required_tiers": ["baseline", "target", "stress"],
-        "required_result_sections": ["bank", "engine", "options", "stages", "compile", "tiers", "summary"],
+        "required_result_sections": [
+            "bank",
+            "engine",
+            "options",
+            "stages",
+            "compile",
+            "tiers",
+            "summary",
+            "environment",
+        ],
         "requires_cache_hit_verified": True,
         "requires_stable_record_counts": True,
     }
@@ -179,6 +208,7 @@ def test_benchmark_fixture_profile_runs_with_stable_smoke_shape(profile_id):
         "validation",
         "document_tier_resolution",
         "compile_cache",
+        "compile_construction",
         "document_prepare",
         "scan_project_sort",
     }
@@ -245,6 +275,7 @@ def test_regress_bank_reports_diff_eval_benchmark_deltas_and_quality_gate(tmp_pa
     assert result["deltas"]["quality"]["positive_failed_delta"] == 1
     assert result["deltas"]["quality"]["regressed"] is True
     assert result["deltas"]["performance"]["target_bytes_per_second_ratio"] is not None
+    assert result["deltas"]["performance"]["warm_cached_compile_seconds_ratio"] is not None
     assert result["gates"]["passed"] is False
     assert result["gates"]["quality"]["passed"] is False
     assert result["benchmarks"]["old"]["summary"]["cache_hit_verified"] is True
@@ -253,6 +284,23 @@ def test_regress_bank_reports_diff_eval_benchmark_deltas_and_quality_gate(tmp_pa
         diagnostic["code"] == EVAL_POSITIVE_FAILED and diagnostic["metadata"]["bank"] == "new_bank"
         for diagnostic in result["diagnostics"]
     )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_cold_compile_seconds_ratio": float("nan")},
+        {"max_warm_cached_compile_seconds_ratio": float("inf")},
+        {"min_target_bytes_per_second_ratio": float("-inf")},
+    ],
+)
+def test_regress_bank_rejects_non_finite_gate_thresholds(minimal_bank, options):
+    with pytest.raises(ExtractionError, match="positive number"):
+        regress_bank(
+            minimal_bank,
+            minimal_bank,
+            options={"benchmark_iterations": 1, "stress_multiplier": 2, **options},
+        )
 
 
 def test_regress_bank_preserves_raw_diff_diagnostics(minimal_bank):

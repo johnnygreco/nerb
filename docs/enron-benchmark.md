@@ -61,3 +61,48 @@ The output directory contains:
 
 The benchmark JSON intentionally stores aggregate counts and NERB benchmark document summaries, not raw extracted record
 strings.
+
+## Stage Semantics
+
+`benchmark.json` includes `benchmark.stages` and `benchmark.compile` sections. The top-level `canonicalize` and
+`validation` stages are benchmark preflight work. The nested `compile_construction` report comes from the extraction
+compile path and intentionally shows the second schema/canonicalization pass that currently happens before native
+construction. Do not sum those fields together.
+
+Python-side stages such as schema validation, canonicalization, extractable-bank filtering, JSON serialization, cache key
+work, runtime validation, and detector-index projection are exclusive timings. Native Rust construction is currently one
+inclusive call that contains Rust source parsing, Rust canonicalization, stable hashing, and matcher compilation; the
+report labels those sub-stages as unavailable until the Rust API exposes finer counters. Warm source-cache hits mark
+native construction as skipped and report only the Python/cache work needed to reuse the compiled bank.
+
+The report also records canonical/extractable bank byte sizes, entity/name/pattern counts, cache hit/miss metadata,
+benchmark iteration counts, and machine metadata. Later optimization runs should compare against the same prepared
+train/test manifest and benchmark options.
+
+## Baseline Gates
+
+To compare a candidate run against a stored baseline, pass the baseline `benchmark.json` and any desired thresholds:
+
+```shell
+uv run python scripts/enron_bank_build_benchmark.py \
+  --input-jsonl tests/data/enron_sample.jsonl \
+  --output-dir .nerb/enron-benchmark/candidate \
+  --sample-fraction 1.0 \
+  --test-fraction 0.35 \
+  --seed fixture-seed \
+  --created-at 2026-06-09T00:00:00Z \
+  --min-address-count 1 \
+  --min-domain-count 1 \
+  --benchmark-documents 5 \
+  --benchmark-iterations 1 \
+  --baseline-benchmark-json .nerb/enron-benchmark/baseline/benchmark.json \
+  --max-cold-compile-seconds-ratio 1.05 \
+  --max-warm-cached-compile-seconds-ratio 1.10 \
+  --min-target-bytes-per-second-ratio 0.95
+```
+
+The gate first checks an evaluator fingerprint: dataset id/revision, sampling settings, train/test artifact hashes,
+generated bank artifact hash, candidate limits, benchmark options, and benchmark tier sizes. If the fingerprint differs,
+the gate fails before interpreting quality or performance ratios. This keeps benchmark/evaluator changes separate from
+optimizer changes. When a stored-baseline gate is configured and fails, the command exits nonzero after writing and
+printing `benchmark.json`. Threshold flags require `--baseline-benchmark-json`; threshold-only commands are rejected.
