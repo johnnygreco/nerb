@@ -652,7 +652,7 @@ def _render_benchmark_cache_figure(plt: Any, results: Mapping[str, Mapping[str, 
     x_positions = list(range(len(labels)))
     width = 0.32
     cold = [float(result["compile"]["cold_seconds"]) * 1000 for result in results.values()]
-    warm = [float(result["compile"]["warm_cache_lookup_seconds"]) * 1000 for result in results.values()]
+    warm = [float(result["compile"]["warm_cached_compile_seconds"]) * 1000 for result in results.values()]
 
     cold_bars = ax.bar([x - width / 2 for x in x_positions], cold, width=width, color="#0ea5e9", label="Cold compile")
     warm_bars = ax.bar(
@@ -726,7 +726,7 @@ def _render_scale_compile_figure(plt: Any, scale_demo: Mapping[str, Any]) -> Non
     x_positions = list(range(len(cases)))
     width = 0.32
     cold = [float(case["compile"]["cold_seconds"]) * 1000 for case in cases]
-    warm = [float(case["compile"]["warm_cache_lookup_seconds"]) * 1000 for case in cases]
+    warm = [float(case["compile"]["warm_cached_compile_seconds"]) * 1000 for case in cases]
 
     cold_bars = ax.bar([x - width / 2 for x in x_positions], cold, width=width, color="#0ea5e9", label="Cold compile")
     warm_bars = ax.bar(

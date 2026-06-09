@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
-from .bank import canonicalize_bank, hash_bank
+from .bank import bank_stats, canonicalize_bank, hash_bank
 from .diagnostics import DIAGNOSTIC_ERROR, Diagnostic, diagnostic, has_errors
 from .engine import Bank
 from .records import MatchRecord, record_sort_key
@@ -28,6 +30,7 @@ __all__ = [
     "DEFAULT_TEXT_BYTES",
     "CompiledBank",
     "ExtractionError",
+    "compile_bank_with_report",
     "resolve_extraction_options",
 ]
 
@@ -151,20 +154,7 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
 
     extractable_bank = _filter_extractable_bank(canonical_bank, resolved.include_statuses)
     if extractable_bank is None:
-        compiled = CompiledBank(
-            bank=canonical_bank,
-            extractable_bank=None,
-            bank_hash=hash_bank(canonical_bank),
-            normalization=str(canonical_bank.get("unicode_normalization", "none")),
-            include_statuses=resolved.include_statuses,
-            engine_name=DEFAULT_ENGINE_NAME,
-            engine_version="uncompiled",
-            engine_options=resolved.engine_options,
-            native_bank=None,
-            cache_metadata={"enabled": False, "hit": False, "key": None},
-            detector_index={},
-        )
-        return compiled, False
+        return _uncompiled_bank(canonical_bank, resolved, hash_bank(canonical_bank)), False
 
     compile_options_json = _canonical_options(resolved.engine_options)
     try:
@@ -191,14 +181,183 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
     if empty_match_diagnostics:
         raise ExtractionError("Bank failed runtime validation and cannot be extracted.", empty_match_diagnostics)
 
+    compiled = _compiled_bank_from_native(
+        canonical_bank,
+        extractable_bank,
+        resolved,
+        native_bank,
+        detector_index=_json_bank_detector_index(extractable_bank),
+    )
+    return compiled, bool(compiled.cache_metadata.get("hit"))
+
+
+def compile_bank_with_report(
+    bank: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> tuple[CompiledBank, bool, dict[str, Any]]:
+    report: dict[str, Any] = {
+        "schema_version": "nerb.json_bank_compile_report.v1",
+        "source": {
+            "canonical_bank_hash": None,
+            "canonical_json_bytes": None,
+            "extractable_json_bytes": None,
+            "bank_stats": None,
+            "extractable_stats": None,
+        },
+        "stages": {},
+        "native": None,
+    }
+
+    stage_start = time.perf_counter()
+    resolved = resolve_extraction_options(options)
+    report["stages"]["options_resolution"] = _stage(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    schema_result = validate_bank_schema(bank)
+    report["stages"]["schema_validation"] = _stage(time.perf_counter() - stage_start)
+    diagnostics = schema_result["diagnostics"]
+    if has_errors(diagnostics):
+        raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics)
+
+    stage_start = time.perf_counter()
+    try:
+        canonical_bank = canonicalize_bank(bank)
+    except TypeError as exc:
+        raise ExtractionError("Bank failed schema validation and cannot be extracted.", diagnostics) from exc
+    report["stages"]["python_canonicalize"] = _stage(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    canonical_json_bytes = _json_source(canonical_bank)
+    report["source"]["canonical_json_bytes"] = len(canonical_json_bytes)
+    report["stages"]["canonical_json_serialization"] = _stage(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    bank_hash = "sha256:" + hashlib.sha256(canonical_json_bytes).hexdigest()
+    report["source"]["canonical_bank_hash"] = bank_hash
+    report["stages"]["stable_hash"] = _stage(time.perf_counter() - stage_start)
+
+    report["source"]["bank_stats"] = bank_stats(canonical_bank)
+
+    stage_start = time.perf_counter()
+    if canonical_bank.get("status") not in resolved.include_statuses:
+        raise ExtractionError(
+            f"Bank status {canonical_bank.get('status')!r} is not included in extraction statuses "
+            f"{list(resolved.include_statuses)!r}."
+        )
+    report["stages"]["status_gate"] = _stage(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    extractable_bank = _filter_extractable_bank(canonical_bank, resolved.include_statuses)
+    report["stages"]["extractable_bank_filter"] = _stage(time.perf_counter() - stage_start)
+    if extractable_bank is None:
+        report["stages"]["compile_options_json"] = _unavailable_stage("no extractable active patterns")
+        report["stages"]["extractable_json_serialization"] = _unavailable_stage("no extractable active patterns")
+        report["stages"]["native_bank_from_source"] = _unavailable_stage("no extractable active patterns")
+        report["stages"]["runtime_validation"] = _unavailable_stage("no extractable active patterns")
+        report["stages"]["metadata_projection"] = _unavailable_stage("no extractable active patterns")
+        report["stages"]["detector_index"] = _unavailable_stage("no extractable active patterns")
+        return _uncompiled_bank(canonical_bank, resolved, bank_hash), False, report
+
+    report["source"]["extractable_stats"] = bank_stats(extractable_bank)
+
+    stage_start = time.perf_counter()
+    compile_options_json = _canonical_options(resolved.engine_options)
+    report["stages"]["compile_options_json"] = _stage(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    extractable_source = _json_source(extractable_bank)
+    report["source"]["extractable_json_bytes"] = len(extractable_source)
+    report["stages"]["extractable_json_serialization"] = _stage(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    try:
+        native_bank, native_report = Bank.from_source_bytes_with_report(
+            extractable_source,
+            format_hint="json",
+            compile_options_json=compile_options_json,
+        )
+    except ValueError as exc:
+        diagnostics = [
+            diagnostic(
+                DIAGNOSTIC_ERROR,
+                "engine.compile_error",
+                "",
+                f"Rust engine failed to compile the bank: {exc}.",
+            )
+        ]
+        message = f"Bank failed Rust engine validation and cannot be extracted: {exc}."
+        raise ExtractionError(message, diagnostics) from exc
+    report["stages"]["native_bank_from_source"] = _native_bank_from_source_stage(
+        time.perf_counter() - stage_start,
+        native_report,
+    )
+    report["native"] = native_report
+
+    from .validation import rust_empty_match_diagnostics
+
+    stage_start = time.perf_counter()
+    empty_match_diagnostics = rust_empty_match_diagnostics(native_bank)
+    report["stages"]["runtime_validation"] = _stage(time.perf_counter() - stage_start)
+    if empty_match_diagnostics:
+        raise ExtractionError("Bank failed runtime validation and cannot be extracted.", empty_match_diagnostics)
+
+    stage_start = time.perf_counter()
     cache_metadata = native_bank.cache_metadata()
+    report["stages"]["metadata_projection"] = _stage(time.perf_counter() - stage_start)
+
+    stage_start = time.perf_counter()
+    detector_index = _json_bank_detector_index(extractable_bank)
+    report["stages"]["detector_index"] = _stage(time.perf_counter() - stage_start)
+
+    compiled = _compiled_bank_from_native(
+        canonical_bank,
+        extractable_bank,
+        resolved,
+        native_bank,
+        cache_metadata=cache_metadata,
+        detector_index=detector_index,
+    )
+    return compiled, bool(cache_metadata.get("hit")), report
+
+
+def _uncompiled_bank(
+    canonical_bank: dict[str, Any],
+    resolved: ResolvedExtractionOptions,
+    bank_hash: str,
+) -> CompiledBank:
+    return CompiledBank(
+        bank=canonical_bank,
+        extractable_bank=None,
+        bank_hash=bank_hash,
+        normalization=str(canonical_bank.get("unicode_normalization", "none")),
+        include_statuses=resolved.include_statuses,
+        engine_name=DEFAULT_ENGINE_NAME,
+        engine_version="uncompiled",
+        engine_options=resolved.engine_options,
+        native_bank=None,
+        cache_metadata={"enabled": False, "hit": False, "key": None},
+        detector_index={},
+    )
+
+
+def _compiled_bank_from_native(
+    canonical_bank: dict[str, Any],
+    extractable_bank: dict[str, Any],
+    resolved: ResolvedExtractionOptions,
+    native_bank: Bank,
+    *,
+    detector_index: Mapping[tuple[str, str, str], _DetectorIdentity],
+    cache_metadata: dict[str, Any] | None = None,
+) -> CompiledBank:
+    cache_metadata = native_bank.cache_metadata() if cache_metadata is None else cache_metadata
     cache_key = cache_metadata.get("key") if isinstance(cache_metadata, Mapping) else None
     engine_version = "unknown"
     if isinstance(cache_key, Mapping) and isinstance(cache_key.get("engine_version"), str):
         engine_version = cache_key["engine_version"]
 
     metadata = native_bank.metadata()
-    compiled = CompiledBank(
+    return CompiledBank(
         bank=canonical_bank,
         extractable_bank=extractable_bank,
         bank_hash=str(metadata["bank_hash"]),
@@ -209,9 +368,8 @@ def compile_bank(bank: Mapping[str, Any], *, options: Mapping[str, Any] | None =
         engine_options=resolved.engine_options,
         native_bank=native_bank,
         cache_metadata=cache_metadata,
-        detector_index=_json_bank_detector_index(extractable_bank),
+        detector_index=detector_index,
     )
-    return compiled, bool(cache_metadata.get("hit"))
 
 
 def _positive_int_option(options: Mapping[str, Any], key: str, default: int) -> int:
@@ -226,6 +384,60 @@ def _canonical_options(options: Mapping[str, Any]) -> str:
         return json.dumps(options, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ExtractionError("Extraction option engine_options must be JSON-compatible.") from exc
+
+
+def _stage(
+    seconds: float,
+    *,
+    exclusive: bool = True,
+    includes: list[str] | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    stage: dict[str, Any] = {"available": True, "seconds": _seconds(seconds), "exclusive": exclusive}
+    if includes is not None:
+        stage["includes"] = includes
+    if note is not None:
+        stage["note"] = note
+    return stage
+
+
+def _unavailable_stage(note: str) -> dict[str, Any]:
+    return {"available": False, "seconds": None, "exclusive": None, "note": note}
+
+
+def _native_bank_from_source_stage(seconds: float, native_report: Mapping[str, Any]) -> dict[str, Any]:
+    native_stages = native_report.get("stages")
+    native_compile = native_stages.get("native_compile") if isinstance(native_stages, Mapping) else None
+    native_constructed = isinstance(native_compile, Mapping) and native_compile.get("available") is True
+    if native_constructed:
+        return _stage(
+            seconds,
+            exclusive=False,
+            includes=[
+                "python_cache_lookup",
+                "rust_source_parse",
+                "rust_canonicalization",
+                "stable_hash",
+                "matcher_compile",
+            ],
+            note="Includes the Python Bank cache wrapper and one native Rust construction call.",
+        )
+    return _stage(
+        seconds,
+        exclusive=False,
+        includes=[
+            "native_engine_import",
+            "source_bytes_copy",
+            "compile_options_normalize",
+            "source_cache_key",
+            "cache_lookup",
+        ],
+        note="Source-cache hit reused a compiled bank; Rust construction was skipped.",
+    )
+
+
+def _seconds(value: float) -> float:
+    return round(value, 9)
 
 
 def _json_source(bank: Mapping[str, Any]) -> bytes:

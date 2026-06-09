@@ -5,6 +5,7 @@ import json
 import math
 import sys
 import sysconfig
+import time
 from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -147,6 +148,161 @@ class Bank:
         return cls(native_bank, cache_key=cache_key, cache_hit=False)
 
     @classmethod
+    def from_source_bytes_with_report(
+        cls,
+        source: bytes,
+        *,
+        format_hint: str | None = None,
+        compile_options_json: str | None = None,
+        use_cache: bool = True,
+    ) -> tuple[Bank, dict[str, Any]]:
+        return cls._from_source_bytes(
+            source,
+            format_hint=format_hint,
+            compile_options_json=compile_options_json,
+            use_cache=use_cache,
+        )
+
+    @classmethod
+    def _from_source_bytes(
+        cls,
+        source: bytes,
+        *,
+        format_hint: str | None,
+        compile_options_json: str | None,
+        use_cache: bool,
+    ) -> tuple[Bank, dict[str, Any]]:
+        report: dict[str, Any] = {
+            "schema_version": "nerb.bank_source_compile_report.v1",
+            "source": {
+                "format_hint": _normalize_format_hint(format_hint),
+                "source_size_bytes": 0,
+                "use_cache": use_cache,
+            },
+            "stages": {},
+            "cache": {"enabled": use_cache, "hit": False, "hit_level": None, "key": None},
+        }
+
+        stage_start = time.perf_counter()
+        native_engine = importlib.import_module("nerb._engine")
+        report["stages"]["native_engine_import"] = _stage(time.perf_counter() - stage_start)
+
+        stage_start = time.perf_counter()
+        source_bytes = bytes(source)
+        report["source"]["source_size_bytes"] = len(source_bytes)
+        report["stages"]["source_bytes_copy"] = _stage(time.perf_counter() - stage_start)
+
+        stage_start = time.perf_counter()
+        normalized_options = _canonical_compile_options_json(compile_options_json)
+        native_options = None if normalized_options == "{}" else normalized_options
+        report["stages"]["compile_options_normalize"] = _stage(time.perf_counter() - stage_start)
+
+        if not use_cache:
+            report["stages"]["source_cache_key"] = _unavailable_stage("cache disabled")
+            report["stages"]["cache_lookup"] = _unavailable_stage("cache disabled")
+            stage_start = time.perf_counter()
+            native_bank = native_engine.Bank.from_source_bytes(
+                source_bytes,
+                format_hint=format_hint,
+                compile_options_json=native_options,
+            )
+            report["stages"]["native_compile"] = _stage(
+                time.perf_counter() - stage_start,
+                exclusive=False,
+                includes=[
+                    "rust_source_parse",
+                    "rust_canonicalization",
+                    "stable_hash",
+                    "matcher_compile",
+                ],
+                note="Native Rust compile is exposed as one inclusive call by the current engine API.",
+            )
+            return cls(native_bank), report
+
+        stage_start = time.perf_counter()
+        source_key = _source_cache_key(
+            native_engine,
+            source_bytes,
+            format_hint=format_hint,
+            compile_options_json=normalized_options,
+        )
+        report["stages"]["source_cache_key"] = _stage(time.perf_counter() - stage_start)
+
+        stage_start = time.perf_counter()
+        with _BANK_CACHE_LOCK:
+            cached_key = _SOURCE_CACHE_KEYS.get(source_key)
+            if cached_key is not None:
+                cached_bank = _BANK_CACHE.get(cached_key)
+                if cached_bank is not None:
+                    _BANK_CACHE.move_to_end(cached_key)
+                    _SOURCE_CACHE_KEYS.move_to_end(source_key)
+                    _record_cache_hit()
+                    report["stages"]["cache_lookup"] = _stage(time.perf_counter() - stage_start)
+                    report["stages"]["native_compile"] = _unavailable_stage("source-cache hit reused a compiled bank")
+                    report["cache"] = {
+                        "enabled": True,
+                        "hit": True,
+                        "hit_level": "source_key",
+                        "key": cached_key.to_dict(),
+                    }
+                    return cls(cached_bank, cache_key=cached_key, cache_hit=True), report
+                del _SOURCE_CACHE_KEYS[source_key]
+        report["stages"]["cache_lookup"] = _stage(time.perf_counter() - stage_start)
+
+        stage_start = time.perf_counter()
+        native_bank = native_engine.Bank.from_source_bytes(
+            source_bytes,
+            format_hint=format_hint,
+            compile_options_json=native_options,
+        )
+        report["stages"]["native_compile"] = _stage(
+            time.perf_counter() - stage_start,
+            exclusive=False,
+            includes=[
+                "rust_source_parse",
+                "rust_canonicalization",
+                "stable_hash",
+                "matcher_compile",
+            ],
+            note="Native Rust compile is exposed as one inclusive call by the current engine API.",
+        )
+
+        stage_start = time.perf_counter()
+        cache_key = _cache_key_from_metadata(native_engine, native_bank.metadata())
+        report["stages"]["cache_key_from_metadata"] = _stage(time.perf_counter() - stage_start)
+
+        stage_start = time.perf_counter()
+        with _BANK_CACHE_LOCK:
+            cached_bank = _BANK_CACHE.get(cache_key)
+            if cached_bank is not None:
+                _SOURCE_CACHE_KEYS[source_key] = cache_key
+                _BANK_CACHE.move_to_end(cache_key)
+                _SOURCE_CACHE_KEYS.move_to_end(source_key)
+                _evict_bank_cache_if_needed()
+                _record_cache_hit()
+                report["stages"]["cache_insert_or_reuse"] = _stage(time.perf_counter() - stage_start)
+                report["cache"] = {
+                    "enabled": True,
+                    "hit": True,
+                    "hit_level": "bank_key",
+                    "key": cache_key.to_dict(),
+                }
+                return cls(cached_bank, cache_key=cache_key, cache_hit=True), report
+
+            _BANK_CACHE[cache_key] = native_bank
+            _SOURCE_CACHE_KEYS[source_key] = cache_key
+            _evict_bank_cache_if_needed()
+            _record_cache_miss()
+        report["stages"]["cache_insert_or_reuse"] = _stage(time.perf_counter() - stage_start)
+        report["cache"] = {
+            "enabled": True,
+            "hit": False,
+            "hit_level": None,
+            "key": cache_key.to_dict(),
+        }
+        return cls(native_bank, cache_key=cache_key, cache_hit=False), report
+
+    @classmethod
     def from_canonical_json_bytes(
         cls,
         source: bytes,
@@ -267,6 +423,29 @@ def _record_cache_hit() -> None:
 def _record_cache_miss() -> None:
     global _CACHE_MISSES
     _CACHE_MISSES += 1
+
+
+def _stage(
+    seconds: float,
+    *,
+    exclusive: bool = True,
+    includes: list[str] | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    stage: dict[str, Any] = {"available": True, "seconds": _seconds(seconds), "exclusive": exclusive}
+    if includes is not None:
+        stage["includes"] = includes
+    if note is not None:
+        stage["note"] = note
+    return stage
+
+
+def _unavailable_stage(note: str) -> dict[str, Any]:
+    return {"available": False, "seconds": None, "exclusive": None, "note": note}
+
+
+def _seconds(value: float) -> float:
+    return round(value, 9)
 
 
 def _evict_bank_cache_if_needed() -> None:
