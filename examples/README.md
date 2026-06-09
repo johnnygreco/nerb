@@ -34,6 +34,9 @@ The banks are intentionally small but domain-specific:
 - `revenue_ops.json`: accounts, products, commercial artifacts, regions, and account health.
 - `compliance_ops.json`: audit frameworks, controls, evidence artifacts, systems, and data boundaries.
 
+Additional committed assets include `artifacts/hero-images/*.jpg`, generated from the prompts and provenance in
+`docs/hero-images.md`. They are not refreshed by `generate_showcase.py`.
+
 The scale figures are generated from deterministic synthetic JSON banks rather than committed large fixtures. They show
 how warm extraction and process-local bank caching behave on a mostly-literal synthetic workload as an agent cache grows
 from 1,000 to 10,000 active patterns and from 50 KB to 300 KB of scanned text. The numbers are local illustrative
