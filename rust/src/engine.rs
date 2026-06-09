@@ -8,7 +8,7 @@ use regex_automata::nfa::thompson::{self, WhichCaptures};
 use regex_automata::{Anchored, Input, MatchKind as RegexMatchKind, PatternID};
 use regex_syntax::hir::Hir;
 use regex_syntax::ParserBuilder;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const ENTITY_INDEPENDENT_NFA_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -54,8 +54,8 @@ struct LiteralMatcherShard {
     matcher: AhoCorasick,
     case_insensitive: bool,
     local_to_detector: Vec<u32>,
-    fallback_patterns: Vec<Hir>,
-    fallback_regex: Mutex<Option<Regex>>,
+    fallback_patterns: Option<Vec<Hir>>,
+    fallback_regex: Mutex<Option<Arc<Regex>>>,
 }
 
 #[derive(Debug)]
@@ -233,24 +233,33 @@ fn scan_literal_shard(
     buffer: &mut NativeMatchBuffer,
 ) -> Result<()> {
     if shard.case_insensitive && !haystack.is_ascii() {
-        let mut fallback = shard.fallback_regex.lock().map_err(|_| {
-            validation(
-                format!("/engine/shards/{}/fallback_regex", shard.entity),
-                "literal matcher fallback lock was poisoned",
-            )
-        })?;
-        if fallback.is_none() {
-            *fallback = Some(compile_entity_regex(
-                &shard.entity,
-                &shard.fallback_patterns,
-            )?);
-        }
-        let regex = fallback
-            .as_ref()
-            .expect("fallback regex is initialized above");
+        let regex = {
+            let mut fallback = shard.fallback_regex.lock().map_err(|_| {
+                validation(
+                    format!("/engine/shards/{}/fallback_regex", shard.entity),
+                    "literal matcher fallback lock was poisoned",
+                )
+            })?;
+            if fallback.is_none() {
+                let fallback_patterns = shard.fallback_patterns.as_ref().ok_or_else(|| {
+                    validation(
+                        format!("/engine/shards/{}/fallback_patterns", shard.entity),
+                        "case-insensitive literal shard is missing fallback regex patterns",
+                    )
+                })?;
+                *fallback = Some(Arc::new(compile_entity_regex(
+                    &shard.entity,
+                    fallback_patterns,
+                )?));
+            }
+            fallback
+                .as_ref()
+                .expect("fallback regex is initialized above")
+                .clone()
+        };
         return scan_regex_matches(
             &shard.entity,
-            regex,
+            &regex,
             &shard.local_to_detector,
             haystack,
             buffer,
@@ -727,7 +736,11 @@ fn compile_literal_shard(
         matcher,
         case_insensitive,
         local_to_detector,
-        fallback_patterns,
+        fallback_patterns: if case_insensitive {
+            Some(fallback_patterns)
+        } else {
+            None
+        },
         fallback_regex: Mutex::new(None),
     })
 }
