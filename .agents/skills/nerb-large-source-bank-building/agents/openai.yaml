@@ -1,0 +1,4 @@
+interface:
+  display_name: "NERB Large-Source Bank Building"
+  short_description: "Build entity banks from large corpora"
+  default_prompt: "Use $nerb-large-source-bank-building to build a NERB entity bank from a large corpus."
