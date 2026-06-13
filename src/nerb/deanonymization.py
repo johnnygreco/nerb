@@ -631,8 +631,13 @@ def _raise_anonymize_error(
     message: str,
     diagnostics: Sequence[Diagnostic],
     options: _AnonymizeOptions,
+    *,
+    raw_error: BaseException | None = None,
 ) -> NoReturn:
-    raise DeanonymizationError(message, _sanitize_diagnostics(diagnostics, options))
+    error = DeanonymizationError(message, _sanitize_diagnostics(diagnostics, options))
+    if options.include_sensitive_metadata and raw_error is not None:
+        raise error from raw_error
+    raise error from None
 
 
 def _raise_extraction_error(exc: ExtractionError, options: _AnonymizeOptions) -> NoReturn:
@@ -1029,10 +1034,14 @@ def _anonymize_resolved_report(
     replacement_db: Mapping[str, Any],
     options: _AnonymizeOptions,
 ) -> dict[str, Any]:
+    db_error: DeanonymizationError | None = None
     try:
         current_db = _validate_replacement_db_for_allocation(replacement_db)
     except DeanonymizationError as exc:
-        _raise_anonymize_error("Replacement database is invalid.", exc.diagnostics, options)
+        db_error = exc
+    if db_error is not None:
+        _raise_anonymize_error("Replacement database is invalid.", db_error.diagnostics, options, raw_error=db_error)
+
     diagnostics = [
         _sanitize_diagnostic(cast(Diagnostic, dict(item)), options)
         for item in report.get("diagnostics", [])
@@ -1047,6 +1056,7 @@ def _anonymize_resolved_report(
         if not isinstance(resolved, Mapping) or not isinstance(resolved.get("record"), Mapping):
             continue
         record = cast(Mapping[str, Any], resolved["record"])
+        allocation_error: DeanonymizationError | None = None
         try:
             allocation = _allocate_assignment_with_policy(
                 record,
@@ -1056,7 +1066,14 @@ def _anonymize_resolved_report(
             )
             entity_id = _record_entity_id(record)
         except DeanonymizationError as exc:
-            _raise_anonymize_error("Anonymization assignment could not be allocated.", exc.diagnostics, options)
+            allocation_error = exc
+        if allocation_error is not None:
+            _raise_anonymize_error(
+                "Anonymization assignment could not be allocated.",
+                allocation_error.diagnostics,
+                options,
+                raw_error=allocation_error,
+            )
         current_db = allocation.replacement_db
         assignment_ref = _assignment_ref(allocation.assignment_key, assignment_refs)
 
@@ -1185,10 +1202,13 @@ def anonymize_text(
     if not isinstance(text, str):
         raise TypeError("anonymize_text text must be a string.")
     resolved_options = _resolve_anonymize_options(options)
+    extraction_error: ExtractionError | None = None
     try:
         report = extract_report(bank, text, options=resolved_options.extraction_options)
     except ExtractionError as exc:
-        _raise_extraction_error(exc, resolved_options)
+        extraction_error = exc
+    if extraction_error is not None:
+        _raise_extraction_error(extraction_error, resolved_options)
     return _anonymize_resolved_report(text, report, replacement_db, resolved_options)
 
 
@@ -1202,11 +1222,14 @@ def anonymize_file(
     """Anonymize a UTF-8 text file through the JSON-bank report resolver without writing output."""
     path = Path(file_path).expanduser()
     resolved_options = _resolve_anonymize_options(options)
+    extraction_error: ExtractionError | None = None
     try:
         extraction_options = resolve_extraction_options(resolved_options.extraction_options)
         text, byte_count = _read_utf8_file(path, max_bytes=extraction_options.max_text_bytes)
         report = dict(extract_report(bank, text, options=resolved_options.extraction_options))
     except ExtractionError as exc:
-        _raise_extraction_error(exc, resolved_options)
+        extraction_error = exc
+    if extraction_error is not None:
+        _raise_extraction_error(extraction_error, resolved_options)
     report["source"] = {"type": "file", "path": str(path), "length": len(text), "bytes": byte_count}
     return _anonymize_resolved_report(text, report, replacement_db, resolved_options)

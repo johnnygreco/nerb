@@ -758,6 +758,7 @@ def test_anonymize_text_sanitizes_bank_schema_diagnostics_by_default():
     assert "primary" not in diagnostics_repr
     assert "person" not in diagnostics_repr
     assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
     with pytest.raises(DeanonymizationError) as sensitive_info:
         anonymize_text(
@@ -823,3 +824,14 @@ def test_anonymize_text_sanitizes_replacement_policy_messages_by_default():
     assert exc_info.value.diagnostics[0]["code"] == "replacement_db.invalid_redaction_template"
     assert "SECRET_PERSON" not in diagnostics_repr
     assert exc_info.value.diagnostics[0]["message"] == "Diagnostic details are redacted by default."
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+
+    with pytest.raises(DeanonymizationError) as sensitive_info:
+        anonymize_text(
+            _person_bank(include_alias=False),
+            "John Smith",
+            db,
+            options={"mode": "pseudonym", "include_sensitive_metadata": True},
+        )
+    assert sensitive_info.value.__cause__ is not None
