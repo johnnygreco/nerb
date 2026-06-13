@@ -1649,6 +1649,64 @@ def test_cli_anonymize_text_requires_save_db_to_persist_assignments(tmp_path):
     assert "assignment_key" not in saved_result.output
 
 
+def test_cli_anonymize_config_text_saves_canonical_assignments(tmp_path):
+    config_path = save_config({"ARTIST": {"Miles Davis": r"Miles Davis|M\. Davis"}}, tmp_path / "entities.yaml")
+    db_path = tmp_path / "replacements.json"
+
+    init_result = runner.invoke(
+        app,
+        [
+            "replacement-db",
+            "init",
+            "--db",
+            str(db_path),
+            "--reversible",
+            "--assignment-scope",
+            "canonical",
+        ],
+    )
+    anonymized_result = runner.invoke(
+        app,
+        [
+            "anonymize-config-text",
+            "--config",
+            str(config_path),
+            "--db",
+            str(db_path),
+            "--text",
+            "Miles Davis met M. Davis.",
+            "--mode",
+            "redact",
+            "--save-db",
+        ],
+    )
+    deanonymized_result = runner.invoke(
+        app,
+        ["deanonymize-text", "--db", str(db_path), "--text", json.loads(anonymized_result.output)["text"]],
+    )
+
+    assert init_result.exit_code == 0
+    assert anonymized_result.exit_code == 0
+    assert deanonymized_result.exit_code == 0
+
+    anonymized_payload = json.loads(anonymized_result.output)
+    deanonymized_payload = json.loads(deanonymized_result.output)
+    first_token, second_token = anonymized_payload["text"].removesuffix(".").split(" met ")
+
+    assert first_token == second_token
+    assert anonymized_payload["replacement_db"]["saved"] is True
+    assert anonymized_payload["bank"] == {
+        "bank_ref": "b1",
+        "schema_version": "nerb.detector_config.v1",
+        "version": "1",
+    }
+    assert deanonymized_payload["text"] == "Miles Davis met Miles Davis."
+    assert len(load_replacement_db(db_path)["assignments"]) == 1
+    assert next(iter(load_replacement_db(db_path)["assignments"])).split("|")[1] == "canonical"
+    assert "Miles Davis" not in anonymized_result.output
+    assert "sha256:" not in anonymized_result.output
+
+
 def test_cli_anonymize_save_uses_single_helper_run(monkeypatch, tmp_path):
     bank_path = _write_json(tmp_path / "people.json", _person_json_bank())
     db_path = tmp_path / "replacements.json"

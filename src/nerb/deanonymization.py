@@ -11,10 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
+from .config import PatternConfig
 from .diagnostics import DIAGNOSTIC_ERROR, DIAGNOSTIC_WARNING, Diagnostic, diagnostic, has_errors
 from .engine import Bank
 from .engines import ExtractionError, resolve_extraction_options
-from .extraction import _read_utf8_file, extract_report
+from .extraction import _ensure_byte_limit, _file_source_metadata, _read_utf8_file, _text_size_bytes, extract_report
 from .replacements import (
     _effective_policy,
     _render_redaction_template,
@@ -24,6 +25,7 @@ from .replacements import (
 )
 from .replacements_schema import MAX_STORED_ORIGINAL_SURFACES
 from .schema import ID_RE, SCHEMA_VERSION, UNICODE_NORMALIZATION_VALUES, validate_bank_schema
+from .validation import rust_empty_match_diagnostics
 
 __all__ = [
     "AssignmentAllocation",
@@ -34,6 +36,8 @@ __all__ = [
     "AppliedByteEdit",
     "allocate_assignment",
     "anonymize_file",
+    "anonymize_config_file",
+    "anonymize_config_text",
     "anonymize_text",
     "apply_byte_replacements",
     "assignment_key",
@@ -46,6 +50,7 @@ __all__ = [
 
 ANONYMIZE_RESPONSE_SCHEMA_VERSION = "nerb.anonymize_response.v1"
 DEANONYMIZE_RESPONSE_SCHEMA_VERSION = "nerb.deanonymize_response.v1"
+CONFIG_BANK_SCHEMA_VERSION = "nerb.detector_config.v1"
 ANONYMIZE_MODES = {"entity_policy", "pseudonym", "redact"}
 ANONYMIZE_MISSING_ASSIGNMENT_POLICIES = {"diagnostic", "fail", "skip"}
 ANONYMIZE_OPTION_KEYS = {
@@ -1319,6 +1324,75 @@ def _anonymize_resolved_report(
     return _anonymize_resolved_run(text, report, replacement_db, options).response
 
 
+def _compile_config_bank_for_anonymize(
+    pattern_config: PatternConfig,
+    *,
+    selected_entity: str | None,
+    word_boundaries: bool,
+) -> Bank:
+    try:
+        bank = Bank.from_config(
+            pattern_config,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+        )
+    except ValueError as exc:
+        raise ExtractionError(
+            "Config-backed anonymization could not compile detector config.",
+            [
+                _error(
+                    "engine.compile_error",
+                    "/config",
+                    f"Config-backed anonymization could not compile detector config: {exc}",
+                )
+            ],
+        ) from exc
+    diagnostics = rust_empty_match_diagnostics(bank)
+    if diagnostics:
+        raise ExtractionError("Config-backed anonymization cannot use a zero-width detector.", diagnostics)
+    return bank
+
+
+def _config_bank_metadata(bank: Bank) -> dict[str, Any]:
+    metadata = bank.metadata()
+    return {
+        "schema_version": CONFIG_BANK_SCHEMA_VERSION,
+        "version": str(metadata.get("schema", "")),
+        "hash": metadata.get("bank_hash"),
+    }
+
+
+def _config_extraction_report(
+    pattern_config: PatternConfig,
+    text: str,
+    *,
+    source: Mapping[str, Any],
+    options: _AnonymizeOptions,
+    selected_entity: str | None,
+    word_boundaries: bool,
+    known_byte_count: int | None = None,
+) -> dict[str, Any]:
+    byte_count = _text_size_bytes(text) if known_byte_count is None else known_byte_count
+    extraction_options = resolve_extraction_options(options.extraction_options)
+    _ensure_byte_limit(byte_count, extraction_options.max_text_bytes)
+    bank = _compile_config_bank_for_anonymize(
+        pattern_config,
+        selected_entity=selected_entity,
+        word_boundaries=word_boundaries,
+    )
+    try:
+        records = bank.scan_text(text)
+    except ValueError as exc:
+        raise ExtractionError(f"Config-backed anonymization scan failed: {exc}.") from exc
+
+    return {
+        "bank": _config_bank_metadata(bank),
+        "source": dict(source),
+        "resolved_records": [{"record": record} for record in records],
+        "diagnostics": [],
+    }
+
+
 def _applied_replacement_payload(
     item: Mapping[str, Any],
     applied_edit: AppliedByteEdit,
@@ -1870,6 +1944,110 @@ def _anonymize_file_with_db_update(
     if extraction_error is not None:
         _raise_extraction_error(extraction_error, resolved_options)
     report["source"] = {"type": "file", "path": str(path), "length": len(text), "bytes": byte_count}
+    result = _anonymize_resolved_run(text, report, replacement_db, resolved_options)
+    return result.response, result.replacement_db
+
+
+def anonymize_config_text(
+    pattern_config: PatternConfig,
+    text: str,
+    replacement_db: Mapping[str, Any],
+    *,
+    selected_entity: str | None = None,
+    word_boundaries: bool = False,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Anonymize text matched by a YAML detector config without saving replacement DB changes."""
+    return _anonymize_config_text_with_db_update(
+        pattern_config,
+        text,
+        replacement_db,
+        selected_entity=selected_entity,
+        word_boundaries=word_boundaries,
+        options=options,
+    )[0]
+
+
+def _anonymize_config_text_with_db_update(
+    pattern_config: PatternConfig,
+    text: str,
+    replacement_db: Mapping[str, Any],
+    *,
+    selected_entity: str | None = None,
+    word_boundaries: bool = False,
+    options: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a config-backed anonymization response plus the updated replacement DB from one scan."""
+    if not isinstance(text, str):
+        raise TypeError("anonymize_config_text text must be a string.")
+    resolved_options = _resolve_anonymize_options(options)
+    extraction_error: ExtractionError | None = None
+    try:
+        report = _config_extraction_report(
+            pattern_config,
+            text,
+            source={"type": "text", "length": len(text), "bytes": _text_size_bytes(text)},
+            options=resolved_options,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+        )
+    except ExtractionError as exc:
+        extraction_error = exc
+    if extraction_error is not None:
+        _raise_extraction_error(extraction_error, resolved_options)
+    result = _anonymize_resolved_run(text, report, replacement_db, resolved_options)
+    return result.response, result.replacement_db
+
+
+def anonymize_config_file(
+    pattern_config: PatternConfig,
+    file_path: str | Path,
+    replacement_db: Mapping[str, Any],
+    *,
+    selected_entity: str | None = None,
+    word_boundaries: bool = False,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Anonymize a UTF-8 text file through a YAML detector config without writing output."""
+    return _anonymize_config_file_with_db_update(
+        pattern_config,
+        file_path,
+        replacement_db,
+        selected_entity=selected_entity,
+        word_boundaries=word_boundaries,
+        options=options,
+    )[0]
+
+
+def _anonymize_config_file_with_db_update(
+    pattern_config: PatternConfig,
+    file_path: str | Path,
+    replacement_db: Mapping[str, Any],
+    *,
+    selected_entity: str | None = None,
+    word_boundaries: bool = False,
+    options: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a config-backed file anonymization response plus the updated replacement DB from one file read."""
+    path = Path(file_path).expanduser()
+    resolved_options = _resolve_anonymize_options(options)
+    extraction_error: ExtractionError | None = None
+    try:
+        extraction_options = resolve_extraction_options(resolved_options.extraction_options)
+        text, byte_count = _read_utf8_file(path, max_bytes=extraction_options.max_text_bytes)
+        report = _config_extraction_report(
+            pattern_config,
+            text,
+            source=_file_source_metadata(path, text, byte_count),
+            options=resolved_options,
+            selected_entity=selected_entity,
+            word_boundaries=word_boundaries,
+            known_byte_count=byte_count,
+        )
+    except ExtractionError as exc:
+        extraction_error = exc
+    if extraction_error is not None:
+        _raise_extraction_error(extraction_error, resolved_options)
     result = _anonymize_resolved_run(text, report, replacement_db, resolved_options)
     return result.response, result.replacement_db
 
