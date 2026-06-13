@@ -39,7 +39,7 @@ from nerb import (
 )
 from nerb.cli import _extract_records, _read_extraction_source, app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
-from nerb.replacements import load_replacement_db
+from nerb.replacements import create_replacement_db, load_replacement_db
 
 runner = CliRunner()
 
@@ -147,6 +147,32 @@ def _person_json_bank() -> dict:
                 "metadata": {},
             }
         },
+        "metadata": {},
+    }
+
+
+def _replacement_assignment(
+    assignment_key: str,
+    *,
+    canonical: str,
+    token: str = "[PERSON_0001]",
+) -> dict:
+    fingerprint = assignment_key.split("|", 2)[2]
+    return {
+        "assignment_key": assignment_key,
+        "entity_id": "person",
+        "identity": {
+            "scope": "name",
+            "name_id": canonical.lower().replace(" ", "_"),
+            "canonical_name": canonical,
+            "fingerprint": fingerprint,
+        },
+        "original": {"canonical": canonical, "surfaces": [canonical]},
+        "replacement": {"mode": "redact", "value": token},
+        "redaction": {"token": token, "ordinal": 1},
+        "created_at": "2026-06-13T00:00:00Z",
+        "updated_at": "2026-06-13T00:00:00Z",
+        "use_count": 1,
         "metadata": {},
     }
 
@@ -1518,6 +1544,42 @@ def test_replacement_db_commands_manage_safe_summary(tmp_path):
     ]
 
 
+def test_replacement_db_validate_sanitizes_assignment_diagnostics_by_default(tmp_path):
+    db_path = tmp_path / "replacements.json"
+    first_key = f"person|name|sha256:{'a' * 64}"
+    second_key = f"person|name|sha256:{'b' * 64}"
+    replacement_db = create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z")
+    replacement_db["assignments"] = {
+        first_key: _replacement_assignment(first_key, canonical="John Smith"),
+        second_key: _replacement_assignment(second_key, canonical="Jane Smith"),
+    }
+    _write_json(db_path, replacement_db)
+
+    result = runner.invoke(app, ["replacement-db", "validate", "--db", str(db_path)])
+    sensitive_result = runner.invoke(
+        app,
+        ["replacement-db", "validate", "--db", str(db_path), "--include-sensitive-metadata"],
+    )
+
+    assert result.exit_code == 0
+    assert sensitive_result.exit_code == 0
+    payload = json.loads(result.output)
+    sensitive_payload = json.loads(sensitive_result.output)
+
+    assert payload["valid"] is False
+    assert payload["diagnostics"][0]["path"] == "/assignments"
+    assert payload["diagnostics"][0]["message"] == "Assignment diagnostic details are redacted by default."
+    assert first_key not in result.output
+    assert second_key not in result.output
+    assert "sha256:" not in result.output
+    assert "first_assignment_key" not in result.output
+    assert "John Smith" not in result.output
+    assert "Jane Smith" not in result.output
+    assert "[PERSON_0001]" not in result.output
+    assert first_key in sensitive_result.output
+    assert sensitive_payload["diagnostics"][0]["metadata"]["first_assignment_key"] == first_key
+
+
 def test_cli_anonymize_text_requires_save_db_to_persist_assignments(tmp_path):
     bank_path = _write_json(tmp_path / "people.json", _person_json_bank())
     db_path = tmp_path / "replacements.json"
@@ -1577,6 +1639,7 @@ def test_cli_anonymize_text_requires_save_db_to_persist_assignments(tmp_path):
     assert saved_payload["replacement_db"]["modified"] is True
     assert saved_payload["replacement_db"]["saved"] is True
     assert saved_payload["replacement_db"]["version"] == 2
+    assert "replacement" not in saved_payload["applied_replacements"][0]
     assert len(load_replacement_db(db_path)["assignments"]) == 1
 
     assert deanonymized_payload["schema_version"] == "nerb.deanonymize_response.v1"
@@ -1584,6 +1647,61 @@ def test_cli_anonymize_text_requires_save_db_to_persist_assignments(tmp_path):
     assert deanonymized_payload["summary"]["applied_count"] == 1
     assert "John Smith" not in saved_result.output
     assert "assignment_key" not in saved_result.output
+
+
+def test_cli_anonymize_save_uses_single_helper_run(monkeypatch, tmp_path):
+    bank_path = _write_json(tmp_path / "people.json", _person_json_bank())
+    db_path = tmp_path / "replacements.json"
+    calls = []
+
+    assert runner.invoke(app, ["replacement-db", "init", "--db", str(db_path), "--reversible"]).exit_code == 0
+
+    def fake_anonymize_text_with_update(bank, text, replacement_db, *, options=None):
+        calls.append({"text": text, "options": dict(options or {})})
+        updated_db = json.loads(json.dumps(replacement_db))
+        return (
+            {
+                "schema_version": "nerb.anonymize_response.v1",
+                "bank": {"bank_ref": "b1"},
+                "replacement_db": {
+                    "replacement_db_ref": "rdb1",
+                    "schema_version": replacement_db["schema_version"],
+                    "version": replacement_db["version"],
+                    "modified": True,
+                    "saved": False,
+                },
+                "source": {"type": "text", "length": len(text), "bytes": len(text.encode("utf-8"))},
+                "text": "[PERSON_0001] joined.",
+                "applied_replacements": [],
+                "summary": {"record_count": 1, "applied_count": 1, "diagnostic_count": 0},
+                "diagnostics": [],
+            },
+            updated_db,
+        )
+
+    monkeypatch.setattr(cli_module, "_anonymize_text_with_db_update", fake_anonymize_text_with_update)
+
+    result = runner.invoke(
+        app,
+        [
+            "anonymize-text",
+            "--bank",
+            str(bank_path),
+            "--db",
+            str(db_path),
+            "--text",
+            "John Smith joined.",
+            "--mode",
+            "redact",
+            "--save-db",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["options"]["include_sensitive_metadata"] is False
+    assert json.loads(result.output)["replacement_db"]["saved"] is True
+    assert load_replacement_db(db_path)["version"] == 2
 
 
 def test_cli_pseudonym_workflow_requires_restore_pseudonyms(tmp_path):
@@ -1643,6 +1761,21 @@ def test_cli_pseudonym_workflow_requires_restore_pseudonyms(tmp_path):
             "--save-db",
         ],
     )
+    sensitive_anonymized_result = runner.invoke(
+        app,
+        [
+            "anonymize-text",
+            "--bank",
+            str(bank_path),
+            "--db",
+            str(db_path),
+            "--text",
+            "John Smith joined.",
+            "--mode",
+            "pseudonym",
+            "--include-sensitive-metadata",
+        ],
+    )
     default_deanonymized_result = runner.invoke(
         app,
         ["deanonymize-text", "--db", str(db_path), "--text", "Mikey Law joined."],
@@ -1661,15 +1794,19 @@ def test_cli_pseudonym_workflow_requires_restore_pseudonyms(tmp_path):
     )
 
     assert anonymized_result.exit_code == 0
+    assert sensitive_anonymized_result.exit_code == 0
     assert default_deanonymized_result.exit_code == 0
     assert opt_in_deanonymized_result.exit_code == 0
 
     anonymized_payload = json.loads(anonymized_result.output)
+    sensitive_payload = json.loads(sensitive_anonymized_result.output)
     default_payload = json.loads(default_deanonymized_result.output)
     opt_in_payload = json.loads(opt_in_deanonymized_result.output)
 
     assert anonymized_payload["text"] == "Mikey Law joined."
     assert anonymized_payload["replacement_db"]["saved"] is True
+    assert "replacement" not in anonymized_payload["applied_replacements"][0]
+    assert sensitive_payload["applied_replacements"][0]["replacement"] == "Mikey Law"
     assert default_payload["text"] == "Mikey Law joined."
     assert default_payload["applied_restorations"] == []
     assert opt_in_payload["text"] == "John Smith joined."
@@ -1762,3 +1899,36 @@ def test_cli_file_outputs_refuse_overwrite_without_force(tmp_path):
 
     assert forced_result.exit_code == 0
     assert output_path.read_text(encoding="utf-8") == "[PERSON_0001] joined."
+
+
+def test_cli_anonymize_file_rejects_non_directory_output_parent_before_saving(tmp_path):
+    bank_path = _write_json(tmp_path / "people.json", _person_json_bank())
+    db_path = tmp_path / "replacements.json"
+    input_path = tmp_path / "input.txt"
+    parent_path = tmp_path / "not-a-directory"
+    output_path = parent_path / "output.txt"
+    input_path.write_text("John Smith joined.", encoding="utf-8")
+    parent_path.write_text("not a directory", encoding="utf-8")
+
+    assert runner.invoke(app, ["replacement-db", "init", "--db", str(db_path), "--reversible"]).exit_code == 0
+    result = runner.invoke(
+        app,
+        [
+            "anonymize-file",
+            "--bank",
+            str(bank_path),
+            "--db",
+            str(db_path),
+            "--file",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--mode",
+            "redact",
+            "--save-db",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert f"Output parent path is not a directory: {parent_path}" in result.output
+    assert load_replacement_db(db_path)["assignments"] == {}

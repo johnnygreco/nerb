@@ -39,9 +39,7 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
-from .deanonymization import DeanonymizationError
-from .deanonymization import anonymize_file as _anonymize_file
-from .deanonymization import anonymize_text as _anonymize_text
+from .deanonymization import DeanonymizationError, _anonymize_file_with_db_update, _anonymize_text_with_db_update
 from .deanonymization import deanonymize_file as _deanonymize_file
 from .deanonymization import deanonymize_text as _deanonymize_text
 from .deanonymization import finalize_replacement_db_update as _finalize_replacement_db_update
@@ -311,23 +309,127 @@ def _run_json_helper(action: Any) -> dict[str, Any]:
 
 def _load_replacement_db_for_command(
     db_path: Path,
+    *,
+    include_sensitive_metadata: bool = False,
 ) -> tuple[dict[str, Any] | None, Path, dict[str, Any] | None]:
     path = db_path.expanduser()
     try:
         return load_replacement_db(path), path, None
     except ReplacementDbError as exc:
-        return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        return (
+            None,
+            path,
+            _replacement_db_diagnostic_payload(
+                str(exc),
+                exc.diagnostics,
+                path=path,
+                include_sensitive_metadata=include_sensitive_metadata,
+            ),
+        )
 
 
-def _validate_replacement_db_file_payload(db_path: Path) -> dict[str, Any]:
+def _validate_replacement_db_file_payload(
+    db_path: Path,
+    *,
+    include_sensitive_metadata: bool = False,
+) -> dict[str, Any]:
     path = db_path.expanduser()
     try:
         raw_db = read_replacement_db_json(path)
     except ReplacementDbError as exc:
-        return _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+        return _replacement_db_diagnostic_payload(
+            str(exc),
+            exc.diagnostics,
+            path=path,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
 
     payload = validate_replacement_db(raw_db)
-    return {"valid": payload["valid"], "path": str(path), "diagnostics": payload["diagnostics"]}
+    return {
+        "valid": payload["valid"],
+        "path": str(path),
+        "diagnostics": _sanitize_replacement_db_diagnostics(
+            payload["diagnostics"],
+            include_sensitive_metadata=include_sensitive_metadata,
+        ),
+    }
+
+
+def _replacement_db_diagnostic_payload(
+    message: str,
+    diagnostics: list[dict[str, Any]],
+    *,
+    path: Path | None = None,
+    include_sensitive_metadata: bool = False,
+) -> dict[str, Any]:
+    return _diagnostic_payload(
+        message if include_sensitive_metadata else "Replacement database command failed.",
+        _sanitize_replacement_db_diagnostics(
+            diagnostics,
+            include_sensitive_metadata=include_sensitive_metadata,
+        ),
+        path=path,
+    )
+
+
+def _sanitize_replacement_db_diagnostics(
+    diagnostics: list[dict[str, Any]],
+    *,
+    include_sensitive_metadata: bool = False,
+) -> list[dict[str, Any]]:
+    if include_sensitive_metadata:
+        return [dict(item) for item in diagnostics]
+
+    return [_sanitize_replacement_db_diagnostic(item) for item in diagnostics]
+
+
+def _sanitize_replacement_db_diagnostic(item: Mapping[str, Any]) -> dict[str, Any]:
+    sanitized = {key: copy_json_value(value) for key, value in item.items() if key != "metadata"}
+    original_path = sanitized.get("path")
+    if isinstance(original_path, str):
+        sanitized["path"] = _redacted_replacement_db_diagnostic_path(original_path)
+    code = sanitized.get("code")
+    if isinstance(code, str) and _replacement_db_diagnostic_message_may_be_sensitive(code):
+        sanitized["message"] = _safe_replacement_db_diagnostic_message(str(sanitized.get("path", "")))
+
+    metadata = item.get("metadata")
+    if isinstance(metadata, Mapping):
+        safe_metadata = {
+            str(key): copy_json_value(value)
+            for key, value in metadata.items()
+            if key in {"bytes", "limit", "first_index", "current_version", "candidate_version"}
+        }
+        if safe_metadata:
+            sanitized["metadata"] = safe_metadata
+    return sanitized
+
+
+def copy_json_value(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _redacted_replacement_db_diagnostic_path(path: str) -> str:
+    if path.startswith("/assignments"):
+        return "/assignments"
+    if path.startswith("/replacement_sets"):
+        return "/replacement_sets"
+    if path.startswith("/entities"):
+        return "/entities"
+    return path
+
+
+def _replacement_db_diagnostic_message_may_be_sensitive(code: str) -> bool:
+    return code.startswith(("replacement_db.", "schema.", "id.", "metadata."))
+
+
+def _safe_replacement_db_diagnostic_message(path: str) -> str:
+    if path == "/assignments":
+        return "Assignment diagnostic details are redacted by default."
+    if path == "/replacement_sets":
+        return "Replacement set diagnostic details are redacted by default."
+    if path == "/entities":
+        return "Entity policy diagnostic details are redacted by default."
+    return "Replacement database diagnostic details are redacted by default."
 
 
 def _ensure_replacement_id(value: str, label: str) -> str:
@@ -350,9 +452,11 @@ def _save_replacement_db_change(
     *,
     expected_hash: str,
     expected_version: int,
+    include_sensitive_metadata: bool = False,
 ) -> dict[str, Any] | None:
     finalized = _run_json_helper(lambda: _finalize_replacement_db_update(replacement_db, base_version=expected_version))
     if finalized.get("valid") is False:
+        _sanitize_replacement_db_error_payload(finalized, include_sensitive_metadata=include_sensitive_metadata)
         return finalized
     save_payload = _run_json_helper(
         lambda: {
@@ -367,8 +471,24 @@ def _save_replacement_db_change(
         }
     )
     if save_payload.get("valid") is False:
+        _sanitize_replacement_db_error_payload(save_payload, include_sensitive_metadata=include_sensitive_metadata)
         return save_payload
     return None
+
+
+def _sanitize_replacement_db_error_payload(
+    payload: dict[str, Any],
+    *,
+    include_sensitive_metadata: bool,
+) -> None:
+    diagnostics = payload.get("diagnostics")
+    if isinstance(diagnostics, list):
+        payload["diagnostics"] = _sanitize_replacement_db_diagnostics(
+            diagnostics,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+    if not include_sensitive_metadata:
+        payload["error"] = "Replacement database command failed."
 
 
 def _safe_replacement_db_summary(
@@ -512,24 +632,34 @@ def _saved_anonymize_payload(
     options: Mapping[str, Any],
     save_db: bool,
 ) -> dict[str, Any]:
-    payload = _run_json_helper(lambda: action(options))
-    if payload.get("valid") is False or payload.get("schema_version") != "nerb.anonymize_response.v1":
-        return payload
+    run_payload = _run_json_helper(lambda: _anonymize_run_payload(action, options))
+    if run_payload.get("valid") is False:
+        return run_payload
+
+    payload = run_payload.get("response")
+    updated_db = run_payload.get("updated_replacement_db")
+    if not isinstance(payload, dict) or payload.get("schema_version") != "nerb.anonymize_response.v1":
+        return _diagnostic_payload(
+            "Anonymization did not return a valid response for saving.",
+            [
+                {
+                    "severity": DIAGNOSTIC_ERROR,
+                    "code": "replacement_db.save_error",
+                    "path": "/replacement_db",
+                    "message": "Anonymization did not return a valid response for saving.",
+                }
+            ],
+            path=db_path,
+        )
+    _sanitize_anonymize_cli_payload(
+        payload,
+        include_sensitive_metadata=bool(options.get("include_sensitive_metadata")),
+    )
 
     replacement_db_metadata = payload.get("replacement_db", {})
     modified = bool(replacement_db_metadata.get("modified")) if isinstance(replacement_db_metadata, Mapping) else False
     if not save_db or not modified:
         return payload
-
-    if options.get("include_sensitive_metadata") is True and isinstance(replacement_db_metadata, Mapping):
-        updated_db = replacement_db_metadata.get("data")
-    else:
-        sensitive_options = dict(options)
-        sensitive_options["include_sensitive_metadata"] = True
-        sensitive_payload = _run_json_helper(lambda: action(sensitive_options))
-        if sensitive_payload.get("valid") is False:
-            return sensitive_payload
-        updated_db = sensitive_payload.get("replacement_db", {}).get("data")
 
     if not isinstance(updated_db, Mapping):
         return _diagnostic_payload(
@@ -550,6 +680,7 @@ def _saved_anonymize_payload(
         db_path,
         expected_hash=base_hash,
         expected_version=base_version,
+        include_sensitive_metadata=bool(options.get("include_sensitive_metadata")),
     )
     if save_error is not None:
         return save_error
@@ -568,6 +699,26 @@ def _saved_anonymize_payload(
     return payload
 
 
+def _sanitize_anonymize_cli_payload(
+    payload: dict[str, Any],
+    *,
+    include_sensitive_metadata: bool,
+) -> None:
+    if include_sensitive_metadata:
+        return
+    applied_replacements = payload.get("applied_replacements")
+    if not isinstance(applied_replacements, list):
+        return
+    for item in applied_replacements:
+        if isinstance(item, dict):
+            item.pop("replacement", None)
+
+
+def _anonymize_run_payload(action: Any, options: Mapping[str, Any]) -> dict[str, Any]:
+    response, updated_replacement_db = action(options)
+    return {"response": response, "updated_replacement_db": updated_replacement_db}
+
+
 def _write_output_text(output_path: Path, text: str, *, force: bool) -> None:
     path = _ensure_output_writable(output_path, force=force)
     try:
@@ -583,6 +734,12 @@ def _ensure_output_writable(output_path: Path, *, force: bool) -> Path:
         _exit_error(f"Output file already exists at {path}; use --force to overwrite it.")
     if path.exists() and not path.is_file():
         _exit_error(f"Output path is not a file: {path}.")
+    if path.parent.exists() and not path.parent.is_dir():
+        _exit_error(f"Output parent path is not a directory: {path.parent}.")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _exit_error(f"Could not prepare output parent at {path.parent}: {exc}")
     return path
 
 
@@ -1419,6 +1576,7 @@ def init_replacement_db(
         }
     )
     if payload.get("valid") is False:
+        _sanitize_replacement_db_error_payload(payload, include_sensitive_metadata=False)
         _echo_json(payload)
         return
     saved = load_replacement_db(path)
@@ -1428,9 +1586,19 @@ def init_replacement_db(
 @replacement_db_app.command("validate")
 def validate_replacement_db_command(
     db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include raw diagnostic paths and metadata.",
+    ),
 ) -> None:
     """Validate a replacement database and print JSON diagnostics."""
-    _echo_json(_validate_replacement_db_file_payload(db_path))
+    _echo_json(
+        _validate_replacement_db_file_payload(
+            db_path,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+    )
 
 
 @replacement_db_app.command("list")
@@ -1445,7 +1613,10 @@ def list_replacement_db_command(
     ),
 ) -> None:
     """Print a privacy-safe replacement database summary."""
-    replacement_db, path, invalid_payload = _load_replacement_db_for_command(db_path)
+    replacement_db, path, invalid_payload = _load_replacement_db_for_command(
+        db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
     if invalid_payload is not None:
         _echo_json(invalid_payload)
         return
@@ -1480,7 +1651,7 @@ def add_replacement_set(
     try:
         replacement_db, expected_hash, expected_version = _current_replacement_db_state(path)
     except ReplacementDbError as exc:
-        _echo_json(_diagnostic_payload(str(exc), exc.diagnostics, path=path))
+        _echo_json(_replacement_db_diagnostic_payload(str(exc), exc.diagnostics, path=path))
         return
     updated_db = json.loads(json.dumps(replacement_db))
     replacement_sets = updated_db.setdefault("replacement_sets", {})
@@ -1552,7 +1723,7 @@ def set_replacement_entity_policy(
     try:
         replacement_db, expected_hash, expected_version = _current_replacement_db_state(path)
     except ReplacementDbError as exc:
-        _echo_json(_diagnostic_payload(str(exc), exc.diagnostics, path=path))
+        _echo_json(_replacement_db_diagnostic_payload(str(exc), exc.diagnostics, path=path))
         return
     updated_db = json.loads(json.dumps(replacement_db))
     existing_policy = updated_db.setdefault("entities", {}).get(entity, {})
@@ -1764,7 +1935,10 @@ def anonymize_json_bank_text(
         return
     if bank is None:
         _exit_error(f"Could not load bank at {bank_path}.")
-    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(
+        db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
     if invalid_db_payload is not None:
         _echo_json(invalid_db_payload)
         return
@@ -1782,7 +1956,12 @@ def anonymize_json_bank_text(
     base_hash = hash_replacement_db(replacement_db)
     base_version = int(replacement_db["version"])
     payload = _saved_anonymize_payload(
-        lambda resolved_options: _anonymize_text(bank, source_text, replacement_db, options=resolved_options),
+        lambda resolved_options: _anonymize_text_with_db_update(
+            bank,
+            source_text,
+            replacement_db,
+            options=resolved_options,
+        ),
         db_path=path,
         base_hash=base_hash,
         base_version=base_version,
@@ -1821,7 +2000,10 @@ def anonymize_json_bank_file(
         return
     if bank is None:
         _exit_error(f"Could not load bank at {bank_path}.")
-    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(
+        db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
     if invalid_db_payload is not None:
         _echo_json(invalid_db_payload)
         return
@@ -1841,7 +2023,12 @@ def anonymize_json_bank_file(
     base_hash = hash_replacement_db(replacement_db)
     base_version = int(replacement_db["version"])
     payload = _saved_anonymize_payload(
-        lambda resolved_options: _anonymize_file(bank, document_path, replacement_db, options=resolved_options),
+        lambda resolved_options: _anonymize_file_with_db_update(
+            bank,
+            document_path,
+            replacement_db,
+            options=resolved_options,
+        ),
         db_path=path,
         base_hash=base_hash,
         base_version=base_version,
@@ -1881,7 +2068,10 @@ def deanonymize_json_bank_text(
     max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
 ) -> None:
     """Restore redaction tokens, and optionally pseudonyms, from text."""
-    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(
+        db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
     if invalid_db_payload is not None:
         _echo_json(invalid_db_payload)
         return
@@ -1924,7 +2114,10 @@ def deanonymize_json_bank_file(
     max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
 ) -> None:
     """Restore redaction tokens, and optionally pseudonyms, from a file."""
-    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(
+        db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
     if invalid_db_payload is not None:
         _echo_json(invalid_db_payload)
         return
