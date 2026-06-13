@@ -38,7 +38,21 @@ from .config import (
 from .config import (
     load_config as load_pattern_config,
 )
-from .diagnostics import JSON_PARSE
+from .deanonymization import (
+    DeanonymizationError,
+    _anonymize_file_with_db_update,
+    _anonymize_text_with_db_update,
+)
+from .deanonymization import (
+    deanonymize_file as _deanonymize_file,
+)
+from .deanonymization import (
+    deanonymize_text as _deanonymize_text,
+)
+from .deanonymization import (
+    finalize_replacement_db_update as _finalize_replacement_db_update,
+)
+from .diagnostics import DIAGNOSTIC_ERROR, JSON_PARSE
 from .diff import diff_banks as _diff_banks
 from .engine import Bank
 from .engine import bank_cache_info as _bank_cache_info
@@ -68,6 +82,25 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
+from .replacements import ReplacementDbError
+from .replacements import (
+    create_replacement_db as _create_replacement_db,
+)
+from .replacements import (
+    hash_replacement_db as _hash_replacement_db,
+)
+from .replacements import (
+    load_replacement_db as _load_replacement_db,
+)
+from .replacements import (
+    sanitize_replacement_db_diagnostics as _sanitize_replacement_db_diagnostics,
+)
+from .replacements import (
+    save_replacement_db as _save_replacement_db,
+)
+from .replacements import (
+    validate_replacement_db as _validate_replacement_db,
+)
 from .validation import rust_empty_match_diagnostics
 from .validation import validate_bank as _validate_bank
 
@@ -283,13 +316,346 @@ def _invalid_bank_payloads_payload(payloads: Mapping[str, dict[str, Any] | None]
 def _run_json_tool(action: Any) -> dict[str, Any]:
     try:
         return action()
-    except (ExtractionError, BankError) as exc:
+    except (ExtractionError, BankError, DeanonymizationError, ReplacementDbError) as exc:
         diagnostics = getattr(exc, "diagnostics", [])
         if diagnostics:
             return _diagnostic_payload(str(exc), diagnostics)
         _raise_tool_error(str(exc))
     except (TypeError, ValueError) as exc:
+        diagnostics = getattr(exc, "diagnostics", [])
+        if diagnostics:
+            return _diagnostic_payload(str(exc), diagnostics)
         _raise_tool_error(str(exc))
+
+
+def _replacement_db_diagnostic_payload(
+    message: str,
+    diagnostics: list[dict[str, Any]],
+    *,
+    path: Path | None = None,
+    include_sensitive_metadata: bool = False,
+) -> dict[str, Any]:
+    return _diagnostic_payload(
+        message if include_sensitive_metadata else "Replacement database command failed.",
+        _sanitize_replacement_db_diagnostics(
+            diagnostics,
+            include_sensitive_metadata=include_sensitive_metadata,
+        ),
+        path=path,
+    )
+
+
+def _replacement_db_stale_write_payload(
+    path: Path,
+    *,
+    include_sensitive_metadata: bool = False,
+) -> dict[str, Any]:
+    diagnostic = {
+        "severity": DIAGNOSTIC_ERROR,
+        "code": "replacement_db.stale_write",
+        "path": "",
+        "message": "Existing replacement database destinations require expected_hash or expected_version.",
+    }
+    return _replacement_db_diagnostic_payload(
+        f"Replacement database {str(path)!r} already exists.",
+        [diagnostic],
+        path=path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+
+
+def _tool_bool_option(options: Mapping[str, Any], key: str, default: bool = False) -> bool:
+    value = options.get(key, default)
+    if not isinstance(value, bool):
+        _raise_tool_error(f"options.{key} must be a boolean.")
+    return value
+
+
+def _tool_string_option(options: Mapping[str, Any], key: str) -> str | None:
+    value = options.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        _raise_tool_error(f"options.{key} must be a non-empty string.")
+    return value
+
+
+def _tool_int_option(options: Mapping[str, Any], key: str) -> int | None:
+    value = options.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        _raise_tool_error(f"options.{key} must be an integer.")
+    return value
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+
+
+def _replacement_db_version(replacement_db: Mapping[str, Any]) -> int:
+    version = replacement_db.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        _raise_tool_error("Replacement database version must be an integer.")
+    return version
+
+
+def _replacement_db_metadata(
+    replacement_db: Mapping[str, Any],
+    *,
+    path: Path | None = None,
+    saved: bool | None = None,
+    include_sensitive_metadata: bool = False,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "replacement_db_ref": "rdb1",
+        "schema_version": replacement_db.get("schema_version"),
+        "version": replacement_db.get("version"),
+    }
+    if path is not None:
+        payload["path"] = str(path)
+    if saved is not None:
+        payload["saved"] = saved
+    if include_sensitive_metadata:
+        payload["id"] = replacement_db.get("id")
+        payload["hash"] = _hash_replacement_db(replacement_db)
+    return payload
+
+
+def _validate_replacement_db_payload(
+    replacement_db: Any,
+    *,
+    path: Path | None = None,
+    include_sensitive_metadata: bool = False,
+) -> dict[str, Any]:
+    result = _validate_replacement_db(replacement_db)
+    payload: dict[str, Any] = {
+        "valid": result["valid"],
+        "diagnostics": _sanitize_replacement_db_diagnostics(
+            result["diagnostics"],
+            include_sensitive_metadata=include_sensitive_metadata,
+        ),
+    }
+    if path is not None:
+        payload["path"] = str(path)
+    if isinstance(replacement_db, Mapping):
+        payload["replacement_db"] = _replacement_db_metadata(
+            replacement_db,
+            path=path,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+    return payload
+
+
+def _resolve_replacement_db_source(
+    replacement_db: Any | None,
+    replacement_db_path: str | None,
+    *,
+    include_sensitive_metadata: bool = False,
+) -> tuple[Mapping[str, Any] | None, Path | None, dict[str, Any] | None]:
+    has_db = replacement_db is not None
+    has_db_path = replacement_db_path is not None
+    if has_db == has_db_path:
+        _raise_tool_error("Provide exactly one replacement database source: replacement_db or replacement_db_path.")
+
+    if replacement_db_path is not None:
+        path = Path(replacement_db_path).expanduser()
+        try:
+            return _load_replacement_db(path), path, None
+        except ReplacementDbError as exc:
+            return (
+                None,
+                path,
+                _replacement_db_diagnostic_payload(
+                    str(exc),
+                    exc.diagnostics,
+                    path=path,
+                    include_sensitive_metadata=include_sensitive_metadata,
+                ),
+            )
+
+    if not isinstance(replacement_db, Mapping):
+        return (
+            None,
+            None,
+            _validate_replacement_db_payload(
+                replacement_db,
+                include_sensitive_metadata=include_sensitive_metadata,
+            ),
+        )
+
+    validation = _validate_replacement_db_payload(
+        replacement_db,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if validation["valid"] is False:
+        return None, None, validation
+    return replacement_db, None, None
+
+
+def _save_options(options: Mapping[str, Any] | None) -> tuple[dict[str, Any], bool, str | None, int | None, bool]:
+    resolved = _options_mapping(options)
+    save = _tool_bool_option(resolved, "save", False)
+    expected_hash = _tool_string_option(resolved, "expected_hash")
+    expected_version = _tool_int_option(resolved, "expected_version")
+    include_sensitive_metadata = _tool_bool_option(resolved, "include_sensitive_metadata", False)
+    return resolved, save, expected_hash, expected_version, include_sensitive_metadata
+
+
+def _operation_options(options: Mapping[str, Any]) -> dict[str, Any]:
+    operation_options = dict(options)
+    operation_options.pop("save", None)
+    operation_options.pop("expected_hash", None)
+    operation_options.pop("expected_version", None)
+    return operation_options
+
+
+def _save_replacement_db_for_tool(
+    replacement_db: Mapping[str, Any],
+    save_db_path: str,
+    *,
+    options: Mapping[str, Any] | None = None,
+    source_path: Path | None = None,
+    source_hash: str | None = None,
+    source_version: int | None = None,
+) -> dict[str, Any]:
+    if not save_db_path:
+        _raise_tool_error("save_db_path must be a non-empty string.")
+
+    save_path = Path(save_db_path).expanduser()
+    resolved_options, _save, expected_hash, expected_version, include_sensitive_metadata = _save_options(options)
+    if save_path.is_file() and expected_hash is None and expected_version is None:
+        if source_path is not None and _same_path(source_path, save_path):
+            expected_hash = source_hash
+            expected_version = source_version
+        else:
+            return _replacement_db_stale_write_payload(
+                save_path,
+                include_sensitive_metadata=include_sensitive_metadata,
+            )
+
+    try:
+        saved_path = _save_replacement_db(
+            replacement_db,
+            save_path,
+            expected_hash=expected_hash,
+            expected_version=expected_version,
+        )
+        saved_db = _load_replacement_db(saved_path)
+    except ReplacementDbError as exc:
+        return _replacement_db_diagnostic_payload(
+            str(exc),
+            exc.diagnostics,
+            path=save_path,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+
+    return {
+        "saved": True,
+        "path": str(saved_path),
+        "replacement_db": _replacement_db_metadata(
+            saved_db,
+            path=saved_path,
+            saved=True,
+            include_sensitive_metadata=include_sensitive_metadata,
+        ),
+        "diagnostics": [],
+        "options": {
+            "expected_hash": expected_hash,
+            "expected_version": expected_version,
+            "save": bool(resolved_options.get("save", False)),
+        },
+    }
+
+
+def _sanitize_anonymize_tool_payload(
+    payload: dict[str, Any],
+    *,
+    include_sensitive_metadata: bool,
+) -> None:
+    if include_sensitive_metadata:
+        return
+    applied_replacements = payload.get("applied_replacements")
+    if not isinstance(applied_replacements, list):
+        return
+    for item in applied_replacements:
+        if isinstance(item, dict):
+            item.pop("replacement", None)
+
+
+def _saved_anonymize_payload_for_tool(
+    action: Any,
+    replacement_db: Mapping[str, Any],
+    *,
+    replacement_db_path: Path | None,
+    save_db_path: str | None,
+    options: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    resolved_options, save, _expected_hash, _expected_version, include_sensitive_metadata = _save_options(options)
+    if save and save_db_path is None:
+        _raise_tool_error("options.save requires save_db_path.")
+    if save_db_path is not None and not save:
+        _raise_tool_error("save_db_path writes require options.save to be true.")
+
+    operation_options = _operation_options(resolved_options)
+    base_hash = _hash_replacement_db(replacement_db)
+    base_version = _replacement_db_version(replacement_db)
+    response, updated_db = action(operation_options)
+    _sanitize_anonymize_tool_payload(response, include_sensitive_metadata=include_sensitive_metadata)
+
+    replacement_db_metadata = response.get("replacement_db", {})
+    modified = bool(replacement_db_metadata.get("modified")) if isinstance(replacement_db_metadata, Mapping) else False
+    if not save or not modified:
+        return response
+
+    if not isinstance(updated_db, Mapping):
+        return _diagnostic_payload(
+            "Anonymization did not return an updated replacement database for saving.",
+            [
+                {
+                    "severity": DIAGNOSTIC_ERROR,
+                    "code": "replacement_db.save_error",
+                    "path": "/replacement_db",
+                    "message": "Anonymization did not return an updated replacement database for saving.",
+                }
+            ],
+        )
+
+    try:
+        finalized = _finalize_replacement_db_update(updated_db, base_version=base_version)
+    except DeanonymizationError as exc:
+        return _replacement_db_diagnostic_payload(
+            str(exc),
+            exc.diagnostics,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+
+    if save_db_path is None:
+        _raise_tool_error("options.save requires save_db_path.")
+    save_result = _save_replacement_db_for_tool(
+        finalized,
+        save_db_path,
+        options=resolved_options,
+        source_path=replacement_db_path,
+        source_hash=base_hash,
+        source_version=base_version,
+    )
+    if save_result.get("saved") is not True:
+        return save_result
+
+    saved_db = _load_replacement_db(str(save_db_path))
+    if isinstance(replacement_db_metadata, dict):
+        replacement_db_metadata["version"] = saved_db.get("version")
+        replacement_db_metadata["saved"] = True
+        if include_sensitive_metadata:
+            replacement_db_metadata["data"] = saved_db
+            replacement_db_metadata["hash"] = _hash_replacement_db(saved_db)
+            replacement_db_metadata["id"] = saved_db.get("id")
+        else:
+            replacement_db_metadata.pop("data", None)
+            replacement_db_metadata.pop("hash", None)
+            replacement_db_metadata.pop("id", None)
+    return response
 
 
 def _tool_config_path(config_path: str) -> Path:
@@ -441,6 +807,237 @@ def _mutation_response(action: str, path: Path, config: PatternConfig, entity: s
         "name": name,
         **_config_summary(config),
     }
+
+
+@mcp.tool()
+def create_replacement_db(
+    db_id: str = "replacements",
+    description: str = "",
+    reversible: bool = False,
+    store_originals: bool | None = None,
+) -> dict[str, Any]:
+    """Create an unsaved replacement database object without filesystem writes."""
+    return {
+        "saved": False,
+        "replacement_db": _create_replacement_db(
+            db_id=db_id,
+            description=description,
+            reversible=reversible,
+            store_originals=store_originals,
+        ),
+    }
+
+
+@mcp.tool()
+def validate_replacement_db(
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a replacement database from a direct object or explicit replacement_db_path."""
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+
+    if replacement_db_path is not None and replacement_db is not None:
+        _raise_tool_error("Provide exactly one replacement database source: replacement_db or replacement_db_path.")
+    if replacement_db_path is None and replacement_db is None:
+        _raise_tool_error("Provide exactly one replacement database source: replacement_db or replacement_db_path.")
+
+    if replacement_db_path is not None:
+        path = Path(replacement_db_path).expanduser()
+        try:
+            loaded = _load_replacement_db(path)
+        except ReplacementDbError as exc:
+            return _replacement_db_diagnostic_payload(
+                str(exc),
+                exc.diagnostics,
+                path=path,
+                include_sensitive_metadata=include_sensitive_metadata,
+            )
+        return _validate_replacement_db_payload(
+            loaded,
+            path=path,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+
+    return _validate_replacement_db_payload(
+        replacement_db,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+
+
+@mcp.tool()
+def save_replacement_db(
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    save_db_path: str = "",
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Save a replacement database only to explicit save_db_path with stale-write protection."""
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+    db, source_path, invalid_payload = _resolve_replacement_db_source(
+        replacement_db,
+        replacement_db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_payload is not None:
+        return invalid_payload
+    if db is None:
+        _raise_tool_error("save_replacement_db requires a valid replacement database object.")
+
+    return _save_replacement_db_for_tool(
+        db,
+        save_db_path,
+        options=resolved_options,
+        source_path=source_path,
+        source_hash=_hash_replacement_db(db) if source_path is not None else None,
+        source_version=_replacement_db_version(db) if source_path is not None else None,
+    )
+
+
+@mcp.tool()
+def anonymize_text(
+    text: str,
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    save_db_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Anonymize text with a JSON bank and optional explicit replacement DB save."""
+    bank_value, _bank_path, _base_path, invalid_bank_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_bank_payload is not None:
+        return invalid_bank_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("anonymize_text requires a JSON bank object.")
+
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+    db, db_path, invalid_db_payload = _resolve_replacement_db_source(
+        replacement_db,
+        replacement_db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        return invalid_db_payload
+    if db is None:
+        _raise_tool_error("anonymize_text requires a valid replacement database object.")
+
+    return _run_json_tool(
+        lambda: _saved_anonymize_payload_for_tool(
+            lambda resolved_operation_options: _anonymize_text_with_db_update(
+                bank_mapping,
+                text,
+                db,
+                options=resolved_operation_options,
+            ),
+            db,
+            replacement_db_path=db_path,
+            save_db_path=save_db_path,
+            options=resolved_options,
+        )
+    )
+
+
+@mcp.tool()
+def anonymize_file(
+    file_path: str,
+    bank: Any | None = None,
+    bank_path: str | None = None,
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    save_db_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Anonymize one explicit UTF-8 file with a JSON bank and optional explicit replacement DB save."""
+    bank_value, _bank_path, _base_path, invalid_bank_payload = _resolve_bank_source(bank, bank_path)
+    if invalid_bank_payload is not None:
+        return invalid_bank_payload
+    bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
+    if mapping_invalid is not None:
+        return mapping_invalid
+    if bank_mapping is None:
+        _raise_tool_error("anonymize_file requires a JSON bank object.")
+
+    document_path = _ensure_explicit_file(file_path, "Document")
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+    db, db_path, invalid_db_payload = _resolve_replacement_db_source(
+        replacement_db,
+        replacement_db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        return invalid_db_payload
+    if db is None:
+        _raise_tool_error("anonymize_file requires a valid replacement database object.")
+
+    return _run_json_tool(
+        lambda: _saved_anonymize_payload_for_tool(
+            lambda resolved_operation_options: _anonymize_file_with_db_update(
+                bank_mapping,
+                document_path,
+                db,
+                options=resolved_operation_options,
+            ),
+            db,
+            replacement_db_path=db_path,
+            save_db_path=save_db_path,
+            options=resolved_options,
+        )
+    )
+
+
+@mcp.tool()
+def deanonymize_text(
+    text: str,
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Restore redaction tokens, and optionally pseudonyms, from text."""
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+    db, _db_path, invalid_db_payload = _resolve_replacement_db_source(
+        replacement_db,
+        replacement_db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        return invalid_db_payload
+    if db is None:
+        _raise_tool_error("deanonymize_text requires a valid replacement database object.")
+
+    return _run_json_tool(lambda: _deanonymize_text(text, db, options=resolved_options))
+
+
+@mcp.tool()
+def deanonymize_file(
+    file_path: str,
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Restore redaction tokens, and optionally pseudonyms, from one explicit UTF-8 file."""
+    document_path = _ensure_explicit_file(file_path, "Document")
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+    db, _db_path, invalid_db_payload = _resolve_replacement_db_source(
+        replacement_db,
+        replacement_db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        return invalid_db_payload
+    if db is None:
+        _raise_tool_error("deanonymize_file requires a valid replacement database object.")
+
+    return _run_json_tool(lambda: _deanonymize_file(document_path, db, options=resolved_options))
 
 
 @mcp.tool()

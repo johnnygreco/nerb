@@ -89,6 +89,37 @@ from nerb.mcp_server import (
     validate_bank,
     validate_config,
 )
+from nerb.mcp_server import (
+    anonymize_file as anonymize_file_tool,
+)
+from nerb.mcp_server import (
+    anonymize_text as anonymize_text_tool,
+)
+from nerb.mcp_server import (
+    create_replacement_db as create_replacement_db_tool,
+)
+from nerb.mcp_server import (
+    deanonymize_file as deanonymize_file_tool,
+)
+from nerb.mcp_server import (
+    deanonymize_text as deanonymize_text_tool,
+)
+from nerb.mcp_server import (
+    save_replacement_db as save_replacement_db_tool,
+)
+from nerb.mcp_server import (
+    validate_replacement_db as validate_replacement_db_tool,
+)
+from nerb.replacements import (
+    create_replacement_db as create_replacement_db_helper,
+)
+from nerb.replacements import (
+    hash_replacement_db,
+    load_replacement_db,
+)
+from nerb.replacements import (
+    save_replacement_db as save_replacement_db_helper,
+)
 
 pytest.importorskip("mcp", reason="The MCP SDK supports Python 3.10+.")
 
@@ -112,6 +143,80 @@ def _expected_config_records(config_path, text: str, entity: str | None = None):
 def _write_json(path, payload):
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     return path
+
+
+def _literal_bank_pattern(value: str, *, priority: int = 100) -> dict:
+    return {
+        "kind": "literal",
+        "value": value,
+        "description": "MCP de-anonymization fixture.",
+        "status": "active",
+        "priority": priority,
+        "case_sensitive": True,
+        "normalize_whitespace": True,
+        "left_boundary": "word",
+        "right_boundary": "word",
+        "metadata": {},
+    }
+
+
+def _person_json_bank() -> dict:
+    return {
+        "schema_version": "nerb.bank.v1",
+        "id": "people",
+        "name": "People",
+        "description": "People fixture.",
+        "version": "2026.06.13",
+        "status": "active",
+        "created_at": "2026-06-13T00:00:00Z",
+        "updated_at": "2026-06-13T00:00:00Z",
+        "unicode_normalization": "none",
+        "default_regex_flags": [],
+        "entities": {
+            "person": {
+                "description": "Known people.",
+                "status": "active",
+                "regex_flags": [],
+                "names": {
+                    "john_smith": {
+                        "canonical": "John Smith",
+                        "description": "John Smith fixture.",
+                        "status": "active",
+                        "patterns": {"primary": _literal_bank_pattern("John Smith")},
+                        "metadata": {},
+                    }
+                },
+                "metadata": {},
+            }
+        },
+        "metadata": {},
+    }
+
+
+def _replacement_assignment(
+    assignment_key: str,
+    *,
+    canonical: str,
+    token: str = "[PERSON_0001]",
+) -> dict:
+    fingerprint = assignment_key.split("|", 2)[2]
+    return {
+        "assignment_key": assignment_key,
+        "entity_id": "person",
+        "identity": {
+            "scope": "name",
+            "name_id": canonical.lower().replace(" ", "_"),
+            "canonical_name": canonical,
+            "fingerprint": fingerprint,
+        },
+        "original": {"canonical": canonical, "surfaces": [canonical]},
+        "replacement": {"mode": "redact", "value": token},
+        "redaction": {"token": token, "ordinal": 1},
+        "created_at": "2026-06-13T00:00:00Z",
+        "updated_at": "2026-06-13T00:00:00Z",
+        "use_count": 1,
+        "metadata": {},
+    }
 
 
 def test_console_script_entry_point_is_registered():
@@ -151,6 +256,13 @@ def test_mcp_server_registers_expected_tools():
         "benchmark_bank",
         "explain_match",
         "regress_bank",
+        "create_replacement_db",
+        "validate_replacement_db",
+        "save_replacement_db",
+        "anonymize_text",
+        "anonymize_file",
+        "deanonymize_text",
+        "deanonymize_file",
     }
 
 
@@ -323,6 +435,176 @@ def test_json_bank_mcp_invalid_bank_returns_diagnostics(tmp_path):
     assert validation["diagnostics"][0]["code"].startswith("schema.")
     assert direct_extraction["diagnostics"][0]["code"].startswith("schema.")
     assert extraction["diagnostics"][0]["code"].startswith("schema.")
+
+
+def test_mcp_replacement_db_create_validate_and_save_are_explicit(tmp_path):
+    db_path = tmp_path / "replacements.json"
+
+    created = create_replacement_db_tool(reversible=True)
+    replacement_db = created["replacement_db"]
+    validation = validate_replacement_db_tool(replacement_db=replacement_db)
+    saved = save_replacement_db_tool(replacement_db=replacement_db, save_db_path=str(db_path))
+
+    assert created["saved"] is False
+    assert not (tmp_path / "implicit.json").exists()
+    assert validation["valid"] is True
+    assert saved["saved"] is True
+    assert saved["replacement_db"]["path"] == str(db_path)
+    assert saved["replacement_db"]["saved"] is True
+    assert load_replacement_db(db_path)["assignments"] == {}
+
+    changed = load_replacement_db(db_path)
+    changed["description"] = "changed"
+    changed["version"] = 2
+    unsafe_overwrite = save_replacement_db_tool(replacement_db=changed, save_db_path=str(db_path))
+
+    assert unsafe_overwrite["valid"] is False
+    assert unsafe_overwrite["diagnostics"][0]["code"] == "replacement_db.stale_write"
+    assert load_replacement_db(db_path)["description"] == ""
+
+    expected_hash = hash_replacement_db(load_replacement_db(db_path))
+    safe_overwrite = save_replacement_db_tool(
+        replacement_db=changed,
+        save_db_path=str(db_path),
+        options={"expected_hash": expected_hash, "expected_version": 1},
+    )
+
+    assert safe_overwrite["saved"] is True
+    assert load_replacement_db(db_path)["description"] == "changed"
+
+
+def test_mcp_anonymize_and_deanonymize_text_use_explicit_save_path(tmp_path):
+    bank = _person_json_bank()
+    db_path = save_replacement_db_helper(
+        create_replacement_db_helper(reversible=True, now="2026-06-13T00:00:00Z"),
+        tmp_path / "replacements.json",
+    )
+
+    unsaved = anonymize_text_tool(
+        "John Smith joined.",
+        bank=bank,
+        replacement_db=load_replacement_db(db_path),
+        options={"mode": "redact"},
+    )
+    direct_existing_save = anonymize_text_tool(
+        "John Smith joined.",
+        bank=bank,
+        replacement_db=load_replacement_db(db_path),
+        save_db_path=str(db_path),
+        options={"mode": "redact", "save": True},
+    )
+
+    assert unsaved["text"] == "[PERSON_0001] joined."
+    assert unsaved["replacement_db"]["modified"] is True
+    assert unsaved["replacement_db"]["saved"] is False
+    assert "replacement" not in unsaved["applied_replacements"][0]
+    assert load_replacement_db(db_path)["assignments"] == {}
+    assert direct_existing_save["valid"] is False
+    assert direct_existing_save["diagnostics"][0]["code"] == "replacement_db.stale_write"
+
+    with pytest.raises(ToolError, match="options.save requires save_db_path"):
+        anonymize_text_tool(
+            "John Smith joined.",
+            bank=bank,
+            replacement_db_path=str(db_path),
+            options={"mode": "redact", "save": True},
+        )
+
+    with pytest.raises(ToolError, match="save_db_path writes require options.save"):
+        anonymize_text_tool(
+            "John Smith joined.",
+            bank=bank,
+            replacement_db_path=str(db_path),
+            save_db_path=str(db_path),
+            options={"mode": "redact"},
+        )
+
+    saved = anonymize_text_tool(
+        "John Smith joined.",
+        bank=bank,
+        replacement_db_path=str(db_path),
+        save_db_path=str(db_path),
+        options={"mode": "redact", "save": True},
+    )
+    restored = deanonymize_text_tool("[PERSON_0001] joined.", replacement_db_path=str(db_path))
+
+    assert saved["text"] == "[PERSON_0001] joined."
+    assert saved["replacement_db"]["modified"] is True
+    assert saved["replacement_db"]["saved"] is True
+    assert saved["replacement_db"]["version"] == 2
+    assert len(load_replacement_db(db_path)["assignments"]) == 1
+    assert restored["schema_version"] == "nerb.deanonymize_response.v1"
+    assert restored["text"] == "John Smith joined."
+    assert restored["summary"]["applied_count"] == 1
+
+
+def test_mcp_anonymize_and_deanonymize_file_match_helper_contracts(tmp_path):
+    bank = _person_json_bank()
+    db_path = save_replacement_db_helper(
+        create_replacement_db_helper(reversible=True, now="2026-06-13T00:00:00Z"),
+        tmp_path / "replacements.json",
+    )
+    document_path = tmp_path / "source.txt"
+    anonymized_path = tmp_path / "anonymized.txt"
+    document_path.write_bytes("Café\r\nJohn Smith joined.".encode())
+
+    saved = anonymize_file_tool(
+        str(document_path),
+        bank=bank,
+        replacement_db_path=str(db_path),
+        save_db_path=str(db_path),
+        options={"mode": "redact", "save": True},
+    )
+    anonymized_path.write_text(saved["text"], encoding="utf-8")
+    restored = deanonymize_file_tool(str(anonymized_path), replacement_db_path=str(db_path))
+
+    assert saved["schema_version"] == "nerb.anonymize_response.v1"
+    assert saved["source"] == {
+        "source_ref": "s1",
+        "type": "file",
+        "length": 24,
+        "bytes": 25,
+    }
+    assert saved["text"] == "Café\r\n[PERSON_0001] joined."
+    assert saved["replacement_db"]["saved"] is True
+    assert restored["schema_version"] == "nerb.deanonymize_response.v1"
+    assert restored["source"] == {
+        "source_ref": "s1",
+        "type": "file",
+        "length": 27,
+        "bytes": 28,
+    }
+    assert restored["text"] == "Café\r\nJohn Smith joined."
+
+
+def test_mcp_replacement_db_diagnostics_are_sanitized_by_default(tmp_path):
+    db_path = tmp_path / "replacements.json"
+    first_key = f"person|name|sha256:{'a' * 64}"
+    second_key = f"person|name|sha256:{'b' * 64}"
+    replacement_db = create_replacement_db_helper(reversible=True, now="2026-06-13T00:00:00Z")
+    replacement_db["assignments"] = {
+        first_key: _replacement_assignment(first_key, canonical="John Smith"),
+        second_key: _replacement_assignment(second_key, canonical="Jane Smith"),
+    }
+    _write_json(db_path, replacement_db)
+
+    payload = validate_replacement_db_tool(replacement_db_path=str(db_path))
+    sensitive_payload = validate_replacement_db_tool(
+        replacement_db_path=str(db_path),
+        options={"include_sensitive_metadata": True},
+    )
+
+    serialized = json.dumps(payload)
+    assert payload["valid"] is False
+    assert payload["diagnostics"][0]["path"] == "/assignments"
+    assert payload["diagnostics"][0]["message"] == "Assignment diagnostic details are redacted by default."
+    assert first_key not in serialized
+    assert second_key not in serialized
+    assert "sha256:" not in serialized
+    assert "first_assignment_key" not in serialized
+    assert "John Smith" not in serialized
+    assert "Jane Smith" not in serialized
+    assert sensitive_payload["diagnostics"][0]["metadata"]["first_assignment_key"] == first_key
 
 
 def test_config_mutation_tools_write_explicit_config_path(tmp_path):
