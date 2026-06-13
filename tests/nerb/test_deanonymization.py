@@ -8,8 +8,15 @@ from nerb.deanonymization import (
     allocate_assignment,
     apply_byte_replacements,
     assignment_key,
+    finalize_replacement_db_update,
 )
-from nerb.replacements import create_replacement_db, validate_replacement_db
+from nerb.replacements import (
+    create_replacement_db,
+    hash_replacement_db,
+    load_replacement_db,
+    save_replacement_db,
+    validate_replacement_db,
+)
 
 
 def _span(text: str, value: str) -> tuple[int, int]:
@@ -99,6 +106,16 @@ def test_apply_byte_replacements_rejects_overlap_invalid_spans_and_source_mismat
     assert mismatch_info.value.diagnostics[0]["code"] == "rewrite.source_mismatch"
 
 
+def test_apply_byte_replacements_rejects_split_utf8_boundaries_and_zero_length_edits():
+    with pytest.raises(DeanonymizationError) as split_info:
+        apply_byte_replacements("éé", [ByteEdit(1, 3, "")])
+    assert split_info.value.diagnostics[0]["code"] == "rewrite.invalid_span"
+
+    with pytest.raises(DeanonymizationError) as zero_length_info:
+        apply_byte_replacements("John", [ByteEdit(0, 0, "X")])
+    assert zero_length_info.value.diagnostics[0]["code"] == "rewrite.invalid_span"
+
+
 def test_assignment_keys_are_stable_by_scope_and_unicode_normalization():
     name_policy = {"assignment_scope": "name", "unicode_normalization": "NFC", "store_originals": False}
     canonical_policy = {"assignment_scope": "canonical", "unicode_normalization": "NFC", "store_originals": False}
@@ -121,6 +138,15 @@ def test_assignment_keys_are_stable_by_scope_and_unicode_normalization():
     )
 
 
+def test_assignment_keys_map_config_style_entities_for_canonical_and_surface_scopes():
+    canonical_policy = {"assignment_scope": "canonical", "unicode_normalization": "NFC", "store_originals": False}
+    surface_policy = {"assignment_scope": "surface", "unicode_normalization": "NFC", "store_originals": False}
+    config_record = {"entity": "ARTIST", "canonical_name": "Miles Davis", "string": "Miles Davis"}
+
+    assert assignment_key(config_record, canonical_policy).startswith("artist|canonical|sha256:")
+    assert assignment_key(config_record, surface_policy).startswith("artist|surface|sha256:")
+
+
 def test_assignment_keys_reject_missing_required_fields():
     with pytest.raises(DeanonymizationError) as name_info:
         assignment_key({"entity_id": "person", "string": "John"}, {"assignment_scope": "name"})
@@ -133,6 +159,20 @@ def test_assignment_keys_reject_missing_required_fields():
     with pytest.raises(DeanonymizationError) as surface_info:
         assignment_key({"entity_id": "person", "name_id": "john"}, {"assignment_scope": "surface"})
     assert surface_info.value.diagnostics[0]["path"] == "/string"
+
+
+def test_assignment_keys_reject_malformed_policy_fields_with_diagnostics():
+    with pytest.raises(DeanonymizationError) as scope_info:
+        assignment_key(_record(), {"assignment_scope": ["name"]})
+    assert scope_info.value.diagnostics[0]["path"] == "/assignment_scope"
+
+    with pytest.raises(DeanonymizationError) as normalization_type_info:
+        assignment_key(_record(), {"unicode_normalization": ["NFC"]})
+    assert normalization_type_info.value.diagnostics[0]["path"] == "/unicode_normalization"
+
+    with pytest.raises(DeanonymizationError) as normalization_value_info:
+        assignment_key(_record(), {"unicode_normalization": "NFD"})
+    assert normalization_value_info.value.diagnostics[0]["path"] == "/unicode_normalization"
 
 
 def test_pseudonym_allocation_is_deterministic_reuses_existing_and_reports_exhaustion():
@@ -169,6 +209,51 @@ def test_pseudonym_allocation_is_deterministic_reuses_existing_and_reports_exhau
     assert exhausted.assignment is None
     assert exhausted.diagnostics[0]["code"] == "replacement_db.candidates_exhausted"
     assert validate_replacement_db(second.replacement_db)["valid"] is True
+
+
+def test_allocation_result_assignment_does_not_alias_replacement_db_assignment():
+    db = _pseudonym_db()
+    result = allocate_assignment(
+        _record(name_id="john_smith", canonical_name="John Smith"),
+        db,
+        now="2026-06-13T00:00:00Z",
+    )
+
+    assert result.assignment is not None
+    result.assignment["replacement"]["value"] = "Mutated Name"
+
+    stored_assignment = result.replacement_db["assignments"][result.assignment_key]
+    assert stored_assignment["replacement"]["value"] == "Mikey Law"
+    assert validate_replacement_db(result.replacement_db)["valid"] is True
+
+
+def test_finalize_replacement_db_update_increments_once_for_save_cycle(tmp_path):
+    db = _pseudonym_db()
+    path = save_replacement_db(db, tmp_path / "replacements.json")
+    loaded = load_replacement_db(path)
+    expected_hash = hash_replacement_db(loaded)
+    first = allocate_assignment(
+        _record(name_id="john_smith", canonical_name="John Smith"),
+        loaded,
+        now="2026-06-13T00:00:00Z",
+    )
+    second = allocate_assignment(
+        _record(name_id="jane_smith", canonical_name="Jane Smith"),
+        first.replacement_db,
+        now="2026-06-13T00:00:00Z",
+    )
+
+    finalized = finalize_replacement_db_update(
+        second.replacement_db,
+        base_version=loaded["version"],
+        now="2026-06-13T00:00:01Z",
+    )
+    save_replacement_db(finalized, path, expected_hash=expected_hash, expected_version=loaded["version"])
+    saved = load_replacement_db(path)
+
+    assert saved["version"] == 2
+    assert saved["updated_at"] == "2026-06-13T00:00:01Z"
+    assert len(saved["assignments"]) == 2
 
 
 def test_pseudonym_allocation_with_reuse_advances_to_avoid_reverse_ambiguity():
@@ -225,6 +310,14 @@ def test_store_originals_false_assignments_omit_originals_and_sensitive_identity
         "fingerprint": result.assignment["identity"]["fingerprint"],
     }
     assert validate_replacement_db(result.replacement_db)["valid"] is True
+
+
+def test_store_originals_false_assignment_results_do_not_repr_plaintext_originals():
+    db = create_replacement_db(now="2026-06-13T00:00:00Z")
+    result = allocate_assignment(_record(), db, now="2026-06-13T00:00:00Z")
+
+    assert "John" not in repr(result)
+    assert "john_smith" not in repr(result)
 
 
 def test_allocation_reports_missing_assignment_when_new_assignments_are_disabled():

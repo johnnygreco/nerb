@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import re
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from .diagnostics import DIAGNOSTIC_ERROR, Diagnostic, diagnostic, has_errors
 from .replacements import (
@@ -20,7 +22,6 @@ from .schema import ID_RE, UNICODE_NORMALIZATION_VALUES
 
 __all__ = [
     "AssignmentAllocation",
-    "AssignmentIdentity",
     "ByteEdit",
     "ByteSpan",
     "DeanonymizationError",
@@ -28,13 +29,14 @@ __all__ = [
     "AppliedByteEdit",
     "allocate_assignment",
     "apply_byte_replacements",
-    "assignment_identity",
     "assignment_key",
+    "finalize_replacement_db_update",
 ]
 
 ASSIGNMENT_SCOPES = {"name", "canonical", "surface"}
 REPLACEMENT_MISSING_ASSIGNMENT = "replacement_db.missing_assignment"
 REPLACEMENT_CANDIDATES_EXHAUSTED = "replacement_db.candidates_exhausted"
+ENTITY_ID_HASH_LENGTH = 12
 
 
 class DeanonymizationError(ValueError):
@@ -64,7 +66,7 @@ class ByteEdit:
     start: int
     end: int
     replacement: str
-    expected: str | None = None
+    expected: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,7 @@ class AppliedByteEdit:
     original_span: ByteSpan
     replacement_span: ByteSpan
     replacement: str
-    expected: str | None = None
+    expected: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -86,25 +88,25 @@ class RewriteResult:
 
 
 @dataclass(frozen=True)
-class AssignmentIdentity:
+class _AssignmentIdentity:
     """Stable opaque identity material for one source record under one policy."""
 
-    assignment_key: str
+    assignment_key: str = field(repr=False)
     entity_id: str
     scope: str
-    fingerprint: str
-    identity: dict[str, Any]
-    canonical: str | None
-    surface: str | None
+    fingerprint: str = field(repr=False)
+    identity: dict[str, Any] = field(repr=False)
+    canonical: str | None = field(repr=False)
+    surface: str | None = field(repr=False)
 
 
 @dataclass(frozen=True)
 class AssignmentAllocation:
     """Result of looking up or allocating an assignment in a replacement DB copy."""
 
-    replacement_db: dict[str, Any]
+    replacement_db: dict[str, Any] = field(repr=False)
     assignment_key: str
-    assignment: dict[str, Any] | None
+    assignment: dict[str, Any] | None = field(repr=False)
     created: bool
     diagnostics: tuple[Diagnostic, ...] = ()
 
@@ -161,29 +163,54 @@ def _record_string(record: Mapping[str, Any], field: str) -> str | None:
 
 
 def _record_entity_id(record: Mapping[str, Any]) -> str:
-    entity_id = _record_string(record, "entity_id") or _record_string(record, "entity")
-    if entity_id is None:
+    entity_id = _record_string(record, "entity_id")
+    if entity_id is not None:
+        if not ID_RE.fullmatch(entity_id):
+            raise DeanonymizationError(
+                "Record entity id is invalid.",
+                [
+                    _error(
+                        "replacement.assignment_key_invalid_entity",
+                        "/entity_id",
+                        f"Assignment key entity id {entity_id!r} must match the NERB ID pattern.",
+                    )
+                ],
+            )
+        return entity_id
+
+    raw_entity = _record_string(record, "entity")
+    if raw_entity is None:
         raise DeanonymizationError(
             "Record is missing an entity id.",
             [_error("replacement.assignment_key_missing_field", "/entity_id", "Assignment key requires entity_id.")],
         )
-    if not ID_RE.fullmatch(entity_id):
-        raise DeanonymizationError(
-            "Record entity id is invalid.",
-            [
-                _error(
-                    "replacement.assignment_key_invalid_entity",
-                    "/entity_id",
-                    f"Assignment key entity id {entity_id!r} must match the NERB ID pattern.",
-                )
-            ],
-        )
-    return entity_id
+    return _config_entity_id(raw_entity)
+
+
+def _config_entity_id(raw_entity: str) -> str:
+    lowered = raw_entity.strip().lower()
+    slug = re.sub(r"[^a-z0-9_]+", "_", lowered)
+    slug = re.sub(r"_+", "_", slug).strip("_") or "entity"
+    if not slug[0].isalpha():
+        slug = f"entity_{slug}"
+
+    needs_suffix = slug != lowered or len(slug) > 80
+    if needs_suffix:
+        suffix = hashlib.sha256(raw_entity.encode("utf-8")).hexdigest()[:ENTITY_ID_HASH_LENGTH]
+        prefix_length = 80 - len(suffix) - 1
+        prefix = slug[:prefix_length].rstrip("_") or "entity"
+        slug = f"{prefix}_{suffix}"
+    else:
+        slug = slug[:80]
+
+    if ID_RE.fullmatch(slug):
+        return slug
+    return "entity_" + hashlib.sha256(raw_entity.encode("utf-8")).hexdigest()[:ENTITY_ID_HASH_LENGTH]
 
 
 def _policy_scope(policy: Mapping[str, Any]) -> str:
     scope = policy.get("assignment_scope", "name")
-    if scope not in ASSIGNMENT_SCOPES:
+    if not isinstance(scope, str) or scope not in ASSIGNMENT_SCOPES:
         raise DeanonymizationError(
             "Unsupported assignment scope.",
             [
@@ -199,10 +226,21 @@ def _policy_scope(policy: Mapping[str, Any]) -> str:
 
 def _policy_normalization(policy: Mapping[str, Any]) -> str:
     normalization = policy.get("unicode_normalization", "NFC")
-    return normalization if isinstance(normalization, str) else "NFC"
+    if not isinstance(normalization, str):
+        raise DeanonymizationError(
+            "Unsupported unicode normalization.",
+            [
+                _error(
+                    "replacement_db.invalid_policy",
+                    "/unicode_normalization",
+                    "Unicode normalization policy must be a string.",
+                )
+            ],
+        )
+    return normalization
 
 
-def assignment_identity(record: Mapping[str, Any], policy: Mapping[str, Any]) -> AssignmentIdentity:
+def _assignment_identity(record: Mapping[str, Any], policy: Mapping[str, Any]) -> _AssignmentIdentity:
     """Return stable assignment identity material for a source record and policy."""
     entity_id = _record_entity_id(record)
     scope = _policy_scope(policy)
@@ -273,7 +311,7 @@ def assignment_identity(record: Mapping[str, Any], policy: Mapping[str, Any]) ->
         surface = _normalize(matched_surface, normalization)
 
     identity["fingerprint"] = digest
-    return AssignmentIdentity(
+    return _AssignmentIdentity(
         assignment_key=f"{entity_id}|{scope}|{digest}",
         entity_id=entity_id,
         scope=scope,
@@ -285,8 +323,12 @@ def assignment_identity(record: Mapping[str, Any], policy: Mapping[str, Any]) ->
 
 
 def assignment_key(record: Mapping[str, Any], policy: Mapping[str, Any]) -> str:
-    """Return the stable opaque assignment key for a source record and policy."""
-    return assignment_identity(record, policy).assignment_key
+    """Return the stable opaque assignment key for a source record and policy.
+
+    Assignment keys and fingerprints are deterministic and linkable. They are lookup identifiers, not a privacy
+    boundary. Treat replacement databases as sensitive even when store_originals is false.
+    """
+    return _assignment_identity(record, policy).assignment_key
 
 
 def _validate_byte_edits(source_bytes: bytes, edits: Sequence[ByteEdit]) -> list[tuple[ByteEdit, bytes]]:
@@ -298,19 +340,30 @@ def _validate_byte_edits(source_bytes: bytes, edits: Sequence[ByteEdit]) -> list
         if not _is_int(edit.start) or not _is_int(edit.end):
             diagnostics.append(_error("rewrite.invalid_span", path, "Byte edit start and end must be integers."))
             continue
-        if edit.start < 0 or edit.end < edit.start or edit.end > len(source_bytes):
+        if edit.start < 0 or edit.end <= edit.start or edit.end > len(source_bytes):
             diagnostics.append(
                 _error(
                     "rewrite.invalid_span",
                     path,
-                    "Byte edit span must satisfy 0 <= start <= end <= len(text.encode('utf-8')).",
+                    "Byte edit span must satisfy 0 <= start < end <= len(text.encode('utf-8')).",
+                )
+            )
+            continue
+        actual_bytes = source_bytes[edit.start : edit.end]
+        try:
+            actual_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            diagnostics.append(
+                _error(
+                    "rewrite.invalid_span",
+                    path,
+                    "Byte edit span must align with UTF-8 character boundaries.",
                 )
             )
             continue
         replacement_bytes = edit.replacement.encode("utf-8")
         if edit.expected is not None:
             expected_bytes = edit.expected.encode("utf-8")
-            actual_bytes = source_bytes[edit.start : edit.end]
             if actual_bytes != expected_bytes:
                 diagnostics.append(
                     _error(
@@ -483,13 +536,13 @@ def _next_redaction_ordinal(replacement_db: Mapping[str, Any], entity_id: str) -
     return max_ordinal + 1
 
 
-def _stored_surfaces(identity: AssignmentIdentity, limit: int) -> list[str]:
+def _stored_surfaces(identity: _AssignmentIdentity, limit: int) -> list[str]:
     if identity.surface is None or limit <= 0:
         return []
     return [identity.surface][:limit]
 
 
-def _original_payload(identity: AssignmentIdentity, source_surface_limit: int) -> dict[str, Any] | None:
+def _original_payload(identity: _AssignmentIdentity, source_surface_limit: int) -> dict[str, Any] | None:
     surfaces = _stored_surfaces(identity, source_surface_limit)
     if identity.scope in {"name", "canonical"}:
         if identity.canonical is None:
@@ -505,7 +558,7 @@ def _original_payload(identity: AssignmentIdentity, source_surface_limit: int) -
 
 def _new_assignment(
     replacement_db: Mapping[str, Any],
-    identity: AssignmentIdentity,
+    identity: _AssignmentIdentity,
     policy: Mapping[str, Any],
     *,
     now: str,
@@ -572,14 +625,14 @@ def allocate_assignment(
     db = _validate_replacement_db_for_allocation(replacement_db)
     entity_id = _record_entity_id(record)
     policy = _effective_policy(db, entity_id)
-    identity = assignment_identity(record, policy)
+    identity = _assignment_identity(record, policy)
     assignments = db.setdefault("assignments", {})
     existing = assignments.get(identity.assignment_key)
     if isinstance(existing, Mapping):
         return AssignmentAllocation(
             replacement_db=db,
             assignment_key=identity.assignment_key,
-            assignment=dict(existing),
+            assignment=cast(dict[str, Any], copy.deepcopy(dict(existing))),
             created=False,
         )
 
@@ -623,6 +676,36 @@ def allocate_assignment(
     return AssignmentAllocation(
         replacement_db=db,
         assignment_key=identity.assignment_key,
-        assignment=assignment,
+        assignment=copy.deepcopy(assignment),
         created=True,
     )
+
+
+def finalize_replacement_db_update(
+    replacement_db: Mapping[str, Any],
+    *,
+    base_version: int | None = None,
+    now: str | None = None,
+) -> dict[str, Any]:
+    """Return a validated DB copy with version incremented once for an operation-level save."""
+    db = _validate_replacement_db_for_allocation(replacement_db)
+    current_version = base_version if base_version is not None else db.get("version")
+    if not isinstance(current_version, int) or isinstance(current_version, bool) or current_version < 1:
+        raise DeanonymizationError(
+            "Replacement database version cannot be finalized.",
+            [
+                _error(
+                    "replacement_db.invalid_version",
+                    "/version",
+                    "Replacement database version must be a positive integer before finalization.",
+                )
+            ],
+        )
+
+    db["version"] = current_version + 1
+    db["updated_at"] = now or _utc_now()
+    result = validate_replacement_db(db)
+    diagnostics = result["diagnostics"]
+    if has_errors(diagnostics):
+        raise DeanonymizationError("Finalized replacement database is invalid.", diagnostics)
+    return db
