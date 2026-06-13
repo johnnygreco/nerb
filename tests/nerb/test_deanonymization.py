@@ -81,6 +81,18 @@ def _literal_pattern(value: str, *, priority: int = 50) -> dict:
     }
 
 
+def _regex_pattern(value: str, *, priority: int = 50) -> dict:
+    return {
+        "kind": "regex",
+        "value": value,
+        "description": "Regex deanonymization fixture.",
+        "status": "active",
+        "priority": priority,
+        "regex_flags": [],
+        "metadata": {},
+    }
+
+
 def _person_bank(*, extra_people: bool = False, include_alias: bool = True) -> dict:
     names = {
         "john_smith": {
@@ -563,6 +575,14 @@ def test_anonymize_text_explicit_mode_mismatch_reports_diagnostic_instead_of_wro
     assert fail_info.value.diagnostics[0]["code"] == "replacement_db.assignment_mode_mismatch"
     assert "assignment_key" not in repr(fail_info.value.diagnostics)
 
+    skip_result = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith",
+        db_with_pseudonym_assignment,
+        options={"mode": "redact", "on_missing_assignment": "skip"},
+    )
+    assert skip_result["diagnostics"][0]["code"] == "replacement_db.assignment_mode_mismatch"
+
 
 def test_anonymize_file_reports_file_source_and_does_not_save(tmp_path):
     source_path = tmp_path / "source.txt"
@@ -579,12 +599,21 @@ def test_anonymize_file_reports_file_source_and_does_not_save(tmp_path):
     assert result["text"] == "Mikey Law joined."
     assert result["source"] == {
         "type": "file",
-        "path": str(source_path),
         "length": len(source),
         "bytes": len(source.encode("utf-8")),
+        "source_ref": "s1",
     }
     assert result["replacement_db"]["modified"] is True
     assert result["replacement_db"]["saved"] is False
+    assert str(source_path) not in repr(result)
+
+    sensitive_result = anonymize_file(
+        _person_bank(include_alias=False),
+        source_path,
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym", "include_sensitive_metadata": True},
+    )
+    assert sensitive_result["source"]["path"] == str(source_path)
 
 
 def test_anonymize_file_preserves_crlf_bytes_and_enforces_extraction_file_limit(tmp_path):
@@ -602,9 +631,9 @@ def test_anonymize_file_preserves_crlf_bytes_and_enforces_extraction_file_limit(
     assert result["text"] == "Mikey Law\r\njoined."
     assert result["source"] == {
         "type": "file",
-        "path": str(source_path),
         "length": len("John Smith\r\njoined."),
         "bytes": len(source_bytes),
+        "source_ref": "s1",
     }
 
     with pytest.raises(DeanonymizationError) as limit_info:
@@ -728,6 +757,22 @@ def test_anonymize_text_sanitizes_bank_schema_diagnostics_by_default():
     assert "john_smith" not in diagnostics_repr
     assert "primary" not in diagnostics_repr
     assert "person" not in diagnostics_repr
+
+
+def test_anonymize_text_sanitizes_extraction_runtime_metadata_by_default():
+    bank = _person_bank(include_alias=False)
+    bank["entities"]["person"]["names"]["john_smith"]["canonical"] = "Secret Person"
+    bank["entities"]["person"]["names"]["john_smith"]["patterns"]["primary"] = _regex_pattern("a*")
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        anonymize_text(bank, "Secret Person", _pseudonym_db(), options={"mode": "pseudonym"})
+
+    diagnostics_repr = repr(exc_info.value.diagnostics)
+    assert exc_info.value.diagnostics[0]["code"] == "regex.matches_empty"
+    assert "Secret Person" not in diagnostics_repr
+    assert "canonical_name" not in diagnostics_repr
+    assert "surface_name" not in diagnostics_repr
+    assert "probe" not in diagnostics_repr
 
 
 def test_anonymize_text_sanitizes_replacement_validation_diagnostics_by_default():

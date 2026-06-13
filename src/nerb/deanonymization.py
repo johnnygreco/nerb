@@ -54,19 +54,15 @@ REPLACEMENT_MISSING_ASSIGNMENT = "replacement_db.missing_assignment"
 REPLACEMENT_CANDIDATES_EXHAUSTED = "replacement_db.candidates_exhausted"
 REPLACEMENT_MODE_MISMATCH = "replacement_db.assignment_mode_mismatch"
 ENTITY_ID_HASH_LENGTH = 12
-SENSITIVE_DIAGNOSTIC_METADATA_KEYS = {
-    "assignment_key",
-    "bank_hash",
-    "bank_id",
-    "fingerprint",
-    "first_assignment_key",
-    "name_id",
-    "pattern_id",
-    "replacement_db_hash",
-    "replacement_db_id",
-    "source_id",
+SAFE_DIAGNOSTIC_METADATA_KEYS = {
+    "assignment_ref",
+    "entity",
+    "bytes",
+    "limit",
 }
 SAFE_DIAGNOSTIC_MESSAGES = {
+    "anonymize.extraction_error": "Anonymization extraction failed.",
+    "engine.compile_error": "Bank extraction failed.",
     REPLACEMENT_CANDIDATES_EXHAUSTED: "Replacement set has no available unambiguous candidates.",
     "replacement_db.assignment_collision": "Replacement value maps to multiple assignments.",
     "replacement_db.assignment_key_mismatch": "Assignment key metadata is inconsistent.",
@@ -569,17 +565,24 @@ def _sanitize_diagnostic(
     if metadata is not None:
         merged_metadata.update(metadata)
     if not options.include_sensitive_metadata:
-        for key in SENSITIVE_DIAGNOSTIC_METADATA_KEYS:
-            merged_metadata.pop(key, None)
+        merged_metadata = {
+            key: copy.deepcopy(value) for key, value in merged_metadata.items() if key in SAFE_DIAGNOSTIC_METADATA_KEYS
+        }
+        message_was_redacted = False
         original_path = sanitized.get("path")
         if isinstance(original_path, str):
             redacted_path = _redacted_diagnostic_path(original_path)
             if redacted_path != original_path:
                 sanitized["path"] = redacted_path
                 sanitized["message"] = _safe_diagnostic_message(str(item.get("code", "")), redacted_path)
+                message_was_redacted = True
         code = sanitized.get("code")
         if isinstance(code, str) and code in SAFE_DIAGNOSTIC_MESSAGES:
             sanitized["message"] = SAFE_DIAGNOSTIC_MESSAGES[code]
+        elif (
+            not message_was_redacted and isinstance(code, str) and _diagnostic_code_may_contain_sensitive_message(code)
+        ):
+            sanitized["message"] = _safe_diagnostic_message(code, str(sanitized.get("path", "")))
     if merged_metadata:
         sanitized["metadata"] = copy.deepcopy(merged_metadata)
     return sanitized
@@ -605,6 +608,19 @@ def _safe_diagnostic_message(code: str, path: str) -> str:
     if path == "/replacement_sets":
         return "Replacement set diagnostic details are redacted by default."
     return "Diagnostic details are redacted by default."
+
+
+def _diagnostic_code_may_contain_sensitive_message(code: str) -> bool:
+    return code.startswith(("engine.", "regex.", "schema.", "id.", "metadata.", "report."))
+
+
+def _diagnostic_code(diagnostic_item: Mapping[str, Any]) -> str | None:
+    code = diagnostic_item.get("code")
+    return code if isinstance(code, str) else None
+
+
+def _allocation_diagnostics_are_skippable(diagnostics: Sequence[Diagnostic]) -> bool:
+    return all(_diagnostic_code(item) == REPLACEMENT_MISSING_ASSIGNMENT for item in diagnostics)
 
 
 def _sanitize_diagnostics(diagnostics: Sequence[Diagnostic], options: _AnonymizeOptions) -> list[Diagnostic]:
@@ -658,6 +674,15 @@ def _safe_replacement_db_metadata(
         payload["id"] = replacement_db.get("id")
         payload["hash"] = hash_replacement_db(replacement_db)
         payload["data"] = copy.deepcopy(dict(replacement_db))
+    return payload
+
+
+def _safe_source_metadata(source: Mapping[str, Any], options: _AnonymizeOptions) -> dict[str, Any]:
+    payload = {key: copy.deepcopy(value) for key, value in source.items() if key != "path"}
+    if source.get("type") == "file":
+        payload.setdefault("source_ref", "s1")
+        if options.include_sensitive_metadata and "path" in source:
+            payload["path"] = source["path"]
     return payload
 
 
@@ -1042,7 +1067,10 @@ def _anonymize_resolved_report(
                     allocation.diagnostics,
                     options,
                 )
-            if allocation.diagnostics and options.on_missing_assignment == "diagnostic":
+            if allocation.diagnostics and (
+                options.on_missing_assignment == "diagnostic"
+                or not _allocation_diagnostics_are_skippable(allocation.diagnostics)
+            ):
                 diagnostics.extend(
                     _sanitize_diagnostic(item, options, metadata=metadata) for item in allocation.diagnostics
                 )
@@ -1090,8 +1118,12 @@ def _anonymize_resolved_report(
         "schema_version": ANONYMIZE_RESPONSE_SCHEMA_VERSION,
         "bank": _safe_bank_metadata(report, options),
         "replacement_db": _safe_replacement_db_metadata(current_db, modified=modified, options=options),
-        "source": copy.deepcopy(
-            report.get("source", {"type": "text", "length": len(text), "bytes": len(text.encode("utf-8"))})
+        "source": _safe_source_metadata(
+            cast(
+                Mapping[str, Any],
+                report.get("source", {"type": "text", "length": len(text), "bytes": len(text.encode("utf-8"))}),
+            ),
+            options,
         ),
         "text": rewrite.text,
         "applied_replacements": applied_replacements,
