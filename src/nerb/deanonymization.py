@@ -70,7 +70,6 @@ DEANONYMIZE_AMBIGUOUS_REPLACEMENT = "deanonymize.ambiguous_replacement"
 DEANONYMIZE_PSEUDONYM_RESTORE_WARNING = "deanonymize.pseudonym_restore_warning"
 DEANONYMIZE_TOO_MANY_REVERSE_ENTITIES = "deanonymize.too_many_reverse_entities"
 ENTITY_ID_HASH_LENGTH = 12
-REVERSE_BANK_HASH_LENGTH = 12
 REVERSE_BANK_MAX_ENTITIES = 1_000
 SAFE_DIAGNOSTIC_METADATA_KEYS = {
     "assignment_ref",
@@ -214,15 +213,6 @@ class _ReverseBankBuild:
     entries: tuple[_ReverseEntry, ...] = field(repr=False)
     lookup: dict[str, _ReverseEntry] = field(repr=False)
     diagnostics: tuple[Diagnostic, ...]
-
-
-@dataclass(frozen=True)
-class _CompiledReverseBank:
-    bank: Bank = field(repr=False)
-    lookup: dict[str, _ReverseEntry] = field(repr=False)
-
-
-_REVERSE_BANK_CACHE: dict[str, _CompiledReverseBank] = {}
 
 
 def _utc_now() -> str:
@@ -1387,17 +1377,7 @@ def _enabled_reverse_patterns(
     return patterns
 
 
-def _reverse_hash(*parts: Any) -> str:
-    payload = json.dumps(parts, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:REVERSE_BANK_HASH_LENGTH]
-
-
-def _reverse_entry_ids(assignment_key_value: str, mode: str, pattern_value: str) -> tuple[str, str]:
-    digest = _reverse_hash("entry", assignment_key_value, mode, pattern_value)
-    return f"r_{digest}", f"a_{digest}"
-
-
-def _reverse_bank_payload(fingerprint: str, entries: Sequence[_ReverseEntry]) -> dict[str, Any]:
+def _reverse_bank_payload(entries: Sequence[_ReverseEntry]) -> dict[str, Any]:
     entities: dict[str, Any] = {}
     for entry in entries:
         priority = len(entry.pattern_value.encode("utf-8"))
@@ -1435,7 +1415,7 @@ def _reverse_bank_payload(fingerprint: str, entries: Sequence[_ReverseEntry]) ->
         "id": "reverse_replacements",
         "name": "Reverse Replacement Bank",
         "description": "Generated in-memory bank for reverse replacement matching.",
-        "version": fingerprint,
+        "version": "generated",
         "status": "active",
         "created_at": "1970-01-01T00:00:00Z",
         "updated_at": "1970-01-01T00:00:00Z",
@@ -1511,7 +1491,7 @@ def _build_reverse_bank(replacement_db: Mapping[str, Any], options: _Deanonymize
             entity_id = assignment.get("entity_id")
             safe_entity_id = entity_id if isinstance(entity_id, str) else "unknown"
             for mode, pattern_value, pattern_id in enabled_patterns:
-                reverse_entity_id, reverse_name_id = _reverse_entry_ids(assignment_key_value, mode, pattern_value)
+                ordinal = len(entries) + 1
                 entry = _ReverseEntry(
                     assignment_key=assignment_key_value,
                     assignment_ref=assignment_ref,
@@ -1520,8 +1500,8 @@ def _build_reverse_bank(replacement_db: Mapping[str, Any], options: _Deanonymize
                     pattern_value=pattern_value,
                     restored_value=restored_value,
                     restored_value_source=restored_value_source,
-                    reverse_entity_id=reverse_entity_id,
-                    reverse_name_id=reverse_name_id,
+                    reverse_entity_id=f"r_{ordinal:012d}",
+                    reverse_name_id=f"a_{ordinal:012d}",
                     pattern_id=pattern_id,
                 )
                 previous = seen_values.get(pattern_value)
@@ -1559,7 +1539,7 @@ def _build_reverse_bank(replacement_db: Mapping[str, Any], options: _Deanonymize
             diagnostics=tuple(diagnostics),
         )
 
-    bank = _reverse_bank_payload(fingerprint, entries)
+    bank = _reverse_bank_payload(entries)
     schema_diagnostics = validate_bank_schema(bank)["diagnostics"]
     if has_errors(schema_diagnostics):
         diagnostics.extend(schema_diagnostics)
@@ -1613,21 +1593,24 @@ def reverse_bank_fingerprint(
 ) -> str:
     """Return the reverse-bank fingerprint for matching-relevant replacement data."""
     resolved_options = _resolve_deanonymize_options(options)
-    build = _build_reverse_bank(replacement_db, resolved_options)
+    build_error: DeanonymizationError | None = None
+    try:
+        build = _build_reverse_bank(replacement_db, resolved_options)
+    except DeanonymizationError as exc:
+        build_error = exc
+    if build_error is not None:
+        _raise_deanonymize_error("Replacement database is invalid.", build_error.diagnostics, resolved_options)
     fatal_diagnostics = _fatal_reverse_bank_diagnostics(build.diagnostics)
     if fatal_diagnostics:
         _raise_deanonymize_error("Reverse bank cannot be fingerprinted.", fatal_diagnostics, resolved_options)
     return build.fingerprint
 
 
-def _compiled_reverse_bank(build: _ReverseBankBuild, options: _DeanonymizeOptions) -> _CompiledReverseBank | None:
+def _compile_reverse_bank(build: _ReverseBankBuild, options: _DeanonymizeOptions) -> Bank | None:
     if build.bank is None:
         return None
-    cached = _REVERSE_BANK_CACHE.get(build.fingerprint)
-    if cached is not None:
-        return cached
     try:
-        bank = Bank.from_source_bytes(
+        return Bank.from_source_bytes(
             json.dumps(build.bank, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
             format_hint="json",
         )
@@ -1638,9 +1621,6 @@ def _compiled_reverse_bank(build: _ReverseBankBuild, options: _DeanonymizeOption
             options,
             raw_error=exc,
         )
-    compiled = _CompiledReverseBank(bank=bank, lookup=dict(build.lookup))
-    _REVERSE_BANK_CACHE[build.fingerprint] = compiled
-    return compiled
 
 
 def _byte_index_to_char_index(text: str, byte_index: int) -> int:
@@ -1772,10 +1752,10 @@ def _deanonymize_text_impl(
     if pseudonym_warning is not None:
         diagnostics.append(_sanitize_diagnostic(pseudonym_warning, options))
 
-    compiled = _compiled_reverse_bank(build, options)
+    compiled = _compile_reverse_bank(build, options)
     records: list[dict[str, Any]] = []
     if compiled is not None:
-        records = compiled.bank.scan_text(text)
+        records = compiled.scan_text(text)
     candidates = _reverse_match_candidates(text, records, build.lookup)
     selected = _resolve_reverse_overlaps(candidates)
     edits = [

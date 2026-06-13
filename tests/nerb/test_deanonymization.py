@@ -4,6 +4,8 @@ import copy
 
 import pytest
 
+from nerb import deanonymize_file as root_deanonymize_file
+from nerb import deanonymize_text as root_deanonymize_text
 from nerb.deanonymization import (
     ByteEdit,
     DeanonymizationError,
@@ -857,11 +859,19 @@ def test_build_reverse_bank_is_valid_and_opaque_by_default():
     reverse_repr = repr(reverse_bank)
     assignment_key_value = next(iter(db["assignments"]))
     assert "[PERSON_0001]" in reverse_repr
+    assert reverse_bank["version"] == "generated"
+    assert list(reverse_bank["entities"]) == ["r_000000000001"]
+    assert list(next(iter(reverse_bank["entities"].values()))["names"]) == ["a_000000000001"]
     assert "John Smith" not in reverse_repr
     assert "john_smith" not in reverse_repr
     assert assignment_key_value not in reverse_repr
     assert "|sha256:" not in reverse_repr
     assert reverse_bank["entities"]
+
+
+def test_deanonymize_helpers_are_exported_from_package_root():
+    assert root_deanonymize_text is deanonymize_text
+    assert root_deanonymize_file is deanonymize_file
 
 
 def test_reverse_bank_fingerprint_ignores_non_matching_metadata():
@@ -890,6 +900,34 @@ def test_reverse_bank_fingerprint_ignores_non_matching_metadata():
         options=options,
     )
     assert reverse_bank_fingerprint(db, options=options) != reverse_bank_fingerprint(changed_match, options=options)
+
+
+def test_reverse_bank_fingerprint_sanitizes_invalid_db_diagnostics_by_default():
+    db = _pseudonym_db(store_originals=True)
+    allocated = allocate_assignment(_record(), db, now="2026-06-13T00:00:00Z").replacement_db
+    first_assignment_key = next(iter(allocated["assignments"]))
+    second_assignment_key = assignment_key(
+        _record(name_id="jane_smith", canonical_name="Jane Smith"),
+        allocated["defaults"],
+    )
+    duplicated_assignment = copy.deepcopy(allocated["assignments"][first_assignment_key])
+    duplicated_assignment["assignment_key"] = second_assignment_key
+    duplicated_assignment["identity"]["fingerprint"] = second_assignment_key.split("|", 2)[2]
+    duplicated_assignment["identity"]["name_id"] = "jane_smith"
+    duplicated_assignment["identity"]["canonical_name"] = "Jane Smith"
+    duplicated_assignment["original"]["canonical"] = "Jane Smith"
+    allocated["assignments"][second_assignment_key] = duplicated_assignment
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        reverse_bank_fingerprint(allocated, options={"restore_pseudonyms": True})
+
+    diagnostics_repr = repr(exc_info.value.diagnostics)
+    assert all("|sha256:" not in item["path"] for item in exc_info.value.diagnostics)
+    assert "first_assignment_key" not in diagnostics_repr
+    assert first_assignment_key not in diagnostics_repr
+    assert second_assignment_key not in diagnostics_repr
+    assert "john_smith" not in diagnostics_repr
+    assert "jane_smith" not in diagnostics_repr
 
 
 def test_deanonymize_text_restores_redaction_tokens_by_default_with_safe_payload():
