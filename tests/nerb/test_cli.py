@@ -1932,3 +1932,36 @@ def test_cli_anonymize_file_rejects_non_directory_output_parent_before_saving(tm
     assert result.exit_code == 1
     assert f"Output parent path is not a directory: {parent_path}" in result.output
     assert load_replacement_db(db_path)["assignments"] == {}
+
+
+def test_cli_anonymize_file_rejects_output_over_replacement_db_before_saving(tmp_path):
+    bank_path = _write_json(tmp_path / "people.json", _person_json_bank())
+    db_path = tmp_path / "replacements.json"
+    input_path = tmp_path / "input.txt"
+    input_path.write_text("John Smith joined.", encoding="utf-8")
+
+    assert runner.invoke(app, ["replacement-db", "init", "--db", str(db_path), "--reversible"]).exit_code == 0
+    before = db_path.read_text(encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "anonymize-file",
+            "--bank",
+            str(bank_path),
+            "--db",
+            str(db_path),
+            "--file",
+            str(input_path),
+            "--output",
+            str(db_path),
+            "--mode",
+            "redact",
+            "--save-db",
+            "--force",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert f"Output path must not overwrite the replacement database file: {db_path}" in result.output
+    assert db_path.read_text(encoding="utf-8") == before
+    assert load_replacement_db(db_path)["assignments"] == {}

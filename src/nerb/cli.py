@@ -743,6 +743,15 @@ def _ensure_output_writable(output_path: Path, *, force: bool) -> Path:
     return path
 
 
+def _reject_output_path_collision(output_path: Path | None, protected_paths: Mapping[str, Path]) -> None:
+    if output_path is None:
+        return
+    resolved_output = output_path.expanduser().resolve(strict=False)
+    for label, protected_path in protected_paths.items():
+        if resolved_output == protected_path.expanduser().resolve(strict=False):
+            _exit_error(f"Output path must not overwrite the {label} file: {protected_path.expanduser()}.")
+
+
 def _refuse_unsaved_assignment_output(payload: Mapping[str, Any], *, save_db: bool) -> None:
     replacement_db_metadata = payload.get("replacement_db")
     if isinstance(replacement_db_metadata, Mapping) and replacement_db_metadata.get("modified") is True and not save_db:
@@ -2011,6 +2020,10 @@ def anonymize_json_bank_file(
         _exit_error(f"Could not load replacement database at {path}.")
 
     document_path = _ensure_explicit_file(file_path, "Document")
+    _reject_output_path_collision(
+        output_path,
+        {"replacement database": path, "bank": bank_path, "input document": document_path},
+    )
     if output_path is not None:
         _ensure_output_writable(output_path, force=force)
     options = _anonymize_options(
@@ -2125,6 +2138,10 @@ def deanonymize_json_bank_file(
         _exit_error(f"Could not load replacement database at {path}.")
 
     document_path = _ensure_explicit_file(file_path, "Document")
+    _reject_output_path_collision(
+        output_path,
+        {"replacement database": path, "input document": document_path},
+    )
     if output_path is not None:
         _ensure_output_writable(output_path, force=force)
     options = _deanonymize_options(
