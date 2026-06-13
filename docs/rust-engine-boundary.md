@@ -282,9 +282,9 @@ Example key shape:
 {
   "bank_hash": "sha256:...",
   "schema_version": 1,
-  "semantic_version": "0.0.6",
+  "semantic_version": "0.0.7",
   "engine_name": "nerb_engine",
-  "engine_version": "0.0.6",
+  "engine_version": "0.0.7",
   "canonical_engine": "rust-regex-meta",
   "compile_options": {"match_mode": "entity_independent"},
   "target_triple": "x86_64-linux-gnu",
