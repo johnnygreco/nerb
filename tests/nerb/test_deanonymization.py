@@ -307,6 +307,25 @@ def test_anonymize_config_text_uses_canonical_scope_for_config_records():
     assert public_response["text"] == response["text"]
 
 
+def test_anonymize_config_text_sensitive_metadata_includes_config_entity():
+    pattern_config = {"ARTIST": {"Miles Davis": r"Miles Davis|M\. Davis"}}
+    db = create_replacement_db(reversible=True, assignment_scope="canonical", now="2026-06-13T00:00:00Z")
+
+    response, _updated_db = _anonymize_config_text_with_db_update(
+        pattern_config,
+        "Miles Davis met M. Davis.",
+        db,
+        options={"mode": "redact", "include_sensitive_metadata": True},
+    )
+
+    source_record = response["applied_replacements"][0]["source_record"]
+    assert source_record == {
+        "entity": "ARTIST",
+        "canonical_name": "Miles Davis",
+        "surface_name": "Miles Davis",
+    }
+
+
 def test_anonymize_config_text_uses_surface_scope_for_exact_surface_restoration():
     pattern_config = {"TICKET": {"Ticket": r"A-\d+"}}
     db = create_replacement_db(reversible=True, assignment_scope="surface", now="2026-06-13T00:00:00Z")

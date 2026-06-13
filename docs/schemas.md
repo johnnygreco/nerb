@@ -280,7 +280,9 @@ Additional top-level properties are rejected.
 
 ### Replacement Policy
 
-`defaults` must contain every policy field. `entities.<entity_id>` may contain any non-empty subset of the same fields.
+`defaults` must contain the base policy fields. `replacement_set_id` is optional for redaction policies, but required in
+the effective policy when `replacement_mode` is `pseudonym`. `entities.<entity_id>` may contain any non-empty subset of
+the same fields.
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -291,7 +293,7 @@ Additional top-level properties are rejected.
 | `collision_policy` | string | Currently `error`. |
 | `store_originals` | boolean | Enables reversible de-anonymization when true. |
 | `allow_new_assignments` | boolean | When false, unknown entities produce diagnostics instead of assignments. |
-| `replacement_set_id` | ID string | Required for new pseudonym assignments. |
+| `replacement_set_id` | ID string | Optional for redaction; required for effective pseudonym policies. |
 
 Assignment scopes:
 
@@ -316,7 +318,10 @@ Assignment keys use this opaque format:
 
 Assignment rows contain `assignment_key`, `entity_id`, `identity`, `replacement`, `redaction`, timestamps, `use_count`,
 and `metadata`. `original` is present only when the effective policy stores originals. Fingerprints, assignment keys,
-source IDs, originals, replacement values, and hashes are linkable or sensitive; default CLI/MCP responses redact them.
+source IDs, originals, replacement values, and hashes are linkable or sensitive. Default CLI response metadata redacts
+them, while the transformed `text` contains replacement values by design. Default Python and MCP anonymization response
+metadata include replacement values because those values are also present in the transformed text; they still redact
+originals, raw assignment keys, fingerprints, and hashes.
 
 ## Anonymization Responses
 
@@ -334,9 +339,10 @@ source IDs, originals, replacement values, and hashes are linkable or sensitive;
 | `summary` | object | `record_count`, `applied_count`, and `diagnostic_count`. |
 | `diagnostics` | array | Non-fatal diagnostics. |
 
-Default `applied_replacements` entries include opaque `assignment_ref`, `entity`, `mode`, `original_span`, and
-`replacement_span`. `include_originals` adds original strings. `include_sensitive_metadata` adds raw assignment keys,
-source record IDs, replacement values, DB data, hashes, and file paths where available.
+Default Python and MCP `applied_replacements` entries include opaque `assignment_ref`, `entity`, `mode`,
+`original_span`, `replacement_span`, and `replacement`. CLI output strips `replacement` unless
+`--include-sensitive-metadata` is set. `include_originals` adds original strings. `include_sensitive_metadata` adds raw
+assignment keys, source record IDs, DB data, hashes, and file paths where available.
 
 Config-backed anonymization uses Rust `Bank.scan_text()` records from YAML detector configs. It does not run JSON-bank
 report resolution. Because config records do not include `name_id`, use `assignment_scope: "canonical"` or
@@ -350,7 +356,6 @@ report resolution. Because config records do not include `name_id`, use `assignm
 | --- | --- | --- |
 | `schema_version` | string | `nerb.deanonymize_response.v1`. |
 | `replacement_db` | object | Safe DB metadata. |
-| `reverse_bank` | object | Safe generated reverse-bank metadata. |
 | `source` | object | Text/file metadata. File paths are omitted by default and replaced with `source_ref`. |
 | `text` | string | Restored text. |
 | `applied_restorations` | array | Per-restoration metadata. |

@@ -1415,9 +1415,18 @@ def _applied_replacement_payload(
         identity = assignment.get("identity") if isinstance(assignment.get("identity"), Mapping) else {}
         source_record = {
             key: record[key]
-            for key in ("entity_id", "name_id", "pattern_id", "pattern_kind", "canonical_name", "surface_name")
+            for key in (
+                "entity_id",
+                "name_id",
+                "pattern_id",
+                "pattern_kind",
+                "canonical_name",
+                "surface_name",
+            )
             if key in record
         }
+        if "entity_id" not in source_record and "entity" in record:
+            source_record["entity"] = record["entity"]
         payload["assignment_key"] = item["assignment_key"]
         payload["fingerprint"] = identity.get("fingerprint") if isinstance(identity, Mapping) else None
         payload["source_record"] = source_record

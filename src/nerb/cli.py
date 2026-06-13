@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
@@ -668,10 +670,25 @@ def _anonymize_run_payload(action: Any, options: Mapping[str, Any]) -> dict[str,
 
 def _write_output_text(output_path: Path, text: str, *, force: bool) -> None:
     path = _ensure_output_writable(output_path, force=force)
+    temp_path = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temp_path = Path(file.name)
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+
+        temp_path.replace(path)
     except OSError as exc:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
         _exit_error(f"Could not write output at {path}: {exc}")
 
 

@@ -93,18 +93,21 @@ nerb anonymize-config-text --config detectors.yaml --db config-replacements.json
 Pseudonyms require a replacement set and are not restored by default:
 
 ```shell
-nerb replacement-db add-set --db replacements.json --set person_names \
+nerb replacement-db init --db pseudonym-replacements.json --reversible
+nerb replacement-db add-set --db pseudonym-replacements.json --set person_names \
   --candidate "Mikey Law" --candidate "Nina Vale"
-nerb replacement-db set-entity --db replacements.json --entity person \
+nerb replacement-db set-entity --db pseudonym-replacements.json --entity person \
   --mode pseudonym --set person_names --store-originals
-nerb anonymize-text --bank people.json --db replacements.json \
+nerb anonymize-text --bank people.json --db pseudonym-replacements.json \
   --text "John Smith joined." --mode pseudonym --save-db
-nerb deanonymize-text --db replacements.json --text "Mikey Law joined." --restore-pseudonyms
+nerb deanonymize-text --db pseudonym-replacements.json --text "Mikey Law joined." --restore-pseudonyms
 ```
 
-Default CLI and MCP responses omit originals, raw assignment keys, fingerprints, bank hashes, and replacement DB hashes.
-Use `--include-originals`, `--include-values`, or `--include-sensitive-metadata` only when you are intentionally sending
-sensitive data to the caller.
+Default CLI response metadata omits originals, replacement values, raw assignment keys, fingerprints, bank hashes, and
+replacement DB hashes. The transformed `text` still contains replacement values by design. Python and MCP anonymization
+response metadata include replacement values because they are already present in the transformed text, but still omit
+originals, raw keys, fingerprints, and hashes by default. Use `--include-originals`, `--include-values`, or
+`--include-sensitive-metadata` only when you are intentionally sending sensitive data to the caller.
 
 ## Python API
 
