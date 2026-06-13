@@ -611,7 +611,7 @@ def _safe_diagnostic_message(code: str, path: str) -> str:
 
 
 def _diagnostic_code_may_contain_sensitive_message(code: str) -> bool:
-    return code.startswith(("engine.", "regex.", "schema.", "id.", "metadata.", "report."))
+    return code.startswith(("engine.", "regex.", "schema.", "id.", "metadata.", "report.", "replacement_db."))
 
 
 def _diagnostic_code(diagnostic_item: Mapping[str, Any]) -> str | None:
@@ -640,7 +640,10 @@ def _raise_extraction_error(exc: ExtractionError, options: _AnonymizeOptions) ->
     if not diagnostics:
         message = str(exc) if options.include_sensitive_metadata else "Anonymization extraction failed."
         diagnostics = [_error("anonymize.extraction_error", "/source", message)]
-    raise DeanonymizationError("Anonymization extraction failed.", diagnostics) from exc
+    error = DeanonymizationError("Anonymization extraction failed.", diagnostics)
+    if options.include_sensitive_metadata:
+        raise error from exc
+    raise error from None
 
 
 def _safe_bank_metadata(report: Mapping[str, Any], options: _AnonymizeOptions) -> dict[str, Any]:
