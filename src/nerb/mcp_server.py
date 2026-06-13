@@ -573,7 +573,8 @@ def _save_replacement_db_for_tool(
     resolved_options, _save, expected_hash, expected_version, include_sensitive_metadata = _save_options(options)
     if expected_hash is None and source_path is not None and _same_path(source_path, save_path):
         expected_hash = source_hash
-        expected_version = source_version
+        if expected_version is None:
+            expected_version = source_version
     require_missing = False
     if save_path.is_file() and expected_hash is None:
         return _replacement_db_stale_write_payload(

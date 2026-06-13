@@ -504,6 +504,18 @@ def test_mcp_replacement_db_create_validate_and_save_are_explicit(tmp_path):
     assert sensitive_overwrite["options"]["expected_replacement_db_hash"] == expected_hash
     assert load_replacement_db(db_path)["description"] == "changed again"
 
+    wrong_version_save = anonymize_text_tool(
+        "John Smith joined.",
+        bank=_person_json_bank(),
+        replacement_db_path=str(db_path),
+        save_db_path=str(db_path),
+        options={"mode": "redact", "save": True, "expected_version": 999},
+    )
+
+    assert wrong_version_save["valid"] is False
+    assert wrong_version_save["diagnostics"][0]["code"] == "replacement_db.stale_write"
+    assert load_replacement_db(db_path)["description"] == "changed again"
+
 
 def test_mcp_anonymize_and_deanonymize_text_use_explicit_save_path(tmp_path):
     bank = _person_json_bank()
