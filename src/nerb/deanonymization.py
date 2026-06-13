@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
-from .diagnostics import DIAGNOSTIC_ERROR, Diagnostic, diagnostic, has_errors
+from .diagnostics import DIAGNOSTIC_ERROR, DIAGNOSTIC_WARNING, Diagnostic, diagnostic, has_errors
+from .engine import Bank
 from .engines import ExtractionError, resolve_extraction_options
 from .extraction import _read_utf8_file, extract_report
 from .replacements import (
@@ -22,7 +23,7 @@ from .replacements import (
     validate_replacement_db,
 )
 from .replacements_schema import MAX_STORED_ORIGINAL_SURFACES
-from .schema import ID_RE, UNICODE_NORMALIZATION_VALUES
+from .schema import ID_RE, SCHEMA_VERSION, UNICODE_NORMALIZATION_VALUES, validate_bank_schema
 
 __all__ = [
     "AssignmentAllocation",
@@ -36,10 +37,15 @@ __all__ = [
     "anonymize_text",
     "apply_byte_replacements",
     "assignment_key",
+    "build_reverse_bank",
+    "deanonymize_file",
+    "deanonymize_text",
     "finalize_replacement_db_update",
+    "reverse_bank_fingerprint",
 ]
 
 ANONYMIZE_RESPONSE_SCHEMA_VERSION = "nerb.anonymize_response.v1"
+DEANONYMIZE_RESPONSE_SCHEMA_VERSION = "nerb.deanonymize_response.v1"
 ANONYMIZE_MODES = {"entity_policy", "pseudonym", "redact"}
 ANONYMIZE_MISSING_ASSIGNMENT_POLICIES = {"diagnostic", "fail", "skip"}
 ANONYMIZE_OPTION_KEYS = {
@@ -49,21 +55,40 @@ ANONYMIZE_OPTION_KEYS = {
     "on_missing_assignment",
     "source_surface_limit",
 }
+DEANONYMIZE_OPTION_KEYS = {
+    "restore_pseudonyms",
+    "restore_redactions",
+    "include_originals",
+    "include_sensitive_metadata",
+}
 ASSIGNMENT_SCOPES = {"name", "canonical", "surface"}
 REPLACEMENT_MISSING_ASSIGNMENT = "replacement_db.missing_assignment"
+REPLACEMENT_MISSING_ORIGINAL = "replacement_db.missing_original"
 REPLACEMENT_CANDIDATES_EXHAUSTED = "replacement_db.candidates_exhausted"
 REPLACEMENT_MODE_MISMATCH = "replacement_db.assignment_mode_mismatch"
+DEANONYMIZE_AMBIGUOUS_REPLACEMENT = "deanonymize.ambiguous_replacement"
+DEANONYMIZE_PSEUDONYM_RESTORE_WARNING = "deanonymize.pseudonym_restore_warning"
+DEANONYMIZE_TOO_MANY_REVERSE_ENTITIES = "deanonymize.too_many_reverse_entities"
 ENTITY_ID_HASH_LENGTH = 12
+REVERSE_BANK_MAX_ENTITIES = 1_000
 SAFE_DIAGNOSTIC_METADATA_KEYS = {
     "assignment_ref",
     "entity",
     "bytes",
     "limit",
+    "mode",
 }
 SAFE_DIAGNOSTIC_MESSAGES = {
     "anonymize.extraction_error": "Anonymization extraction failed.",
+    "deanonymize.invalid_option": "De-anonymization option is invalid.",
+    DEANONYMIZE_AMBIGUOUS_REPLACEMENT: "Reverse replacement value maps to multiple originals.",
+    DEANONYMIZE_PSEUDONYM_RESTORE_WARNING: (
+        "Pseudonym restoration is enabled; natural occurrences of pseudonyms may be restored."
+    ),
+    DEANONYMIZE_TOO_MANY_REVERSE_ENTITIES: "Reverse bank exceeds the supported generated entity limit.",
     "engine.compile_error": "Bank extraction failed.",
     REPLACEMENT_CANDIDATES_EXHAUSTED: "Replacement set has no available unambiguous candidates.",
+    REPLACEMENT_MISSING_ORIGINAL: "Assignment cannot be restored because no original is stored.",
     "replacement_db.assignment_collision": "Replacement value maps to multiple assignments.",
     "replacement_db.assignment_key_mismatch": "Assignment key metadata is inconsistent.",
     "replacement_db.invalid_assignment_key": "Assignment key is invalid.",
@@ -156,6 +181,38 @@ class _AnonymizeOptions:
     on_missing_assignment: str
     source_surface_limit: int
     extraction_options: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _DeanonymizeOptions:
+    restore_pseudonyms: bool
+    restore_redactions: bool
+    include_originals: bool
+    include_sensitive_metadata: bool
+    extraction_options: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _ReverseEntry:
+    assignment_key: str = field(repr=False)
+    assignment_ref: str
+    entity_id: str
+    mode: str
+    pattern_value: str = field(repr=False)
+    restored_value: str = field(repr=False)
+    restored_value_source: str
+    reverse_entity_id: str
+    reverse_name_id: str
+    pattern_id: str
+
+
+@dataclass(frozen=True)
+class _ReverseBankBuild:
+    bank: dict[str, Any] | None
+    fingerprint: str = field(repr=False)
+    entries: tuple[_ReverseEntry, ...] = field(repr=False)
+    lookup: dict[str, _ReverseEntry] = field(repr=False)
+    diagnostics: tuple[Diagnostic, ...]
 
 
 def _utc_now() -> str:
@@ -552,9 +609,43 @@ def _resolve_anonymize_options(options: Mapping[str, Any] | None) -> _AnonymizeO
     )
 
 
+def _bool_deanonymize_option(options: Mapping[str, Any], key: str, default: bool) -> bool:
+    value = options.get(key, default)
+    if not isinstance(value, bool):
+        raise DeanonymizationError(
+            "De-anonymization option is invalid.",
+            [
+                _error(
+                    "deanonymize.invalid_option",
+                    f"/options/{key}",
+                    f"De-anonymization option {key} must be a boolean.",
+                )
+            ],
+        )
+    return value
+
+
+def _resolve_deanonymize_options(options: Mapping[str, Any] | None) -> _DeanonymizeOptions:
+    if options is None:
+        raw_options: Mapping[str, Any] = {}
+    elif isinstance(options, Mapping):
+        raw_options = options
+    else:
+        raise TypeError("De-anonymization options must be a mapping.")
+
+    extraction_options = {key: value for key, value in raw_options.items() if key not in DEANONYMIZE_OPTION_KEYS}
+    return _DeanonymizeOptions(
+        restore_pseudonyms=_bool_deanonymize_option(raw_options, "restore_pseudonyms", False),
+        restore_redactions=_bool_deanonymize_option(raw_options, "restore_redactions", True),
+        include_originals=_bool_deanonymize_option(raw_options, "include_originals", False),
+        include_sensitive_metadata=_bool_deanonymize_option(raw_options, "include_sensitive_metadata", False),
+        extraction_options=extraction_options,
+    )
+
+
 def _sanitize_diagnostic(
     item: Diagnostic,
-    options: _AnonymizeOptions,
+    options: Any,
     *,
     metadata: Mapping[str, Any] | None = None,
 ) -> Diagnostic:
@@ -627,6 +718,13 @@ def _sanitize_diagnostics(diagnostics: Sequence[Diagnostic], options: _Anonymize
     return [_sanitize_diagnostic(dict(item), options) for item in diagnostics if isinstance(item, Mapping)]
 
 
+def _sanitize_deanonymize_diagnostics(
+    diagnostics: Sequence[Diagnostic],
+    options: _DeanonymizeOptions,
+) -> list[Diagnostic]:
+    return [_sanitize_diagnostic(dict(item), options) for item in diagnostics if isinstance(item, Mapping)]
+
+
 def _raise_anonymize_error(
     message: str,
     diagnostics: Sequence[Diagnostic],
@@ -640,12 +738,36 @@ def _raise_anonymize_error(
     raise error from None
 
 
+def _raise_deanonymize_error(
+    message: str,
+    diagnostics: Sequence[Diagnostic],
+    options: _DeanonymizeOptions,
+    *,
+    raw_error: BaseException | None = None,
+) -> NoReturn:
+    error = DeanonymizationError(message, _sanitize_deanonymize_diagnostics(diagnostics, options))
+    if options.include_sensitive_metadata and raw_error is not None:
+        raise error from raw_error
+    raise error from None
+
+
 def _raise_extraction_error(exc: ExtractionError, options: _AnonymizeOptions) -> NoReturn:
     diagnostics = _sanitize_diagnostics(exc.diagnostics, options)
     if not diagnostics:
         message = str(exc) if options.include_sensitive_metadata else "Anonymization extraction failed."
         diagnostics = [_error("anonymize.extraction_error", "/source", message)]
     error = DeanonymizationError("Anonymization extraction failed.", diagnostics)
+    if options.include_sensitive_metadata:
+        raise error from exc
+    raise error from None
+
+
+def _raise_deanonymize_extraction_error(exc: ExtractionError, options: _DeanonymizeOptions) -> NoReturn:
+    diagnostics = _sanitize_deanonymize_diagnostics(exc.diagnostics, options)
+    if not diagnostics:
+        message = str(exc) if options.include_sensitive_metadata else "De-anonymization source option failed."
+        diagnostics = [_error("deanonymize.extraction_error", "/source", message)]
+    error = DeanonymizationError("De-anonymization source option failed.", diagnostics)
     if options.include_sensitive_metadata:
         raise error from exc
     raise error from None
@@ -685,7 +807,32 @@ def _safe_replacement_db_metadata(
     return payload
 
 
+def _safe_deanonymize_replacement_db_metadata(
+    replacement_db: Mapping[str, Any],
+    options: _DeanonymizeOptions,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "replacement_db_ref": "rdb1",
+        "schema_version": replacement_db.get("schema_version"),
+        "version": replacement_db.get("version"),
+    }
+    if options.include_sensitive_metadata:
+        payload["id"] = replacement_db.get("id")
+        payload["hash"] = hash_replacement_db(replacement_db)
+        payload["data"] = copy.deepcopy(dict(replacement_db))
+    return payload
+
+
 def _safe_source_metadata(source: Mapping[str, Any], options: _AnonymizeOptions) -> dict[str, Any]:
+    payload = {key: copy.deepcopy(value) for key, value in source.items() if key != "path"}
+    if source.get("type") == "file":
+        payload.setdefault("source_ref", "s1")
+        if options.include_sensitive_metadata and "path" in source:
+            payload["path"] = source["path"]
+    return payload
+
+
+def _safe_deanonymize_source_metadata(source: Mapping[str, Any], options: _DeanonymizeOptions) -> dict[str, Any]:
     payload = {key: copy.deepcopy(value) for key, value in source.items() if key != "path"}
     if source.get("type") == "file":
         payload.setdefault("source_ref", "s1")
@@ -1191,6 +1338,458 @@ def _applied_replacement_payload(
     return payload
 
 
+def _assignment_restore_value(assignment: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    original = assignment.get("original")
+    identity = assignment.get("identity")
+    scope = identity.get("scope") if isinstance(identity, Mapping) else None
+    if not isinstance(original, Mapping):
+        return None, None
+    if scope == "surface":
+        surfaces = original.get("surfaces")
+        if isinstance(surfaces, list):
+            for surface in surfaces:
+                if isinstance(surface, str) and surface:
+                    return surface, "surface"
+        return None, None
+    canonical = original.get("canonical")
+    if isinstance(canonical, str) and canonical:
+        return canonical, "canonical"
+    return None, None
+
+
+def _enabled_reverse_patterns(
+    assignment: Mapping[str, Any],
+    options: _DeanonymizeOptions,
+) -> list[tuple[str, str, str]]:
+    patterns: list[tuple[str, str, str]] = []
+    redaction = assignment.get("redaction")
+    if options.restore_redactions and isinstance(redaction, Mapping):
+        token = redaction.get("token")
+        if isinstance(token, str) and token:
+            patterns.append(("redact", token, "token"))
+
+    replacement = assignment.get("replacement")
+    if options.restore_pseudonyms and isinstance(replacement, Mapping):
+        mode = replacement.get("mode")
+        value = replacement.get("value")
+        if mode == "pseudonym" and isinstance(value, str) and value:
+            patterns.append(("pseudonym", value, "pseudonym"))
+    return patterns
+
+
+def _reverse_bank_payload(entries: Sequence[_ReverseEntry]) -> dict[str, Any]:
+    entities: dict[str, Any] = {}
+    for entry in entries:
+        priority = len(entry.pattern_value.encode("utf-8"))
+        entities[entry.reverse_entity_id] = {
+            "description": "Generated reverse replacement matcher.",
+            "status": "active",
+            "regex_flags": [],
+            "names": {
+                entry.reverse_name_id: {
+                    "canonical": f"assignment:{entry.reverse_entity_id[2:]}",
+                    "description": "Generated reverse replacement assignment.",
+                    "status": "active",
+                    "patterns": {
+                        entry.pattern_id: {
+                            "kind": "literal",
+                            "value": entry.pattern_value,
+                            "description": "Generated reverse replacement literal.",
+                            "status": "active",
+                            "priority": priority,
+                            "case_sensitive": True,
+                            "normalize_whitespace": False,
+                            "left_boundary": "none",
+                            "right_boundary": "none",
+                            "metadata": {},
+                        }
+                    },
+                    "metadata": {},
+                }
+            },
+            "metadata": {},
+        }
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "id": "reverse_replacements",
+        "name": "Reverse Replacement Bank",
+        "description": "Generated in-memory bank for reverse replacement matching.",
+        "version": "generated",
+        "status": "active",
+        "created_at": "1970-01-01T00:00:00Z",
+        "updated_at": "1970-01-01T00:00:00Z",
+        "unicode_normalization": "none",
+        "default_regex_flags": [],
+        "entities": entities,
+        "metadata": {},
+    }
+
+
+def _reverse_fingerprint_payload(entries: Sequence[_ReverseEntry], options: _DeanonymizeOptions) -> list[Any]:
+    return [
+        {
+            "assignment_key": entry.assignment_key,
+            "entity_id": entry.entity_id,
+            "mode": entry.mode,
+            "pattern_value": entry.pattern_value,
+            "restored_value": entry.restored_value,
+            "restored_value_source": entry.restored_value_source,
+        }
+        for entry in entries
+    ] + [{"restore_pseudonyms": options.restore_pseudonyms, "restore_redactions": options.restore_redactions}]
+
+
+def _reverse_bank_fingerprint(entries: Sequence[_ReverseEntry], options: _DeanonymizeOptions) -> str:
+    return _hash_parts("reverse_bank", _reverse_fingerprint_payload(entries, options))
+
+
+def _missing_original_diagnostic(
+    assignment_key_value: str,
+    assignment_ref: str,
+    assignment: Mapping[str, Any],
+    options: _DeanonymizeOptions,
+) -> Diagnostic:
+    metadata: dict[str, Any] = {"assignment_ref": assignment_ref}
+    entity_id = assignment.get("entity_id")
+    if isinstance(entity_id, str):
+        metadata["entity"] = entity_id
+    if options.include_sensitive_metadata:
+        metadata["assignment_key"] = assignment_key_value
+    return _error(
+        REPLACEMENT_MISSING_ORIGINAL,
+        "/assignments",
+        "Assignment cannot be restored because no original is stored.",
+        metadata=metadata,
+    )
+
+
+def _build_reverse_bank(replacement_db: Mapping[str, Any], options: _DeanonymizeOptions) -> _ReverseBankBuild:
+    db = _validate_replacement_db_for_allocation(replacement_db)
+    assignments = db.get("assignments")
+    assignment_refs: dict[str, str] = {}
+    diagnostics: list[Diagnostic] = []
+    entries: list[_ReverseEntry] = []
+    seen_values: dict[str, _ReverseEntry] = {}
+
+    if isinstance(assignments, Mapping):
+        for assignment_key_value in sorted(str(key) for key in assignments):
+            assignment = assignments.get(assignment_key_value)
+            if not isinstance(assignment, Mapping):
+                continue
+            enabled_patterns = _enabled_reverse_patterns(assignment, options)
+            if not enabled_patterns:
+                continue
+            assignment_ref = _assignment_ref(assignment_key_value, assignment_refs)
+            restored_value, restored_value_source = _assignment_restore_value(assignment)
+            if restored_value is None or restored_value_source is None:
+                diagnostics.append(
+                    _missing_original_diagnostic(assignment_key_value, assignment_ref, assignment, options)
+                )
+                continue
+
+            entity_id = assignment.get("entity_id")
+            safe_entity_id = entity_id if isinstance(entity_id, str) else "unknown"
+            for mode, pattern_value, pattern_id in enabled_patterns:
+                ordinal = len(entries) + 1
+                entry = _ReverseEntry(
+                    assignment_key=assignment_key_value,
+                    assignment_ref=assignment_ref,
+                    entity_id=safe_entity_id,
+                    mode=mode,
+                    pattern_value=pattern_value,
+                    restored_value=restored_value,
+                    restored_value_source=restored_value_source,
+                    reverse_entity_id=f"r_{ordinal:012d}",
+                    reverse_name_id=f"a_{ordinal:012d}",
+                    pattern_id=pattern_id,
+                )
+                previous = seen_values.get(pattern_value)
+                if previous is not None:
+                    if previous.restored_value != restored_value:
+                        diagnostics.append(
+                            _error(
+                                DEANONYMIZE_AMBIGUOUS_REPLACEMENT,
+                                "/assignments",
+                                "Reverse replacement value maps to multiple originals.",
+                                metadata={"assignment_ref": assignment_ref, "entity": safe_entity_id},
+                            )
+                        )
+                    continue
+                seen_values[pattern_value] = entry
+                entries.append(entry)
+
+    if len(entries) > REVERSE_BANK_MAX_ENTITIES:
+        diagnostics.append(
+            _error(
+                DEANONYMIZE_TOO_MANY_REVERSE_ENTITIES,
+                "/assignments",
+                f"Reverse bank has {len(entries)} generated entities; limit is {REVERSE_BANK_MAX_ENTITIES}.",
+                metadata={"limit": REVERSE_BANK_MAX_ENTITIES},
+            )
+        )
+
+    fingerprint = _reverse_bank_fingerprint(entries, options)
+    if not entries or len(entries) > REVERSE_BANK_MAX_ENTITIES:
+        return _ReverseBankBuild(
+            bank=None,
+            fingerprint=fingerprint,
+            entries=tuple(entries),
+            lookup={},
+            diagnostics=tuple(diagnostics),
+        )
+
+    bank = _reverse_bank_payload(entries)
+    schema_diagnostics = validate_bank_schema(bank)["diagnostics"]
+    if has_errors(schema_diagnostics):
+        diagnostics.extend(schema_diagnostics)
+
+    lookup = {entry.reverse_entity_id: entry for entry in entries}
+    return _ReverseBankBuild(
+        bank=bank,
+        fingerprint=fingerprint,
+        entries=tuple(entries),
+        lookup=lookup,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def _fatal_reverse_bank_diagnostics(diagnostics: Sequence[Diagnostic]) -> list[Diagnostic]:
+    fatal_codes = {DEANONYMIZE_AMBIGUOUS_REPLACEMENT, DEANONYMIZE_TOO_MANY_REVERSE_ENTITIES}
+    return [
+        item
+        for item in diagnostics
+        if item.get("code") in fatal_codes
+        or (isinstance(item.get("code"), str) and str(item["code"]).startswith(("schema.", "id.")))
+    ]
+
+
+def build_reverse_bank(
+    replacement_db: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the opaque generated reverse JSON bank for reversible assignments."""
+    resolved_options = _resolve_deanonymize_options(options)
+    build_error: DeanonymizationError | None = None
+    try:
+        build = _build_reverse_bank(replacement_db, resolved_options)
+    except DeanonymizationError as exc:
+        build_error = exc
+    if build_error is not None:
+        _raise_deanonymize_error("Replacement database is invalid.", build_error.diagnostics, resolved_options)
+    fatal_diagnostics = _fatal_reverse_bank_diagnostics(build.diagnostics)
+    if fatal_diagnostics:
+        _raise_deanonymize_error("Reverse bank cannot be built.", fatal_diagnostics, resolved_options)
+    if build.bank is None:
+        _raise_deanonymize_error("Reverse bank has no reversible assignments.", build.diagnostics, resolved_options)
+    return copy.deepcopy(build.bank)
+
+
+def reverse_bank_fingerprint(
+    replacement_db: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> str:
+    """Return the reverse-bank fingerprint for matching-relevant replacement data."""
+    resolved_options = _resolve_deanonymize_options(options)
+    build_error: DeanonymizationError | None = None
+    try:
+        build = _build_reverse_bank(replacement_db, resolved_options)
+    except DeanonymizationError as exc:
+        build_error = exc
+    if build_error is not None:
+        _raise_deanonymize_error("Replacement database is invalid.", build_error.diagnostics, resolved_options)
+    fatal_diagnostics = _fatal_reverse_bank_diagnostics(build.diagnostics)
+    if fatal_diagnostics:
+        _raise_deanonymize_error("Reverse bank cannot be fingerprinted.", fatal_diagnostics, resolved_options)
+    return build.fingerprint
+
+
+def _compile_reverse_bank(build: _ReverseBankBuild, options: _DeanonymizeOptions) -> Bank | None:
+    if build.bank is None:
+        return None
+    try:
+        return Bank.from_source_bytes(
+            json.dumps(build.bank, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            format_hint="json",
+        )
+    except Exception as exc:  # pragma: no cover - generated bank schema validation should catch this first.
+        _raise_deanonymize_error(
+            "Reverse bank could not be compiled.",
+            [_error("engine.compile_error", "/reverse_bank", "Reverse bank could not be compiled.")],
+            options,
+            raw_error=exc,
+        )
+
+
+def _byte_index_to_char_index(text: str, byte_index: int) -> int:
+    return len(text.encode("utf-8")[:byte_index].decode("utf-8"))
+
+
+def _is_word_char(value: str) -> bool:
+    return bool(value) and bool(re.match(r"\w", value, flags=re.UNICODE))
+
+
+def _pseudonym_adjacency_allowed(text: str, start: int, end: int, pattern_value: str) -> bool:
+    if not pattern_value:
+        return False
+    char_start = _byte_index_to_char_index(text, start)
+    char_end = _byte_index_to_char_index(text, end)
+    if _is_word_char(pattern_value[0]) and char_start > 0 and _is_word_char(text[char_start - 1]):
+        return False
+    if _is_word_char(pattern_value[-1]) and char_end < len(text) and _is_word_char(text[char_end]):
+        return False
+    return True
+
+
+def _reverse_match_candidates(
+    text: str,
+    records: Sequence[Mapping[str, Any]],
+    lookup: Mapping[str, _ReverseEntry],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for record in records:
+        entity_id = record.get("entity")
+        if not isinstance(entity_id, str):
+            continue
+        entry = lookup.get(entity_id)
+        if entry is None:
+            continue
+        start = record.get("start")
+        end = record.get("end")
+        matched = record.get("string")
+        if not _is_int(start) or not _is_int(end) or not isinstance(matched, str):
+            continue
+        start_int = cast(int, start)
+        end_int = cast(int, end)
+        if entry.mode == "pseudonym" and not _pseudonym_adjacency_allowed(
+            text,
+            start_int,
+            end_int,
+            entry.pattern_value,
+        ):
+            continue
+        candidates.append({"record": record, "entry": entry, "start": start_int, "end": end_int})
+    return candidates
+
+
+def _reverse_candidate_priority(candidate: Mapping[str, Any]) -> tuple[int, int, str, int]:
+    entry = cast(_ReverseEntry, candidate["entry"])
+    length = int(candidate["end"]) - int(candidate["start"])
+    mode_rank = 0 if entry.mode == "redact" else 1
+    return (-length, mode_rank, entry.assignment_key, int(candidate["start"]))
+
+
+def _resolve_reverse_overlaps(candidates: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    selected: list[Mapping[str, Any]] = []
+    for candidate in sorted(candidates, key=_reverse_candidate_priority):
+        start = int(candidate["start"])
+        end = int(candidate["end"])
+        if any(start < int(item["end"]) and int(item["start"]) < end for item in selected):
+            continue
+        selected.append(candidate)
+    return sorted(selected, key=lambda item: (int(item["start"]), int(item["end"])))
+
+
+def _pseudonym_warning(options: _DeanonymizeOptions, entries: Sequence[_ReverseEntry]) -> Diagnostic | None:
+    if not options.restore_pseudonyms or not any(entry.mode == "pseudonym" for entry in entries):
+        return None
+    return diagnostic(
+        DIAGNOSTIC_WARNING,
+        DEANONYMIZE_PSEUDONYM_RESTORE_WARNING,
+        "/options/restore_pseudonyms",
+        "Pseudonym restoration is enabled; natural occurrences of pseudonyms may be restored.",
+        metadata={"mode": "pseudonym"},
+    )
+
+
+def _applied_restoration_payload(
+    candidate: Mapping[str, Any],
+    applied_edit: AppliedByteEdit,
+    options: _DeanonymizeOptions,
+) -> dict[str, Any]:
+    entry = cast(_ReverseEntry, candidate["entry"])
+    payload: dict[str, Any] = {
+        "assignment_ref": entry.assignment_ref,
+        "entity": entry.entity_id,
+        "mode": entry.mode,
+        "replacement_span": applied_edit.original_span.as_dict(),
+        "restored_span": applied_edit.replacement_span.as_dict(),
+        "restored_value_source": entry.restored_value_source,
+    }
+    if options.include_originals:
+        payload["restored"] = entry.restored_value
+    if options.include_sensitive_metadata:
+        payload["assignment_key"] = entry.assignment_key
+        payload["replacement"] = entry.pattern_value
+        payload["reverse_entity_id"] = entry.reverse_entity_id
+    return payload
+
+
+def _deanonymize_text_impl(
+    text: str,
+    replacement_db: Mapping[str, Any],
+    options: _DeanonymizeOptions,
+    *,
+    source: Mapping[str, Any],
+) -> dict[str, Any]:
+    db_error: DeanonymizationError | None = None
+    try:
+        db = _validate_replacement_db_for_allocation(replacement_db)
+    except DeanonymizationError as exc:
+        db_error = exc
+    if db_error is not None:
+        _raise_deanonymize_error("Replacement database is invalid.", db_error.diagnostics, options, raw_error=db_error)
+
+    build = _build_reverse_bank(db, options)
+    fatal_diagnostics = _fatal_reverse_bank_diagnostics(build.diagnostics)
+    if fatal_diagnostics:
+        _raise_deanonymize_error("Reverse bank cannot be built.", fatal_diagnostics, options)
+
+    diagnostics = _sanitize_deanonymize_diagnostics(build.diagnostics, options)
+    pseudonym_warning = _pseudonym_warning(options, build.entries)
+    if pseudonym_warning is not None:
+        diagnostics.append(_sanitize_diagnostic(pseudonym_warning, options))
+
+    compiled = _compile_reverse_bank(build, options)
+    records: list[dict[str, Any]] = []
+    if compiled is not None:
+        records = compiled.scan_text(text)
+    candidates = _reverse_match_candidates(text, records, build.lookup)
+    selected = _resolve_reverse_overlaps(candidates)
+    edits = [
+        ByteEdit(
+            int(candidate["start"]),
+            int(candidate["end"]),
+            cast(_ReverseEntry, candidate["entry"]).restored_value,
+            expected=cast(Mapping[str, Any], candidate["record"]).get("string")
+            if isinstance(cast(Mapping[str, Any], candidate["record"]).get("string"), str)
+            else None,
+        )
+        for candidate in selected
+    ]
+    rewrite = apply_byte_replacements(text, edits)
+    applied_restorations = [
+        _applied_restoration_payload(candidate, applied_edit, options)
+        for candidate, applied_edit in zip(selected, rewrite.applied_edits, strict=True)
+    ]
+
+    return {
+        "schema_version": DEANONYMIZE_RESPONSE_SCHEMA_VERSION,
+        "replacement_db": _safe_deanonymize_replacement_db_metadata(db, options),
+        "source": _safe_deanonymize_source_metadata(source, options),
+        "text": rewrite.text,
+        "applied_restorations": applied_restorations,
+        "summary": {
+            "match_count": len(candidates),
+            "applied_count": len(applied_restorations),
+            "diagnostic_count": len(diagnostics),
+        },
+        "diagnostics": diagnostics,
+    }
+
+
 def anonymize_text(
     bank: Mapping[str, Any],
     text: str,
@@ -1233,3 +1832,73 @@ def anonymize_file(
         _raise_extraction_error(extraction_error, resolved_options)
     report["source"] = {"type": "file", "path": str(path), "length": len(text), "bytes": byte_count}
     return _anonymize_resolved_report(text, report, replacement_db, resolved_options)
+
+
+def deanonymize_text(
+    text: str,
+    replacement_db: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Restore known redaction tokens, and optionally pseudonyms, without saving replacement DB changes."""
+    if not isinstance(text, str):
+        raise TypeError("deanonymize_text text must be a string.")
+    resolved_options = _resolve_deanonymize_options(options)
+    option_error: ExtractionError | None = None
+    try:
+        extraction_options = resolve_extraction_options(resolved_options.extraction_options)
+    except ExtractionError as exc:
+        option_error = exc
+    if option_error is not None:
+        _raise_deanonymize_extraction_error(option_error, resolved_options)
+    source_bytes = text.encode("utf-8")
+    if len(source_bytes) > extraction_options.max_text_bytes:
+        _raise_deanonymize_error(
+            "De-anonymization source exceeds the text byte limit.",
+            [
+                _error(
+                    "deanonymize.extraction_error",
+                    "/source",
+                    "De-anonymization source exceeds the text byte limit.",
+                    metadata={"bytes": len(source_bytes), "limit": extraction_options.max_text_bytes},
+                )
+            ],
+            resolved_options,
+        )
+    return _deanonymize_text_impl(
+        text,
+        replacement_db,
+        resolved_options,
+        source={"type": "text", "length": len(text), "bytes": len(source_bytes)},
+    )
+
+
+def deanonymize_file(
+    file_path: str | Path,
+    replacement_db: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Restore known redaction tokens, and optionally pseudonyms, from a UTF-8 text file without writing output."""
+    path = Path(file_path).expanduser()
+    resolved_options = _resolve_deanonymize_options(options)
+    option_error: ExtractionError | None = None
+    try:
+        extraction_options = resolve_extraction_options(resolved_options.extraction_options)
+    except ExtractionError as exc:
+        option_error = exc
+    if option_error is not None:
+        _raise_deanonymize_extraction_error(option_error, resolved_options)
+    file_error: ExtractionError | None = None
+    try:
+        text, byte_count = _read_utf8_file(path, max_bytes=extraction_options.max_text_bytes)
+    except ExtractionError as exc:
+        file_error = exc
+    if file_error is not None:
+        _raise_deanonymize_extraction_error(file_error, resolved_options)
+    return _deanonymize_text_impl(
+        text,
+        replacement_db,
+        resolved_options,
+        source={"type": "file", "path": str(path), "length": len(text), "bytes": byte_count},
+    )

@@ -4,6 +4,8 @@ import copy
 
 import pytest
 
+from nerb import deanonymize_file as root_deanonymize_file
+from nerb import deanonymize_text as root_deanonymize_text
 from nerb.deanonymization import (
     ByteEdit,
     DeanonymizationError,
@@ -12,7 +14,11 @@ from nerb.deanonymization import (
     anonymize_text,
     apply_byte_replacements,
     assignment_key,
+    build_reverse_bank,
+    deanonymize_file,
+    deanonymize_text,
     finalize_replacement_db_update,
+    reverse_bank_fingerprint,
 )
 from nerb.replacements import (
     create_replacement_db,
@@ -21,6 +27,7 @@ from nerb.replacements import (
     save_replacement_db,
     validate_replacement_db,
 )
+from nerb.schema import validate_bank_schema
 
 
 def _span(text: str, value: str) -> tuple[int, int]:
@@ -835,3 +842,364 @@ def test_anonymize_text_sanitizes_replacement_policy_messages_by_default():
             options={"mode": "pseudonym", "include_sensitive_metadata": True},
         )
     assert sensitive_info.value.__cause__ is not None
+
+
+def test_build_reverse_bank_is_valid_and_opaque_by_default():
+    anonymized = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith joined.",
+        create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z"),
+        options={"mode": "redact", "include_sensitive_metadata": True},
+    )
+    db = anonymized["replacement_db"]["data"]
+
+    reverse_bank = build_reverse_bank(db)
+
+    assert validate_bank_schema(reverse_bank)["valid"] is True
+    reverse_repr = repr(reverse_bank)
+    assignment_key_value = next(iter(db["assignments"]))
+    assert "[PERSON_0001]" in reverse_repr
+    assert reverse_bank["version"] == "generated"
+    assert list(reverse_bank["entities"]) == ["r_000000000001"]
+    assert list(next(iter(reverse_bank["entities"].values()))["names"]) == ["a_000000000001"]
+    assert "John Smith" not in reverse_repr
+    assert "john_smith" not in reverse_repr
+    assert assignment_key_value not in reverse_repr
+    assert "|sha256:" not in reverse_repr
+    assert reverse_bank["entities"]
+
+
+def test_deanonymize_helpers_are_exported_from_package_root():
+    assert root_deanonymize_text is deanonymize_text
+    assert root_deanonymize_file is deanonymize_file
+
+
+def test_reverse_bank_fingerprint_ignores_non_matching_metadata():
+    anonymized = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith joined.",
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym", "include_sensitive_metadata": True},
+    )
+    db = anonymized["replacement_db"]["data"]
+    changed_metadata = copy.deepcopy(db)
+    assignment = next(iter(changed_metadata["assignments"].values()))
+    changed_metadata["version"] += 1
+    changed_metadata["updated_at"] = "2026-06-13T00:00:01Z"
+    changed_metadata["metadata"]["note"] = "not used for matching"
+    assignment["use_count"] += 1
+    assignment["metadata"]["note"] = "not used for matching"
+
+    changed_match = copy.deepcopy(db)
+    changed_match["replacement_sets"]["person_names"]["candidates"][0]["value"] = "Mikey Lawyer"
+    next(iter(changed_match["assignments"].values()))["replacement"]["value"] = "Mikey Lawyer"
+
+    options = {"restore_pseudonyms": True}
+    assert reverse_bank_fingerprint(db, options=options) == reverse_bank_fingerprint(
+        changed_metadata,
+        options=options,
+    )
+    assert reverse_bank_fingerprint(db, options=options) != reverse_bank_fingerprint(changed_match, options=options)
+
+
+def test_reverse_bank_fingerprint_sanitizes_invalid_db_diagnostics_by_default():
+    db = _pseudonym_db(store_originals=True)
+    allocated = allocate_assignment(_record(), db, now="2026-06-13T00:00:00Z").replacement_db
+    first_assignment_key = next(iter(allocated["assignments"]))
+    second_assignment_key = assignment_key(
+        _record(name_id="jane_smith", canonical_name="Jane Smith"),
+        allocated["defaults"],
+    )
+    duplicated_assignment = copy.deepcopy(allocated["assignments"][first_assignment_key])
+    duplicated_assignment["assignment_key"] = second_assignment_key
+    duplicated_assignment["identity"]["fingerprint"] = second_assignment_key.split("|", 2)[2]
+    duplicated_assignment["identity"]["name_id"] = "jane_smith"
+    duplicated_assignment["identity"]["canonical_name"] = "Jane Smith"
+    duplicated_assignment["original"]["canonical"] = "Jane Smith"
+    allocated["assignments"][second_assignment_key] = duplicated_assignment
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        reverse_bank_fingerprint(allocated, options={"restore_pseudonyms": True})
+
+    diagnostics_repr = repr(exc_info.value.diagnostics)
+    assert all("|sha256:" not in item["path"] for item in exc_info.value.diagnostics)
+    assert "first_assignment_key" not in diagnostics_repr
+    assert first_assignment_key not in diagnostics_repr
+    assert second_assignment_key not in diagnostics_repr
+    assert "john_smith" not in diagnostics_repr
+    assert "jane_smith" not in diagnostics_repr
+
+
+def test_build_reverse_bank_fails_before_returning_oversized_generated_bank():
+    db = create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z")
+    assignments = {}
+    for index in range(1001):
+        key = f"person|name|sha256:{index:064x}"
+        assignments[key] = {
+            "assignment_key": key,
+            "entity_id": "person",
+            "identity": {
+                "scope": "name",
+                "name_id": f"name_{index}",
+                "canonical_name": f"Original {index}",
+                "fingerprint": f"sha256:{index:064x}",
+            },
+            "original": {"canonical": f"Original {index}", "surfaces": [f"Original {index}"]},
+            "replacement": {"mode": "redact", "value": f"[PERSON_{index + 1:04d}]"},
+            "redaction": {"token": f"[PERSON_{index + 1:04d}]", "ordinal": index + 1},
+            "created_at": "2026-06-13T00:00:00Z",
+            "updated_at": "2026-06-13T00:00:00Z",
+            "use_count": 1,
+            "metadata": {},
+        }
+    db["assignments"] = assignments
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        build_reverse_bank(db)
+
+    assert exc_info.value.diagnostics[0]["code"] == "deanonymize.too_many_reverse_entities"
+    assert exc_info.value.diagnostics[0]["metadata"] == {"limit": 1000}
+
+
+def test_deanonymize_text_restores_redaction_tokens_by_default_with_safe_payload():
+    anonymized = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith joined.",
+        create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z"),
+        options={"mode": "redact", "include_sensitive_metadata": True},
+    )
+
+    result = deanonymize_text(anonymized["text"], anonymized["replacement_db"]["data"])
+
+    assert result["schema_version"] == "nerb.deanonymize_response.v1"
+    assert result["text"] == "John Smith joined."
+    assert result["replacement_db"] == {
+        "replacement_db_ref": "rdb1",
+        "schema_version": "nerb.replacements.v1",
+        "version": 1,
+    }
+    assert result["source"] == {
+        "type": "text",
+        "length": len("[PERSON_0001] joined."),
+        "bytes": len(b"[PERSON_0001] joined."),
+    }
+    assert result["summary"] == {"match_count": 1, "applied_count": 1, "diagnostic_count": 0}
+    assert result["diagnostics"] == []
+    assert result["applied_restorations"] == [
+        {
+            "assignment_ref": "a1",
+            "entity": "person",
+            "mode": "redact",
+            "replacement_span": {"start": 0, "end": 13, "offset_unit": "byte"},
+            "restored_span": {"start": 0, "end": 10, "offset_unit": "byte"},
+            "restored_value_source": "canonical",
+        }
+    ]
+    assert "restored" not in result["applied_restorations"][0]
+    assert "assignment_key" not in result["applied_restorations"][0]
+
+
+def test_deanonymize_text_restores_pseudonyms_only_when_explicit_and_warns():
+    anonymized = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith joined.",
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym", "include_sensitive_metadata": True},
+    )
+    db = anonymized["replacement_db"]["data"]
+
+    default_result = deanonymize_text("Mikey Law joined.", db)
+    opt_in_result = deanonymize_text(
+        "Mikey Law joined.",
+        db,
+        options={"restore_pseudonyms": True, "include_originals": True},
+    )
+
+    assert default_result["text"] == "Mikey Law joined."
+    assert default_result["applied_restorations"] == []
+    assert default_result["diagnostics"] == []
+    assert opt_in_result["text"] == "John Smith joined."
+    assert opt_in_result["diagnostics"][0]["code"] == "deanonymize.pseudonym_restore_warning"
+    assert opt_in_result["diagnostics"][0]["severity"] == "warning"
+    assert opt_in_result["applied_restorations"][0]["mode"] == "pseudonym"
+    assert opt_in_result["applied_restorations"][0]["restored"] == "John Smith"
+
+
+def test_deanonymize_text_reports_missing_original_for_non_reversible_assignments():
+    anonymized = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith joined.",
+        create_replacement_db(now="2026-06-13T00:00:00Z"),
+        options={"mode": "redact", "include_sensitive_metadata": True},
+    )
+
+    result = deanonymize_text(anonymized["text"], anonymized["replacement_db"]["data"])
+
+    assert result["text"] == "[PERSON_0001] joined."
+    assert result["applied_restorations"] == []
+    assert result["summary"] == {"match_count": 0, "applied_count": 0, "diagnostic_count": 1}
+    assert result["diagnostics"][0]["code"] == "replacement_db.missing_original"
+    assert result["diagnostics"][0]["metadata"] == {"assignment_ref": "a1", "entity": "person"}
+    assert "John Smith" not in repr(result["diagnostics"])
+    assert "assignment_key" not in repr(result["diagnostics"])
+
+
+def test_deanonymize_text_rejects_ambiguous_reverse_values_before_scanning():
+    db = _pseudonym_db(store_originals=True)
+    db["replacement_sets"]["person_names"]["candidates"].append(
+        {"id": "person_name_0003", "value": "[PERSON_0001]", "metadata": {}}
+    )
+    first = allocate_assignment(
+        _record(name_id="john_smith", canonical_name="John Smith"),
+        db,
+        now="2026-06-13T00:00:00Z",
+    )
+    assert first.assignment is not None
+    first_key = first.assignment_key
+    first.replacement_db["assignments"][first_key]["redaction"] = {"token": "[PERSON_0001]", "ordinal": 1}
+    second = allocate_assignment(
+        _record(name_id="jane_smith", canonical_name="Jane Smith"),
+        first.replacement_db,
+        now="2026-06-13T00:00:00Z",
+    )
+    third = allocate_assignment(
+        _record(name_id="alex_smith", canonical_name="Alex Smith"),
+        second.replacement_db,
+        now="2026-06-13T00:00:00Z",
+    )
+    assert third.assignment is not None
+    assert third.assignment["replacement"]["value"] == "[PERSON_0001]"
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        deanonymize_text("[PERSON_0001]", third.replacement_db, options={"restore_pseudonyms": True})
+
+    assert exc_info.value.diagnostics[0]["code"] == "deanonymize.ambiguous_replacement"
+    assert "John Smith" not in repr(exc_info.value.diagnostics)
+    assert "Jane Smith" not in repr(exc_info.value.diagnostics)
+    assert "Alex Smith" not in repr(exc_info.value.diagnostics)
+
+
+def test_deanonymize_pseudonyms_use_longest_exact_matches_and_punctuation_boundaries():
+    db = create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z")
+    db["defaults"]["replacement_mode"] = "pseudonym"
+    db["defaults"]["replacement_set_id"] = "names"
+    db["replacement_sets"]["names"] = {
+        "description": "Synthetic names.",
+        "reuse": False,
+        "candidates": [
+            {"id": "sam", "value": "Sam", "metadata": {}},
+            {"id": "samwise", "value": "Samwise", "metadata": {}},
+        ],
+        "metadata": {},
+    }
+    first = allocate_assignment(
+        _record(name_id="original_sam", canonical_name="Original Sam"),
+        db,
+        now="2026-06-13T00:00:00Z",
+    )
+    second = allocate_assignment(
+        _record(name_id="original_samwise", canonical_name="Original Samwise"),
+        first.replacement_db,
+        now="2026-06-13T00:00:00Z",
+    )
+
+    result = deanonymize_text(
+        "Samwise, Sam, SAM, Sam wise.",
+        second.replacement_db,
+        options={"restore_pseudonyms": True},
+    )
+
+    assert result["text"] == "Original Samwise, Original Sam, SAM, Original Sam wise."
+    assert result["summary"]["applied_count"] == 3
+    assert [item["mode"] for item in result["applied_restorations"]] == ["pseudonym", "pseudonym", "pseudonym"]
+
+
+def test_deanonymize_pseudonym_restore_rejects_word_substrings_by_default():
+    anonymized = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith joined.",
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym", "include_sensitive_metadata": True},
+    )
+
+    result = deanonymize_text(
+        "Mikey Lawless met Mikey  Law and Mikey Law.",
+        anonymized["replacement_db"]["data"],
+        options={"restore_pseudonyms": True},
+    )
+
+    assert result["text"] == "Mikey Lawless met Mikey  Law and John Smith."
+    assert result["summary"]["applied_count"] == 1
+
+
+def test_deanonymize_file_reports_file_source_preserves_crlf_and_enforces_limit(tmp_path):
+    anonymized = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith\r\njoined.",
+        create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z"),
+        options={"mode": "redact", "include_sensitive_metadata": True},
+    )
+    source_path = tmp_path / "redacted.txt"
+    source_path.write_bytes(anonymized["text"].encode("utf-8"))
+
+    result = deanonymize_file(source_path, anonymized["replacement_db"]["data"])
+
+    assert result["text"] == "John Smith\r\njoined."
+    assert result["source"] == {
+        "type": "file",
+        "length": len("[PERSON_0001]\r\njoined."),
+        "bytes": len(b"[PERSON_0001]\r\njoined."),
+        "source_ref": "s1",
+    }
+    assert str(source_path) not in repr(result)
+
+    sensitive_result = deanonymize_file(
+        source_path,
+        anonymized["replacement_db"]["data"],
+        options={"include_sensitive_metadata": True},
+    )
+    assert sensitive_result["source"]["path"] == str(source_path)
+
+    with pytest.raises(DeanonymizationError) as limit_info:
+        deanonymize_file(source_path, anonymized["replacement_db"]["data"], options={"max_text_bytes": 4})
+    assert limit_info.value.diagnostics[0]["code"] == "deanonymize.extraction_error"
+
+
+def test_deanonymize_file_suppresses_raw_extraction_context_by_default(tmp_path):
+    missing_path = tmp_path / "John-Smith-secret-missing.txt"
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        deanonymize_file(missing_path, create_replacement_db())
+
+    diagnostics_repr = repr(exc_info.value.diagnostics)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "John-Smith-secret" not in diagnostics_repr
+
+
+def test_deanonymize_helpers_suppress_raw_option_error_context_by_default(tmp_path):
+    source_path = tmp_path / "redacted.txt"
+    source_path.write_text("[PERSON_0001]", encoding="utf-8")
+    sensitive_mode = "/Users/donnie/secret-client/path"
+    options = {"engine_options": {"match_mode": sensitive_mode}}
+
+    with pytest.raises(DeanonymizationError) as text_info:
+        deanonymize_text("[PERSON_0001]", create_replacement_db(), options=options)
+    with pytest.raises(DeanonymizationError) as file_info:
+        deanonymize_file(source_path, create_replacement_db(), options=options)
+
+    for error in (text_info.value, file_info.value):
+        diagnostics_repr = repr(error.diagnostics)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        assert sensitive_mode not in diagnostics_repr
+
+
+def test_deanonymize_text_rejects_invalid_options_with_diagnostics():
+    with pytest.raises(DeanonymizationError) as pseudonym_info:
+        deanonymize_text("Mikey Law", _pseudonym_db(), options={"restore_pseudonyms": "yes"})
+    assert pseudonym_info.value.diagnostics[0]["path"] == "/options/restore_pseudonyms"
+
+    with pytest.raises(DeanonymizationError) as source_limit_info:
+        deanonymize_text("Mikey Law", _pseudonym_db(), options={"max_text_bytes": 0})
+    assert source_limit_info.value.diagnostics[0]["code"] == "deanonymize.extraction_error"
