@@ -245,13 +245,37 @@ def _copy_json_value(value: Any) -> Any:
 
 
 def _redacted_replacement_db_diagnostic_path(path: str) -> str:
+    safe_exact_paths = {
+        "",
+        "/schema_version",
+        "/id",
+        "/description",
+        "/version",
+        "/created_at",
+        "/updated_at",
+        "/defaults",
+        "/defaults/unicode_normalization",
+        "/defaults/assignment_scope",
+        "/defaults/replacement_mode",
+        "/defaults/redaction_template",
+        "/defaults/collision_policy",
+        "/defaults/store_originals",
+        "/defaults/allow_new_assignments",
+        "/defaults/replacement_set_id",
+    }
+    if path in safe_exact_paths:
+        return path
     if path.startswith("/assignments"):
         return "/assignments"
     if path.startswith("/replacement_sets"):
         return "/replacement_sets"
     if path.startswith("/entities"):
         return "/entities"
-    return path
+    if path.startswith("/metadata"):
+        return "/metadata"
+    if path.startswith("/defaults"):
+        return "/defaults"
+    return "/replacement_db"
 
 
 def _replacement_db_diagnostic_message_may_be_sensitive(code: str) -> bool:
@@ -681,6 +705,7 @@ def save_replacement_db(
     *,
     expected_hash: str | None = None,
     expected_version: int | None = None,
+    require_missing: bool = False,
 ) -> Path:
     """Validate and atomically save a replacement database to an explicit JSON path."""
     db_path = _resolve_local_path(path)
@@ -712,6 +737,17 @@ def save_replacement_db(
             raise ReplacementDbSaveError(
                 f"Replacement database path {str(db_path)!r} must be a file.",
                 [_not_file_diagnostic(db_path)],
+            )
+        if existing_stat is not None and require_missing:
+            raise ReplacementDbSaveError(
+                f"Replacement database {str(db_path)!r} already exists.",
+                [
+                    _error(
+                        "replacement_db.stale_write",
+                        "",
+                        "Destination must not exist for this replacement database save.",
+                    )
+                ],
             )
 
         if existing_stat is not None:

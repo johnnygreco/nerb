@@ -313,6 +313,45 @@ def _invalid_bank_payloads_payload(payloads: Mapping[str, dict[str, Any] | None]
     return {"valid": False, "banks": invalid_payloads, "diagnostics": diagnostics}
 
 
+def _sanitize_bank_diagnostics_for_anonymize(
+    diagnostics: list[dict[str, Any]],
+    *,
+    include_sensitive_metadata: bool,
+) -> list[dict[str, Any]]:
+    if include_sensitive_metadata:
+        return [dict(item) for item in diagnostics]
+    sanitized: list[dict[str, Any]] = []
+    for item in diagnostics:
+        diagnostic = {
+            key: json.loads(json.dumps(value, ensure_ascii=False)) for key, value in item.items() if key != "metadata"
+        }
+        diagnostic["path"] = "/bank"
+        code = diagnostic.get("code")
+        if isinstance(code, str) and code.startswith(("schema.", "id.", "metadata.", "engine.", "regex.")):
+            diagnostic["message"] = "Bank diagnostic details are redacted by default."
+        sanitized.append(diagnostic)
+    return sanitized
+
+
+def _sanitize_invalid_bank_payload_for_anonymize(
+    payload: dict[str, Any],
+    *,
+    include_sensitive_metadata: bool,
+) -> dict[str, Any]:
+    if include_sensitive_metadata:
+        return payload
+    sanitized = dict(payload)
+    diagnostics = sanitized.get("diagnostics")
+    if isinstance(diagnostics, list):
+        sanitized["diagnostics"] = _sanitize_bank_diagnostics_for_anonymize(
+            diagnostics,
+            include_sensitive_metadata=False,
+        )
+    if "error" in sanitized:
+        sanitized["error"] = "Bank diagnostic details are redacted by default."
+    return sanitized
+
+
 def _run_json_tool(action: Any) -> dict[str, Any]:
     try:
         return action()
@@ -354,7 +393,7 @@ def _replacement_db_stale_write_payload(
         "severity": DIAGNOSTIC_ERROR,
         "code": "replacement_db.stale_write",
         "path": "",
-        "message": "Existing replacement database destinations require expected_hash or expected_version.",
+        "message": "Existing replacement database destinations require expected_replacement_db_hash.",
     }
     return _replacement_db_diagnostic_payload(
         f"Replacement database {str(path)!r} already exists.",
@@ -496,7 +535,14 @@ def _resolve_replacement_db_source(
 def _save_options(options: Mapping[str, Any] | None) -> tuple[dict[str, Any], bool, str | None, int | None, bool]:
     resolved = _options_mapping(options)
     save = _tool_bool_option(resolved, "save", False)
-    expected_hash = _tool_string_option(resolved, "expected_hash")
+    expected_hash = _tool_string_option(resolved, "expected_replacement_db_hash")
+    legacy_expected_hash = _tool_string_option(resolved, "expected_hash")
+    if expected_hash is not None and legacy_expected_hash is not None and expected_hash != legacy_expected_hash:
+        _raise_tool_error(
+            "options.expected_replacement_db_hash and options.expected_hash must match when both are set."
+        )
+    if expected_hash is None:
+        expected_hash = legacy_expected_hash
     expected_version = _tool_int_option(resolved, "expected_version")
     include_sensitive_metadata = _tool_bool_option(resolved, "include_sensitive_metadata", False)
     return resolved, save, expected_hash, expected_version, include_sensitive_metadata
@@ -506,6 +552,7 @@ def _operation_options(options: Mapping[str, Any]) -> dict[str, Any]:
     operation_options = dict(options)
     operation_options.pop("save", None)
     operation_options.pop("expected_hash", None)
+    operation_options.pop("expected_replacement_db_hash", None)
     operation_options.pop("expected_version", None)
     return operation_options
 
@@ -524,15 +571,17 @@ def _save_replacement_db_for_tool(
 
     save_path = Path(save_db_path).expanduser()
     resolved_options, _save, expected_hash, expected_version, include_sensitive_metadata = _save_options(options)
-    if save_path.is_file() and expected_hash is None and expected_version is None:
-        if source_path is not None and _same_path(source_path, save_path):
-            expected_hash = source_hash
-            expected_version = source_version
-        else:
-            return _replacement_db_stale_write_payload(
-                save_path,
-                include_sensitive_metadata=include_sensitive_metadata,
-            )
+    if expected_hash is None and source_path is not None and _same_path(source_path, save_path):
+        expected_hash = source_hash
+        expected_version = source_version
+    require_missing = False
+    if save_path.is_file() and expected_hash is None:
+        return _replacement_db_stale_write_payload(
+            save_path,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+    elif source_path is None and expected_hash is None:
+        require_missing = True
 
     try:
         saved_path = _save_replacement_db(
@@ -540,6 +589,7 @@ def _save_replacement_db_for_tool(
             save_path,
             expected_hash=expected_hash,
             expected_version=expected_version,
+            require_missing=require_missing,
         )
         saved_db = _load_replacement_db(saved_path)
     except ReplacementDbError as exc:
@@ -550,7 +600,14 @@ def _save_replacement_db_for_tool(
             include_sensitive_metadata=include_sensitive_metadata,
         )
 
-    return {
+    response_options: dict[str, Any] = {
+        "expected_version": expected_version,
+        "save": bool(resolved_options.get("save", False)),
+        "stale_guard": "hash" if expected_hash is not None else "missing_destination",
+    }
+    if include_sensitive_metadata and expected_hash is not None:
+        response_options["expected_replacement_db_hash"] = expected_hash
+    response = {
         "saved": True,
         "path": str(saved_path),
         "replacement_db": _replacement_db_metadata(
@@ -560,27 +617,9 @@ def _save_replacement_db_for_tool(
             include_sensitive_metadata=include_sensitive_metadata,
         ),
         "diagnostics": [],
-        "options": {
-            "expected_hash": expected_hash,
-            "expected_version": expected_version,
-            "save": bool(resolved_options.get("save", False)),
-        },
+        "options": response_options,
     }
-
-
-def _sanitize_anonymize_tool_payload(
-    payload: dict[str, Any],
-    *,
-    include_sensitive_metadata: bool,
-) -> None:
-    if include_sensitive_metadata:
-        return
-    applied_replacements = payload.get("applied_replacements")
-    if not isinstance(applied_replacements, list):
-        return
-    for item in applied_replacements:
-        if isinstance(item, dict):
-            item.pop("replacement", None)
+    return response
 
 
 def _saved_anonymize_payload_for_tool(
@@ -601,7 +640,6 @@ def _saved_anonymize_payload_for_tool(
     base_hash = _hash_replacement_db(replacement_db)
     base_version = _replacement_db_version(replacement_db)
     response, updated_db = action(operation_options)
-    _sanitize_anonymize_tool_payload(response, include_sensitive_metadata=include_sensitive_metadata)
 
     replacement_db_metadata = response.get("replacement_db", {})
     modified = bool(replacement_db_metadata.get("modified")) if isinstance(replacement_db_metadata, Mapping) else False
@@ -907,17 +945,23 @@ def anonymize_text(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Anonymize text with a JSON bank and optional explicit replacement DB save."""
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
     bank_value, _bank_path, _base_path, invalid_bank_payload = _resolve_bank_source(bank, bank_path)
     if invalid_bank_payload is not None:
-        return invalid_bank_payload
+        return _sanitize_invalid_bank_payload_for_anonymize(
+            invalid_bank_payload,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
     bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
     if mapping_invalid is not None:
-        return mapping_invalid
+        return _sanitize_invalid_bank_payload_for_anonymize(
+            mapping_invalid,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
     if bank_mapping is None:
         _raise_tool_error("anonymize_text requires a JSON bank object.")
 
-    resolved_options = _options_mapping(options)
-    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
     db, db_path, invalid_db_payload = _resolve_replacement_db_source(
         replacement_db,
         replacement_db_path,
@@ -955,18 +999,24 @@ def anonymize_file(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Anonymize one explicit UTF-8 file with a JSON bank and optional explicit replacement DB save."""
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
     bank_value, _bank_path, _base_path, invalid_bank_payload = _resolve_bank_source(bank, bank_path)
     if invalid_bank_payload is not None:
-        return invalid_bank_payload
+        return _sanitize_invalid_bank_payload_for_anonymize(
+            invalid_bank_payload,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
     bank_mapping, mapping_invalid = _mapping_bank_or_payload(bank_value, "bank")
     if mapping_invalid is not None:
-        return mapping_invalid
+        return _sanitize_invalid_bank_payload_for_anonymize(
+            mapping_invalid,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
     if bank_mapping is None:
         _raise_tool_error("anonymize_file requires a JSON bank object.")
 
     document_path = _ensure_explicit_file(file_path, "Document")
-    resolved_options = _options_mapping(options)
-    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
     db, db_path, invalid_db_payload = _resolve_replacement_db_source(
         replacement_db,
         replacement_db_path,

@@ -59,6 +59,12 @@ from nerb import (
 )
 from nerb.cli import app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
+from nerb.deanonymization import (
+    anonymize_file as anonymize_file_helper,
+)
+from nerb.deanonymization import (
+    anonymize_text as anonymize_text_helper,
+)
 from nerb.mcp_server import (
     _ToolError as ToolError,
 )
@@ -457,20 +463,46 @@ def test_mcp_replacement_db_create_validate_and_save_are_explicit(tmp_path):
     changed["description"] = "changed"
     changed["version"] = 2
     unsafe_overwrite = save_replacement_db_tool(replacement_db=changed, save_db_path=str(db_path))
+    version_only_overwrite = save_replacement_db_tool(
+        replacement_db=changed,
+        save_db_path=str(db_path),
+        options={"expected_version": 1},
+    )
 
     assert unsafe_overwrite["valid"] is False
     assert unsafe_overwrite["diagnostics"][0]["code"] == "replacement_db.stale_write"
+    assert version_only_overwrite["valid"] is False
+    assert version_only_overwrite["diagnostics"][0]["code"] == "replacement_db.stale_write"
     assert load_replacement_db(db_path)["description"] == ""
 
     expected_hash = hash_replacement_db(load_replacement_db(db_path))
     safe_overwrite = save_replacement_db_tool(
         replacement_db=changed,
         save_db_path=str(db_path),
-        options={"expected_hash": expected_hash, "expected_version": 1},
+        options={"expected_replacement_db_hash": expected_hash},
     )
 
     assert safe_overwrite["saved"] is True
+    assert "sha256:" not in json.dumps(safe_overwrite)
     assert load_replacement_db(db_path)["description"] == "changed"
+
+    changed_again = load_replacement_db(db_path)
+    changed_again["description"] = "changed again"
+    changed_again["version"] = 3
+    expected_hash = hash_replacement_db(load_replacement_db(db_path))
+    sensitive_overwrite = save_replacement_db_tool(
+        replacement_db=changed_again,
+        save_db_path=str(db_path),
+        options={
+            "expected_replacement_db_hash": expected_hash,
+            "expected_version": 2,
+            "include_sensitive_metadata": True,
+        },
+    )
+
+    assert sensitive_overwrite["saved"] is True
+    assert sensitive_overwrite["options"]["expected_replacement_db_hash"] == expected_hash
+    assert load_replacement_db(db_path)["description"] == "changed again"
 
 
 def test_mcp_anonymize_and_deanonymize_text_use_explicit_save_path(tmp_path):
@@ -486,6 +518,12 @@ def test_mcp_anonymize_and_deanonymize_text_use_explicit_save_path(tmp_path):
         replacement_db=load_replacement_db(db_path),
         options={"mode": "redact"},
     )
+    expected_unsaved = anonymize_text_helper(
+        bank,
+        "John Smith joined.",
+        load_replacement_db(db_path),
+        options={"mode": "redact"},
+    )
     direct_existing_save = anonymize_text_tool(
         "John Smith joined.",
         bank=bank,
@@ -495,9 +533,10 @@ def test_mcp_anonymize_and_deanonymize_text_use_explicit_save_path(tmp_path):
     )
 
     assert unsaved["text"] == "[PERSON_0001] joined."
+    assert unsaved == expected_unsaved
     assert unsaved["replacement_db"]["modified"] is True
     assert unsaved["replacement_db"]["saved"] is False
-    assert "replacement" not in unsaved["applied_replacements"][0]
+    assert unsaved["applied_replacements"][0]["replacement"] == "[PERSON_0001]"
     assert load_replacement_db(db_path)["assignments"] == {}
     assert direct_existing_save["valid"] is False
     assert direct_existing_save["diagnostics"][0]["code"] == "replacement_db.stale_write"
@@ -548,6 +587,18 @@ def test_mcp_anonymize_and_deanonymize_file_match_helper_contracts(tmp_path):
     anonymized_path = tmp_path / "anonymized.txt"
     document_path.write_bytes("Café\r\nJohn Smith joined.".encode())
 
+    expected_unsaved = anonymize_file_helper(
+        bank,
+        document_path,
+        load_replacement_db(db_path),
+        options={"mode": "redact"},
+    )
+    unsaved = anonymize_file_tool(
+        str(document_path),
+        bank=bank,
+        replacement_db_path=str(db_path),
+        options={"mode": "redact"},
+    )
     saved = anonymize_file_tool(
         str(document_path),
         bank=bank,
@@ -558,6 +609,7 @@ def test_mcp_anonymize_and_deanonymize_file_match_helper_contracts(tmp_path):
     anonymized_path.write_text(saved["text"], encoding="utf-8")
     restored = deanonymize_file_tool(str(anonymized_path), replacement_db_path=str(db_path))
 
+    assert unsaved == expected_unsaved
     assert saved["schema_version"] == "nerb.anonymize_response.v1"
     assert saved["source"] == {
         "source_ref": "s1",
@@ -605,6 +657,38 @@ def test_mcp_replacement_db_diagnostics_are_sanitized_by_default(tmp_path):
     assert "John Smith" not in serialized
     assert "Jane Smith" not in serialized
     assert sensitive_payload["diagnostics"][0]["metadata"]["first_assignment_key"] == first_key
+
+
+def test_mcp_anonymize_sanitizes_invalid_bank_diagnostics_by_default(tmp_path):
+    invalid_bank = _person_json_bank()
+    person_entity = invalid_bank["entities"].pop("person")
+    name = person_entity["names"].pop("john_smith")
+    pattern = name["patterns"].pop("primary")
+    pattern["value"] = 7
+    name["patterns"]["secret_pattern_id"] = pattern
+    person_entity["names"]["john_smith_secret_name_id"] = name
+    invalid_bank["entities"]["secret_person"] = person_entity
+    invalid_bank_path = _write_json(tmp_path / "invalid_bank.json", invalid_bank)
+    replacement_db = create_replacement_db_helper(reversible=True, now="2026-06-13T00:00:00Z")
+
+    payload = anonymize_text_tool("John Smith", bank_path=str(invalid_bank_path), replacement_db=replacement_db)
+    sensitive_payload = anonymize_text_tool(
+        "John Smith",
+        bank_path=str(invalid_bank_path),
+        replacement_db=replacement_db,
+        options={"include_sensitive_metadata": True},
+    )
+
+    serialized = json.dumps(payload)
+    assert payload["valid"] is False
+    assert payload["diagnostics"][0]["path"] == "/bank"
+    assert payload["diagnostics"][0]["message"] == "Bank diagnostic details are redacted by default."
+    assert "secret_person" not in serialized
+    assert "john_smith_secret_name_id" not in serialized
+    assert "secret_pattern_id" not in serialized
+    assert sensitive_payload["diagnostics"][0]["path"].startswith(
+        "/entities/secret_person/names/john_smith_secret_name_id"
+    )
 
 
 def test_config_mutation_tools_write_explicit_config_path(tmp_path):
