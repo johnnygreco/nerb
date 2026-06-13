@@ -20,6 +20,7 @@ from nerb.replacements import (
     create_replacement_db,
     hash_replacement_db,
     load_replacement_db,
+    sanitize_replacement_db_diagnostics,
     save_replacement_db,
     validate_replacement_db,
 )
@@ -206,6 +207,20 @@ def test_schema_rejects_non_string_object_keys_before_canonicalization(tmp_path)
     }.issubset({(item["code"], item["path"]) for item in result["diagnostics"]})
     with pytest.raises(ReplacementDbSchemaError):
         save_replacement_db(db, tmp_path / "invalid.json")
+
+
+def test_sanitize_replacement_db_diagnostics_redacts_unknown_top_level_paths():
+    db = create_replacement_db(now="2026-06-12T00:00:00Z")
+    db["John Smith"] = "secret"
+
+    result = validate_replacement_db(db)
+    sanitized = sanitize_replacement_db_diagnostics(result["diagnostics"])
+    sensitive = sanitize_replacement_db_diagnostics(result["diagnostics"], include_sensitive_metadata=True)
+
+    assert sanitized[0]["path"] == "/replacement_db"
+    assert sanitized[0]["message"] == "Replacement database diagnostic details are redacted by default."
+    assert "John Smith" not in json.dumps(sanitized)
+    assert sensitive[0]["path"] == "/John Smith"
 
 
 def test_canonicalization_and_hash_are_stable_for_mapping_order_and_sensitive_to_changes():
@@ -410,6 +425,20 @@ def test_save_replacement_db_atomically_writes_canonical_json_with_owner_only_pe
     assert json.loads(path.read_text(encoding="utf-8")) == canonicalize_replacement_db(db)
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_save_replacement_db_can_require_missing_destination_under_lock(tmp_path):
+    first = create_replacement_db(now="2026-06-12T00:00:00Z")
+    path = save_replacement_db(first, tmp_path / "replacements.json", require_missing=True)
+    second = load_replacement_db(path)
+    second["description"] = "changed"
+    second["version"] += 1
+
+    with pytest.raises(ReplacementDbSaveError) as exc_info:
+        save_replacement_db(second, path, require_missing=True)
+
+    assert exc_info.value.diagnostics[0]["code"] == "replacement_db.stale_write"
+    assert load_replacement_db(path)["description"] == ""
 
 
 def test_save_replacement_db_keeps_existing_file_when_candidate_is_invalid(tmp_path):

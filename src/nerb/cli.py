@@ -68,6 +68,7 @@ from .replacements import (
     hash_replacement_db,
     load_replacement_db,
     read_replacement_db_json,
+    sanitize_replacement_db_diagnostics,
     save_replacement_db,
     validate_replacement_db,
 )
@@ -348,7 +349,7 @@ def _validate_replacement_db_file_payload(
     return {
         "valid": payload["valid"],
         "path": str(path),
-        "diagnostics": _sanitize_replacement_db_diagnostics(
+        "diagnostics": sanitize_replacement_db_diagnostics(
             payload["diagnostics"],
             include_sensitive_metadata=include_sensitive_metadata,
         ),
@@ -364,72 +365,12 @@ def _replacement_db_diagnostic_payload(
 ) -> dict[str, Any]:
     return _diagnostic_payload(
         message if include_sensitive_metadata else "Replacement database command failed.",
-        _sanitize_replacement_db_diagnostics(
+        sanitize_replacement_db_diagnostics(
             diagnostics,
             include_sensitive_metadata=include_sensitive_metadata,
         ),
         path=path,
     )
-
-
-def _sanitize_replacement_db_diagnostics(
-    diagnostics: list[dict[str, Any]],
-    *,
-    include_sensitive_metadata: bool = False,
-) -> list[dict[str, Any]]:
-    if include_sensitive_metadata:
-        return [dict(item) for item in diagnostics]
-
-    return [_sanitize_replacement_db_diagnostic(item) for item in diagnostics]
-
-
-def _sanitize_replacement_db_diagnostic(item: Mapping[str, Any]) -> dict[str, Any]:
-    sanitized = {key: copy_json_value(value) for key, value in item.items() if key != "metadata"}
-    original_path = sanitized.get("path")
-    if isinstance(original_path, str):
-        sanitized["path"] = _redacted_replacement_db_diagnostic_path(original_path)
-    code = sanitized.get("code")
-    if isinstance(code, str) and _replacement_db_diagnostic_message_may_be_sensitive(code):
-        sanitized["message"] = _safe_replacement_db_diagnostic_message(str(sanitized.get("path", "")))
-
-    metadata = item.get("metadata")
-    if isinstance(metadata, Mapping):
-        safe_metadata = {
-            str(key): copy_json_value(value)
-            for key, value in metadata.items()
-            if key in {"bytes", "limit", "first_index", "current_version", "candidate_version"}
-        }
-        if safe_metadata:
-            sanitized["metadata"] = safe_metadata
-    return sanitized
-
-
-def copy_json_value(value: Any) -> Any:
-    return json.loads(json.dumps(value, ensure_ascii=False))
-
-
-def _redacted_replacement_db_diagnostic_path(path: str) -> str:
-    if path.startswith("/assignments"):
-        return "/assignments"
-    if path.startswith("/replacement_sets"):
-        return "/replacement_sets"
-    if path.startswith("/entities"):
-        return "/entities"
-    return path
-
-
-def _replacement_db_diagnostic_message_may_be_sensitive(code: str) -> bool:
-    return code.startswith(("replacement_db.", "schema.", "id.", "metadata."))
-
-
-def _safe_replacement_db_diagnostic_message(path: str) -> str:
-    if path == "/assignments":
-        return "Assignment diagnostic details are redacted by default."
-    if path == "/replacement_sets":
-        return "Replacement set diagnostic details are redacted by default."
-    if path == "/entities":
-        return "Entity policy diagnostic details are redacted by default."
-    return "Replacement database diagnostic details are redacted by default."
 
 
 def _ensure_replacement_id(value: str, label: str) -> str:
@@ -483,7 +424,7 @@ def _sanitize_replacement_db_error_payload(
 ) -> None:
     diagnostics = payload.get("diagnostics")
     if isinstance(diagnostics, list):
-        payload["diagnostics"] = _sanitize_replacement_db_diagnostics(
+        payload["diagnostics"] = sanitize_replacement_db_diagnostics(
             diagnostics,
             include_sensitive_metadata=include_sensitive_metadata,
         )
