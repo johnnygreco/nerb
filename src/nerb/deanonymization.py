@@ -215,6 +215,12 @@ class _ReverseBankBuild:
     diagnostics: tuple[Diagnostic, ...]
 
 
+@dataclass(frozen=True)
+class _AnonymizeRun:
+    response: dict[str, Any]
+    replacement_db: dict[str, Any] = field(repr=False)
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -1175,12 +1181,12 @@ def finalize_replacement_db_update(
     return db
 
 
-def _anonymize_resolved_report(
+def _anonymize_resolved_run(
     text: str,
     report: Mapping[str, Any],
     replacement_db: Mapping[str, Any],
     options: _AnonymizeOptions,
-) -> dict[str, Any]:
+) -> _AnonymizeRun:
     db_error: DeanonymizationError | None = None
     try:
         current_db = _validate_replacement_db_for_allocation(replacement_db)
@@ -1281,7 +1287,7 @@ def _anonymize_resolved_report(
         for item, applied_edit in zip(edit_items, rewrite.applied_edits, strict=True)
     ]
 
-    return {
+    response = {
         "schema_version": ANONYMIZE_RESPONSE_SCHEMA_VERSION,
         "bank": _safe_bank_metadata(report, options),
         "replacement_db": _safe_replacement_db_metadata(current_db, modified=modified, options=options),
@@ -1301,6 +1307,16 @@ def _anonymize_resolved_report(
         },
         "diagnostics": diagnostics,
     }
+    return _AnonymizeRun(response=response, replacement_db=current_db)
+
+
+def _anonymize_resolved_report(
+    text: str,
+    report: Mapping[str, Any],
+    replacement_db: Mapping[str, Any],
+    options: _AnonymizeOptions,
+) -> dict[str, Any]:
+    return _anonymize_resolved_run(text, report, replacement_db, options).response
 
 
 def _applied_replacement_payload(
@@ -1798,6 +1814,17 @@ def anonymize_text(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Anonymize text matched by a JSON bank without saving replacement DB changes."""
+    return _anonymize_text_with_db_update(bank, text, replacement_db, options=options)[0]
+
+
+def _anonymize_text_with_db_update(
+    bank: Mapping[str, Any],
+    text: str,
+    replacement_db: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the anonymization response plus the updated replacement DB from one scan."""
     if not isinstance(text, str):
         raise TypeError("anonymize_text text must be a string.")
     resolved_options = _resolve_anonymize_options(options)
@@ -1808,7 +1835,8 @@ def anonymize_text(
         extraction_error = exc
     if extraction_error is not None:
         _raise_extraction_error(extraction_error, resolved_options)
-    return _anonymize_resolved_report(text, report, replacement_db, resolved_options)
+    result = _anonymize_resolved_run(text, report, replacement_db, resolved_options)
+    return result.response, result.replacement_db
 
 
 def anonymize_file(
@@ -1819,6 +1847,17 @@ def anonymize_file(
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Anonymize a UTF-8 text file through the JSON-bank report resolver without writing output."""
+    return _anonymize_file_with_db_update(bank, file_path, replacement_db, options=options)[0]
+
+
+def _anonymize_file_with_db_update(
+    bank: Mapping[str, Any],
+    file_path: str | Path,
+    replacement_db: Mapping[str, Any],
+    *,
+    options: Mapping[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return the file anonymization response plus the updated replacement DB from one file read."""
     path = Path(file_path).expanduser()
     resolved_options = _resolve_anonymize_options(options)
     extraction_error: ExtractionError | None = None
@@ -1831,7 +1870,8 @@ def anonymize_file(
     if extraction_error is not None:
         _raise_extraction_error(extraction_error, resolved_options)
     report["source"] = {"type": "file", "path": str(path), "length": len(text), "bytes": byte_count}
-    return _anonymize_resolved_report(text, report, replacement_db, resolved_options)
+    result = _anonymize_resolved_run(text, report, replacement_db, resolved_options)
+    return result.response, result.replacement_db
 
 
 def deanonymize_text(
