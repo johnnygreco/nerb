@@ -14,7 +14,6 @@ from nerb.deanonymization import (
     assignment_key,
     finalize_replacement_db_update,
 )
-from nerb.extraction import ExtractionError
 from nerb.replacements import (
     create_replacement_db,
     hash_replacement_db,
@@ -530,6 +529,41 @@ def test_anonymize_text_redaction_mode_works_without_candidate_sets_and_byte_spa
     ]
 
 
+def test_anonymize_text_explicit_mode_mismatch_reports_diagnostic_instead_of_wrong_reuse():
+    pseudonym_result = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith",
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym", "include_sensitive_metadata": True},
+    )
+    db_with_pseudonym_assignment = pseudonym_result["replacement_db"]["data"]
+
+    result = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith",
+        db_with_pseudonym_assignment,
+        options={"mode": "redact"},
+    )
+
+    assert result["text"] == "John Smith"
+    assert result["applied_replacements"] == []
+    assert result["summary"] == {"record_count": 1, "applied_count": 0, "diagnostic_count": 1}
+    assert result["diagnostics"][0]["code"] == "replacement_db.assignment_mode_mismatch"
+    assert result["diagnostics"][0]["path"] == "/assignments"
+    assert result["diagnostics"][0]["metadata"] == {"assignment_ref": "a1", "entity": "person"}
+    assert "assignment_key" not in repr(result)
+
+    with pytest.raises(DeanonymizationError) as fail_info:
+        anonymize_text(
+            _person_bank(include_alias=False),
+            "John Smith",
+            db_with_pseudonym_assignment,
+            options={"mode": "redact", "on_missing_assignment": "fail"},
+        )
+    assert fail_info.value.diagnostics[0]["code"] == "replacement_db.assignment_mode_mismatch"
+    assert "assignment_key" not in repr(fail_info.value.diagnostics)
+
+
 def test_anonymize_file_reports_file_source_and_does_not_save(tmp_path):
     source_path = tmp_path / "source.txt"
     source = "John Smith joined."
@@ -551,6 +585,36 @@ def test_anonymize_file_reports_file_source_and_does_not_save(tmp_path):
     }
     assert result["replacement_db"]["modified"] is True
     assert result["replacement_db"]["saved"] is False
+
+
+def test_anonymize_file_preserves_crlf_bytes_and_enforces_extraction_file_limit(tmp_path):
+    source_path = tmp_path / "source.txt"
+    source_bytes = b"John Smith\r\njoined."
+    source_path.write_bytes(source_bytes)
+
+    result = anonymize_file(
+        _person_bank(include_alias=False),
+        source_path,
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym"},
+    )
+
+    assert result["text"] == "Mikey Law\r\njoined."
+    assert result["source"] == {
+        "type": "file",
+        "path": str(source_path),
+        "length": len("John Smith\r\njoined."),
+        "bytes": len(source_bytes),
+    }
+
+    with pytest.raises(DeanonymizationError) as limit_info:
+        anonymize_file(
+            _person_bank(include_alias=False),
+            source_path,
+            _pseudonym_db(store_originals=True),
+            options={"mode": "pseudonym", "max_text_bytes": 4},
+        )
+    assert limit_info.value.diagnostics[0]["code"] == "anonymize.extraction_error"
 
 
 def test_anonymize_text_name_scope_aliases_share_replacement_and_surface_scope_splits_surfaces():
@@ -612,17 +676,20 @@ def test_anonymize_text_reports_exhausted_pseudonym_candidates_without_rewriting
     assert result["summary"] == {"record_count": 3, "applied_count": 2, "diagnostic_count": 1}
     assert [item["replacement"] for item in result["applied_replacements"]] == ["Mikey Law", "Nina Vale"]
     assert result["diagnostics"][0]["code"] == "replacement_db.candidates_exhausted"
+    assert result["diagnostics"][0]["path"] == "/replacement_sets"
+    assert "person_names" not in result["diagnostics"][0]["message"]
     assert result["diagnostics"][0]["metadata"] == {"assignment_ref": "a3", "entity": "person"}
 
 
 def test_anonymize_text_passes_max_text_bytes_to_json_bank_extraction():
-    with pytest.raises(ExtractionError):
+    with pytest.raises(DeanonymizationError) as exc_info:
         anonymize_text(
             _person_bank(include_alias=False),
             "John Smith",
             _pseudonym_db(),
             options={"mode": "pseudonym", "max_text_bytes": 4},
         )
+    assert exc_info.value.diagnostics[0]["code"] == "anonymize.extraction_error"
 
 
 def test_anonymize_text_rejects_invalid_options_with_diagnostics():
@@ -647,3 +714,44 @@ def test_anonymize_text_does_not_mutate_replacement_db_input():
     anonymize_text(_person_bank(include_alias=False), "John Smith", db, options={"mode": "pseudonym"})
 
     assert db == original
+
+
+def test_anonymize_text_sanitizes_bank_schema_diagnostics_by_default():
+    bank = _person_bank(include_alias=False)
+    bank["entities"]["person"]["names"]["john_smith"]["patterns"]["primary"]["priority"] = "bad"
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        anonymize_text(bank, "John Smith", _pseudonym_db(), options={"mode": "pseudonym"})
+
+    diagnostics_repr = repr(exc_info.value.diagnostics)
+    assert exc_info.value.diagnostics[0]["path"] == "/bank"
+    assert "john_smith" not in diagnostics_repr
+    assert "primary" not in diagnostics_repr
+    assert "person" not in diagnostics_repr
+
+
+def test_anonymize_text_sanitizes_replacement_validation_diagnostics_by_default():
+    db = _pseudonym_db(store_originals=True)
+    allocated = allocate_assignment(_record(), db, now="2026-06-13T00:00:00Z").replacement_db
+    first_assignment_key = next(iter(allocated["assignments"]))
+    second_assignment_key = assignment_key(
+        _record(name_id="jane_smith", canonical_name="Jane Smith"),
+        allocated["defaults"],
+    )
+    duplicated_assignment = copy.deepcopy(allocated["assignments"][first_assignment_key])
+    duplicated_assignment["assignment_key"] = second_assignment_key
+    duplicated_assignment["identity"]["fingerprint"] = second_assignment_key.split("|", 2)[2]
+    duplicated_assignment["identity"]["name_id"] = "jane_smith"
+    duplicated_assignment["identity"]["canonical_name"] = "Jane Smith"
+    duplicated_assignment["original"]["canonical"] = "Jane Smith"
+    allocated["assignments"][second_assignment_key] = duplicated_assignment
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        anonymize_text(_person_bank(include_alias=False), "John Smith", allocated, options={"mode": "pseudonym"})
+
+    diagnostics_repr = repr(exc_info.value.diagnostics)
+    assert all("|sha256:" not in item["path"] for item in exc_info.value.diagnostics)
+    assert "person_names" not in diagnostics_repr
+    assert "john_smith" not in diagnostics_repr
+    assert first_assignment_key not in diagnostics_repr
+    assert second_assignment_key not in diagnostics_repr

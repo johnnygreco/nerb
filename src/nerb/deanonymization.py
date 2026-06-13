@@ -9,10 +9,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from .diagnostics import DIAGNOSTIC_ERROR, Diagnostic, diagnostic, has_errors
-from .extraction import extract_report
+from .engines import ExtractionError, resolve_extraction_options
+from .extraction import _read_utf8_file, extract_report
 from .replacements import (
     _effective_policy,
     _render_redaction_template,
@@ -51,6 +52,7 @@ ANONYMIZE_OPTION_KEYS = {
 ASSIGNMENT_SCOPES = {"name", "canonical", "surface"}
 REPLACEMENT_MISSING_ASSIGNMENT = "replacement_db.missing_assignment"
 REPLACEMENT_CANDIDATES_EXHAUSTED = "replacement_db.candidates_exhausted"
+REPLACEMENT_MODE_MISMATCH = "replacement_db.assignment_mode_mismatch"
 ENTITY_ID_HASH_LENGTH = 12
 SENSITIVE_DIAGNOSTIC_METADATA_KEYS = {
     "assignment_key",
@@ -63,6 +65,18 @@ SENSITIVE_DIAGNOSTIC_METADATA_KEYS = {
     "replacement_db_hash",
     "replacement_db_id",
     "source_id",
+}
+SAFE_DIAGNOSTIC_MESSAGES = {
+    REPLACEMENT_CANDIDATES_EXHAUSTED: "Replacement set has no available unambiguous candidates.",
+    "replacement_db.assignment_collision": "Replacement value maps to multiple assignments.",
+    "replacement_db.assignment_key_mismatch": "Assignment key metadata is inconsistent.",
+    "replacement_db.invalid_assignment_key": "Assignment key is invalid.",
+    "replacement_db.invalid_assignment_candidate": "Pseudonym assignment candidate metadata is invalid.",
+    "replacement_db.unknown_replacement_set": "Replacement set is not defined.",
+    "schema.required": "Input failed schema validation.",
+    "schema.additional_property": "Input failed schema validation.",
+    "schema.type": "Input failed schema validation.",
+    "id.invalid": "Input contains an invalid identifier.",
 }
 
 
@@ -557,9 +571,60 @@ def _sanitize_diagnostic(
     if not options.include_sensitive_metadata:
         for key in SENSITIVE_DIAGNOSTIC_METADATA_KEYS:
             merged_metadata.pop(key, None)
+        original_path = sanitized.get("path")
+        if isinstance(original_path, str):
+            redacted_path = _redacted_diagnostic_path(original_path)
+            if redacted_path != original_path:
+                sanitized["path"] = redacted_path
+                sanitized["message"] = _safe_diagnostic_message(str(item.get("code", "")), redacted_path)
+        code = sanitized.get("code")
+        if isinstance(code, str) and code in SAFE_DIAGNOSTIC_MESSAGES:
+            sanitized["message"] = SAFE_DIAGNOSTIC_MESSAGES[code]
     if merged_metadata:
         sanitized["metadata"] = copy.deepcopy(merged_metadata)
     return sanitized
+
+
+def _redacted_diagnostic_path(path: str) -> str:
+    if path.startswith("/entities/"):
+        return "/bank"
+    if path.startswith("/assignments/"):
+        return "/assignments"
+    if path.startswith("/replacement_sets/"):
+        return "/replacement_sets"
+    return path
+
+
+def _safe_diagnostic_message(code: str, path: str) -> str:
+    if code in SAFE_DIAGNOSTIC_MESSAGES:
+        return SAFE_DIAGNOSTIC_MESSAGES[code]
+    if path == "/bank":
+        return "Bank diagnostic details are redacted by default."
+    if path == "/assignments":
+        return "Assignment diagnostic details are redacted by default."
+    if path == "/replacement_sets":
+        return "Replacement set diagnostic details are redacted by default."
+    return "Diagnostic details are redacted by default."
+
+
+def _sanitize_diagnostics(diagnostics: Sequence[Diagnostic], options: _AnonymizeOptions) -> list[Diagnostic]:
+    return [_sanitize_diagnostic(dict(item), options) for item in diagnostics if isinstance(item, Mapping)]
+
+
+def _raise_anonymize_error(
+    message: str,
+    diagnostics: Sequence[Diagnostic],
+    options: _AnonymizeOptions,
+) -> NoReturn:
+    raise DeanonymizationError(message, _sanitize_diagnostics(diagnostics, options))
+
+
+def _raise_extraction_error(exc: ExtractionError, options: _AnonymizeOptions) -> NoReturn:
+    diagnostics = _sanitize_diagnostics(exc.diagnostics, options)
+    if not diagnostics:
+        message = str(exc) if options.include_sensitive_metadata else "Anonymization extraction failed."
+        diagnostics = [_error("anonymize.extraction_error", "/source", message)]
+    raise DeanonymizationError("Anonymization extraction failed.", diagnostics) from exc
 
 
 def _safe_bank_metadata(report: Mapping[str, Any], options: _AnonymizeOptions) -> dict[str, Any]:
@@ -827,6 +892,27 @@ def _allocate_assignment_with_policy(
     assignments = db.setdefault("assignments", {})
     existing = assignments.get(identity.assignment_key)
     if isinstance(existing, Mapping):
+        if policy_override is not None:
+            requested_mode = policy_override.get("replacement_mode")
+            replacement = existing.get("replacement")
+            existing_mode = replacement.get("mode") if isinstance(replacement, Mapping) else None
+            if isinstance(requested_mode, str) and existing_mode != requested_mode:
+                return AssignmentAllocation(
+                    replacement_db=db,
+                    assignment_key=identity.assignment_key,
+                    assignment=None,
+                    created=False,
+                    diagnostics=(
+                        _error(
+                            REPLACEMENT_MODE_MISMATCH,
+                            "/assignments",
+                            (
+                                f"Existing assignment replacement mode {existing_mode!r} "
+                                f"does not match {requested_mode!r}."
+                            ),
+                        ),
+                    ),
+                )
         return AssignmentAllocation(
             replacement_db=db,
             assignment_key=identity.assignment_key,
@@ -915,7 +1001,10 @@ def _anonymize_resolved_report(
     replacement_db: Mapping[str, Any],
     options: _AnonymizeOptions,
 ) -> dict[str, Any]:
-    current_db = _validate_replacement_db_for_allocation(replacement_db)
+    try:
+        current_db = _validate_replacement_db_for_allocation(replacement_db)
+    except DeanonymizationError as exc:
+        _raise_anonymize_error("Replacement database is invalid.", exc.diagnostics, options)
     diagnostics = [
         _sanitize_diagnostic(cast(Diagnostic, dict(item)), options)
         for item in report.get("diagnostics", [])
@@ -930,22 +1019,29 @@ def _anonymize_resolved_report(
         if not isinstance(resolved, Mapping) or not isinstance(resolved.get("record"), Mapping):
             continue
         record = cast(Mapping[str, Any], resolved["record"])
-        allocation = _allocate_assignment_with_policy(
-            record,
-            current_db,
-            source_surface_limit=options.source_surface_limit,
-            policy_override=policy_override,
-        )
+        try:
+            allocation = _allocate_assignment_with_policy(
+                record,
+                current_db,
+                source_surface_limit=options.source_surface_limit,
+                policy_override=policy_override,
+            )
+            entity_id = _record_entity_id(record)
+        except DeanonymizationError as exc:
+            _raise_anonymize_error("Anonymization assignment could not be allocated.", exc.diagnostics, options)
         current_db = allocation.replacement_db
         assignment_ref = _assignment_ref(allocation.assignment_key, assignment_refs)
-        entity_id = _record_entity_id(record)
 
         if allocation.assignment is None:
             metadata: dict[str, Any] = {"assignment_ref": assignment_ref, "entity": entity_id}
             if options.include_sensitive_metadata:
                 metadata["assignment_key"] = allocation.assignment_key
             if allocation.diagnostics and options.on_missing_assignment == "fail":
-                raise DeanonymizationError("Anonymization assignment could not be allocated.", allocation.diagnostics)
+                _raise_anonymize_error(
+                    "Anonymization assignment could not be allocated.",
+                    allocation.diagnostics,
+                    options,
+                )
             if allocation.diagnostics and options.on_missing_assignment == "diagnostic":
                 diagnostics.extend(
                     _sanitize_diagnostic(item, options, metadata=metadata) for item in allocation.diagnostics
@@ -961,7 +1057,7 @@ def _anonymize_resolved_report(
                 metadata={"assignment_ref": assignment_ref, "entity": entity_id},
             )
             if options.on_missing_assignment == "fail":
-                raise DeanonymizationError("Anonymization assignment is invalid.", [diagnostic_item])
+                _raise_anonymize_error("Anonymization assignment is invalid.", [diagnostic_item], options)
             if options.on_missing_assignment == "diagnostic":
                 diagnostics.append(_sanitize_diagnostic(diagnostic_item, options))
             continue
@@ -1054,7 +1150,10 @@ def anonymize_text(
     if not isinstance(text, str):
         raise TypeError("anonymize_text text must be a string.")
     resolved_options = _resolve_anonymize_options(options)
-    report = extract_report(bank, text, options=resolved_options.extraction_options)
+    try:
+        report = extract_report(bank, text, options=resolved_options.extraction_options)
+    except ExtractionError as exc:
+        _raise_extraction_error(exc, resolved_options)
     return _anonymize_resolved_report(text, report, replacement_db, resolved_options)
 
 
@@ -1067,20 +1166,12 @@ def anonymize_file(
 ) -> dict[str, Any]:
     """Anonymize a UTF-8 text file through the JSON-bank report resolver without writing output."""
     path = Path(file_path).expanduser()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise DeanonymizationError(
-            "Anonymization source file cannot be read.",
-            [_error("anonymize.file_read_error", "/file_path", f"Could not read source file {str(path)!r}: {exc}.")],
-        ) from exc
-    except UnicodeDecodeError as exc:
-        raise DeanonymizationError(
-            "Anonymization source file is not valid UTF-8.",
-            [_error("anonymize.file_decode_error", "/file_path", f"Source file {str(path)!r} is not valid UTF-8.")],
-        ) from exc
-
     resolved_options = _resolve_anonymize_options(options)
-    report = dict(extract_report(bank, text, options=resolved_options.extraction_options))
-    report["source"] = {"type": "file", "path": str(path), "length": len(text), "bytes": len(text.encode("utf-8"))}
+    try:
+        extraction_options = resolve_extraction_options(resolved_options.extraction_options)
+        text, byte_count = _read_utf8_file(path, max_bytes=extraction_options.max_text_bytes)
+        report = dict(extract_report(bank, text, options=resolved_options.extraction_options))
+    except ExtractionError as exc:
+        _raise_extraction_error(exc, resolved_options)
+    report["source"] = {"type": "file", "path": str(path), "length": len(text), "bytes": byte_count}
     return _anonymize_resolved_report(text, report, replacement_db, resolved_options)
