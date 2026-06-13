@@ -17,7 +17,7 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
-from .deanonymization import anonymize_file, anonymize_text
+from .deanonymization import anonymize_file, anonymize_text, deanonymize_file, deanonymize_text
 from .diff import diff_banks
 from .engine import Bank, bank_cache_info, clear_bank_cache
 from .evals import eval_bank
@@ -68,6 +68,8 @@ __all__ = [
     "canonicalize_bank",
     "clear_bank_cache",
     "diff_banks",
+    "deanonymize_file",
+    "deanonymize_text",
     "extract_batch",
     "extract_file",
     "extract_report",
