@@ -39,6 +39,12 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
+from .deanonymization import DeanonymizationError
+from .deanonymization import anonymize_file as _anonymize_file
+from .deanonymization import anonymize_text as _anonymize_text
+from .deanonymization import deanonymize_file as _deanonymize_file
+from .deanonymization import deanonymize_text as _deanonymize_text
+from .deanonymization import finalize_replacement_db_update as _finalize_replacement_db_update
 from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
 from .engine import Bank
@@ -58,6 +64,16 @@ from .extraction import (
     extract_text as _json_extract_text,
 )
 from .patches import apply_bank_patches as _apply_bank_patches
+from .replacements import (
+    ReplacementDbError,
+    create_replacement_db,
+    hash_replacement_db,
+    load_replacement_db,
+    read_replacement_db_json,
+    save_replacement_db,
+    validate_replacement_db,
+)
+from .schema import ID_RE
 from .validation import rust_empty_match_diagnostics
 from .validation import validate_bank as _validate_bank
 
@@ -76,6 +92,12 @@ app = typer.Typer(
     no_args_is_help=True,
     rich_markup_mode=None,
 )
+replacement_db_app = typer.Typer(
+    help="Manage explicit local replacement databases.",
+    no_args_is_help=True,
+    rich_markup_mode=None,
+)
+app.add_typer(replacement_db_app, name="replacement-db")
 
 
 @dataclass(frozen=True)
@@ -275,13 +297,311 @@ def _non_mapping_bank_payload(raw_bank: Any, path: Path, label: str) -> dict[str
 def _run_json_helper(action: Any) -> dict[str, Any]:
     try:
         return action()
-    except (ExtractionError, BankError) as exc:
+    except (ExtractionError, BankError, DeanonymizationError, ReplacementDbError) as exc:
         diagnostics = getattr(exc, "diagnostics", [])
         if diagnostics:
             return _diagnostic_payload(str(exc), diagnostics)
         _exit_error(str(exc))
     except (TypeError, ValueError) as exc:
+        diagnostics = getattr(exc, "diagnostics", [])
+        if diagnostics:
+            return _diagnostic_payload(str(exc), diagnostics)
         _exit_error(str(exc))
+
+
+def _load_replacement_db_for_command(
+    db_path: Path,
+) -> tuple[dict[str, Any] | None, Path, dict[str, Any] | None]:
+    path = db_path.expanduser()
+    try:
+        return load_replacement_db(path), path, None
+    except ReplacementDbError as exc:
+        return None, path, _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+
+
+def _validate_replacement_db_file_payload(db_path: Path) -> dict[str, Any]:
+    path = db_path.expanduser()
+    try:
+        raw_db = read_replacement_db_json(path)
+    except ReplacementDbError as exc:
+        return _diagnostic_payload(str(exc), exc.diagnostics, path=path)
+
+    payload = validate_replacement_db(raw_db)
+    return {"valid": payload["valid"], "path": str(path), "diagnostics": payload["diagnostics"]}
+
+
+def _ensure_replacement_id(value: str, label: str) -> str:
+    if ID_RE.fullmatch(value) is None:
+        _exit_error(f"{label} {value!r} must match {ID_RE.pattern}.")
+    return value
+
+
+def _current_replacement_db_state(db_path: Path) -> tuple[dict[str, Any], str, int]:
+    replacement_db = load_replacement_db(db_path)
+    version = replacement_db.get("version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        _exit_error(f"Replacement database at {db_path} has an invalid version.")
+    return replacement_db, hash_replacement_db(replacement_db), version
+
+
+def _save_replacement_db_change(
+    replacement_db: Mapping[str, Any],
+    db_path: Path,
+    *,
+    expected_hash: str,
+    expected_version: int,
+) -> dict[str, Any] | None:
+    finalized = _run_json_helper(lambda: _finalize_replacement_db_update(replacement_db, base_version=expected_version))
+    if finalized.get("valid") is False:
+        return finalized
+    save_payload = _run_json_helper(
+        lambda: {
+            "path": str(
+                save_replacement_db(
+                    finalized,
+                    db_path,
+                    expected_hash=expected_hash,
+                    expected_version=expected_version,
+                )
+            )
+        }
+    )
+    if save_payload.get("valid") is False:
+        return save_payload
+    return None
+
+
+def _safe_replacement_db_summary(
+    replacement_db: Mapping[str, Any],
+    *,
+    path: Path | None = None,
+    saved: bool | None = None,
+    include_originals: bool = False,
+    include_values: bool = False,
+    include_sensitive_metadata: bool = False,
+) -> dict[str, Any]:
+    assignments = replacement_db.get("assignments", {})
+    assignment_items = assignments.items() if isinstance(assignments, Mapping) else []
+    replacement_sets = replacement_db.get("replacement_sets", {})
+    replacement_set_items = replacement_sets.items() if isinstance(replacement_sets, Mapping) else []
+    entities = replacement_db.get("entities", {})
+    entity_items = entities.items() if isinstance(entities, Mapping) else []
+    defaults = replacement_db.get("defaults", {})
+
+    by_mode: dict[str, int] = {}
+    assignment_summaries: list[dict[str, Any]] = []
+    for assignment_key, assignment in assignment_items:
+        if not isinstance(assignment, Mapping):
+            continue
+        replacement = assignment.get("replacement")
+        mode = replacement.get("mode") if isinstance(replacement, Mapping) else None
+        if isinstance(mode, str):
+            by_mode[mode] = by_mode.get(mode, 0) + 1
+        if include_originals or include_values or include_sensitive_metadata:
+            assignment_summary: dict[str, Any] = {
+                "assignment_ref": f"a{len(assignment_summaries) + 1}",
+                "entity": assignment.get("entity_id"),
+                "mode": mode,
+            }
+            if include_values and isinstance(replacement, Mapping):
+                assignment_summary["replacement"] = replacement.get("value")
+            if include_originals and isinstance(assignment.get("original"), Mapping):
+                assignment_summary["original"] = assignment["original"]
+            if include_sensitive_metadata:
+                assignment_summary["assignment_key"] = assignment_key
+                identity = assignment.get("identity")
+                if isinstance(identity, Mapping):
+                    assignment_summary["fingerprint"] = identity.get("fingerprint")
+            assignment_summaries.append(assignment_summary)
+
+    assignment_payload: dict[str, Any] = {"count": sum(1 for _key, _assignment in assignment_items), "by_mode": by_mode}
+    payload: dict[str, Any] = {
+        "schema_version": "nerb.replacement_db_summary.v1",
+        "replacement_db": {
+            "replacement_db_ref": "rdb1",
+            "schema_version": replacement_db.get("schema_version"),
+            "version": replacement_db.get("version"),
+        },
+        "defaults": dict(defaults) if isinstance(defaults, Mapping) else {},
+        "entities": {
+            str(entity_id): dict(entity_policy)
+            for entity_id, entity_policy in entity_items
+            if isinstance(entity_policy, Mapping)
+        },
+        "replacement_sets": {
+            str(set_id): {
+                "description": replacement_set.get("description"),
+                "reuse": replacement_set.get("reuse"),
+                "candidate_count": len(replacement_set.get("candidates", []))
+                if isinstance(replacement_set.get("candidates"), list)
+                else 0,
+            }
+            for set_id, replacement_set in replacement_set_items
+            if isinstance(replacement_set, Mapping)
+        },
+        "assignments": assignment_payload,
+        "diagnostics": [],
+    }
+    if path is not None:
+        payload["path"] = str(path)
+    if saved is not None:
+        payload["replacement_db"]["saved"] = saved
+    if include_sensitive_metadata:
+        payload["replacement_db"]["id"] = replacement_db.get("id")
+        payload["replacement_db"]["hash"] = hash_replacement_db(replacement_db)
+    if include_values:
+        for set_id, replacement_set in replacement_set_items:
+            if not isinstance(replacement_set, Mapping):
+                continue
+            candidates = replacement_set.get("candidates")
+            if isinstance(candidates, list) and str(set_id) in payload["replacement_sets"]:
+                payload["replacement_sets"][str(set_id)]["candidates"] = [
+                    {"id": candidate.get("id"), "value": candidate.get("value")}
+                    for candidate in candidates
+                    if isinstance(candidate, Mapping)
+                ]
+    if assignment_summaries:
+        assignment_payload["items"] = assignment_summaries
+    return payload
+
+
+def _anonymize_options(
+    *,
+    mode: str,
+    include_originals: bool,
+    include_sensitive_metadata: bool,
+    on_missing_assignment: str,
+    max_text_bytes: int | None,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "mode": mode,
+        "include_originals": include_originals,
+        "include_sensitive_metadata": include_sensitive_metadata,
+        "on_missing_assignment": on_missing_assignment,
+    }
+    if max_text_bytes is not None:
+        options["max_text_bytes"] = max_text_bytes
+    return options
+
+
+def _deanonymize_options(
+    *,
+    restore_pseudonyms: bool,
+    restore_redactions: bool,
+    include_originals: bool,
+    include_sensitive_metadata: bool,
+    max_text_bytes: int | None,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "restore_pseudonyms": restore_pseudonyms,
+        "restore_redactions": restore_redactions,
+        "include_originals": include_originals,
+        "include_sensitive_metadata": include_sensitive_metadata,
+    }
+    if max_text_bytes is not None:
+        options["max_text_bytes"] = max_text_bytes
+    return options
+
+
+def _saved_anonymize_payload(
+    action: Any,
+    *,
+    db_path: Path,
+    base_hash: str,
+    base_version: int,
+    options: Mapping[str, Any],
+    save_db: bool,
+) -> dict[str, Any]:
+    payload = _run_json_helper(lambda: action(options))
+    if payload.get("valid") is False or payload.get("schema_version") != "nerb.anonymize_response.v1":
+        return payload
+
+    replacement_db_metadata = payload.get("replacement_db", {})
+    modified = bool(replacement_db_metadata.get("modified")) if isinstance(replacement_db_metadata, Mapping) else False
+    if not save_db or not modified:
+        return payload
+
+    if options.get("include_sensitive_metadata") is True and isinstance(replacement_db_metadata, Mapping):
+        updated_db = replacement_db_metadata.get("data")
+    else:
+        sensitive_options = dict(options)
+        sensitive_options["include_sensitive_metadata"] = True
+        sensitive_payload = _run_json_helper(lambda: action(sensitive_options))
+        if sensitive_payload.get("valid") is False:
+            return sensitive_payload
+        updated_db = sensitive_payload.get("replacement_db", {}).get("data")
+
+    if not isinstance(updated_db, Mapping):
+        return _diagnostic_payload(
+            "Anonymization did not return an updated replacement database for saving.",
+            [
+                {
+                    "severity": DIAGNOSTIC_ERROR,
+                    "code": "replacement_db.save_error",
+                    "path": "/replacement_db",
+                    "message": "Anonymization did not return an updated replacement database for saving.",
+                }
+            ],
+            path=db_path,
+        )
+
+    save_error = _save_replacement_db_change(
+        updated_db,
+        db_path,
+        expected_hash=base_hash,
+        expected_version=base_version,
+    )
+    if save_error is not None:
+        return save_error
+
+    saved_db = load_replacement_db(db_path)
+    payload["replacement_db"]["version"] = saved_db.get("version")
+    payload["replacement_db"]["saved"] = True
+    if options.get("include_sensitive_metadata") is True:
+        payload["replacement_db"]["data"] = saved_db
+        payload["replacement_db"]["hash"] = hash_replacement_db(saved_db)
+        payload["replacement_db"]["id"] = saved_db.get("id")
+    else:
+        payload["replacement_db"].pop("data", None)
+        payload["replacement_db"].pop("hash", None)
+        payload["replacement_db"].pop("id", None)
+    return payload
+
+
+def _write_output_text(output_path: Path, text: str, *, force: bool) -> None:
+    path = _ensure_output_writable(output_path, force=force)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        _exit_error(f"Could not write output at {path}: {exc}")
+
+
+def _ensure_output_writable(output_path: Path, *, force: bool) -> Path:
+    path = output_path.expanduser()
+    if path.exists() and not force:
+        _exit_error(f"Output file already exists at {path}; use --force to overwrite it.")
+    if path.exists() and not path.is_file():
+        _exit_error(f"Output path is not a file: {path}.")
+    return path
+
+
+def _refuse_unsaved_assignment_output(payload: Mapping[str, Any], *, save_db: bool) -> None:
+    replacement_db_metadata = payload.get("replacement_db")
+    if isinstance(replacement_db_metadata, Mapping) and replacement_db_metadata.get("modified") is True and not save_db:
+        _exit_error("Refusing to write output that depends on new unsaved assignments; pass --save-db.")
+
+
+def _candidate_id(set_id: str, ordinal: int, existing_ids: set[str]) -> str:
+    suffix = f"_{ordinal:04d}"
+    prefix = set_id[: 80 - len(suffix)]
+    candidate_id = f"{prefix}{suffix}"
+    while candidate_id in existing_ids:
+        ordinal += 1
+        suffix = f"_{ordinal:04d}"
+        prefix = set_id[: 80 - len(suffix)]
+        candidate_id = f"{prefix}{suffix}"
+    return candidate_id
 
 
 def _load_command_config(config_path: Path, *, allow_missing: bool = False) -> PatternConfig:
@@ -1055,6 +1375,221 @@ def _run_doctor(config_path: Path) -> dict[str, Any]:
     return _doctor_payload(config_path, pattern_config, diagnostics)
 
 
+@replacement_db_app.command("init")
+def init_replacement_db(
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    db_id: str = typer.Option("replacements", "--id", help="Replacement database id."),
+    description: str = typer.Option("", "--description", help="Replacement database description."),
+    reversible: bool = typer.Option(False, "--reversible", help="Store originals by default for reversible workflows."),
+    store_originals: bool = typer.Option(False, "--store-originals", help="Alias for --reversible."),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing replacement database."),
+) -> None:
+    """Create an explicit local replacement database."""
+    path = db_path.expanduser()
+    _ensure_replacement_id(db_id, "Replacement database id")
+    exists = path.exists()
+    if exists and not force:
+        _exit_error(f"Replacement database already exists at {path}; use --force to overwrite it.")
+
+    replacement_db = create_replacement_db(
+        db_id=db_id,
+        description=description,
+        reversible=reversible or store_originals,
+    )
+    expected_hash: str | None = None
+    expected_version: int | None = None
+    if exists:
+        try:
+            current, expected_hash, expected_version = _current_replacement_db_state(path)
+        except ReplacementDbError:
+            current = None
+        if current is not None and expected_version is not None:
+            replacement_db["version"] = expected_version + 1
+
+    payload = _run_json_helper(
+        lambda: {
+            "path": str(
+                save_replacement_db(
+                    replacement_db,
+                    path,
+                    expected_hash=expected_hash,
+                    expected_version=expected_version,
+                )
+            )
+        }
+    )
+    if payload.get("valid") is False:
+        _echo_json(payload)
+        return
+    saved = load_replacement_db(path)
+    _echo_json(_safe_replacement_db_summary(saved, path=path, saved=True))
+
+
+@replacement_db_app.command("validate")
+def validate_replacement_db_command(
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+) -> None:
+    """Validate a replacement database and print JSON diagnostics."""
+    _echo_json(_validate_replacement_db_file_payload(db_path))
+
+
+@replacement_db_app.command("list")
+def list_replacement_db_command(
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    include_originals: bool = typer.Option(False, "--include-originals", help="Include stored originals."),
+    include_values: bool = typer.Option(False, "--include-values", help="Include candidate and replacement values."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include database id, hash, assignment keys, and fingerprints.",
+    ),
+) -> None:
+    """Print a privacy-safe replacement database summary."""
+    replacement_db, path, invalid_payload = _load_replacement_db_for_command(db_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        return
+    if replacement_db is None:
+        _exit_error(f"Could not load replacement database at {path}.")
+    _echo_json(
+        _safe_replacement_db_summary(
+            replacement_db,
+            path=path,
+            include_originals=include_originals,
+            include_values=include_values,
+            include_sensitive_metadata=include_sensitive_metadata,
+        )
+    )
+
+
+@replacement_db_app.command("add-set")
+def add_replacement_set(
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    set_id: str = typer.Option(..., "--set", help="Replacement set id."),
+    candidates: list[str] | None = typer.Option(
+        None,
+        "--candidate",
+        help="Candidate replacement value. May be repeated.",
+    ),
+    description: str = typer.Option("", "--description", help="Replacement set description."),
+    reuse: bool = typer.Option(False, "--reuse", help="Allow deterministic candidate reuse."),
+) -> None:
+    """Create or extend a replacement candidate set."""
+    set_id = _ensure_replacement_id(set_id, "Replacement set id")
+    path = db_path.expanduser()
+    try:
+        replacement_db, expected_hash, expected_version = _current_replacement_db_state(path)
+    except ReplacementDbError as exc:
+        _echo_json(_diagnostic_payload(str(exc), exc.diagnostics, path=path))
+        return
+    updated_db = json.loads(json.dumps(replacement_db))
+    replacement_sets = updated_db.setdefault("replacement_sets", {})
+    set_exists = set_id in replacement_sets
+    replacement_set = replacement_sets.setdefault(
+        set_id,
+        {"description": description, "reuse": reuse, "candidates": [], "metadata": {}},
+    )
+    if not isinstance(replacement_set, dict):
+        _exit_error(f"Replacement set {set_id!r} is invalid in {path}.")
+    replacement_set["description"] = description if description else replacement_set.get("description", "")
+    if reuse or not set_exists:
+        replacement_set["reuse"] = reuse
+    replacement_set.setdefault("metadata", {})
+    replacement_set.setdefault("candidates", [])
+    if not isinstance(replacement_set["candidates"], list):
+        _exit_error(f"Replacement set {set_id!r} candidates are invalid in {path}.")
+
+    existing_ids: set[str] = set()
+    for candidate in replacement_set["candidates"]:
+        if isinstance(candidate, Mapping) and isinstance(candidate.get("id"), str):
+            existing_ids.add(candidate["id"])
+    for value in candidates or []:
+        candidate_id = _candidate_id(set_id, len(replacement_set["candidates"]) + 1, existing_ids)
+        existing_ids.add(candidate_id)
+        replacement_set["candidates"].append({"id": candidate_id, "value": value, "metadata": {}})
+
+    save_error = _save_replacement_db_change(
+        updated_db,
+        path,
+        expected_hash=expected_hash,
+        expected_version=expected_version,
+    )
+    if save_error is not None:
+        _echo_json(save_error)
+        return
+    _echo_json(_safe_replacement_db_summary(load_replacement_db(path), path=path, saved=True))
+
+
+@replacement_db_app.command("set-entity")
+def set_replacement_entity_policy(
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    entity: str = typer.Option(..., "--entity", help="Entity id to configure."),
+    mode: str = typer.Option(..., "--mode", help="Replacement mode: redact or pseudonym."),
+    replacement_set: str | None = typer.Option(None, "--set", help="Replacement set id for pseudonym mode."),
+    store_originals: bool = typer.Option(False, "--store-originals", help="Store originals for this entity."),
+    no_store_originals: bool = typer.Option(False, "--no-store-originals", help="Do not store originals."),
+    assignment_scope: str | None = typer.Option(None, "--assignment-scope", help="Assignment scope override."),
+    redaction_template: str | None = typer.Option(None, "--redaction-template", help="Redaction token template."),
+    allow_new_assignments: bool = typer.Option(False, "--allow-new-assignments", help="Allow new assignments."),
+    no_allow_new_assignments: bool = typer.Option(
+        False,
+        "--no-allow-new-assignments",
+        help="Reject new assignments for this entity.",
+    ),
+) -> None:
+    """Set replacement policy for one entity."""
+    entity = _ensure_replacement_id(entity, "Entity id")
+    if mode not in {"redact", "pseudonym"}:
+        _exit_error("Replacement mode must be 'redact' or 'pseudonym'.")
+    if store_originals and no_store_originals:
+        _exit_error("Use only one of --store-originals or --no-store-originals.")
+    if allow_new_assignments and no_allow_new_assignments:
+        _exit_error("Use only one of --allow-new-assignments or --no-allow-new-assignments.")
+    if replacement_set is not None:
+        replacement_set = _ensure_replacement_id(replacement_set, "Replacement set id")
+
+    path = db_path.expanduser()
+    try:
+        replacement_db, expected_hash, expected_version = _current_replacement_db_state(path)
+    except ReplacementDbError as exc:
+        _echo_json(_diagnostic_payload(str(exc), exc.diagnostics, path=path))
+        return
+    updated_db = json.loads(json.dumps(replacement_db))
+    existing_policy = updated_db.setdefault("entities", {}).get(entity, {})
+    policy = dict(existing_policy) if isinstance(existing_policy, Mapping) else {}
+    policy["replacement_mode"] = mode
+    if replacement_set is not None:
+        policy["replacement_set_id"] = replacement_set
+    elif mode == "redact":
+        policy.pop("replacement_set_id", None)
+    if store_originals:
+        policy["store_originals"] = True
+    if no_store_originals:
+        policy["store_originals"] = False
+    if assignment_scope is not None:
+        policy["assignment_scope"] = assignment_scope
+    if redaction_template is not None:
+        policy["redaction_template"] = redaction_template
+    if allow_new_assignments:
+        policy["allow_new_assignments"] = True
+    if no_allow_new_assignments:
+        policy["allow_new_assignments"] = False
+    if mode == "pseudonym" and not policy.get("replacement_set_id"):
+        _exit_error("Pseudonym mode requires --set or an existing replacement_set_id.")
+    updated_db["entities"][entity] = policy
+
+    save_error = _save_replacement_db_change(
+        updated_db,
+        path,
+        expected_hash=expected_hash,
+        expected_version=expected_version,
+    )
+    if save_error is not None:
+        _echo_json(save_error)
+        return
+    _echo_json(_safe_replacement_db_summary(load_replacement_db(path), path=path, saved=True))
+
+
 @app.callback()
 def callback(
     ctx: typer.Context,
@@ -1199,6 +1734,220 @@ def extract_json_bank_report(
 
     document_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
     _echo_json(_run_json_helper(lambda: _json_extract_report(bank, document_text)))
+
+
+@app.command("anonymize-text")
+def anonymize_json_bank_text(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    text: str | None = typer.Option(None, "--text", help="Literal document text to anonymize."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+    mode: str = typer.Option("entity_policy", "--mode", help="Mode: entity_policy, redact, or pseudonym."),
+    save_db: bool = typer.Option(False, "--save-db", help="Persist new assignments to --db."),
+    include_originals: bool = typer.Option(False, "--include-originals", help="Include original strings in output."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include sensitive ids, hashes, paths, and assignment data.",
+    ),
+    on_missing_assignment: str = typer.Option(
+        "diagnostic",
+        "--on-missing-assignment",
+        help="Missing assignment policy: diagnostic, fail, or skip.",
+    ),
+    max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
+) -> None:
+    """Anonymize one in-memory text source with a JSON bank."""
+    bank, _bank_path, invalid_bank_payload = _load_json_bank_for_command(bank_path)
+    if invalid_bank_payload is not None:
+        _echo_json(invalid_bank_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    if invalid_db_payload is not None:
+        _echo_json(invalid_db_payload)
+        return
+    if replacement_db is None:
+        _exit_error(f"Could not load replacement database at {path}.")
+
+    source_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
+    options = _anonymize_options(
+        mode=mode,
+        include_originals=include_originals,
+        include_sensitive_metadata=include_sensitive_metadata,
+        on_missing_assignment=on_missing_assignment,
+        max_text_bytes=max_text_bytes,
+    )
+    base_hash = hash_replacement_db(replacement_db)
+    base_version = int(replacement_db["version"])
+    payload = _saved_anonymize_payload(
+        lambda resolved_options: _anonymize_text(bank, source_text, replacement_db, options=resolved_options),
+        db_path=path,
+        base_hash=base_hash,
+        base_version=base_version,
+        options=options,
+        save_db=save_db,
+    )
+    _echo_json(payload)
+
+
+@app.command("anonymize-file")
+def anonymize_json_bank_file(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    file_path: Path = typer.Option(..., "--file", help="UTF-8 document file path."),
+    output_path: Path | None = typer.Option(None, "--output", help="Write transformed text to this file."),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing output file."),
+    mode: str = typer.Option("entity_policy", "--mode", help="Mode: entity_policy, redact, or pseudonym."),
+    save_db: bool = typer.Option(False, "--save-db", help="Persist new assignments to --db."),
+    include_originals: bool = typer.Option(False, "--include-originals", help="Include original strings in output."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include sensitive ids, hashes, paths, and assignment data.",
+    ),
+    on_missing_assignment: str = typer.Option(
+        "diagnostic",
+        "--on-missing-assignment",
+        help="Missing assignment policy: diagnostic, fail, or skip.",
+    ),
+    max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
+) -> None:
+    """Anonymize one explicit UTF-8 document file with a JSON bank."""
+    bank, _bank_path, invalid_bank_payload = _load_json_bank_for_command(bank_path)
+    if invalid_bank_payload is not None:
+        _echo_json(invalid_bank_payload)
+        return
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    if invalid_db_payload is not None:
+        _echo_json(invalid_db_payload)
+        return
+    if replacement_db is None:
+        _exit_error(f"Could not load replacement database at {path}.")
+
+    document_path = _ensure_explicit_file(file_path, "Document")
+    if output_path is not None:
+        _ensure_output_writable(output_path, force=force)
+    options = _anonymize_options(
+        mode=mode,
+        include_originals=include_originals,
+        include_sensitive_metadata=include_sensitive_metadata,
+        on_missing_assignment=on_missing_assignment,
+        max_text_bytes=max_text_bytes,
+    )
+    base_hash = hash_replacement_db(replacement_db)
+    base_version = int(replacement_db["version"])
+    payload = _saved_anonymize_payload(
+        lambda resolved_options: _anonymize_file(bank, document_path, replacement_db, options=resolved_options),
+        db_path=path,
+        base_hash=base_hash,
+        base_version=base_version,
+        options=options,
+        save_db=save_db,
+    )
+    if output_path is not None and payload.get("valid") is not False:
+        _refuse_unsaved_assignment_output(payload, save_db=save_db)
+        result_text = payload.get("text")
+        if isinstance(result_text, str):
+            _write_output_text(output_path, result_text, force=force)
+            payload["output"] = {"path": str(output_path.expanduser()), "written": True}
+    _echo_json(payload)
+
+
+@app.command("deanonymize-text")
+def deanonymize_json_bank_text(
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    text: str | None = typer.Option(None, "--text", help="Literal document text to restore."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+    restore_pseudonyms: bool = typer.Option(
+        False,
+        "--restore-pseudonyms",
+        help="Restore pseudonyms as well as redaction tokens.",
+    ),
+    restore_redactions: bool = typer.Option(
+        True,
+        "--restore-redactions/--no-restore-redactions",
+        help="Restore redaction tokens.",
+    ),
+    include_originals: bool = typer.Option(False, "--include-originals", help="Include restored strings in metadata."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include sensitive ids, hashes, paths, and assignment data.",
+    ),
+    max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
+) -> None:
+    """Restore redaction tokens, and optionally pseudonyms, from text."""
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    if invalid_db_payload is not None:
+        _echo_json(invalid_db_payload)
+        return
+    if replacement_db is None:
+        _exit_error(f"Could not load replacement database at {path}.")
+
+    source_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
+    options = _deanonymize_options(
+        restore_pseudonyms=restore_pseudonyms,
+        restore_redactions=restore_redactions,
+        include_originals=include_originals,
+        include_sensitive_metadata=include_sensitive_metadata,
+        max_text_bytes=max_text_bytes,
+    )
+    _echo_json(_run_json_helper(lambda: _deanonymize_text(source_text, replacement_db, options=options)))
+
+
+@app.command("deanonymize-file")
+def deanonymize_json_bank_file(
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    file_path: Path = typer.Option(..., "--file", help="UTF-8 document file path."),
+    output_path: Path | None = typer.Option(None, "--output", help="Write restored text to this file."),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing output file."),
+    restore_pseudonyms: bool = typer.Option(
+        False,
+        "--restore-pseudonyms",
+        help="Restore pseudonyms as well as redaction tokens.",
+    ),
+    restore_redactions: bool = typer.Option(
+        True,
+        "--restore-redactions/--no-restore-redactions",
+        help="Restore redaction tokens.",
+    ),
+    include_originals: bool = typer.Option(False, "--include-originals", help="Include restored strings in metadata."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include sensitive ids, hashes, paths, and assignment data.",
+    ),
+    max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
+) -> None:
+    """Restore redaction tokens, and optionally pseudonyms, from a file."""
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(db_path)
+    if invalid_db_payload is not None:
+        _echo_json(invalid_db_payload)
+        return
+    if replacement_db is None:
+        _exit_error(f"Could not load replacement database at {path}.")
+
+    document_path = _ensure_explicit_file(file_path, "Document")
+    if output_path is not None:
+        _ensure_output_writable(output_path, force=force)
+    options = _deanonymize_options(
+        restore_pseudonyms=restore_pseudonyms,
+        restore_redactions=restore_redactions,
+        include_originals=include_originals,
+        include_sensitive_metadata=include_sensitive_metadata,
+        max_text_bytes=max_text_bytes,
+    )
+    payload = _run_json_helper(lambda: _deanonymize_file(document_path, replacement_db, options=options))
+    if output_path is not None and payload.get("valid") is not False:
+        result_text = payload.get("text")
+        if isinstance(result_text, str):
+            _write_output_text(output_path, result_text, force=force)
+            payload["output"] = {"path": str(output_path.expanduser()), "written": True}
+    _echo_json(payload)
 
 
 @app.command("eval-bank")
