@@ -930,6 +930,37 @@ def test_reverse_bank_fingerprint_sanitizes_invalid_db_diagnostics_by_default():
     assert "jane_smith" not in diagnostics_repr
 
 
+def test_build_reverse_bank_fails_before_returning_oversized_generated_bank():
+    db = create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z")
+    assignments = {}
+    for index in range(1001):
+        key = f"person|name|sha256:{index:064x}"
+        assignments[key] = {
+            "assignment_key": key,
+            "entity_id": "person",
+            "identity": {
+                "scope": "name",
+                "name_id": f"name_{index}",
+                "canonical_name": f"Original {index}",
+                "fingerprint": f"sha256:{index:064x}",
+            },
+            "original": {"canonical": f"Original {index}", "surfaces": [f"Original {index}"]},
+            "replacement": {"mode": "redact", "value": f"[PERSON_{index + 1:04d}]"},
+            "redaction": {"token": f"[PERSON_{index + 1:04d}]", "ordinal": index + 1},
+            "created_at": "2026-06-13T00:00:00Z",
+            "updated_at": "2026-06-13T00:00:00Z",
+            "use_count": 1,
+            "metadata": {},
+        }
+    db["assignments"] = assignments
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        build_reverse_bank(db)
+
+    assert exc_info.value.diagnostics[0]["code"] == "deanonymize.too_many_reverse_entities"
+    assert exc_info.value.diagnostics[0]["metadata"] == {"limit": 1000}
+
+
 def test_deanonymize_text_restores_redaction_tokens_by_default_with_safe_payload():
     anonymized = anonymize_text(
         _person_bank(include_alias=False),
@@ -1132,6 +1163,18 @@ def test_deanonymize_file_reports_file_source_preserves_crlf_and_enforces_limit(
     with pytest.raises(DeanonymizationError) as limit_info:
         deanonymize_file(source_path, anonymized["replacement_db"]["data"], options={"max_text_bytes": 4})
     assert limit_info.value.diagnostics[0]["code"] == "deanonymize.extraction_error"
+
+
+def test_deanonymize_file_suppresses_raw_extraction_context_by_default(tmp_path):
+    missing_path = tmp_path / "John-Smith-secret-missing.txt"
+
+    with pytest.raises(DeanonymizationError) as exc_info:
+        deanonymize_file(missing_path, create_replacement_db())
+
+    diagnostics_repr = repr(exc_info.value.diagnostics)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    assert "John-Smith-secret" not in diagnostics_repr
 
 
 def test_deanonymize_text_rejects_invalid_options_with_diagnostics():

@@ -1530,11 +1530,11 @@ def _build_reverse_bank(replacement_db: Mapping[str, Any], options: _Deanonymize
         )
 
     fingerprint = _reverse_bank_fingerprint(entries, options)
-    if not entries:
+    if not entries or len(entries) > REVERSE_BANK_MAX_ENTITIES:
         return _ReverseBankBuild(
             bank=None,
             fingerprint=fingerprint,
-            entries=tuple(),
+            entries=tuple(entries),
             lookup={},
             diagnostics=tuple(diagnostics),
         )
@@ -1883,10 +1883,13 @@ def deanonymize_file(
         extraction_options = resolve_extraction_options(resolved_options.extraction_options)
     except ExtractionError as exc:
         _raise_deanonymize_extraction_error(exc, resolved_options)
+    file_error: ExtractionError | None = None
     try:
         text, byte_count = _read_utf8_file(path, max_bytes=extraction_options.max_text_bytes)
     except ExtractionError as exc:
-        _raise_deanonymize_extraction_error(exc, resolved_options)
+        file_error = exc
+    if file_error is not None:
+        _raise_deanonymize_extraction_error(file_error, resolved_options)
     return _deanonymize_text_impl(
         text,
         replacement_db,
