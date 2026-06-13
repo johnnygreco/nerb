@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -113,6 +114,15 @@ def _resolve_local_path(path: str | Path) -> Path:
     return Path(path).expanduser()
 
 
+def _not_file_diagnostic(db_path: Path) -> Diagnostic:
+    return diagnostic(
+        DIAGNOSTIC_ERROR,
+        "replacement_db.not_file",
+        "",
+        f"Replacement database path {str(db_path)!r} must be a regular file.",
+    )
+
+
 def read_replacement_db_json(path: str | Path) -> Any:
     """Read JSON from an explicit replacement database path without applying schema validation."""
     db_path = _resolve_local_path(path)
@@ -130,13 +140,10 @@ def read_replacement_db_json(path: str | Path) -> Any:
         ) from exc
 
     if not db_path.is_file():
-        file_diagnostic = diagnostic(
-            DIAGNOSTIC_ERROR,
-            "replacement_db.not_file",
-            "",
-            f"Replacement database path {str(db_path)!r} must be a regular file.",
+        raise ReplacementDbLoadError(
+            f"Replacement database path {str(db_path)!r} must be a file.",
+            [_not_file_diagnostic(db_path)],
         )
-        raise ReplacementDbLoadError(f"Replacement database path {str(db_path)!r} must be a file.", [file_diagnostic])
 
     if stat_result.st_size > MAX_REPLACEMENT_DB_BYTES:
         size_diagnostic = diagnostic(
@@ -636,7 +643,17 @@ def save_replacement_db(
     db_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path: Path | None = None
     with _locked_path(db_path):
-        if db_path.exists():
+        try:
+            existing_stat = db_path.lstat()
+        except FileNotFoundError:
+            existing_stat = None
+        if existing_stat is not None and not stat.S_ISREG(existing_stat.st_mode):
+            raise ReplacementDbSaveError(
+                f"Replacement database path {str(db_path)!r} must be a file.",
+                [_not_file_diagnostic(db_path)],
+            )
+
+        if existing_stat is not None:
             try:
                 current_hash, current_version = _current_file_state(db_path)
             except ReplacementDbError as exc:

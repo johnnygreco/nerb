@@ -478,6 +478,29 @@ def test_save_replacement_db_can_replace_corrupt_file_without_expected_state(tmp
     assert load_replacement_db(path)["schema_version"] == REPLACEMENT_DB_SCHEMA_VERSION
 
 
+def test_save_replacement_db_refuses_existing_directory_destination(tmp_path):
+    path = tmp_path / "replacements.json"
+    path.mkdir()
+
+    with pytest.raises(ReplacementDbSaveError) as exc_info:
+        save_replacement_db(create_replacement_db(now="2026-06-12T00:00:00Z"), path)
+
+    assert exc_info.value.diagnostics[0]["code"] == "replacement_db.not_file"
+    assert path.is_dir()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="os.mkfifo is not available on this platform")
+def test_save_replacement_db_refuses_existing_fifo_destination(tmp_path):
+    path = tmp_path / "replacements.json"
+    os.mkfifo(path)
+
+    with pytest.raises(ReplacementDbSaveError) as exc_info:
+        save_replacement_db(create_replacement_db(now="2026-06-12T00:00:00Z"), path)
+
+    assert exc_info.value.diagnostics[0]["code"] == "replacement_db.not_file"
+    assert stat.S_ISFIFO(path.lstat().st_mode)
+
+
 def test_interprocess_locked_save_allows_one_writer_and_refuses_one_stale_writer(tmp_path):
     db = create_replacement_db(now="2026-06-12T00:00:00Z")
     path = save_replacement_db(db, tmp_path / "replacements.json")
