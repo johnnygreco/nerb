@@ -143,8 +143,19 @@ def test_assignment_keys_map_config_style_entities_for_canonical_and_surface_sco
     surface_policy = {"assignment_scope": "surface", "unicode_normalization": "NFC", "store_originals": False}
     config_record = {"entity": "ARTIST", "canonical_name": "Miles Davis", "string": "Miles Davis"}
 
-    assert assignment_key(config_record, canonical_policy).startswith("artist|canonical|sha256:")
-    assert assignment_key(config_record, surface_policy).startswith("artist|surface|sha256:")
+    assert assignment_key(config_record, canonical_policy).startswith("artist_")
+    assert "|canonical|sha256:" in assignment_key(config_record, canonical_policy)
+    assert assignment_key(config_record, surface_policy).startswith("artist_")
+    assert "|surface|sha256:" in assignment_key(config_record, surface_policy)
+
+
+def test_assignment_keys_do_not_merge_distinct_config_style_entity_names():
+    canonical_policy = {"assignment_scope": "canonical", "unicode_normalization": "NFC", "store_originals": False}
+    upper_record = {"entity": "ARTIST", "canonical_name": "Miles Davis", "string": "Miles Davis"}
+    lower_record = {"entity": "artist", "canonical_name": "Miles Davis", "string": "Miles Davis"}
+
+    assert assignment_key(upper_record, canonical_policy) != assignment_key(lower_record, canonical_policy)
+    assert assignment_key(lower_record, canonical_policy).startswith("artist|canonical|sha256:")
 
 
 def test_assignment_keys_reject_missing_required_fields():

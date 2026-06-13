@@ -188,20 +188,20 @@ def _record_entity_id(record: Mapping[str, Any]) -> str:
 
 
 def _config_entity_id(raw_entity: str) -> str:
-    lowered = raw_entity.strip().lower()
+    stripped = raw_entity.strip()
+    if ID_RE.fullmatch(stripped):
+        return stripped
+
+    lowered = stripped.lower()
     slug = re.sub(r"[^a-z0-9_]+", "_", lowered)
     slug = re.sub(r"_+", "_", slug).strip("_") or "entity"
     if not slug[0].isalpha():
         slug = f"entity_{slug}"
 
-    needs_suffix = slug != lowered or len(slug) > 80
-    if needs_suffix:
-        suffix = hashlib.sha256(raw_entity.encode("utf-8")).hexdigest()[:ENTITY_ID_HASH_LENGTH]
-        prefix_length = 80 - len(suffix) - 1
-        prefix = slug[:prefix_length].rstrip("_") or "entity"
-        slug = f"{prefix}_{suffix}"
-    else:
-        slug = slug[:80]
+    suffix = hashlib.sha256(raw_entity.encode("utf-8")).hexdigest()[:ENTITY_ID_HASH_LENGTH]
+    prefix_length = 80 - len(suffix) - 1
+    prefix = slug[:prefix_length].rstrip("_") or "entity"
+    slug = f"{prefix}_{suffix}"
 
     if ID_RE.fullmatch(slug):
         return slug
