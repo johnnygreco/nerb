@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 
-from nerb.diagnostics import JSON_PARSE, METADATA_TOO_LARGE, SCHEMA_REQUIRED
+from nerb.diagnostics import ID_INVALID, JSON_PARSE, METADATA_TOO_LARGE, SCHEMA_REQUIRED
 from nerb.replacements import (
     MAX_REPLACEMENT_DB_BYTES,
     ReplacementDbLoadError,
@@ -149,6 +149,22 @@ def test_schema_rejects_missing_required_and_unknown_fields():
     assert {
         (SCHEMA_REQUIRED, "/defaults/assignment_scope"),
         ("schema.additional_property", "/unexpected"),
+    }.issubset({(item["code"], item["path"]) for item in result["diagnostics"]})
+
+
+def test_schema_reports_invalid_structural_ids_at_field_paths():
+    db = create_replacement_db(now="2026-06-12T00:00:00Z")
+    db["id"] = "Replacement DB"
+    db["entities"]["Bad-ID"] = {"store_originals": False}
+    db["replacement_sets"]["Bad Set"] = {"description": "Names.", "reuse": False, "candidates": []}
+
+    result = validate_replacement_db_schema(db)
+
+    assert result["valid"] is False
+    assert {
+        (ID_INVALID, "/id"),
+        (ID_INVALID, "/entities/Bad-ID"),
+        (ID_INVALID, "/replacement_sets/Bad Set"),
     }.issubset({(item["code"], item["path"]) for item in result["diagnostics"]})
 
 

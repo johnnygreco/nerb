@@ -13,6 +13,7 @@ from jsonschema.validators import extend
 from .diagnostics import (
     DIAGNOSTIC_ERROR,
     DIAGNOSTIC_WARNING,
+    ID_INVALID,
     METADATA_LARGE,
     METADATA_TOO_LARGE,
     SCHEMA_ADDITIONAL_PROPERTY,
@@ -25,6 +26,7 @@ from .diagnostics import (
 )
 from .schema import (
     ID_PATTERN,
+    ID_RE,
     MAX_DESCRIPTION_LENGTH,
     MAX_PATTERN_VALUE_LENGTH,
     METADATA_ERROR_BYTES,
@@ -345,6 +347,8 @@ def _iter_schema_diagnostics(replacement_db: Any) -> list[Diagnostic]:
     for error in sorted(REPLACEMENT_DB_SCHEMA_VALIDATOR.iter_errors(replacement_db), key=_schema_sort_key):
         if error.validator == "propertyNames":
             continue
+        if error.validator == "pattern" and list(error.path) == ["id"]:
+            continue
         if error.validator == "additionalProperties":
             properties = _additional_properties(error)
             if properties:
@@ -354,6 +358,42 @@ def _iter_schema_diagnostics(replacement_db: Any) -> list[Diagnostic]:
                 continue
         diagnostics.append(_schema_diagnostic(error))
     return diagnostics
+
+
+def _iter_invalid_ids(replacement_db: Any) -> Iterable[Diagnostic]:
+    if not isinstance(replacement_db, Mapping):
+        return
+
+    replacement_db_id = replacement_db.get("id")
+    if isinstance(replacement_db_id, str) and not ID_RE.fullmatch(replacement_db_id):
+        yield diagnostic(
+            DIAGNOSTIC_ERROR,
+            ID_INVALID,
+            "/id",
+            f"Replacement database id {replacement_db_id!r} must match {ID_PATTERN}.",
+        )
+
+    entities = replacement_db.get("entities")
+    if isinstance(entities, Mapping):
+        for entity_id in entities:
+            if not isinstance(entity_id, str) or not ID_RE.fullmatch(entity_id):
+                yield diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    ID_INVALID,
+                    _json_pointer(["entities", entity_id]),
+                    f"Entity id {entity_id!r} must match {ID_PATTERN}.",
+                )
+
+    replacement_sets = replacement_db.get("replacement_sets")
+    if isinstance(replacement_sets, Mapping):
+        for replacement_set_id in replacement_sets:
+            if not isinstance(replacement_set_id, str) or not ID_RE.fullmatch(replacement_set_id):
+                yield diagnostic(
+                    DIAGNOSTIC_ERROR,
+                    ID_INVALID,
+                    _json_pointer(["replacement_sets", replacement_set_id]),
+                    f"Replacement set id {replacement_set_id!r} must match {ID_PATTERN}.",
+                )
 
 
 def _metadata_size_diagnostic(path: str, size_bytes: int) -> Diagnostic | None:
@@ -412,6 +452,10 @@ def _iter_resource_limit_diagnostics(replacement_db: Any) -> Iterable[Diagnostic
 
 def validate_replacement_db_schema(replacement_db: Any) -> dict[str, Any]:
     """Validate a replacement database object against the v1 JSON Schema layer."""
-    diagnostics = [*_iter_schema_diagnostics(replacement_db), *_iter_resource_limit_diagnostics(replacement_db)]
+    diagnostics = [
+        *_iter_schema_diagnostics(replacement_db),
+        *_iter_invalid_ids(replacement_db),
+        *_iter_resource_limit_diagnostics(replacement_db),
+    ]
     diagnostics.sort(key=lambda item: (item["path"], item["severity"], item["code"], item["message"]))
     return {"valid": not has_errors(diagnostics), "diagnostics": diagnostics}
