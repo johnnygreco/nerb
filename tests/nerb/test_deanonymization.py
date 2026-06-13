@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from nerb.deanonymization import (
     ByteEdit,
     DeanonymizationError,
     allocate_assignment,
+    anonymize_file,
+    anonymize_text,
     apply_byte_replacements,
     assignment_key,
     finalize_replacement_db_update,
 )
+from nerb.extraction import ExtractionError
 from nerb.replacements import (
     create_replacement_db,
     hash_replacement_db,
@@ -60,6 +65,73 @@ def _pseudonym_db(*, reuse: bool = False, store_originals: bool = True) -> dict:
         "metadata": {},
     }
     return db
+
+
+def _literal_pattern(value: str, *, priority: int = 50) -> dict:
+    return {
+        "kind": "literal",
+        "value": value,
+        "description": "Literal deanonymization fixture.",
+        "status": "active",
+        "priority": priority,
+        "case_sensitive": True,
+        "normalize_whitespace": True,
+        "left_boundary": "word",
+        "right_boundary": "word",
+        "metadata": {},
+    }
+
+
+def _person_bank(*, extra_people: bool = False, include_alias: bool = True) -> dict:
+    names = {
+        "john_smith": {
+            "canonical": "John Smith",
+            "description": "John Smith fixture.",
+            "status": "active",
+            "patterns": {"primary": _literal_pattern("John Smith", priority=100)},
+            "metadata": {},
+        }
+    }
+    if include_alias:
+        names["john_smith"]["patterns"]["alias"] = _literal_pattern("Johnny", priority=90)
+    if extra_people:
+        names["jane_smith"] = {
+            "canonical": "Jane Smith",
+            "description": "Jane Smith fixture.",
+            "status": "active",
+            "patterns": {"primary": _literal_pattern("Jane Smith", priority=100)},
+            "metadata": {},
+        }
+        names["alex_smith"] = {
+            "canonical": "Alex Smith",
+            "description": "Alex Smith fixture.",
+            "status": "active",
+            "patterns": {"primary": _literal_pattern("Alex Smith", priority=100)},
+            "metadata": {},
+        }
+
+    return {
+        "schema_version": "nerb.bank.v1",
+        "id": "people",
+        "name": "People",
+        "description": "People fixture.",
+        "version": "2026.06.13",
+        "status": "active",
+        "created_at": "2026-06-13T00:00:00Z",
+        "updated_at": "2026-06-13T00:00:00Z",
+        "unicode_normalization": "none",
+        "default_regex_flags": [],
+        "entities": {
+            "person": {
+                "description": "Known people.",
+                "status": "active",
+                "regex_flags": [],
+                "names": names,
+                "metadata": {},
+            }
+        },
+        "metadata": {},
+    }
 
 
 def test_apply_byte_replacements_handles_multibyte_text_and_reports_final_byte_spans():
@@ -343,3 +415,235 @@ def test_allocation_reports_missing_assignment_when_new_assignments_are_disabled
     assert result.created is False
     assert result.diagnostics[0]["code"] == "replacement_db.missing_assignment"
     assert result.replacement_db["assignments"] == {}
+
+
+def test_anonymize_text_pseudonymizes_json_bank_matches_with_safe_default_payload():
+    db = _pseudonym_db(store_originals=True)
+    source = "John Smith met John Smith."
+
+    result = anonymize_text(_person_bank(include_alias=False), source, db, options={"mode": "pseudonym"})
+
+    assert result["schema_version"] == "nerb.anonymize_response.v1"
+    assert result["text"] == "Mikey Law met Mikey Law."
+    assert result["bank"] == {
+        "bank_ref": "b1",
+        "version": "2026.06.13",
+        "schema_version": "nerb.bank.v1",
+    }
+    assert result["replacement_db"] == {
+        "replacement_db_ref": "rdb1",
+        "schema_version": "nerb.replacements.v1",
+        "version": 1,
+        "modified": True,
+        "saved": False,
+    }
+    assert result["source"] == {"type": "text", "length": len(source), "bytes": len(source.encode("utf-8"))}
+    assert result["summary"] == {"record_count": 2, "applied_count": 2, "diagnostic_count": 0}
+    assert result["diagnostics"] == []
+    assert db["assignments"] == {}
+
+    applied = result["applied_replacements"]
+    assert applied == [
+        {
+            "assignment_ref": "a1",
+            "entity": "person",
+            "mode": "pseudonym",
+            "original_span": {"start": 0, "end": 10, "offset_unit": "byte"},
+            "replacement_span": {"start": 0, "end": 9, "offset_unit": "byte"},
+            "replacement": "Mikey Law",
+        },
+        {
+            "assignment_ref": "a1",
+            "entity": "person",
+            "mode": "pseudonym",
+            "original_span": {"start": 15, "end": 25, "offset_unit": "byte"},
+            "replacement_span": {"start": 14, "end": 23, "offset_unit": "byte"},
+            "replacement": "Mikey Law",
+        },
+    ]
+    assert "John Smith" not in repr(result)
+    assert "john_smith" not in repr(result)
+    assert "assignment_key" not in repr(result)
+    assert "fingerprint" not in repr(result)
+    assert "hash" not in result["bank"]
+    assert "id" not in result["bank"]
+    assert "data" not in result["replacement_db"]
+
+
+def test_anonymize_text_sensitive_options_return_debug_metadata_and_updated_db():
+    result = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith joined.",
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym", "include_originals": True, "include_sensitive_metadata": True},
+    )
+
+    applied = result["applied_replacements"][0]
+    assignment_key_value = applied["assignment_key"]
+
+    assert result["text"] == "Mikey Law joined."
+    assert result["bank"]["id"] == "people"
+    assert result["bank"]["hash"].startswith("sha256:")
+    assert result["replacement_db"]["id"] == "replacements"
+    assert result["replacement_db"]["hash"].startswith("sha256:")
+    assert applied["original"] == "John Smith"
+    assert applied["fingerprint"].startswith("sha256:")
+    assert applied["source_record"] == {
+        "entity_id": "person",
+        "name_id": "john_smith",
+        "pattern_id": "primary",
+        "pattern_kind": "literal",
+        "canonical_name": "John Smith",
+        "surface_name": "John Smith",
+    }
+    assert result["replacement_db"]["data"]["assignments"][assignment_key_value]["replacement"] == {
+        "mode": "pseudonym",
+        "value": "Mikey Law",
+        "set_id": "person_names",
+        "candidate_id": "person_name_0001",
+    }
+
+
+def test_anonymize_text_redaction_mode_works_without_candidate_sets_and_byte_spans():
+    db = create_replacement_db(reversible=True, now="2026-06-13T00:00:00Z")
+    source = "Café John Smith now."
+    start, end = _span(source, "John Smith")
+
+    result = anonymize_text(_person_bank(include_alias=False), source, db, options={"mode": "redact"})
+
+    assert result["text"] == "Café [PERSON_0001] now."
+    assert result["replacement_db"]["modified"] is True
+    assert result["replacement_db"]["saved"] is False
+    assert result["applied_replacements"] == [
+        {
+            "assignment_ref": "a1",
+            "entity": "person",
+            "mode": "redact",
+            "original_span": {"start": start, "end": end, "offset_unit": "byte"},
+            "replacement_span": {
+                "start": start,
+                "end": start + len(b"[PERSON_0001]"),
+                "offset_unit": "byte",
+            },
+            "replacement": "[PERSON_0001]",
+        }
+    ]
+
+
+def test_anonymize_file_reports_file_source_and_does_not_save(tmp_path):
+    source_path = tmp_path / "source.txt"
+    source = "John Smith joined."
+    source_path.write_text(source, encoding="utf-8")
+
+    result = anonymize_file(
+        _person_bank(include_alias=False),
+        source_path,
+        _pseudonym_db(store_originals=True),
+        options={"mode": "pseudonym"},
+    )
+
+    assert result["text"] == "Mikey Law joined."
+    assert result["source"] == {
+        "type": "file",
+        "path": str(source_path),
+        "length": len(source),
+        "bytes": len(source.encode("utf-8")),
+    }
+    assert result["replacement_db"]["modified"] is True
+    assert result["replacement_db"]["saved"] is False
+
+
+def test_anonymize_text_name_scope_aliases_share_replacement_and_surface_scope_splits_surfaces():
+    bank = _person_bank(include_alias=True)
+    source = "John Smith and Johnny"
+
+    name_scope_result = anonymize_text(bank, source, _pseudonym_db(), options={"mode": "pseudonym"})
+
+    surface_scope_db = _pseudonym_db()
+    surface_scope_db["defaults"]["assignment_scope"] = "surface"
+    surface_scope_result = anonymize_text(bank, source, surface_scope_db, options={"mode": "pseudonym"})
+
+    assert name_scope_result["text"] == "Mikey Law and Mikey Law"
+    assert [item["assignment_ref"] for item in name_scope_result["applied_replacements"]] == ["a1", "a1"]
+    assert surface_scope_result["text"] == "Mikey Law and Nina Vale"
+    assert [item["assignment_ref"] for item in surface_scope_result["applied_replacements"]] == ["a1", "a2"]
+
+
+def test_anonymize_text_missing_assignment_policies_are_deterministic():
+    db = create_replacement_db(now="2026-06-13T00:00:00Z")
+    db["defaults"]["allow_new_assignments"] = False
+
+    diagnostic_result = anonymize_text(_person_bank(include_alias=False), "John Smith", db)
+    skip_result = anonymize_text(
+        _person_bank(include_alias=False),
+        "John Smith",
+        db,
+        options={"on_missing_assignment": "skip"},
+    )
+
+    assert diagnostic_result["text"] == "John Smith"
+    assert diagnostic_result["applied_replacements"] == []
+    assert diagnostic_result["summary"] == {"record_count": 1, "applied_count": 0, "diagnostic_count": 1}
+    assert diagnostic_result["diagnostics"][0]["code"] == "replacement_db.missing_assignment"
+    assert diagnostic_result["diagnostics"][0]["metadata"] == {"assignment_ref": "a1", "entity": "person"}
+    assert "assignment_key" not in repr(diagnostic_result)
+    assert skip_result["text"] == "John Smith"
+    assert skip_result["diagnostics"] == []
+
+    with pytest.raises(DeanonymizationError) as fail_info:
+        anonymize_text(
+            _person_bank(include_alias=False),
+            "John Smith",
+            db,
+            options={"on_missing_assignment": "fail"},
+        )
+    assert fail_info.value.diagnostics[0]["code"] == "replacement_db.missing_assignment"
+
+
+def test_anonymize_text_reports_exhausted_pseudonym_candidates_without_rewriting_that_span():
+    result = anonymize_text(
+        _person_bank(extra_people=True, include_alias=False),
+        "John Smith Jane Smith Alex Smith",
+        _pseudonym_db(),
+        options={"mode": "pseudonym"},
+    )
+
+    assert result["text"] == "Mikey Law Nina Vale Alex Smith"
+    assert result["summary"] == {"record_count": 3, "applied_count": 2, "diagnostic_count": 1}
+    assert [item["replacement"] for item in result["applied_replacements"]] == ["Mikey Law", "Nina Vale"]
+    assert result["diagnostics"][0]["code"] == "replacement_db.candidates_exhausted"
+    assert result["diagnostics"][0]["metadata"] == {"assignment_ref": "a3", "entity": "person"}
+
+
+def test_anonymize_text_passes_max_text_bytes_to_json_bank_extraction():
+    with pytest.raises(ExtractionError):
+        anonymize_text(
+            _person_bank(include_alias=False),
+            "John Smith",
+            _pseudonym_db(),
+            options={"mode": "pseudonym", "max_text_bytes": 4},
+        )
+
+
+def test_anonymize_text_rejects_invalid_options_with_diagnostics():
+    with pytest.raises(DeanonymizationError) as mode_info:
+        anonymize_text(_person_bank(include_alias=False), "John Smith", _pseudonym_db(), options={"mode": "mask"})
+    assert mode_info.value.diagnostics[0]["path"] == "/options/mode"
+
+    with pytest.raises(DeanonymizationError) as originals_info:
+        anonymize_text(
+            _person_bank(include_alias=False),
+            "John Smith",
+            _pseudonym_db(),
+            options={"include_originals": "yes"},
+        )
+    assert originals_info.value.diagnostics[0]["path"] == "/options/include_originals"
+
+
+def test_anonymize_text_does_not_mutate_replacement_db_input():
+    db = _pseudonym_db()
+    original = copy.deepcopy(db)
+
+    anonymize_text(_person_bank(include_alias=False), "John Smith", db, options={"mode": "pseudonym"})
+
+    assert db == original

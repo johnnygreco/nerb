@@ -17,6 +17,7 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
+from .deanonymization import anonymize_file, anonymize_text
 from .diff import diff_banks
 from .engine import Bank, bank_cache_info, clear_bank_cache
 from .evals import eval_bank
@@ -60,6 +61,8 @@ __all__ = [
     "__version__",
     "add_entity_pattern",
     "apply_bank_patches",
+    "anonymize_file",
+    "anonymize_text",
     "bank_stats",
     "bank_cache_info",
     "canonicalize_bank",
