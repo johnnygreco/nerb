@@ -9,7 +9,9 @@ from nerb import deanonymize_text as root_deanonymize_text
 from nerb.deanonymization import (
     ByteEdit,
     DeanonymizationError,
+    _anonymize_config_text_with_db_update,
     allocate_assignment,
+    anonymize_config_text,
     anonymize_file,
     anonymize_text,
     apply_byte_replacements,
@@ -276,6 +278,70 @@ def test_assignment_keys_reject_malformed_policy_fields_with_diagnostics():
     with pytest.raises(DeanonymizationError) as normalization_value_info:
         assignment_key(_record(), {"unicode_normalization": "NFD"})
     assert normalization_value_info.value.diagnostics[0]["path"] == "/unicode_normalization"
+
+
+def test_anonymize_config_text_uses_canonical_scope_for_config_records():
+    pattern_config = {"ARTIST": {"Miles Davis": r"Miles Davis|M\. Davis"}}
+    db = create_replacement_db(reversible=True, assignment_scope="canonical", now="2026-06-13T00:00:00Z")
+
+    response, updated_db = _anonymize_config_text_with_db_update(
+        pattern_config,
+        "Miles Davis met M. Davis.",
+        db,
+        options={"mode": "redact"},
+    )
+    public_response = anonymize_config_text(
+        pattern_config,
+        "Miles Davis met M. Davis.",
+        db,
+        options={"mode": "redact"},
+    )
+    restored = deanonymize_text(response["text"], updated_db)
+
+    first_token, second_token = response["text"].removesuffix(".").split(" met ")
+    assert response["schema_version"] == "nerb.anonymize_response.v1"
+    assert response["bank"] == {"bank_ref": "b1", "schema_version": "nerb.detector_config.v1", "version": "1"}
+    assert first_token == second_token
+    assert len(updated_db["assignments"]) == 1
+    assert restored["text"] == "Miles Davis met Miles Davis."
+    assert public_response["text"] == response["text"]
+
+
+def test_anonymize_config_text_sensitive_metadata_includes_config_entity():
+    pattern_config = {"ARTIST": {"Miles Davis": r"Miles Davis|M\. Davis"}}
+    db = create_replacement_db(reversible=True, assignment_scope="canonical", now="2026-06-13T00:00:00Z")
+
+    response, _updated_db = _anonymize_config_text_with_db_update(
+        pattern_config,
+        "Miles Davis met M. Davis.",
+        db,
+        options={"mode": "redact", "include_sensitive_metadata": True},
+    )
+
+    source_record = response["applied_replacements"][0]["source_record"]
+    assert source_record == {
+        "entity": "ARTIST",
+        "canonical_name": "Miles Davis",
+        "surface_name": "Miles Davis",
+    }
+
+
+def test_anonymize_config_text_uses_surface_scope_for_exact_surface_restoration():
+    pattern_config = {"TICKET": {"Ticket": r"A-\d+"}}
+    db = create_replacement_db(reversible=True, assignment_scope="surface", now="2026-06-13T00:00:00Z")
+
+    response, updated_db = _anonymize_config_text_with_db_update(
+        pattern_config,
+        "A-123 then A-124",
+        db,
+        options={"mode": "redact"},
+    )
+    restored = deanonymize_text(response["text"], updated_db)
+
+    first_token, second_token = response["text"].split(" then ")
+    assert first_token != second_token
+    assert len(updated_db["assignments"]) == 2
+    assert restored["text"] == "A-123 then A-124"
 
 
 def test_pseudonym_allocation_is_deterministic_reuses_existing_and_reports_exhaustion():

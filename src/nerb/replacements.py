@@ -72,6 +72,7 @@ def create_replacement_db(
     description: str = "",
     reversible: bool = False,
     store_originals: bool | None = None,
+    assignment_scope: str = "name",
     now: str | None = None,
 ) -> dict[str, Any]:
     """Create a minimal replacement database object without writing it to disk."""
@@ -87,7 +88,7 @@ def create_replacement_db(
         "metadata": {},
         "defaults": {
             "unicode_normalization": "NFC",
-            "assignment_scope": "name",
+            "assignment_scope": assignment_scope,
             "replacement_mode": "redact",
             "redaction_template": "[{ENTITY}_{ordinal:04d}]",
             "collision_policy": "error",

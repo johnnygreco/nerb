@@ -60,6 +60,9 @@ from nerb import (
 from nerb.cli import app
 from nerb.config import DEFAULT_CONFIG_ENV_VAR
 from nerb.deanonymization import (
+    anonymize_config_file as anonymize_config_file_helper,
+)
+from nerb.deanonymization import (
     anonymize_file as anonymize_file_helper,
 )
 from nerb.deanonymization import (
@@ -94,6 +97,12 @@ from nerb.mcp_server import (
     update_detector,
     validate_bank,
     validate_config,
+)
+from nerb.mcp_server import (
+    anonymize_config_file as anonymize_config_file_tool,
+)
+from nerb.mcp_server import (
+    anonymize_config_text as anonymize_config_text_tool,
 )
 from nerb.mcp_server import (
     anonymize_file as anonymize_file_tool,
@@ -267,6 +276,8 @@ def test_mcp_server_registers_expected_tools():
         "save_replacement_db",
         "anonymize_text",
         "anonymize_file",
+        "anonymize_config_text",
+        "anonymize_config_file",
         "deanonymize_text",
         "deanonymize_file",
     }
@@ -639,6 +650,55 @@ def test_mcp_anonymize_and_deanonymize_file_match_helper_contracts(tmp_path):
         "bytes": 28,
     }
     assert restored["text"] == "Café\r\nJohn Smith joined."
+
+
+def test_mcp_anonymize_config_tools_use_config_scopes_and_explicit_save(tmp_path):
+    config_path = save_config({"TICKET": {"Ticket": r"A-\d+"}}, tmp_path / "entities.yaml")
+    db_path = save_replacement_db_helper(
+        create_replacement_db_helper(
+            reversible=True,
+            assignment_scope="surface",
+            now="2026-06-13T00:00:00Z",
+        ),
+        tmp_path / "replacements.json",
+    )
+    document_path = tmp_path / "source.txt"
+    document_path.write_text("A-123 then A-124", encoding="utf-8")
+
+    text_unsaved = anonymize_config_text_tool(
+        "A-123",
+        str(config_path),
+        replacement_db=load_replacement_db(db_path),
+        options={"mode": "redact"},
+    )
+    expected_unsaved = anonymize_config_file_helper(
+        load_config(config_path),
+        document_path,
+        load_replacement_db(db_path),
+        options={"mode": "redact"},
+    )
+    unsaved = anonymize_config_file_tool(
+        str(document_path),
+        str(config_path),
+        replacement_db_path=str(db_path),
+        options={"mode": "redact"},
+    )
+    saved = anonymize_config_file_tool(
+        str(document_path),
+        str(config_path),
+        replacement_db_path=str(db_path),
+        save_db_path=str(db_path),
+        options={"mode": "redact", "save": True},
+    )
+    restored = deanonymize_text_tool(saved["text"], replacement_db_path=str(db_path))
+
+    first_token, second_token = saved["text"].split(" then ")
+    assert text_unsaved["text"].startswith("[")
+    assert unsaved == expected_unsaved
+    assert first_token != second_token
+    assert saved["replacement_db"]["saved"] is True
+    assert len(load_replacement_db(db_path)["assignments"]) == 2
+    assert restored["text"] == "A-123 then A-124"
 
 
 def test_mcp_replacement_db_diagnostics_are_sanitized_by_default(tmp_path):

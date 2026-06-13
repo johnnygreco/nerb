@@ -1,8 +1,9 @@
 # NERB Schema Reference
 
-This document describes the public JSON-compatible contracts for NERB banks, extraction records, eval refs, YAML detector
-configs, and shared diagnostic objects. The runtime source of truth is the code in `src/nerb/schema.py`,
-`src/nerb/extraction.py`, `src/nerb/reports.py`, and `src/nerb/evals.py`.
+This document describes the public JSON-compatible contracts for NERB banks, extraction records, replacement databases,
+anonymization responses, eval refs, YAML detector configs, and shared diagnostic objects. The runtime source of truth is
+the code in `src/nerb/schema.py`, `src/nerb/extraction.py`, `src/nerb/replacements_schema.py`,
+`src/nerb/deanonymization.py`, `src/nerb/reports.py`, and `src/nerb/evals.py`.
 
 ## Shared Rules
 
@@ -252,6 +253,118 @@ IDs, and matched string ordering.
 
 Report batch responses mirror batch extraction and add flat `resolved_records`, flat `overlaps`, and per-document report
 objects.
+
+## Replacement Database
+
+A replacement database is a local JSON object with schema version `nerb.replacements.v1`. It stores default replacement
+policy, optional per-entity policy, replacement candidate sets, and assignments. When `store_originals` is true, the
+database contains sensitive originals and must be treated as sensitive local state.
+
+### Top-Level Replacement DB
+
+| Field | Type | Required | Notes |
+| --- | --- | --- | --- |
+| `schema_version` | string | yes | Must be `nerb.replacements.v1`. |
+| `id` | ID string | yes | Local database ID. |
+| `description` | string | yes | Up to 2,000 characters. |
+| `version` | integer | yes | Positive integer incremented by save operations. |
+| `created_at` | string | yes | Timestamp string; format is not schema-enforced. |
+| `updated_at` | string | yes | Timestamp string; format is not schema-enforced. |
+| `metadata` | object | yes | JSON-compatible metadata. |
+| `defaults` | object | yes | Default replacement policy. |
+| `entities` | object | yes | Per-entity policy overrides keyed by replacement entity ID. |
+| `replacement_sets` | object | yes | Pseudonym candidate sets keyed by replacement set ID. |
+| `assignments` | object | yes | Stable assignment rows keyed by opaque assignment key. |
+
+Additional top-level properties are rejected.
+
+### Replacement Policy
+
+`defaults` must contain the base policy fields. `replacement_set_id` is optional for redaction policies, but required in
+the effective policy when `replacement_mode` is `pseudonym`. `entities.<entity_id>` may contain any non-empty subset of
+the same fields.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `unicode_normalization` | string | `none`, `NFC`, or `NFKC`. |
+| `assignment_scope` | string | `name`, `canonical`, or `surface`. JSON banks usually use `name`; config-backed workflows use `canonical` or `surface`. |
+| `replacement_mode` | string | `redact` or `pseudonym`. |
+| `redaction_template` | string | Format string supporting `{entity}`, `{ENTITY}`, and `{ordinal:04d}`. |
+| `collision_policy` | string | Currently `error`. |
+| `store_originals` | boolean | Enables reversible de-anonymization when true. |
+| `allow_new_assignments` | boolean | When false, unknown entities produce diagnostics instead of assignments. |
+| `replacement_set_id` | ID string | Optional for redaction; required for effective pseudonym policies. |
+
+Assignment scopes:
+
+- `name`: uses JSON-bank `entity_id` and `name_id`; aliases share one assignment and de-anonymization restores the
+  canonical value.
+- `canonical`: uses entity plus normalized `canonical_name`; useful for YAML detector configs.
+- `surface`: uses entity plus normalized matched `string`; useful when exact source-surface restoration matters.
+
+### Replacement Sets
+
+Each replacement set contains `description`, `reuse`, `candidates`, and optional `metadata`. Candidates are objects with
+`id`, non-empty `value`, and `metadata`. Pseudonym mode allocates from the configured candidate set and rejects exhausted
+or ambiguous candidate pools.
+
+### Assignments
+
+Assignment keys use this opaque format:
+
+```text
+<entity>|<scope>|sha256:<64 lowercase hex>
+```
+
+Assignment rows contain `assignment_key`, `entity_id`, `identity`, `replacement`, `redaction`, timestamps, `use_count`,
+and `metadata`. `original` is present only when the effective policy stores originals. Fingerprints, assignment keys,
+source IDs, originals, replacement values, and hashes are linkable or sensitive. Default CLI response metadata redacts
+them, while the transformed `text` contains replacement values by design. Default Python and MCP anonymization response
+metadata include replacement values because those values are also present in the transformed text; they still redact
+originals, raw assignment keys, fingerprints, and hashes.
+
+## Anonymization Responses
+
+`anonymize_text`, `anonymize_file`, `anonymize_config_text`, and `anonymize_config_file` return
+`nerb.anonymize_response.v1` payloads.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema_version` | string | `nerb.anonymize_response.v1`. |
+| `bank` | object | Safe metadata with `bank_ref`, `schema_version`, and `version`; hashes/IDs require sensitive metadata. |
+| `replacement_db` | object | Safe DB metadata: `replacement_db_ref`, `schema_version`, `version`, `modified`, `saved`. |
+| `source` | object | Text/file metadata. File paths are omitted by default and replaced with `source_ref`. |
+| `text` | string | Transformed text. |
+| `applied_replacements` | array | Per-replacement metadata. |
+| `summary` | object | `record_count`, `applied_count`, and `diagnostic_count`. |
+| `diagnostics` | array | Non-fatal diagnostics. |
+
+Default Python and MCP `applied_replacements` entries include opaque `assignment_ref`, `entity`, `mode`,
+`original_span`, `replacement_span`, and `replacement`. CLI output strips `replacement` unless
+`--include-sensitive-metadata` is set. `include_originals` adds original strings. `include_sensitive_metadata` adds raw
+assignment keys, source record IDs, DB data, hashes, and file paths where available.
+
+Config-backed anonymization uses Rust `Bank.scan_text()` records from YAML detector configs. It does not run JSON-bank
+report resolution. Because config records do not include `name_id`, use `assignment_scope: "canonical"` or
+`assignment_scope: "surface"` for config-backed replacement DBs.
+
+## De-Anonymization Responses
+
+`deanonymize_text` and `deanonymize_file` return `nerb.deanonymize_response.v1` payloads.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema_version` | string | `nerb.deanonymize_response.v1`. |
+| `replacement_db` | object | Safe DB metadata. |
+| `source` | object | Text/file metadata. File paths are omitted by default and replaced with `source_ref`. |
+| `text` | string | Restored text. |
+| `applied_restorations` | array | Per-restoration metadata. |
+| `summary` | object | `match_count`, `applied_count`, and `diagnostic_count`. |
+| `diagnostics` | array | Non-fatal diagnostics and warnings. |
+
+Redaction tokens are restored by default. Pseudonym restoration requires `restore_pseudonyms=true` or
+`--restore-pseudonyms` and emits a warning because it is exact string replacement. If `store_originals` was false or a
+replacement maps to multiple originals, de-anonymization returns diagnostics instead of guessing.
 
 ## Eval JSONL
 

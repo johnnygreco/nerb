@@ -67,6 +67,48 @@ nerb regress-bank --old-bank old-company.json --new-bank new-company.json
 the candidate response. `regress-bank` combines diff, eval, and benchmark checks so a bank update can be promoted by a
 machine-readable gate.
 
+## Anonymization And De-Anonymization
+
+NERB can replace extracted entities with stable redaction tokens or pseudonyms. Reversible workflows use an explicit
+local replacement database; that database is sensitive when it stores originals.
+
+Reversible redaction with a JSON bank:
+
+```shell
+nerb replacement-db init --db replacements.json --reversible
+nerb anonymize-text --bank people.json --db replacements.json \
+  --text "John Smith joined." --mode redact --save-db
+nerb deanonymize-text --db replacements.json --text "[PERSON_0001] joined."
+```
+
+Config-backed anonymization uses the Rust-resolved YAML detector records. Because YAML configs do not have JSON-bank
+`name_id` values, initialize or configure the replacement DB with `canonical` or `surface` assignment scope:
+
+```shell
+nerb replacement-db init --db config-replacements.json --reversible --assignment-scope canonical
+nerb anonymize-config-text --config detectors.yaml --db config-replacements.json \
+  --text "Miles Davis met M. Davis." --mode redact --save-db
+```
+
+Pseudonyms require a replacement set and are not restored by default:
+
+```shell
+nerb replacement-db init --db pseudonym-replacements.json --reversible
+nerb replacement-db add-set --db pseudonym-replacements.json --set person_names \
+  --candidate "Mikey Law" --candidate "Nina Vale"
+nerb replacement-db set-entity --db pseudonym-replacements.json --entity person \
+  --mode pseudonym --set person_names --store-originals
+nerb anonymize-text --bank people.json --db pseudonym-replacements.json \
+  --text "John Smith joined." --mode pseudonym --save-db
+nerb deanonymize-text --db pseudonym-replacements.json --text "Mikey Law joined." --restore-pseudonyms
+```
+
+Default CLI response metadata omits originals, replacement values, raw assignment keys, fingerprints, bank hashes, and
+replacement DB hashes. The transformed `text` still contains replacement values by design. Python and MCP anonymization
+response metadata include replacement values because they are already present in the transformed text, but still omit
+originals, raw keys, fingerprints, and hashes by default. Use `--include-originals`, `--include-values`, or
+`--include-sensitive-metadata` only when you are intentionally sending sensitive data to the caller.
+
 ## Python API
 
 Use JSON-bank helpers for agent, service, and test integrations:
@@ -95,9 +137,10 @@ records = bank.scan_text("Rush played in Toronto.")
 `Bank.scan_text` returns records with `entity`, `canonical_name`, `surface_name`, `string`, `start`, `end`, and
 `offset_unit`. Byte offsets are the default record contract across the CLI, Python helpers, and MCP tools.
 
-Other public helpers include `apply_bank_patches`, `bank_stats`, `benchmark_bank`, `canonicalize_bank`, `diff_banks`,
-`eval_bank`, `extract_batch`, `extract_file`, `extract_report`, `explain_match`, `hash_bank`, `regress_bank`, and
-`validate_bank_schema`.
+Other public helpers include `anonymize_text`, `anonymize_file`, `anonymize_config_text`, `anonymize_config_file`,
+`deanonymize_text`, `deanonymize_file`, `apply_bank_patches`, `bank_stats`, `benchmark_bank`, `canonicalize_bank`,
+`diff_banks`, `eval_bank`, `extract_batch`, `extract_file`, `extract_report`, `explain_match`, `hash_bank`,
+`regress_bank`, and `validate_bank_schema`.
 
 ## MCP Server
 
@@ -135,8 +178,25 @@ From a source checkout, point the client at the repo:
 ```
 
 The MCP tools mirror the Python and CLI surfaces: JSON-bank validation, patching, diffing, extraction, reporting, eval,
-benchmarking, regression, stats, and match explanation. Config-backed extraction tools are also available for YAML
-detector configs.
+benchmarking, regression, stats, match explanation, replacement DB validation/save, anonymization, and
+de-anonymization. Config-backed extraction and config-backed anonymization tools are also available for YAML detector
+configs.
+
+MCP anonymization tools:
+
+- `create_replacement_db`
+- `validate_replacement_db`
+- `save_replacement_db`
+- `anonymize_text`
+- `anonymize_file`
+- `anonymize_config_text`
+- `anonymize_config_file`
+- `deanonymize_text`
+- `deanonymize_file`
+
+MCP writes are explicit: `create_replacement_db` does not write files; `save_replacement_db` writes only to
+`save_db_path`; anonymize tools save DB changes only when `options.save` is true and `save_db_path` is provided. Reading
+from `replacement_db_path` never implies an in-place save.
 
 ## YAML Detector Configs
 
@@ -168,6 +228,16 @@ nerb extract --all --text "Pink Floyd played progressive rock." \
 
 Config path resolution is explicit `--config`, then `NERB_CONFIG_PATH`, then the platform user config path. YAML
 extraction uses the same Rust-backed `Bank` scanner and byte-offset record contract.
+
+## Security Notes
+
+NERB pseudonymization is deterministic replacement, not cryptographic anonymization. A pseudonym can still be identifying
+through context, frequency, or an exposed replacement database. Treat reversible DBs as sensitive local files, especially
+when `store_originals` is true. `store_originals=false` supports stable future replacement but cannot de-anonymize back
+to originals.
+
+De-anonymization restores redaction tokens by default. Pseudonym restoration is opt-in because it is exact string
+replacement: if the pseudonym also appears naturally in transformed text, that natural occurrence may be restored too.
 
 ## Performance
 

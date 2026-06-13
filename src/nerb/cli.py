@@ -1,5 +1,7 @@
 import json
+import os
 import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
@@ -39,7 +41,13 @@ from .config import (
     validate_pattern_config,
     validate_regex_flags,
 )
-from .deanonymization import DeanonymizationError, _anonymize_file_with_db_update, _anonymize_text_with_db_update
+from .deanonymization import (
+    DeanonymizationError,
+    _anonymize_config_file_with_db_update,
+    _anonymize_config_text_with_db_update,
+    _anonymize_file_with_db_update,
+    _anonymize_text_with_db_update,
+)
 from .deanonymization import deanonymize_file as _deanonymize_file
 from .deanonymization import deanonymize_text as _deanonymize_text
 from .deanonymization import finalize_replacement_db_update as _finalize_replacement_db_update
@@ -662,10 +670,25 @@ def _anonymize_run_payload(action: Any, options: Mapping[str, Any]) -> dict[str,
 
 def _write_output_text(output_path: Path, text: str, *, force: bool) -> None:
     path = _ensure_output_writable(output_path, force=force)
+    temp_path = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as file:
+            temp_path = Path(file.name)
+            file.write(text)
+            file.flush()
+            os.fsync(file.fileno())
+
+        temp_path.replace(path)
     except OSError as exc:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
         _exit_error(f"Could not write output at {path}: {exc}")
 
 
@@ -723,6 +746,15 @@ def _load_command_config(config_path: Path, *, allow_missing: bool = False) -> P
         _exit_error(f"Could not load config at {config_path}: {exc}")
     except OSError as exc:
         _exit_error(f"Could not read config at {config_path}: {exc}")
+
+
+def _load_anonymize_config(config_path: Path, *, selected_entity: str | None) -> PatternConfig:
+    pattern_config = _load_command_config(config_path)
+    if selected_entity is not None and selected_entity not in pattern_config:
+        _exit_error(f"Entity {selected_entity!r} is not configured in {config_path}.")
+    if not pattern_config:
+        _exit_error(f"No detector patterns are configured in {config_path}.")
+    return pattern_config
 
 
 def _save_command_config(config: PatternConfig, config_path: Path) -> None:
@@ -1489,11 +1521,18 @@ def init_replacement_db(
     description: str = typer.Option("", "--description", help="Replacement database description."),
     reversible: bool = typer.Option(False, "--reversible", help="Store originals by default for reversible workflows."),
     store_originals: bool = typer.Option(False, "--store-originals", help="Alias for --reversible."),
+    assignment_scope: str = typer.Option(
+        "name",
+        "--assignment-scope",
+        help="Default assignment scope: name, canonical, or surface.",
+    ),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing replacement database."),
 ) -> None:
     """Create an explicit local replacement database."""
     path = db_path.expanduser()
     _ensure_replacement_id(db_id, "Replacement database id")
+    if assignment_scope not in {"name", "canonical", "surface"}:
+        _exit_error("Assignment scope must be 'name', 'canonical', or 'surface'.")
     exists = path.exists()
     if exists and not force:
         _exit_error(f"Replacement database already exists at {path}; use --force to overwrite it.")
@@ -1502,6 +1541,7 @@ def init_replacement_db(
         db_id=db_id,
         description=description,
         reversible=reversible or store_originals,
+        assignment_scope=assignment_scope,
     )
     expected_hash: str | None = None
     expected_version: int | None = None
@@ -1981,6 +2021,157 @@ def anonymize_json_bank_file(
             bank,
             document_path,
             replacement_db,
+            options=resolved_options,
+        ),
+        db_path=path,
+        base_hash=base_hash,
+        base_version=base_version,
+        options=options,
+        save_db=save_db,
+    )
+    if output_path is not None and payload.get("valid") is not False:
+        _refuse_unsaved_assignment_output(payload, save_db=save_db)
+        result_text = payload.get("text")
+        if isinstance(result_text, str):
+            _write_output_text(output_path, result_text, force=force)
+            payload["output"] = {"path": str(output_path.expanduser()), "written": True}
+    _echo_json(payload)
+
+
+@app.command("anonymize-config-text")
+def anonymize_config_text_command(
+    ctx: typer.Context,
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    text: str | None = typer.Option(None, "--text", help="Literal document text to anonymize."),
+    read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
+    entity: str | None = typer.Option(None, "--entity", "-e", help="Restrict anonymization to one detector entity."),
+    mode: str = typer.Option("entity_policy", "--mode", help="Mode: entity_policy, redact, or pseudonym."),
+    save_db: bool = typer.Option(False, "--save-db", help="Persist new assignments to --db."),
+    include_originals: bool = typer.Option(False, "--include-originals", help="Include original strings in output."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include sensitive ids, hashes, paths, and assignment data.",
+    ),
+    on_missing_assignment: str = typer.Option(
+        "diagnostic",
+        "--on-missing-assignment",
+        help="Missing assignment policy: diagnostic, fail, or skip.",
+    ),
+    max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
+    word_boundaries: bool = typer.Option(
+        False,
+        "--word-boundaries",
+        help="Add regex word boundaries around configured detector patterns.",
+    ),
+    config: Path | None = _config_option(),
+) -> None:
+    """Anonymize one in-memory text source with a YAML detector config."""
+    config_path = _command_config_path(ctx, config)
+    pattern_config = _load_anonymize_config(config_path, selected_entity=entity)
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(
+        db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        _echo_json(invalid_db_payload)
+        return
+    if replacement_db is None:
+        _exit_error(f"Could not load replacement database at {path}.")
+
+    source_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
+    options = _anonymize_options(
+        mode=mode,
+        include_originals=include_originals,
+        include_sensitive_metadata=include_sensitive_metadata,
+        on_missing_assignment=on_missing_assignment,
+        max_text_bytes=max_text_bytes,
+    )
+    base_hash = hash_replacement_db(replacement_db)
+    base_version = int(replacement_db["version"])
+    payload = _saved_anonymize_payload(
+        lambda resolved_options: _anonymize_config_text_with_db_update(
+            pattern_config,
+            source_text,
+            replacement_db,
+            selected_entity=entity,
+            word_boundaries=word_boundaries,
+            options=resolved_options,
+        ),
+        db_path=path,
+        base_hash=base_hash,
+        base_version=base_version,
+        options=options,
+        save_db=save_db,
+    )
+    _echo_json(payload)
+
+
+@app.command("anonymize-config-file")
+def anonymize_config_file_command(
+    ctx: typer.Context,
+    db_path: Path = typer.Option(..., "--db", help="Replacement database JSON path."),
+    file_path: Path = typer.Option(..., "--file", help="UTF-8 document file path."),
+    output_path: Path | None = typer.Option(None, "--output", help="Write transformed text to this file."),
+    force: bool = typer.Option(False, "--force", "-f", help="Overwrite an existing output file."),
+    entity: str | None = typer.Option(None, "--entity", "-e", help="Restrict anonymization to one detector entity."),
+    mode: str = typer.Option("entity_policy", "--mode", help="Mode: entity_policy, redact, or pseudonym."),
+    save_db: bool = typer.Option(False, "--save-db", help="Persist new assignments to --db."),
+    include_originals: bool = typer.Option(False, "--include-originals", help="Include original strings in output."),
+    include_sensitive_metadata: bool = typer.Option(
+        False,
+        "--include-sensitive-metadata",
+        help="Include sensitive ids, hashes, paths, and assignment data.",
+    ),
+    on_missing_assignment: str = typer.Option(
+        "diagnostic",
+        "--on-missing-assignment",
+        help="Missing assignment policy: diagnostic, fail, or skip.",
+    ),
+    max_text_bytes: int | None = typer.Option(None, "--max-text-bytes", help="Maximum UTF-8 source bytes."),
+    word_boundaries: bool = typer.Option(
+        False,
+        "--word-boundaries",
+        help="Add regex word boundaries around configured detector patterns.",
+    ),
+    config: Path | None = _config_option(),
+) -> None:
+    """Anonymize one explicit UTF-8 document file with a YAML detector config."""
+    config_path = _command_config_path(ctx, config)
+    pattern_config = _load_anonymize_config(config_path, selected_entity=entity)
+    replacement_db, path, invalid_db_payload = _load_replacement_db_for_command(
+        db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        _echo_json(invalid_db_payload)
+        return
+    if replacement_db is None:
+        _exit_error(f"Could not load replacement database at {path}.")
+
+    document_path = _ensure_explicit_file(file_path, "Document")
+    _reject_output_path_collision(
+        output_path,
+        {"replacement database": path, "config": config_path, "input document": document_path},
+    )
+    if output_path is not None:
+        _ensure_output_writable(output_path, force=force)
+    options = _anonymize_options(
+        mode=mode,
+        include_originals=include_originals,
+        include_sensitive_metadata=include_sensitive_metadata,
+        on_missing_assignment=on_missing_assignment,
+        max_text_bytes=max_text_bytes,
+    )
+    base_hash = hash_replacement_db(replacement_db)
+    base_version = int(replacement_db["version"])
+    payload = _saved_anonymize_payload(
+        lambda resolved_options: _anonymize_config_file_with_db_update(
+            pattern_config,
+            document_path,
+            replacement_db,
+            selected_entity=entity,
+            word_boundaries=word_boundaries,
             options=resolved_options,
         ),
         db_path=path,

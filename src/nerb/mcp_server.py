@@ -40,6 +40,8 @@ from .config import (
 )
 from .deanonymization import (
     DeanonymizationError,
+    _anonymize_config_file_with_db_update,
+    _anonymize_config_text_with_db_update,
     _anonymize_file_with_db_update,
     _anonymize_text_with_db_update,
 )
@@ -786,6 +788,14 @@ def _ensure_configured_patterns(pattern_config: PatternConfig, source: str) -> N
         _raise_tool_error(f"No detector patterns are configured in {source}.")
 
 
+def _load_anonymize_tool_config(config_path: str, selected_entity: str | None) -> tuple[Path, PatternConfig]:
+    path, pattern_config = _load_tool_config(config_path)
+    if selected_entity is not None:
+        _ensure_entity(pattern_config, selected_entity, f"config at {path}")
+    _ensure_configured_patterns(pattern_config, f"config at {path}")
+    return path, pattern_config
+
+
 def _compile_config_bank(
     pattern_config: PatternConfig,
     selected_entity: str | None,
@@ -854,8 +864,11 @@ def create_replacement_db(
     description: str = "",
     reversible: bool = False,
     store_originals: bool | None = None,
+    assignment_scope: str = "name",
 ) -> dict[str, Any]:
     """Create an unsaved replacement database object without filesystem writes."""
+    if assignment_scope not in {"name", "canonical", "surface"}:
+        _raise_tool_error("assignment_scope must be 'name', 'canonical', or 'surface'.")
     return {
         "saved": False,
         "replacement_db": _create_replacement_db(
@@ -863,6 +876,7 @@ def create_replacement_db(
             description=description,
             reversible=reversible,
             store_originals=store_originals,
+            assignment_scope=assignment_scope,
         ),
     }
 
@@ -1034,6 +1048,93 @@ def anonymize_file(
                 bank_mapping,
                 document_path,
                 db,
+                options=resolved_operation_options,
+            ),
+            db,
+            replacement_db_path=db_path,
+            save_db_path=save_db_path,
+            options=resolved_options,
+        )
+    )
+
+
+@mcp.tool()
+def anonymize_config_text(
+    text: str,
+    config_path: str,
+    entity: str | None = None,
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    save_db_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Anonymize text with a YAML detector config and optional explicit replacement DB save."""
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+    word_boundaries = _tool_bool_option(resolved_options, "word_boundaries", False)
+    _config_path, pattern_config = _load_anonymize_tool_config(config_path, entity)
+    db, db_path, invalid_db_payload = _resolve_replacement_db_source(
+        replacement_db,
+        replacement_db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        return invalid_db_payload
+    if db is None:
+        _raise_tool_error("anonymize_config_text requires a valid replacement database object.")
+
+    return _run_json_tool(
+        lambda: _saved_anonymize_payload_for_tool(
+            lambda resolved_operation_options: _anonymize_config_text_with_db_update(
+                pattern_config,
+                text,
+                db,
+                selected_entity=entity,
+                word_boundaries=word_boundaries,
+                options=resolved_operation_options,
+            ),
+            db,
+            replacement_db_path=db_path,
+            save_db_path=save_db_path,
+            options=resolved_options,
+        )
+    )
+
+
+@mcp.tool()
+def anonymize_config_file(
+    file_path: str,
+    config_path: str,
+    entity: str | None = None,
+    replacement_db: Any | None = None,
+    replacement_db_path: str | None = None,
+    save_db_path: str | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Anonymize one explicit UTF-8 file with a YAML detector config and optional explicit replacement DB save."""
+    resolved_options = _options_mapping(options)
+    include_sensitive_metadata = _tool_bool_option(resolved_options, "include_sensitive_metadata", False)
+    word_boundaries = _tool_bool_option(resolved_options, "word_boundaries", False)
+    _config_path, pattern_config = _load_anonymize_tool_config(config_path, entity)
+    document_path = _ensure_explicit_file(file_path, "Document")
+    db, db_path, invalid_db_payload = _resolve_replacement_db_source(
+        replacement_db,
+        replacement_db_path,
+        include_sensitive_metadata=include_sensitive_metadata,
+    )
+    if invalid_db_payload is not None:
+        return invalid_db_payload
+    if db is None:
+        _raise_tool_error("anonymize_config_file requires a valid replacement database object.")
+
+    return _run_json_tool(
+        lambda: _saved_anonymize_payload_for_tool(
+            lambda resolved_operation_options: _anonymize_config_file_with_db_update(
+                pattern_config,
+                document_path,
+                db,
+                selected_entity=entity,
+                word_boundaries=word_boundaries,
                 options=resolved_operation_options,
             ),
             db,
