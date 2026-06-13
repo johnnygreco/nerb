@@ -188,10 +188,10 @@ def _record_entity_id(record: Mapping[str, Any]) -> str:
 
 
 def _config_entity_id(raw_entity: str) -> str:
-    stripped = raw_entity.strip()
-    if ID_RE.fullmatch(stripped):
-        return stripped
+    if ID_RE.fullmatch(raw_entity):
+        return raw_entity
 
+    stripped = raw_entity.strip()
     lowered = stripped.lower()
     slug = re.sub(r"[^a-z0-9_]+", "_", lowered)
     slug = re.sub(r"_+", "_", slug).strip("_") or "entity"

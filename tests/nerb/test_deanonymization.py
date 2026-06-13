@@ -153,8 +153,10 @@ def test_assignment_keys_do_not_merge_distinct_config_style_entity_names():
     canonical_policy = {"assignment_scope": "canonical", "unicode_normalization": "NFC", "store_originals": False}
     upper_record = {"entity": "ARTIST", "canonical_name": "Miles Davis", "string": "Miles Davis"}
     lower_record = {"entity": "artist", "canonical_name": "Miles Davis", "string": "Miles Davis"}
+    spaced_record = {"entity": " artist ", "canonical_name": "Miles Davis", "string": "Miles Davis"}
 
     assert assignment_key(upper_record, canonical_policy) != assignment_key(lower_record, canonical_policy)
+    assert assignment_key(spaced_record, canonical_policy) != assignment_key(lower_record, canonical_policy)
     assert assignment_key(lower_record, canonical_policy).startswith("artist|canonical|sha256:")
 
 
