@@ -1844,10 +1844,13 @@ def deanonymize_text(
     if not isinstance(text, str):
         raise TypeError("deanonymize_text text must be a string.")
     resolved_options = _resolve_deanonymize_options(options)
+    option_error: ExtractionError | None = None
     try:
         extraction_options = resolve_extraction_options(resolved_options.extraction_options)
     except ExtractionError as exc:
-        _raise_deanonymize_extraction_error(exc, resolved_options)
+        option_error = exc
+    if option_error is not None:
+        _raise_deanonymize_extraction_error(option_error, resolved_options)
     source_bytes = text.encode("utf-8")
     if len(source_bytes) > extraction_options.max_text_bytes:
         _raise_deanonymize_error(
@@ -1879,10 +1882,13 @@ def deanonymize_file(
     """Restore known redaction tokens, and optionally pseudonyms, from a UTF-8 text file without writing output."""
     path = Path(file_path).expanduser()
     resolved_options = _resolve_deanonymize_options(options)
+    option_error: ExtractionError | None = None
     try:
         extraction_options = resolve_extraction_options(resolved_options.extraction_options)
     except ExtractionError as exc:
-        _raise_deanonymize_extraction_error(exc, resolved_options)
+        option_error = exc
+    if option_error is not None:
+        _raise_deanonymize_extraction_error(option_error, resolved_options)
     file_error: ExtractionError | None = None
     try:
         text, byte_count = _read_utf8_file(path, max_bytes=extraction_options.max_text_bytes)

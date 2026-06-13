@@ -1177,6 +1177,24 @@ def test_deanonymize_file_suppresses_raw_extraction_context_by_default(tmp_path)
     assert "John-Smith-secret" not in diagnostics_repr
 
 
+def test_deanonymize_helpers_suppress_raw_option_error_context_by_default(tmp_path):
+    source_path = tmp_path / "redacted.txt"
+    source_path.write_text("[PERSON_0001]", encoding="utf-8")
+    sensitive_mode = "/Users/donnie/secret-client/path"
+    options = {"engine_options": {"match_mode": sensitive_mode}}
+
+    with pytest.raises(DeanonymizationError) as text_info:
+        deanonymize_text("[PERSON_0001]", create_replacement_db(), options=options)
+    with pytest.raises(DeanonymizationError) as file_info:
+        deanonymize_file(source_path, create_replacement_db(), options=options)
+
+    for error in (text_info.value, file_info.value):
+        diagnostics_repr = repr(error.diagnostics)
+        assert error.__cause__ is None
+        assert error.__context__ is None
+        assert sensitive_mode not in diagnostics_repr
+
+
 def test_deanonymize_text_rejects_invalid_options_with_diagnostics():
     with pytest.raises(DeanonymizationError) as pseudonym_info:
         deanonymize_text("Mikey Law", _pseudonym_db(), options={"restore_pseudonyms": "yes"})
