@@ -159,13 +159,17 @@ def test_schema_reports_invalid_structural_ids_at_field_paths():
     db["replacement_sets"]["Bad Set"] = {"description": "Names.", "reuse": False, "candidates": []}
 
     result = validate_replacement_db_schema(db)
+    diagnostics = {(item["code"], item["path"]) for item in result["diagnostics"]}
 
     assert result["valid"] is False
     assert {
         (ID_INVALID, "/id"),
         (ID_INVALID, "/entities/Bad-ID"),
         (ID_INVALID, "/replacement_sets/Bad Set"),
-    }.issubset({(item["code"], item["path"]) for item in result["diagnostics"]})
+    }.issubset(diagnostics)
+    assert ("schema.pattern", "/id") not in diagnostics
+    assert ("schema.pattern", "/entities") not in diagnostics
+    assert ("schema.pattern", "/replacement_sets") not in diagnostics
 
 
 def test_schema_rejects_non_json_metadata_and_metadata_over_hard_limit():

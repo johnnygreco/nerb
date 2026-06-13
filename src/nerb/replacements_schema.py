@@ -347,6 +347,8 @@ def _iter_schema_diagnostics(replacement_db: Any) -> list[Diagnostic]:
     for error in sorted(REPLACEMENT_DB_SCHEMA_VALIDATOR.iter_errors(replacement_db), key=_schema_sort_key):
         if error.validator == "propertyNames":
             continue
+        if error.validator == "pattern" and "propertyNames" in error.schema_path:
+            continue
         if error.validator == "pattern" and list(error.path) == ["id"]:
             continue
         if error.validator == "additionalProperties":
