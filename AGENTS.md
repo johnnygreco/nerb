@@ -13,7 +13,7 @@ This guide is for coding agents working in NERB. Keep changes small, verify them
 - `tests/nerb/`: unit tests for the public API, CLI behavior, config validation, and extraction output.
 - `examples/`: README example inputs.
 - `docs/releasing.md`: release and publishing process.
-- `.agents/skills/`: focused reusable instructions for recurring agent work.
+- `.agents/skills/nerb-large-source-bank-building/`: specialized workflow for large-corpus bank construction.
 
 ## Local Setup
 
@@ -68,6 +68,20 @@ make build
 - Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
 
+## Surface Ownership
+
+- CLI/config changes should keep `src/nerb/cli.py` thin and route path resolution, validation, mutation, and atomic YAML
+  persistence through `src/nerb/config.py`. Cover user-facing CLI behavior in `tests/nerb/test_cli.py` and config helper
+  behavior in `tests/nerb/test_config.py`.
+- Extraction changes should preserve the Rust-backed `Bank` record contract and shared JSON-bank enrichment in
+  `engine.py`, `engines.py`, `extraction.py`, and `records.py`. Export new names from `src/nerb/__init__.py` only when
+  they are intended public Python API.
+- MCP tools should wrap the same shared helpers used by the Python API and CLI. They should read only explicit
+  config/document paths or provided text, and writes should require explicit output paths.
+- Release changes should treat `docs/releasing.md` as the canonical process. Keep `pyproject.toml` and
+  `src/nerb/__init__.py` versions aligned, preserve the trusted-publishing workflow, and run `make check` plus
+  `make build` before release PRs when practical.
+
 ## Kata Files
 
 - Keep `.kata.toml` tracked as the portable workspace-to-project binding. It should stay minimal: the Kata file format
@@ -114,13 +128,9 @@ document `file_path`. `extract_inline` uses provided detector definitions and do
 - Detector names are preserved as Rust-backed canonical names; they are not constrained by Python regex group-name rules.
 - MCP support uses the official Python MCP SDK, which currently requires Python 3.10 or newer.
 
-## Reusable Skills
+## Reusable Skill
 
-Use these when the task matches:
+Use this when the task matches:
 
-- `.agents/skills/nerb-cli-config/SKILL.md`: CLI commands and detector config behavior.
-- `.agents/skills/nerb-extraction-surfaces/SKILL.md`: extraction behavior, records, and public extraction surfaces.
 - `.agents/skills/nerb-large-source-bank-building/SKILL.md`: large-corpus entity-bank construction workflow,
   guardrails, evals, and benchmark/regression use.
-- `.agents/skills/nerb-mcp-tools/SKILL.md`: MCP tool implementation and launch/test workflow.
-- `.agents/skills/nerb-release-publishing/SKILL.md`: release, build, and publishing workflow changes.
