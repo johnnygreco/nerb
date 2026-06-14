@@ -55,7 +55,8 @@ make build
 
 ## Development Rules
 
-- During the Rust engine migration, treat the Rust-backed `Bank` API as the target. Do not add shims for removed Python regex-builder callers unless an active issue explicitly requires one.
+- Treat the Rust-backed `Bank` API as the target. Do not add shims for removed Python regex-builder callers unless an
+  active issue explicitly requires one.
 - Put shared behavior in `config.py`, `engine.py`, `engines.py`, `extraction.py`, `records.py`, or the existing bank/report
   helpers; have CLI and MCP code call those helpers instead of reimplementing parsing, validation, scanning, or
   serialization.
@@ -65,7 +66,8 @@ make build
 - Maintain deterministic behavior. Rust-backed `Bank` scan ordering follows
   `docs/decisions/0001-rust-engine-semantics.md`, and JSON-bank extraction uses the shared record sort key.
 - Keep user-facing CLI behavior covered with `typer.testing.CliRunner` tests in `tests/nerb/test_cli.py`.
-- Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.
+- Respect configured tooling in `pyproject.toml`: Ruff line length is 120, CI checks run on Python 3.10 and 3.13, and
+  wheel build/install smoke tests cover Python 3.10 through 3.14.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
 
 ## Surface Ownership

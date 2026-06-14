@@ -1,7 +1,8 @@
 # Rust Engine Gate Evidence
 
-Recorded on 2026-06-05 from the Rust engine migration branches, then updated by the final gate follow-up after the
-Rust-backed `Bank` surface, wheel matrix, and record contract follow-ups merged.
+Historical Rust engine gate evidence was recorded on 2026-06-05, then updated by the final gate follow-up after the
+Rust-backed `Bank` surface, wheel matrix, and record contract follow-ups merged. Use this file as recorded release-gate
+evidence for the current Rust-backed engine path.
 
 ## Gate Command
 
@@ -98,7 +99,7 @@ Larger 1 MB report, 1 iteration:
 
 The 1 MB report uses the same fields as the routine report.
 
-The literal-heavy, regex-heavy, and mixed gates pass independently. All preserve the planned records, have stable counts,
+The literal-heavy, regex-heavy, and mixed gates pass independently. All preserve the public records, have stable counts,
 and stay inside the Rust timing and throughput thresholds. The small-bank floor also remains inside the checked-in floor.
 
 Routine 100 KB report, 5 iterations, final gate update:

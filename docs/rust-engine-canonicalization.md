@@ -1,8 +1,9 @@
 # Rust Engine Canonicalization
 
-Issue #49 introduced Rust-owned source-bank canonicalization for the engine migration. The current Rust-backed `Bank`
-layer parses source bytes, validates the supported source schema, assigns deterministic stable IDs, emits canonical JSON,
-computes the bank hash, compiles detector indexes, scans UTF-8 text, and projects public records.
+This document records the Rust-owned source-bank canonicalization used by the current `Bank` layer. Historical issue #49
+introduced this path; it now parses source bytes, validates the supported source schema, assigns deterministic stable
+IDs, emits canonical JSON, computes the bank hash, compiles detector indexes, scans UTF-8 text, and projects public
+records.
 
 The current Rust entry point is the native module:
 
@@ -133,8 +134,8 @@ Source parsing rejects duplicate object keys before canonicalization, caps sourc
 full canonicalization, and rejects excessive nesting depth.
 
 YAML support currently uses the `serde_yaml` parser, which is deprecated upstream and pulls `unsafe-libyaml`. The parser
-is isolated to source-bank canonicalization and remains in scope because YAML authoring is part of the Rust engine plan;
-it should be revisited before release hardening or any dependency-deny policy.
+is isolated to source-bank canonicalization and remains in scope because YAML authoring is a supported input path. Track
+it as a dependency risk for any future deny-policy or parser-hardening work.
 
 ## Deferred Fields
 
