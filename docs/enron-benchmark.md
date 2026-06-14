@@ -2,7 +2,7 @@
 
 This benchmark prepares a local, ignored Enron email corpus split, mines a baseline JSON bank from the training split,
 and runs NERB's public benchmark and extraction summaries against held-out documents. It is the baseline evaluator for
-the entity-bank construction optimization goal tracked in GitHub issue #86.
+large-source entity-bank construction work.
 
 Raw and cleaned Enron text can include personal information. Keep generated artifacts under `.nerb/`, which is ignored
 by git, and do not paste raw records into issues, pull requests, docs, or screenshots.
@@ -123,5 +123,5 @@ from private-corpus runs.
 
 ## Hero Image Direction
 
-Use `docs/hero-images.md` for benchmark-grounded plot assets. The committed visuals are generated from aggregate
-measurement JSON and intentionally avoid raw email text, personal data, screenshots, and unsupported claims.
+Use [`hero-images.md`](hero-images.md) for benchmark-grounded plot assets. The committed visuals are generated from
+aggregate measurement JSON and intentionally avoid raw email text, personal data, screenshots, and unsupported claims.

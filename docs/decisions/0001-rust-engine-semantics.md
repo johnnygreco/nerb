@@ -2,7 +2,7 @@
 
 Date: 2026-06-04
 
-Status: accepted for the Rust engine migration baseline.
+Status: accepted; current Rust-backed engine contract.
 
 Tracker: <https://github.com/johnnygreco/nerb/issues/45>
 
@@ -10,10 +10,10 @@ Implementation issue: <https://github.com/johnnygreco/nerb/issues/46>
 
 ## Context
 
-The Rust engine migration changes NERB into a package with Python as the authoring/control plane and Rust as the matching
-data plane. This is a planned breaking migration: the Rust engine behavior is the target, and the removed Python regex
-object model does not constrain the design. Silent semantic drift is unacceptable. Every planned engine mode must either
-satisfy this record or be documented as a deliberate divergence.
+The Rust engine migration changed NERB into a package with Python as the authoring/control plane and Rust as the matching
+data plane. The Rust engine behavior is the target, and the removed Python regex object model does not constrain the
+design. Silent semantic drift is unacceptable. Every engine mode must either satisfy this record or be documented as a
+deliberate divergence.
 
 The pre-removal Python surfaces were useful differential oracles during migration. They helped identify and name semantic
 changes, but they do not define the target surface.
@@ -43,7 +43,7 @@ New public Rust-backed records use this schema:
 }
 ```
 
-Conformance tests compare Rust byte-offset records directly against the planned record schema.
+Conformance tests compare Rust byte-offset records directly against the public record schema.
 
 ### Attribution
 
@@ -73,17 +73,17 @@ collected.
 
 `all_overlaps` has a different semantic contract. It reports cross-entity overlap, within-entity overlap, and all
 matching spans for each detector pattern unless a reconstruction step restores leftmost-first behavior. It does not
-preserve branch identity inside one regex; attribution remains at the NERB detector index. Slice 6 showed that a
-span-only raw-candidate post-filter is not sufficient to prove exact reconstruction: `MatchKind::All` can expose the
+preserve branch identity inside one regex; attribution remains at the NERB detector index. Historical Slice 6 showed
+that a span-only raw-candidate post-filter is not sufficient to prove exact reconstruction: `MatchKind::All` can expose the
 shorter span of one detector such as `Sam` from `Samwise|Sam`, while leftmost-first semantics choose `Samwise` when that
 branch appears first. The prototype therefore keeps raw `all_overlaps` output separate from an exact reconstruction
 measurement path that reruns the entity-independent shards after measuring raw overlap scan cost. It must remain a
 measured prototype until raw semantics, reconstruction cost, and dense-hit match amplification justify a mode strategy
 change.
 
-The Slice 6 lower-level DFA prototype rejects Unicode word-boundary assertions such as `\b`. `regex-automata` hybrid DFA
-support for Unicode boundaries is heuristic and can quit on valid non-ASCII UTF-8, which is not an acceptable runtime
-failure mode for NERB text scans. Raw `all_overlaps` can still use explicit ASCII word-boundary syntax such as
+The lower-level DFA prototype rejects Unicode word-boundary assertions such as `\b`. `regex-automata` hybrid DFA support
+for Unicode boundaries is heuristic and can quit on valid non-ASCII UTF-8, which is not an acceptable runtime failure
+mode for NERB text scans. Raw `all_overlaps` can still use explicit ASCII word-boundary syntax such as
 `(?-u:\b)`, while Unicode boundary semantics stay on the `entity_independent` path unless a later issue adds a measured
 fallback.
 
@@ -96,10 +96,10 @@ separate product decision. Native metadata labels it `internal_benchmark_only` w
 
 The Rust regex profile rejects constructs that require a backtracking engine, including backreferences and lookaround.
 Earlier Python validation accepted some of these patterns because they were valid Python `re`; those cases are deliberate
-migration divergences. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture categories for the conformance
-and validation gates even when the removed Python path could compile them.
+semantic divergences from the removed implementation. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture
+categories for the conformance and validation gates even when the removed Python path could compile them.
 
-Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The current direct migration set is
+Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The current direct flag set is
 `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`. `ASCII` lowers only ASCII-sensitive escapes and boundaries
 such as `\w`, `\d`, `\s`, and `\b`; the rest of the pattern stays in the UTF-8-safe Unicode regex mode. Unsupported flags
 fail validation.
@@ -109,16 +109,16 @@ it with explicit boundary rules rather than Python-side regex string substitutio
 
 ## Entity Cardinality Assumption
 
-The repository's example banks are examples only and do not define the migration target. For #73, the bank-owner target
-is a representative synthetic medium bank with 1,000 top-level entities. Final gate evidence validates the production
-default against that generated 1,000-entity target while keeping the dense raw `all_overlaps` stress probe bounded to 64
-entities. If the target grows beyond the validated 1,000-entity range, open a new issue before changing the default mode
-strategy.
+The repository's example banks are examples only and do not define the engine target. Historical issue #73 set the
+bank-owner target as a representative synthetic medium bank with 1,000 top-level entities. Final gate evidence validates
+the production default against that generated 1,000-entity target while keeping the dense raw `all_overlaps` stress probe
+bounded to 64 entities. If the target grows beyond the validated 1,000-entity range, open a new issue before changing the
+default mode strategy.
 
-## Slice 10 Gate Decision
+## Final Gate Decision
 
-Slice 10 gate evidence keeps `entity_independent` as the production default for the current Rust engine path. The routine
-gate report in `docs/rust-engine-gates.md` measured a dense two-entity prefix workload where production
+Historical Slice 10 gate evidence keeps `entity_independent` as the production default for the current Rust engine path.
+The routine gate report in `docs/rust-engine-gates.md` measured a dense two-entity prefix workload where production
 `entity_independent` emitted 32 matches, raw `all_overlaps` emitted 31,776 matches, exact `all_overlaps` reconstruction
 matched the production raw tuples, and `global_leftmost` emitted 16 matches. That means raw `all_overlaps` amplified
 materialized output by 993x, while `global_leftmost` dropped half of the valid cross-entity production matches.
@@ -172,7 +172,7 @@ The conformance suite covers these categories as evidence for the Rust-backed ma
 - ordered alternation ties;
 - underscores in detector names as a known Python-oracle divergence;
 - word-boundary behavior, including a Unicode boundary fixture that ASCII-only boundaries would fail;
-- direct flag migration behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and UTF-8-safe `ASCII` lowering;
+- direct flag behavior for `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and UTF-8-safe `ASCII` lowering;
 - unsupported backtracking-only regex syntax;
 - ReDoS-shaped regexes;
 - compile-bomb-shaped regexes.

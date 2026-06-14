@@ -1,8 +1,8 @@
 # Rust Engine PyO3 Boundary
 
-Issues #50, #51, #52, #53, and #54 expose the native boundary, the first Rust scanning path, the measured
-`all_overlaps` prototype, the internal `global_leftmost` throughput baseline, and the first public Python `Bank` wrapper
-used by CLI/MCP extraction.
+This document records the native boundary that backs the current Python `Bank` wrapper and the CLI/MCP extraction
+surfaces. Historical issues #50, #51, #52, #53, and #54 introduced the boundary, the first Rust scanning path, the
+measured `all_overlaps` prototype, the internal `global_leftmost` throughput baseline, and the first public wrapper.
 
 ## Native Bank Constructors
 
@@ -206,8 +206,8 @@ translate an unexpected Rust panic into `RuntimeError` instead of unwinding thro
 
 ## Public Python Bank
 
-`from nerb import Bank` exposes the high-level Rust-backed wrapper. It projects raw native matches into the planned public
-record schema:
+`from nerb import Bank` exposes the high-level Rust-backed wrapper. It projects raw native matches into the public record
+schema:
 
 ```python
 from nerb import Bank
@@ -311,5 +311,5 @@ uv run nerb extract-batch --stdin --entity ARTIST --config detectors.yaml --form
 
 The JSON output includes top-level `cache` metadata and document payloads in input order. Manifest files are UTF-8 text
 files with one explicit path per nonblank line; relative paths resolve against the manifest file's parent directory.
-Recursive walking, gitignore discovery, Rayon batch parallelism, and serialized DFA or engine-payload caches remain out
-of scope for this slice.
+Recursive walking, gitignore discovery, Rayon batch parallelism, and serialized DFA or engine-payload caches are not part
+of the current process-local cache.

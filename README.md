@@ -41,7 +41,7 @@ regex patterns, statuses, metadata, and optional eval references in one validate
 [`docs/schemas.md`](docs/schemas.md) for the complete bank schema, extraction record contracts, eval JSONL format, and a
 copyable minimal `company.json`.
 
-Validate and extract:
+After saving a bank such as the minimal `company.json` from [`docs/schemas.md`](docs/schemas.md), validate and extract:
 
 ```shell
 nerb validate-bank --bank company.json
@@ -106,8 +106,9 @@ nerb deanonymize-text --db pseudonym-replacements.json --text "Mikey Law joined.
 Default CLI response metadata omits originals, replacement values, raw assignment keys, fingerprints, bank hashes, and
 replacement DB hashes. The transformed `text` still contains replacement values by design. Python and MCP anonymization
 response metadata include replacement values because they are already present in the transformed text, but still omit
-originals, raw keys, fingerprints, and hashes by default. Use `--include-originals`, `--include-values`, or
-`--include-sensitive-metadata` only when you are intentionally sending sensitive data to the caller.
+originals, raw keys, fingerprints, and hashes by default. Use `--include-originals` or
+`--include-sensitive-metadata` only when you are intentionally sending sensitive data to the caller. The
+`replacement-db list` command also has `--include-values` for explicitly inspecting candidate and assignment values.
 
 ## Python API
 
@@ -246,15 +247,14 @@ canonicalized into Rust detector metadata, scanned natively, then projected into
 cached in process by canonical bank hash, engine version, compile options, and platform dimensions.
 
 The final Rust engine gate covers conformance, dense memory, mode strategy, wheel smoke tests, and a representative
-synthetic medium bank with 1,000 entities. See [`docs/performance.md`](docs/performance.md) and
-[`docs/rust-engine-gates.md`](docs/rust-engine-gates.md) for reproducible benchmark and release-gate evidence.
+synthetic medium bank with 1,000 entities. See [`docs/performance.md`](docs/performance.md) for the current performance
+summary and [`docs/rust-engine-gates.md`](docs/rust-engine-gates.md) for recorded release-gate evidence.
 
 For large-source bank construction, see the Enron-backed benchmark guide in
-[`docs/enron-benchmark.md`](docs/enron-benchmark.md), the measured optimization harness in
-[`docs/autoresearch.md`](docs/autoresearch.md), and the benchmark-grounded visual direction in
-[`docs/hero-images.md`](docs/hero-images.md). Agent workflows can also use the reusable
-[`nerb-large-source-bank-building`](.agents/skills/nerb-large-source-bank-building/SKILL.md) skill for corpus profiling,
-taxonomy design, privacy-safe artifacts, eval integrity, and handoff guidance.
+[`docs/enron-benchmark.md`](docs/enron-benchmark.md) and the measured optimization harness in
+[`docs/autoresearch.md`](docs/autoresearch.md). Agent workflows can also use the reusable
+[`nerb-large-source-bank-building`](.agents/skills/nerb-large-source-bank-building/SKILL.md) skill for corpus profiling
+and privacy-safe handoff guidance.
 
 ## Development
 
