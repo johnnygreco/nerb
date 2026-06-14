@@ -51,7 +51,8 @@ uv run ty check
 make build
 ```
 
-`make check` runs Ruff lint/format checks, `mypy src/nerb`, `ty check`, and pytest. `make build` builds and validates distributions with twine. For release changes, follow `docs/releasing.md`.
+`make check` runs Ruff lint/format checks, `mypy src/nerb`, `ty check`, pytest, and Rust crate tests. `make build`
+builds and validates distributions with twine. For release changes, follow `docs/releasing.md`.
 
 ## Development Rules
 

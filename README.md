@@ -264,5 +264,5 @@ make check
 make build
 ```
 
-`make check` runs Ruff linting and formatting checks, `mypy src/nerb`, `ty check`, and pytest. `make build` builds and
-validates the source distribution plus the local platform wheel with `twine check --strict`.
+`make check` runs Ruff linting and formatting checks, `mypy src/nerb`, `ty check`, pytest, and Rust crate tests.
+`make build` builds and validates the source distribution plus the local platform wheel with `twine check --strict`.

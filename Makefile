@@ -2,7 +2,7 @@ UV ?= uv
 
 .DEFAULT_GOAL := help
 
-.PHONY: help sync format lint type test check build build-sdist clean publish-test publish
+.PHONY: help sync format lint type test rust-test check build build-sdist clean publish-test publish
 
 help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "Available targets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-14s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -25,7 +25,10 @@ type: ## Run static type checks.
 test: ## Run the test suite.
 	$(UV) run pytest
 
-check: lint type test ## Run linting, type checks, and tests.
+rust-test: ## Run Rust crate tests without Python extension-module linker settings.
+	cargo test --manifest-path rust/Cargo.toml
+
+check: lint type test rust-test ## Run linting, type checks, Python tests, and Rust tests.
 
 build: ## Build and validate source and wheel distributions.
 	$(UV) build --clear
