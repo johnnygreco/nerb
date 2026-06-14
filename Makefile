@@ -26,7 +26,7 @@ test: ## Run the test suite.
 	$(UV) run pytest
 
 rust-test: ## Run Rust crate tests without Python extension-module linker settings.
-	cargo test --manifest-path rust/Cargo.toml
+	cargo test --locked --manifest-path rust/Cargo.toml
 
 check: lint type test rust-test ## Run linting, type checks, Python tests, and Rust tests.
 
