@@ -139,3 +139,7 @@ agent-scratchpads/
 
 # Local benchmark corpora and generated artifacts
 .nerb/
+
+# Kata keeps the shared workspace binding in tracked .kata.toml.
+# Per-machine daemon/server overrides stay local.
+.kata.local.toml

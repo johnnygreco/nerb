@@ -68,6 +68,17 @@ make build
 - Respect configured tooling in `pyproject.toml`: Ruff line length is 120 and CI runs Python 3.10 and 3.13.
 - Do not broaden filesystem side effects. Config writes should stay explicit and atomic through `save_config`.
 
+## Kata Files
+
+- Keep `.kata.toml` tracked as the portable workspace-to-project binding. It should stay minimal: the Kata file format
+  version and the shared project name.
+- Keep `.kata.local.toml` untracked for per-machine overrides such as a remote Kata daemon URL. `KATA_SERVER` still takes
+  precedence over that file when set.
+- Do not commit Kata daemon state, temporary exports, or scratch issue ledgers. Put one-off investigation notes under
+  ignored scratch paths such as `agent-scratchpads/`.
+- Use GitHub issues and PRs for goals that explicitly request GitHub delivery. Use Kata only when a task explicitly
+  chooses Kata as the durable issue ledger.
+
 ## MCP Server
 
 Launch the local stdio MCP server from the repo with:
