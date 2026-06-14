@@ -55,11 +55,17 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
 
+      - name: mypy
+        run: uv run mypy src/nerb
+
       - name: ty
         run: uv run ty check
 
       - name: pytest
         run: uv run pytest
+
+      - name: Rust crate tests
+        run: cargo test --locked --manifest-path rust/Cargo.toml
 
   build-sdist:
     name: Build source distribution

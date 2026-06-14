@@ -36,6 +36,7 @@ Issues = "https://github.com/johnnygreco/nerb/issues"
 
 [tool.maturin]
 bindings = "pyo3"
+features = ["extension-module"]
 manifest-path = "rust/Cargo.toml"
 module-name = "nerb._engine"
 python-source = "src"

@@ -10,9 +10,13 @@ repository = "https://github.com/johnnygreco/nerb"
 name = "nerb_engine"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = []
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 aho-corasick = "1.1.4"
-pyo3 = { version = "0.27", features = ["extension-module"] }
+pyo3 = "0.27"
 regex-automata = "0.4.14"
 regex-syntax = "0.8"
 serde = { version = "1", features = ["derive"] }
