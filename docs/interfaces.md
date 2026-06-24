@@ -13,7 +13,9 @@ surface that matches the caller, and keep shared behavior in the bank itself.
 === "CLI"
 
     ```shell
-    nerb extract-text --bank company.json --text "Send this to Acme Corp today."
+    nerb extract-text \
+      --bank company.json \
+      --text "Send this to Acme Corp today."
     nerb extract-file --bank company.json --file email.txt
     nerb extract-report --bank company.json --file email.txt
     ```
@@ -48,7 +50,9 @@ The CLI is the best surface for CI, local bank authoring, and shell-driven repor
 ```shell
 nerb validate-bank --bank company.json
 nerb diff-banks old-company.json new-company.json
-nerb regress-bank --old-bank old-company.json --new-bank new-company.json
+nerb regress-bank \
+  --old-bank old-company.json \
+  --new-bank new-company.json
 ```
 
 Config-backed YAML detector commands are also available for compact regex detector authoring:
@@ -56,7 +60,10 @@ Config-backed YAML detector commands are also available for compact regex detect
 ```shell
 nerb init --config detectors.yaml
 nerb add ARTIST "Pink Floyd" 'Pink\sFloyd' --config detectors.yaml
-nerb extract --all --text "Pink Floyd played progressive rock." --config detectors.yaml --format json
+nerb extract --all \
+  --text "Pink Floyd played progressive rock." \
+  --config detectors.yaml \
+  --format json
 ```
 
 ## Python API
@@ -87,6 +94,18 @@ Run the local stdio server:
 
 ```shell
 nerb-mcp --version
+```
+
+Installed-package client config:
+
+```json
+{
+  "mcpServers": {
+    "nerb": {
+      "command": "nerb-mcp"
+    }
+  }
+}
 ```
 
 From a source checkout:

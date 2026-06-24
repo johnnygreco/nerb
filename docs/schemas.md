@@ -120,10 +120,10 @@ Literal patterns must not include `regex_flags`. Regex patterns must not include
   "id": "company_entities",
   "name": "Company Entities",
   "description": "Companies to recognize in internal documents.",
-  "version": "2026.06.05",
+  "version": "2026.06.24",
   "status": "active",
-  "created_at": "2026-06-05T00:00:00Z",
-  "updated_at": "2026-06-05T00:00:00Z",
+  "created_at": "2026-06-24T00:00:00Z",
+  "updated_at": "2026-06-24T00:00:00Z",
   "unicode_normalization": "none",
   "default_regex_flags": ["IGNORECASE"],
   "entities": {

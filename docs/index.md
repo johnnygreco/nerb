@@ -15,7 +15,9 @@ can cite, patch, diff, evaluate, and promote.
 ```shell
 pip install --upgrade nerb
 nerb validate-bank --bank company.json
-nerb extract-text --bank company.json --text "Send this to Acme Corp today."
+nerb extract-text \
+  --bank company.json \
+  --text "Send this to Acme Corp today."
 ```
 
 <p class="nerb-actions" markdown="span">
@@ -118,7 +120,9 @@ Validate and scan:
 
 ```shell
 nerb validate-bank --bank company.json
-nerb extract-text --bank company.json --text "Send this to Acme Corp today."
+nerb extract-text \
+  --bank company.json \
+  --text "Send this to Acme Corp today."
 ```
 
 NERB returns deterministic JSON records:
