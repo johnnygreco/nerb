@@ -24,13 +24,26 @@ nerb-mcp = "nerb.mcp_server:main"
 
 [project.optional-dependencies]
 tests = ["mypy>=1.14,<1.15", "pytest>=7.0"]
-dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "ty>=0.0.39"]
+dev = [
+    "mypy>=1.14,<1.15",
+    "pytest>=7.0",
+    "ruff>=0.15.14",
+    "ty>=0.0.39",
+    "zensical>=0.0.46,<0.1",
+]
 
 [dependency-groups]
-dev = ["mypy>=1.14,<1.15", "pytest>=7.0", "ruff>=0.15.14", "ty>=0.0.39"]
+dev = [
+    "mypy>=1.14,<1.15",
+    "pytest>=7.0",
+    "ruff>=0.15.14",
+    "ty>=0.0.39",
+    "zensical>=0.0.46,<0.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/johnnygreco/nerb"
+Documentation = "https://johnnygreco.github.io/nerb/"
 Repository = "https://github.com/johnnygreco/nerb"
 Issues = "https://github.com/johnnygreco/nerb/issues"
 
