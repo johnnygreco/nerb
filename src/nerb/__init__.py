@@ -42,7 +42,7 @@ from .patches import BankPatchError, apply_bank_patches
 from .schema import BANK_SCHEMA, ID_PATTERN, REGEX_FLAG_ORDER, SCHEMA_VERSION, validate_bank_schema
 from .validation import validate_bank
 
-__version__ = "0.0.10"
+__version__ = "0.0.11"
 
 package_path: Path = Path(__file__).parent
 repo_path: Path = package_path.parent.parent
