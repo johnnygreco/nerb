@@ -81,9 +81,9 @@ builds and validates distributions with twine. For release changes, follow `docs
   they are intended public Python API.
 - MCP tools should wrap the same shared helpers used by the Python API and CLI. They should read only explicit
   config/document paths or provided text, and writes should require explicit output paths.
-- Release changes should treat `docs/releasing.md` as the canonical process. Keep `pyproject.toml` and
-  `src/nerb/__init__.py` versions aligned, preserve the trusted-publishing workflow, and run `make check` plus
-  `make build` before release PRs when practical.
+- Release changes should treat `docs/releasing.md` as the canonical process. Keep `pyproject.toml`,
+  `src/nerb/__init__.py`, `rust/Cargo.toml`, and lockfile versions aligned, preserve the trusted-publishing workflow,
+  and run `make check` plus `make build` before release PRs when practical.
 
 ## Kata Files
 

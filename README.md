@@ -41,14 +41,16 @@ uv run nerb --help
 
 JSON banks are the main format for agent and service workflows. A bank stores entity types, canonical names, literal or
 regex patterns, statuses, metadata, and optional eval references in one validated JSON object. See
-[`docs/schemas.md`](docs/schemas.md) for the complete bank schema, extraction record contracts, eval JSONL format, and a
-copyable minimal `company.json`.
+[`docs/quickstart.md`](docs/quickstart.md) for a copyable minimal `company.json`, and [`docs/schemas.md`](docs/schemas.md)
+for the complete bank schema, extraction record contracts, and eval JSONL format.
 
-After saving a bank such as the minimal `company.json` from [`docs/schemas.md`](docs/schemas.md), validate and extract:
+After saving the minimal `company.json` from the quickstart, validate and extract:
 
 ```shell
 nerb validate-bank --bank company.json
-nerb extract-text --bank company.json --text "Send this to Acme Corp today."
+nerb extract-text \
+  --bank company.json \
+  --text "Send this to Acme Corp today."
 nerb extract-file --bank company.json --file email.txt
 nerb extract-report --bank company.json --file email.txt
 ```
@@ -63,7 +65,9 @@ nerb apply-patches --bank company.json --patch patches.json
 nerb diff-banks old-company.json new-company.json
 nerb eval-bank --bank company.json
 nerb benchmark-bank --bank company.json
-nerb regress-bank --old-bank old-company.json --new-bank new-company.json
+nerb regress-bank \
+  --old-bank old-company.json \
+  --new-bank new-company.json
 ```
 
 `apply-patches` accepts RFC 6902 JSON Patch operations, validates the patched candidate, and returns diagnostics with
