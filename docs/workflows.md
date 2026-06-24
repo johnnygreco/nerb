@@ -34,7 +34,7 @@ with diff/eval/benchmark evidence.
 Use validation before extraction in automation:
 
 ```shell
-nerb validate-bank --bank company.json --format json
+nerb validate-bank --bank company.json
 ```
 
 Validation catches schema errors, runtime regex problems, unsafe eval references, overly large metadata, and extraction

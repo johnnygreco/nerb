@@ -21,12 +21,12 @@ surface that matches the caller, and keep shared behavior in the bank itself.
 === "Python"
 
     ```python
-    from nerb import extract_file, extract_report, extract_text, load_bank
+    from nerb import extract_file, extract_report_file, extract_text, load_bank
 
     bank = load_bank("company.json")
     result = extract_text(bank, "Send this to Acme Corp today.")
     file_result = extract_file(bank, "email.txt")
-    report = extract_report(bank, "email.txt")
+    report = extract_report_file(bank, "email.txt")
     ```
 
 === "MCP"

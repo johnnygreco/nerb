@@ -58,8 +58,9 @@ Use these flags only when the caller is allowed to receive sensitive data:
 ```shell
 --include-originals
 --include-sensitive-metadata
---include-values
 ```
+
+`--include-values` is available on `nerb replacement-db list` for explicitly inspecting candidate and assignment values.
 
 ## Operational Rules
 
