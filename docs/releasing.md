@@ -4,7 +4,7 @@ NERB publishes to PyPI through the `Publish` GitHub Actions workflow. The workfl
 
 The public documentation site is built with Zensical and deployed to GitHub Pages by the `Documentation` workflow. Pull
 requests and pushes to `main` build the static site for validation. Publishing a non-prerelease GitHub release deploys
-the release docs to <https://johnnygreco.github.io/nerb/>. The workflow also supports `workflow_dispatch` for manual
+the release docs to <https://johnnygreco.dev/nerb/>. The workflow also supports `workflow_dispatch` for manual
 recovery deployments.
 
 ## Required PyPI setup
