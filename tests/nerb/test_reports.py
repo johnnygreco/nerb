@@ -7,7 +7,14 @@ from typing import Any
 
 import pytest
 
-from nerb import ExtractionError, explain_match, extract_report, extract_report_batch, extract_report_file
+from nerb import (
+    ExtractionError,
+    clear_bank_cache,
+    explain_match,
+    extract_report,
+    extract_report_batch,
+    extract_report_file,
+)
 
 
 @pytest.fixture
@@ -123,7 +130,10 @@ def test_extract_report_file_preserves_file_source_metadata(tmp_path, minimal_ba
     document_path = tmp_path / "email.txt"
     document_path.write_bytes("Café\r\nAcme Corp now.".encode())
 
+    clear_bank_cache()
     report = extract_report_file(minimal_bank, document_path, options={"context_chars": 10})
+    clear_bank_cache()
+    file_path_report = extract_report(minimal_bank, file_path=document_path, options={"context_chars": 10})
 
     assert report["source"] == {
         "type": "file",
@@ -134,6 +144,7 @@ def test_extract_report_file_preserves_file_source_metadata(tmp_path, minimal_ba
     assert report["records"][0]["start"] == 7
     assert report["records"][0]["end"] == 16
     assert report["resolved_records"][0]["context"] == {"before": "Café\r\n", "match": "Acme Corp", "after": " now."}
+    assert file_path_report == report
 
 
 def test_report_uses_rust_leftmost_first_records_before_report_resolution(minimal_bank):

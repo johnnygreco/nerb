@@ -117,12 +117,13 @@ The response includes a record like:
 For a file:
 
 ```shell
+nerb extract-text --bank company.json --file email.txt
 nerb extract-file --bank company.json --file email.txt
 nerb extract-report --bank company.json --file email.txt
 ```
 
-`extract-text` and `extract-file` return JSON extraction responses. `extract-report` applies report-oriented overlap
-resolution and summary metadata.
+`extract-text` accepts `--text`, `--stdin`, or `--file`; `extract-file` is the explicit file-only equivalent. Both
+return JSON extraction responses. `extract-report` applies report-oriented overlap resolution and summary metadata.
 
 ## Use Python
 
@@ -132,9 +133,11 @@ from nerb import extract_text, load_bank, validate_bank
 bank = load_bank("company.json")
 validation = validate_bank(bank)
 result = extract_text(bank, "Send this to Acme Corp today.")
+file_result = extract_text(bank, file_path="email.txt")
 
 assert validation["valid"]
 print(result["records"])
+print(file_result["records"])
 ```
 
 For direct Rust-backed source-bank scans:

@@ -16,6 +16,7 @@ surface that matches the caller, and keep shared behavior in the bank itself.
     nerb extract-text \
       --bank company.json \
       --text "Send this to Acme Corp today."
+    nerb extract-text --bank company.json --file email.txt
     nerb extract-file --bank company.json --file email.txt
     nerb extract-report --bank company.json --file email.txt
     ```
@@ -27,7 +28,8 @@ surface that matches the caller, and keep shared behavior in the bank itself.
 
     bank = load_bank("company.json")
     result = extract_text(bank, "Send this to Acme Corp today.")
-    file_result = extract_file(bank, "email.txt")
+    file_result = extract_text(bank, file_path="email.txt")
+    dedicated_file_result = extract_file(bank, "email.txt")
     report = extract_report_file(bank, "email.txt")
     ```
 
@@ -76,6 +78,7 @@ from nerb import benchmark_bank, extract_text, load_bank, validate_bank
 bank = load_bank("company.json")
 assert validate_bank(bank)["valid"]
 records = extract_text(bank, "Acme Corp renewed.")["records"]
+file_records = extract_text(bank, file_path="email.txt")["records"]
 timings = benchmark_bank(bank)
 ```
 

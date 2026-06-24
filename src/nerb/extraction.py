@@ -23,8 +23,21 @@ __all__ = [
 ]
 
 
-def extract_text(bank: Mapping[str, Any], text: str, *, options: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Extract JSON-bank records with the Rust-backed Bank scanner."""
+def extract_text(
+    bank: Mapping[str, Any],
+    text: str | None = None,
+    *,
+    file_path: str | Path | None = None,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract JSON-bank records from exactly one text string or UTF-8 file."""
+    if file_path is not None:
+        if text is not None:
+            raise ExtractionError("Provide exactly one text source: text or file_path.")
+        return extract_file(bank, file_path, options=options)
+
+    if text is None:
+        raise ExtractionError("Provide exactly one text source: text or file_path.")
     if not isinstance(text, str):
         raise TypeError("extract_text text must be a string.")
 
@@ -144,11 +157,24 @@ def _extract_prepared_batch(
 
 def extract_report(
     bank: Mapping[str, Any],
-    text: str,
+    text: str | None = None,
     *,
+    file_path: str | Path | None = None,
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a single-document extraction report."""
+    if file_path is not None:
+        if text is not None:
+            raise ExtractionError("Provide exactly one text source: text or file_path.")
+        from .reports import extract_report_file as _extract_report_file
+
+        return _extract_report_file(bank, file_path, options=options)
+
+    if text is None:
+        raise ExtractionError("Provide exactly one text source: text or file_path.")
+    if not isinstance(text, str):
+        raise TypeError("extract_report text must be a string.")
+
     from .reports import extract_report as _extract_report
 
     return _extract_report(bank, text, options=options)

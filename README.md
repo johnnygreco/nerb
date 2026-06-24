@@ -51,6 +51,7 @@ nerb validate-bank --bank company.json
 nerb extract-text \
   --bank company.json \
   --text "Send this to Acme Corp today."
+nerb extract-text --bank company.json --file email.txt
 nerb extract-file --bank company.json --file email.txt
 nerb extract-report --bank company.json --file email.txt
 ```
@@ -128,9 +129,11 @@ bank = load_bank("company.json")
 
 validation = validate_bank(bank)
 result = extract_text(bank, "Send this to Acme Corp today.")
+file_result = extract_text(bank, file_path="email.txt")
 
 print(validation["valid"])
 print(result["records"])
+print(file_result["records"])
 ```
 
 For direct source-bank scanning, use the Rust-backed `Bank` API:

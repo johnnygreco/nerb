@@ -395,15 +395,19 @@ def test_json_bank_extraction_commands_match_helpers(tmp_path, test_data_path):
     clear_bank_cache()
     expected_file = extract_json_file(bank, document_path)
     clear_bank_cache()
+    text_file_result = runner.invoke(app, ["extract-text", "--bank", str(bank_path), "--file", str(document_path)])
+    clear_bank_cache()
     report_result = runner.invoke(app, ["extract-report", "--bank", str(bank_path), "--file", str(document_path)])
     clear_bank_cache()
     expected_report = extract_json_report_file(bank, document_path)
 
     assert text_result.exit_code == 0
     assert file_result.exit_code == 0
+    assert text_file_result.exit_code == 0
     assert report_result.exit_code == 0
     assert json.loads(text_result.output) == expected_text
     assert json.loads(file_result.output) == expected_file
+    assert json.loads(text_file_result.output) == expected_file
     assert json.loads(report_result.output) == expected_report
     assert json.loads(file_result.output)["records"][0]["start"] == 7
     assert json.loads(file_result.output)["source"]["bytes"] == 23
@@ -419,11 +423,17 @@ def test_json_bank_cli_enforces_text_source_rules(tmp_path, test_data_path):
         app,
         ["extract-report", "--bank", str(bank_path), "--file", str(document_path), "--text", "Acme Corp"],
     )
+    duplicate_text_source = runner.invoke(
+        app,
+        ["extract-text", "--bank", str(bank_path), "--file", str(document_path), "--text", "Acme Corp"],
+    )
 
     assert missing_source.exit_code == 1
     assert duplicate_source.exit_code == 1
+    assert duplicate_text_source.exit_code == 1
     assert "Provide exactly one text source" in missing_source.output
     assert "Provide exactly one text source" in duplicate_source.output
+    assert "Provide exactly one text source" in duplicate_text_source.output
 
 
 def test_json_bank_cli_stdin_extraction_commands_keep_text_inputs(test_data_path):

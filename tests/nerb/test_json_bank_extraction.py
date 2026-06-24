@@ -207,6 +207,20 @@ def test_extract_file_uses_original_file_bytes_for_metadata_and_offsets(tmp_path
     assert result["records"][0]["end"] == 16
 
 
+def test_extract_text_accepts_file_path_as_source(tmp_path, minimal_bank):
+    source_path = tmp_path / "source.txt"
+    source_path.write_bytes("Café\r\nAcme Corp".encode())
+
+    clear_bank_cache()
+    result = extract_text(minimal_bank, file_path=source_path)
+    clear_bank_cache()
+    expected = extract_file(minimal_bank, source_path)
+
+    assert result == expected
+    assert result["source"] == {"type": "file", "path": str(source_path), "length": 15, "bytes": 16}
+    assert result["records"][0]["start"] == 7
+
+
 def test_extract_file_rejects_oversized_file_before_read(monkeypatch, tmp_path, minimal_bank):
     source_path = tmp_path / "source.txt"
     source_path.write_text("Acme Corp", encoding="utf-8")
