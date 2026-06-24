@@ -31,6 +31,10 @@ nerb extract-text --bank company.json --text "Send this to Acme Corp today."
 </figure>
 </section>
 
+Text summary for the benchmark image: the Enron held-out test measured 1,000 documents, 17,806 predicted records,
+0.985 precision, 0.536 recall, and 0.724 micro F1. The same benchmark used a 5,500-pattern literal bank and verified a
+warm compile-cache hit with 651.29 target documents per second.
+
 ## Why Teams Use NERB
 
 <div class="nerb-card-grid" markdown="1">
@@ -125,6 +129,7 @@ NERB returns deterministic JSON records:
     {
       "entity": "company",
       "canonical_name": "Acme Corp",
+      "surface_name": "Acme Corp",
       "string": "Acme Corp",
       "start": 13,
       "end": 22,
@@ -132,7 +137,8 @@ NERB returns deterministic JSON records:
       "entity_id": "company",
       "name_id": "acme_corp",
       "pattern_id": "primary",
-      "pattern_kind": "literal"
+      "pattern_kind": "literal",
+      "captures": {}
     }
   ]
 }
@@ -180,6 +186,10 @@ NERB returns deterministic JSON records:
 | --- | ---: | ---: | ---: |
 | Medium production bank | 8,000 | 0.008654s | 11.6 MB/s |
 | 1 MB evidence run | 8,000 | 0.043692s | 22.9 MB/s |
+
+The scale chart compares three synthetic banks: 1,000 patterns over 49,983 document bytes at 10.68 MB/s, 4,000 patterns
+over 149,995 bytes at 8.59 MB/s, and 10,000 patterns over 299,991 bytes at 6.15 MB/s. The corresponding record counts
+were 1,136, 3,409, and 6,818.
 
 Reproduce the gate with:
 

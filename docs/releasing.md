@@ -50,8 +50,11 @@ The GitHub Actions publish workflow builds the source distribution, platform whe
 3. Run `make build`.
 4. Push the release commit and tag.
 5. Confirm the CI wheel matrix is green on the release commit.
-6. Publish a GitHub release for the tag, or run the `Publish` workflow manually for that tag.
-7. Confirm the `Documentation` workflow deployed GitHub Pages for the release and verify the live docs URL.
+6. Publish a non-prerelease GitHub release for the tag. This automatically starts both the `Publish` workflow and the
+   release-triggered `Documentation` deployment.
+7. If you use the manual `Publish` workflow instead of a GitHub release, also run the `Documentation` workflow manually
+   with the same tag or ref.
+8. Confirm the `Documentation` workflow deployed GitHub Pages for the release and verify the live docs URL.
 
 The `make publish-test` and `make publish` targets remain available for manual source-distribution publishing with uv
 credentials, but the trusted-publishing workflow is preferred for PyPI releases.

@@ -39,6 +39,7 @@ nav = [
 
 [project.theme]
 language = "en"
+font = false
 features = [
   "content.action.edit",
   "content.action.view",
@@ -61,10 +62,6 @@ features = [
 
 [project.theme.icon]
 repo = "fontawesome/brands/github"
-
-[project.theme.font]
-text = "Inter"
-code = "JetBrains Mono"
 
 [[project.theme.palette]]
 media = "(prefers-color-scheme: light)"
