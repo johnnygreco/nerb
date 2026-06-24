@@ -45,7 +45,8 @@ The GitHub Actions publish workflow builds the source distribution, platform whe
 
 ## Release steps
 
-1. Update the project version and changelog or release notes as needed.
+1. Update the project version in `pyproject.toml`, `src/nerb/__init__.py`, and `rust/Cargo.toml`, refresh `uv.lock`
+   and `rust/Cargo.lock`, and prepare changelog or release notes as needed.
 2. Run `make check`.
 3. Run `make build`.
 4. Push the release commit and tag.
