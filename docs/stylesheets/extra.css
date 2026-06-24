@@ -1,0 +1,138 @@
+:root {
+  --nerb-accent: #0f766e;
+  --nerb-accent-soft: rgba(15, 118, 110, 0.12);
+  --nerb-border: rgba(15, 23, 42, 0.14);
+  --nerb-surface: rgba(248, 250, 252, 0.78);
+}
+
+[data-md-color-scheme="slate"] {
+  --nerb-accent: #5eead4;
+  --nerb-accent-soft: rgba(45, 212, 191, 0.14);
+  --nerb-border: rgba(226, 232, 240, 0.16);
+  --nerb-surface: rgba(15, 23, 42, 0.56);
+}
+
+.md-typeset {
+  font-size: 0.82rem;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3 {
+  letter-spacing: 0;
+}
+
+.md-typeset h1 {
+  font-weight: 760;
+}
+
+.nerb-hero {
+  display: grid;
+  grid-template-columns: minmax(19rem, 1.05fr) minmax(17rem, 0.95fr);
+  gap: 1.4rem;
+  align-items: center;
+  margin: 1rem 0 1.7rem;
+}
+
+.nerb-hero > div {
+  min-width: 0;
+}
+
+.nerb-hero p {
+  font-size: 0.98rem;
+  line-height: 1.65;
+}
+
+.nerb-hero figure,
+.nerb-wide-figure {
+  margin: 0;
+}
+
+.nerb-hero img,
+.nerb-wide-figure img {
+  width: 100%;
+  border: 1px solid var(--nerb-border);
+  border-radius: 8px;
+  background: var(--nerb-surface);
+}
+
+.nerb-hero figcaption,
+.nerb-wide-figure figcaption {
+  margin-top: 0.45rem;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+
+.nerb-card-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.8rem;
+  margin: 1rem 0 1.3rem;
+}
+
+.nerb-card-grid article {
+  border: 1px solid var(--nerb-border);
+  border-radius: 8px;
+  padding: 0.9rem;
+  background: var(--nerb-surface);
+}
+
+.nerb-card-grid h3 {
+  margin-top: 0;
+}
+
+.nerb-card-grid p {
+  margin-bottom: 0;
+}
+
+.nerb-link-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.55rem 1rem;
+  margin: 1rem 0 1.4rem;
+}
+
+.nerb-link-grid dt {
+  font-weight: 700;
+}
+
+.nerb-link-grid dd {
+  margin: 0 0 0.45rem;
+  color: var(--md-default-fg-color--light);
+}
+
+.md-typeset .md-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
+  margin-right: 0.35rem;
+  margin-bottom: 0.35rem;
+}
+
+.nerb-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.nerb-actions .md-button {
+  margin: 0;
+}
+
+.md-typeset table:not([class]) {
+  font-size: 0.72rem;
+}
+
+@media screen and (max-width: 900px) {
+  .nerb-hero,
+  .nerb-card-grid,
+  .nerb-link-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .nerb-hero {
+    gap: 1rem;
+  }
+}

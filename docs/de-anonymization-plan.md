@@ -6,7 +6,7 @@ below.
 
 The implemented behavior is now documented in:
 
-- [`README.md`](../README.md): copyable CLI workflows and security notes.
+- [Anonymization](anonymization.md): copyable CLI workflows and security notes.
 - [`docs/schemas.md`](schemas.md): replacement database, anonymization response, and de-anonymization response
   contracts.
 - `src/nerb/replacements_schema.py`: replacement database schema.
