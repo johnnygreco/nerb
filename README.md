@@ -7,7 +7,7 @@ NERB is a Python package, CLI, and MCP server for validated named-entity regex b
 names and aliases, validate them before use, scan text locally with a Rust-backed engine, and return deterministic
 JSON records for agents, services, and CI gates.
 
-The full documentation site is published at <https://johnnygreco.github.io/nerb/>. It includes the quickstart, workflow
+The full documentation site is published at <https://johnnygreco.dev/nerb/>. It includes the quickstart, workflow
 guides, schema reference, interface guide, anonymization notes, and performance evidence.
 
 Use NERB when you need:

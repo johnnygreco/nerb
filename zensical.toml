@@ -2,7 +2,7 @@
 site_name = "NERB Documentation"
 site_description = "Validated named-entity banks, Rust-backed extraction, CLI, Python API, and MCP server documentation."
 site_author = "Johnny Greco"
-site_url = "https://johnnygreco.github.io/nerb/"
+site_url = "https://johnnygreco.dev/nerb/"
 repo_url = "https://github.com/johnnygreco/nerb"
 repo_name = "johnnygreco/nerb"
 edit_uri = "edit/main/docs/"

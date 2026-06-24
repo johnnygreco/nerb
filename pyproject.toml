@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "nerb"
-version = "0.0.8"
+version = "0.0.9"
 description = "Named-entity bank validation and Rust-backed extraction"
 readme = "README.md"
 authors = [{ name = "Johnny Greco" }]
@@ -43,7 +43,7 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/johnnygreco/nerb"
-Documentation = "https://johnnygreco.github.io/nerb/"
+Documentation = "https://johnnygreco.dev/nerb/"
 Repository = "https://github.com/johnnygreco/nerb"
 Issues = "https://github.com/johnnygreco/nerb/issues"
 
