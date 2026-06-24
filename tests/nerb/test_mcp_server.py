@@ -342,6 +342,8 @@ def test_json_bank_mcp_extraction_and_reports_match_helpers(tmp_path, test_data_
     clear_bank_cache()
     expected_file = extract_file_helper(bank, document_path)
     clear_bank_cache()
+    text_file_result = extract_text(file_path=str(document_path), bank=bank)
+    clear_bank_cache()
     batch_result = extract_batch(documents, bank=bank)
     clear_bank_cache()
     expected_batch = extract_batch_helper(bank, documents)
@@ -360,6 +362,7 @@ def test_json_bank_mcp_extraction_and_reports_match_helpers(tmp_path, test_data_
 
     assert text_result == expected_text
     assert file_result == expected_file
+    assert text_file_result == expected_file
     assert batch_result == expected_batch
     assert report_result == expected_report
     assert file_report_result == expected_file_report
@@ -435,6 +438,9 @@ def test_json_bank_mcp_tools_enforce_source_rules(tmp_path, test_data_path):
 
     with pytest.raises(ToolError, match="exactly one text source"):
         extract_report(bank=bank, text="Acme Corp", file_path=str(document_path))
+
+    with pytest.raises(ToolError, match="exactly one text source"):
+        extract_text("Acme Corp", bank=bank, file_path=str(document_path))
 
 
 def test_json_bank_mcp_invalid_bank_returns_diagnostics(tmp_path):

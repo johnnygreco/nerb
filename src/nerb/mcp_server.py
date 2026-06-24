@@ -1474,12 +1474,13 @@ def bank_stats(
 
 @mcp.tool()
 def extract_text(
-    text: str,
+    text: str | None = None,
+    file_path: str | None = None,
     bank: Any | None = None,
     bank_path: str | None = None,
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Extract JSON-bank records from a single in-memory text document."""
+    """Extract JSON-bank records from exactly one text document or explicit file_path."""
     bank_value, _path, _base_path, invalid_payload = _resolve_bank_source(bank, bank_path)
     if invalid_payload is not None:
         return invalid_payload
@@ -1488,6 +1489,17 @@ def extract_text(
         return mapping_invalid
     if bank_mapping is None:
         _raise_tool_error("extract_text requires a JSON bank object.")
+
+    if file_path is not None:
+        if text is not None:
+            _raise_tool_error("Provide exactly one text source: text or file_path.")
+        document_path = _ensure_explicit_file(file_path, "Document")
+        return _run_json_tool(
+            lambda: _json_extract_file(bank_mapping, document_path, options=_options_mapping(options))
+        )
+
+    if text is None:
+        _raise_tool_error("Provide exactly one text source: text or file_path.")
 
     return _run_json_tool(lambda: _json_extract_text(bank_mapping, text, options=_options_mapping(options)))
 

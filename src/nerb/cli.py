@@ -1839,16 +1839,24 @@ def diff_json_banks(
 @app.command("extract-text")
 def extract_json_bank_text(
     bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    file_path: Path | None = typer.Option(None, "--file", help="UTF-8 document file path."),
     text: str | None = typer.Option(None, "--text", help="Literal document text to extract from."),
     read_stdin: bool = typer.Option(False, "--stdin", help="Read document text from standard input."),
 ) -> None:
-    """Extract from one in-memory text source using a JSON bank."""
+    """Extract from one text source or explicit document file using a JSON bank."""
     bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
     if invalid_payload is not None:
         _echo_json(invalid_payload)
         return
     if bank is None:
         _exit_error(f"Could not load bank at {bank_path}.")
+
+    if file_path is not None:
+        if read_stdin or text is not None:
+            _exit_error("Provide exactly one text source: --file, --stdin, or --text.")
+        document_path = _ensure_explicit_file(file_path, "Document")
+        _echo_json(_run_json_helper(lambda: _json_extract_file(bank, document_path)))
+        return
 
     document_text = _read_json_bank_text_source(None, read_stdin=read_stdin, text=text)
     _echo_json(_run_json_helper(lambda: _json_extract_text(bank, document_text)))
