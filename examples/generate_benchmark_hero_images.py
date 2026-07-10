@@ -17,10 +17,17 @@ DEFAULT_AUTORESEARCH_RESULTS_JSONL = Path(".nerb/autoresearch/f1-results.jsonl")
 CREATED_AT = "2026-06-09T00:00:00Z"
 SCALE_ENTITY_COUNTS = (1_000, 10_000, 50_000, 100_000)
 SCALE_TARGET_TOKEN_CAP = 2_000
+HISTORICAL_V1_CLAIM_STATUS = "historical_unsupported"
+HISTORICAL_V1_NOTICE = (
+    "This generator uses the retired Enron v1 evaluator and test-F1 objective. Pass --allow-historical-v1 only to "
+    "reproduce visibly historical artifacts; do not use them for current NERB claims."
+)
 
 
 def main() -> None:
     args = _parse_args()
+    if not args.allow_historical_v1:
+        raise SystemExit(HISTORICAL_V1_NOTICE)
     try:
         matplotlib = import_module("matplotlib")
         matplotlib.use("Agg")
@@ -40,6 +47,8 @@ def main() -> None:
     autoresearch = _autoresearch_objective_measurement(args.autoresearch_results_jsonl)
     measurements = {
         "schema_version": "nerb.hero_measurements.v1",
+        "claim_status": HISTORICAL_V1_CLAIM_STATUS,
+        "claim_notice": HISTORICAL_V1_NOTICE,
         "created_at": CREATED_AT,
         "enron": enron,
         "scale": scale,
@@ -56,6 +65,11 @@ def main() -> None:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate benchmark-grounded NERB hero plot assets.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--allow-historical-v1",
+        action="store_true",
+        help="Reproduce retired v1 plots with an explicit historical claim marker.",
+    )
     parser.add_argument(
         "--enron-artifact-dir",
         type=Path,
@@ -349,6 +363,7 @@ def _render_enron_quality_performance(plt: Any, measurement: Mapping[str, Any], 
     ax.set_ylabel("Seconds or MB/s")
     _label_bars(ax, bars, list(metrics.values()), precision=2)
 
+    _historical_watermark(fig)
     fig.tight_layout(rect=(0, 0, 1, 0.9), pad=2.1)
     fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -432,6 +447,7 @@ def _render_autoresearch_objective(plt: Any, measurement: Mapping[str, Any], pat
     ax.set_title("Keep/discard guards")
     ax.tick_params(axis="x", rotation=20)
 
+    _historical_watermark(fig)
     fig.tight_layout(rect=(0, 0, 1, 0.86), pad=2.1)
     fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -458,6 +474,22 @@ def _configure_matplotlib(plt: Any) -> None:
 def _figure_title(fig: Any, title: str, subtitle: str) -> None:
     fig.text(0.03, 0.965, title, fontsize=22, weight="bold", color="#0f172a", va="top")
     fig.text(0.03, 0.925, subtitle, fontsize=10.5, color="#475569", va="top")
+
+
+def _historical_watermark(fig: Any) -> None:
+    fig.text(
+        0.5,
+        0.5,
+        "HISTORICAL V1 · UNSUPPORTED",
+        fontsize=34,
+        weight="bold",
+        color="#b91c1c",
+        alpha=0.3,
+        ha="center",
+        va="center",
+        rotation=28,
+        zorder=100,
+    )
 
 
 def _panel(ax: Any) -> None:

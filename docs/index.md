@@ -24,18 +24,29 @@ nerb extract-text \
 [Quickstart](quickstart.md){ .md-button .md-button--primary }
 [Schema](schemas.md){ .md-button }
 [Performance](performance.md){ .md-button }
+[Enron v2 charter](enron-benchmark.md){ .md-button }
 </p>
 
 </div>
-<figure markdown="span">
-  ![NERB benchmark evidence showing extraction quality and performance for the Enron-backed workflow.](assets/images/enron-quality-performance.png)
-  <figcaption>Real benchmark output from the Enron-backed quality and performance workflow.</figcaption>
-</figure>
+<div markdown="1">
+
+### Compile knowledge once, scan many times
+
+An entity bank is a reviewable cache of approved names, aliases, and structured patterns. NERB deterministically finds
+qualifying cataloged occurrences under the bank's declared matching semantics. Unknown PII remains a coverage problem,
+so privacy evidence must report open-world recall and misses separately from catalog conformance.
+
+[Read the guarantee boundary](enron-benchmark.md#guarantee-boundary)
+
+</div>
 </section>
 
-Text summary for the benchmark image: the Enron held-out test measured 1,000 documents, 17,806 predicted records,
-0.985 precision, 0.536 recall, and 0.724 micro F1. The same benchmark used a 5,500-pattern literal bank and verified a
-warm compile-cache hit with 651.29 target documents per second.
+!!! warning "Enron evidence is being rebuilt"
+
+    The privacy-first Enron benchmark v2 contract is frozen, but its pipeline and real-corpus evidence are staged work.
+    Historical v1 quality, autoresearch, and performance artifacts do not meet the v2 contract and do not support current
+    public claims. See the [v2 charter](enron-benchmark.md) for the guarantee boundary, recall-first metrics, sealed-test
+    policy, and promotion gates.
 
 ## Why Teams Use NERB
 

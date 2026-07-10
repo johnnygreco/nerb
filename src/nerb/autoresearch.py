@@ -9,6 +9,7 @@ import platform
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -25,6 +26,12 @@ DEFAULT_MIN_IMPROVEMENT_RATIO = 0.01
 DEFAULT_MAX_CANONICAL_JSON_BYTES_RATIO = 1.05
 DEFAULT_MAX_EXTRACTABLE_JSON_BYTES_RATIO = 1.05
 PRIMARY_SCORE_FIELD = "quality.test.f1"
+HISTORICAL_V1_CLAIM_STATUS = "historical_non_promotable"
+HISTORICAL_V1_NOTICE = (
+    "The Enron v1 autoresearch evaluator optimized the historical test split and is retired for promotion. "
+    "Benchmark-v2 validation-only optimization is not implemented yet. Pass --allow-historical-v1 only to "
+    "reproduce old diagnostics; git decisions and benchmark promotion remain disabled."
+)
 PROCESS_OUTPUT_TAIL_BYTES = 64 * 1024
 PROCESS_OUTPUT_TAIL_CHARS = 4_000
 PROCESS_OUTPUT_READ_CHUNK_BYTES = 8 * 1024
@@ -79,6 +86,11 @@ class FileFingerprint:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    if not args.allow_historical_v1:
+        raise SystemExit(HISTORICAL_V1_NOTICE)
+    if args.apply_git_decision or args.promote_kept_benchmark:
+        raise SystemExit("Historical Enron v1 diagnostics cannot apply git decisions or promote benchmark artifacts.")
+    print(f"WARNING: {HISTORICAL_V1_NOTICE}", file=sys.stderr)
     result = run_autoresearch(
         baseline_benchmark_json=args.baseline_benchmark_json,
         candidate_benchmark_json=args.candidate_benchmark_json,
@@ -95,6 +107,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         frozen_paths=args.frozen_paths or DEFAULT_FROZEN_PATHS,
         apply_git_decision=args.apply_git_decision,
         promote_kept_benchmark=args.promote_kept_benchmark,
+        allow_historical_v1=args.allow_historical_v1,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
     if result["decision"]["value"] != "keep":
@@ -118,7 +131,12 @@ def run_autoresearch(
     frozen_paths: Sequence[str] = DEFAULT_FROZEN_PATHS,
     apply_git_decision: bool = False,
     promote_kept_benchmark: bool = False,
+    allow_historical_v1: bool = False,
 ) -> dict[str, Any]:
+    if not allow_historical_v1:
+        raise ValueError(HISTORICAL_V1_NOTICE)
+    if apply_git_decision or promote_kept_benchmark:
+        raise ValueError("Historical Enron v1 diagnostics cannot apply git decisions or promote benchmark artifacts.")
     repo = repo_root.expanduser().resolve()
     baseline_path = _resolve_repo_path(repo, baseline_benchmark_json)
     candidate_path = _resolve_repo_path(repo, candidate_benchmark_json)
@@ -267,6 +285,7 @@ def _load_score_and_decide(
             min_improvement_ratio=min_improvement_ratio,
             max_canonical_json_bytes_ratio=max_canonical_json_bytes_ratio,
             max_extractable_json_bytes_ratio=max_extractable_json_bytes_ratio,
+            allow_historical_v1=True,
         )
     except (OSError, TypeError, ValueError) as exc:
         reason = "crash" if process.exit_code not in (None, 0) else "benchmark result could not be scored"
@@ -292,7 +311,10 @@ def score_candidate(
     min_improvement_ratio: float = DEFAULT_MIN_IMPROVEMENT_RATIO,
     max_canonical_json_bytes_ratio: float | None = DEFAULT_MAX_CANONICAL_JSON_BYTES_RATIO,
     max_extractable_json_bytes_ratio: float | None = DEFAULT_MAX_EXTRACTABLE_JSON_BYTES_RATIO,
+    allow_historical_v1: bool = False,
 ) -> tuple[dict[str, Any], dict[str, str]]:
+    if not allow_historical_v1:
+        raise ValueError(HISTORICAL_V1_NOTICE)
     _validate_nonnegative_ratio(min_improvement_ratio, "min_improvement_ratio")
     baseline_score = _required_unit_metric(baseline, ("quality", "test", "f1"))
     candidate_score = _required_unit_metric(candidate, ("quality", "test", "f1"))
@@ -396,6 +418,7 @@ def _result_payload(
 ) -> dict[str, Any]:
     return {
         "schema_version": AUTORESEARCH_RESULT_SCHEMA_VERSION,
+        "claim_status": HISTORICAL_V1_CLAIM_STATUS,
         "created_at": _timestamp(),
         "description": description,
         "result_log": str(results_jsonl),
@@ -1165,6 +1188,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--frozen-path", dest="frozen_paths", action="append", default=[])
     parser.add_argument("--apply-git-decision", action="store_true")
     parser.add_argument("--promote-kept-benchmark", action="store_true")
+    parser.add_argument(
+        "--allow-historical-v1",
+        action="store_true",
+        help="Reproduce retired Enron v1 diagnostics without applying or promoting the result.",
+    )
     parser.add_argument("--candidate-command", nargs=argparse.REMAINDER)
     parsed = parser.parse_args(argv)
     if not parsed.candidate_command:

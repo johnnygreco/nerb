@@ -1,4 +1,6 @@
 {
+  "claim_notice": "Retired Enron v1/test-F1 evidence; historical and unsupported for current NERB claims.",
+  "claim_status": "historical_unsupported",
   "autoresearch": {
     "baseline": {
       "cold_compile_seconds": 0.001047958,
