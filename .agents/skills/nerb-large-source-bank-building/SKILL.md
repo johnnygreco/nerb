@@ -70,10 +70,11 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 7. Iterate with gates.
    - Add or change eval refs when they reveal a real quality gap, then refreeze before optimization claims.
    - Keep a result log with bank hash, artifact hashes, metrics, command lines, and the decision to keep or discard.
-   - For Enron-backed goal work, use `docs/enron-benchmark.md` and `scripts/enron_bank_build_benchmark.py` for the
-     frozen benchmark/gate contract.
-   - When using the autoresearch loop, keep `src/nerb/enron_benchmark.py` frozen and make bank-construction changes in
-     `src/nerb/enron_bank_builder.py` or another explicitly editable experiment surface.
+   - For Enron-backed goal work, use the privacy-first contract in `docs/enron-benchmark.md`. The v2 implementation is
+     staged; `scripts/enron_bank_build_benchmark.py` and `src/nerb/enron_benchmark.py` emit retired v1 evidence and must
+     not support current quality, privacy, performance, or promotion claims.
+   - Do not optimize against an Enron test score. Until the v2 train/validation/sealed-test pipeline exists, stop after
+     contract or synthetic-fixture work. Historical v1 autoresearch requires explicit opt-in and is non-promotable.
 
 8. Leave a handoff another agent can use.
    - Summarize entity classes, split policy, artifact locations, eval coverage, known false positives, and next candidate

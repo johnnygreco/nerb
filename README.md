@@ -260,9 +260,11 @@ The final Rust engine gate covers conformance, dense memory, mode strategy, whee
 synthetic medium bank with 1,000 entities. See [`docs/performance.md`](docs/performance.md) for the current performance
 summary and [`docs/rust-engine-gates.md`](docs/rust-engine-gates.md) for recorded release-gate evidence.
 
-For large-source bank construction, see the Enron-backed benchmark guide in
-[`docs/enron-benchmark.md`](docs/enron-benchmark.md) and the measured optimization harness in
-[`docs/autoresearch.md`](docs/autoresearch.md). Agent workflows can also use the reusable
+For large-source bank construction, see the privacy-first Enron v2 charter in
+[`docs/enron-benchmark.md`](docs/enron-benchmark.md) and its train/validation-only experiment policy in
+[`docs/autoresearch.md`](docs/autoresearch.md). V2 implementation and real-corpus evidence are staged; the existing v1
+benchmark/autoresearch commands, scores, and hero artifacts are historical and do not support current public Enron
+quality or performance claims. Agent workflows can also use the reusable
 [`nerb-large-source-bank-building`](.agents/skills/nerb-large-source-bank-building/SKILL.md) skill for corpus profiling
 and privacy-safe handoff guidance.
 

@@ -1,127 +1,320 @@
-# Enron Entity-Bank Build Benchmark
+# Enron Benchmark v2 Charter
 
-This benchmark prepares a local, ignored Enron email corpus split, mines a baseline JSON bank from the training split,
-and runs NERB's public benchmark and extraction summaries against held-out documents. It is the baseline evaluator for
-large-source entity-bank construction work.
+> **Status: contract frozen; implementation staged.** The v2 preparation pipeline, evaluator, bank, and real-corpus
+> evidence will land in later work. The existing `scripts/enron_bank_build_benchmark.py`, its `nerb.enron_benchmark.v1`
+> output, the v1 autoresearch harness, committed hero measurements, and previously published Enron numbers are historical.
+> They do **not** satisfy this charter and must not support a public quality, privacy, performance, or product claim.
 
-Raw and cleaned Enron text can include personal information. Keep generated artifacts under `.nerb/`, which is ignored
-by git, and do not paste raw records into issues, pull requests, docs, or screenshots.
+NERB's Enron benchmark demonstrates a privacy-first intelligence-cache workflow: a capable agent turns a large private
+organizational source into a reviewed entity bank once; an application compiles that bank once and reuses it for fast,
+deterministic scans. The benchmark must show both sides of that proposition without conflating them:
 
-## Real-Corpus Run
+1. how much sensitive information the construction process learned; and
+2. whether NERB reliably and efficiently recognizes the approved knowledge it was given.
 
-Use the Hugging Face `datasets` package only for the data-prep command. Pin both the package and dataset revision for
-baseline runs:
+Preventing sensitive-data leakage is the primary user outcome. Speed, memory, false alarms, and over-redaction remain
+important constraints, but an aggregate F1 score or a fast scan cannot compensate for unexplained misses.
 
-```shell
-uv run --with datasets==5.0.0 scripts/enron_bank_build_benchmark.py \
-  --dataset corbt/enron-emails \
-  --dataset-split train \
-  --dataset-revision cfc06c758093d90993abce1a43668fb7357258a6 \
-  --output-dir .nerb/enron-benchmark/baseline \
-  --sample-fraction 0.5 \
-  --test-fraction 0.2 \
-  --seed nerb-enron-v1 \
-  --created-at 2026-06-09T00:00:00Z \
-  --benchmark-documents 50 \
-  --quality-documents 1000 \
-  --benchmark-iterations 3
-```
+## User Workflow
 
-The default `--sample-fraction 0.5` uses a deterministic hash sample, so it can stream a large fraction of the dataset
-without loading all raw text into memory. Record `manifest.json`, `benchmark.json`, the dataset id, revision, row counts,
-artifact hashes, and machine metadata in benchmark notes.
+The v2 demonstration models the following production workflow:
 
-## Local Fixture Smoke
+1. A user authorizes a specific source, revision, purpose, taxonomy, and retention policy.
+2. Private preparation profiles and cleans the source, assigns stable document identities, builds duplicate/thread leakage
+   groups, and freezes train, validation, and sealed-test manifests.
+3. An agent uses **train only** to mine candidates. A reviewer promotes well-supported aliases and generic structured-PII
+   patterns; ambiguous candidates stay draft or inactive.
+4. Synthetic conformance cases validate every approved active pattern, including its case, normalization, boundary,
+   overlap, and canonical-identity semantics.
+5. Validation evidence tunes construction rules and explicit privacy/utility thresholds. Validation text may inform the
+   algorithm and thresholds, but its labels or literal surfaces may not be copied into the bank as a shortcut.
+6. The bank, evaluator, thresholds, and performance workloads are frozen and hashed.
+7. The application compiles the bank once, then scans many documents through the direct reusable `Bank` path. One-time
+   profiling, build, curation, and compile costs are reported separately from repeated scan cost.
+8. A release steward runs the sealed final test once. A privacy-safe verifier checks provenance, arithmetic, gates, and
+   claim consistency before aggregate evidence is published.
 
-For development and CI-style validation, pass a small local JSONL file:
+This is an intelligence-cache demonstration, not a claim that Enron represents every organization or that a bank built
+for one organization transfers unchanged to another.
 
-```shell
-uv run python scripts/enron_bank_build_benchmark.py \
-  --input-jsonl tests/data/enron_sample.jsonl \
-  --output-dir .nerb/enron-benchmark/fixture \
-  --sample-fraction 1.0 \
-  --test-fraction 0.35 \
-  --seed fixture-seed \
-  --created-at 2026-06-09T00:00:00Z \
-  --min-address-count 1 \
-  --min-domain-count 1 \
-  --benchmark-documents 5 \
-  --quality-documents 5 \
-  --benchmark-iterations 1
-```
+## Privacy Threat Model
 
-The committed tests build temporary fixture files instead of requiring the real Hugging Face dataset.
+The protected subject is a person or organization represented in authorized plaintext by a sensitive span: for example a
+person name, email address, phone number, account identifier, or another class approved by the benchmark taxonomy. The
+principal failure is residual sensitive text after a workflow relied on NERB to find or redact it. One miss can matter,
+so the headline evidence includes missed spans and documents containing any miss rather than F1 alone.
 
-## Outputs
+In scope are failures caused by:
 
-The output directory contains:
+- an identity or alias absent from the catalog;
+- an approved pattern not matching under its declared normalization and boundary semantics;
+- a match mapped to the wrong canonical identity;
+- cleaning, MIME/HTML handling, Unicode, malformed input, overlap resolution, or document-size behavior;
+- overbroad patterns that create false alarms or remove excessive non-sensitive text; and
+- performance or memory behavior that makes compile-once/scan-many use impractical at realistic bank sizes.
 
-- `train.jsonl` and `test.jsonl`: cleaned local documents with mined address/domain metadata.
-- `bank.json`: baseline JSON bank mined from the training split.
-- `manifest.json`: provenance, sampling settings, prep counts, artifact hashes, bank stats, and environment metadata.
-- `benchmark.json`: manifest plus `benchmark_bank` output and aggregate train/test exact-span NER metrics.
+The primary scan text is the cleaned message content that a user would actually process. The evaluator must never append
+`From`, `To`, `Addresses`, labels, candidate inventories, or other answer-bearing fields to that text. Structured fields
+may provide separately labeled weak-supervision evidence, but not an injected primary test view.
 
-The benchmark JSON intentionally stores aggregate counts and NERB benchmark document summaries, not raw extracted record
-strings. Quality metrics include precision, recall, F1, true positives, false positives, false negatives, gold span
-count, predicted span count, and per-entity metric summaries. `--benchmark-documents` controls the small document sample
-used for timing tiers; `--quality-documents` controls the train/test document sample used for exact-span NER metrics.
+Out of scope unless a later version names and measures them are encrypted content, undecoded attachments, OCR, images,
+audio, meaning that is identifiable only from broad context, deliberate bank theft, and cryptographic anonymity. NERB
+pseudonymization is deterministic replacement, not proof of anonymization. The bank and reversible replacement data are
+themselves sensitive assets.
 
-## Stage Semantics
+## Guarantee Boundary
 
-`benchmark.json` includes `benchmark.stages` and `benchmark.compile` sections. The top-level `canonicalize` and
-`validation` stages are benchmark preflight work. The nested `compile_construction` report comes from the extraction
-compile path and intentionally shows the second schema/canonicalization pass that currently happens before native
-construction. Do not sum those fields together.
+NERB can make a narrow deterministic guarantee:
 
-Python-side stages such as schema validation, canonicalization, extractable-bank filtering, JSON serialization, cache key
-work, runtime validation, and detector-index projection are exclusive timings. Native Rust construction is currently one
-inclusive call that contains Rust source parsing, Rust canonicalization, stable hashing, and matcher compilation; the
-report labels those sub-stages as unavailable until the Rust API exposes finer counters. Warm source-cache hits mark
-native construction as skipped and report only the Python/cache work needed to reuse the compiled bank.
+> Given the same validated bank, engine identity, scan options, and input bytes, an approved active pattern is detected
+> and mapped according to its declared normalization, regex, boundary, priority, and overlap semantics when the input
+> contains a qualifying occurrence.
 
-The report also records canonical/extractable bank byte sizes, entity/name/pattern counts, cache hit/miss metadata,
-benchmark iteration counts, and machine metadata. Later optimization runs should compare against the same prepared
-train/test manifest and benchmark options.
+V2 promotion requires 100% synthetic catalog conformance and zero wrong canonical mappings for those approved cases.
+Natural-text cataloged spans provide a second check that preparation and scanning preserve that behavior.
 
-## Baseline Gates
+The guarantee does not cover an unknown name or free-form identifier merely because it is PII. Detection of unknown PII
+depends on catalog coverage and any separately evaluated generic fallback patterns. Open-world recall must therefore be
+measured and reported; it must never be described as guaranteed 100% recall. A deterministic miss is still a miss.
 
-To compare a candidate run against a stored baseline, pass the baseline `benchmark.json` and any desired thresholds:
+## Taxonomy And Bank Policy
 
-```shell
-uv run python scripts/enron_bank_build_benchmark.py \
-  --input-jsonl tests/data/enron_sample.jsonl \
-  --output-dir .nerb/enron-benchmark/candidate \
-  --sample-fraction 1.0 \
-  --test-fraction 0.35 \
-  --seed fixture-seed \
-  --created-at 2026-06-09T00:00:00Z \
-  --min-address-count 1 \
-  --min-domain-count 1 \
-  --benchmark-documents 5 \
-  --quality-documents 5 \
-  --benchmark-iterations 1 \
-  --baseline-benchmark-json .nerb/enron-benchmark/baseline/benchmark.json \
-  --max-cold-compile-seconds-ratio 1.05 \
-  --max-warm-cached-compile-seconds-ratio 1.10 \
-  --min-target-bytes-per-second-ratio 0.95
-```
+Taxonomy follows the privacy workflow and corpus evidence rather than a universal NER label set. The initial v2 bank is
+expected to consider high-confidence people and contact aliases, organizations and domains, and defensible generic
+structured-PII fallbacks. Additional classes require a written threat rationale and appropriate labels. A class without
+credible quality evidence may remain exploratory but cannot contribute to a promoted headline claim.
 
-The gate first checks an evaluator fingerprint: dataset id/revision, sampling settings, train/test artifact hashes,
-benchmark options, quality-document count, and benchmark tier sizes. If the fingerprint differs, the gate fails before
-interpreting quality or performance ratios. This keeps benchmark/evaluator changes separate from optimizer changes while
-still allowing the candidate bank to change. The quality gate requires held-out F1, precision, and recall to stay at or
-above the stored baseline. When a stored-baseline gate is configured and fails, the command exits nonzero after writing
-and printing `benchmark.json`. Threshold flags require `--baseline-benchmark-json`; threshold-only commands are rejected.
+Every promoted name or pattern must retain inspectable, privacy-safe metadata or a private reference for:
 
-## Autoresearch Loop
+- privacy class and canonical identity;
+- source/provenance hash and construction policy version;
+- observation count and first/last-seen interval;
+- confidence and label strength;
+- ambiguity/collision analysis and curation rationale; and
+- active, draft, or inactive status.
 
-Use `docs/autoresearch.md` and `scripts/nerb_autoresearch.py` when running repeated construction optimization
-experiments. The harness treats this benchmark command as the frozen evaluator, appends JSONL result rows under ignored
-`.nerb/` paths with aggregate scores plus bounded process output tails, and can keep or discard a candidate based on
-score, gate status, timeout/crash behavior, and an explicit editable-file surface. Do not commit unredacted result logs
-from private-corpus runs.
+Stable aliases should normally be literals. Regexes are appropriate for genuinely structured forms, not for hiding an
+unreviewed inventory. A collision that cannot be mapped unambiguously must be resolved by context-independent policy or
+kept inactive. Test observations never become candidates for the same benchmark version.
 
-## Hero Image Direction
+## Evidence Strength
 
-Use [`hero-images.md`](hero-images.md) for benchmark-grounded plot assets. The committed visuals are generated from
-aggregate measurement JSON and intentionally avoid raw email text, personal data, screenshots, and unsupported claims.
+Every quality slice carries exactly one `label_strength`. Counts from different strengths stay separate.
+
+| Label strength | Meaning | Permitted use |
+| --- | --- | --- |
+| `independent` | Human or externally published annotations produced independently of the candidate bank and its output. Annotation scope and known omissions are recorded. | Open-world privacy recall, precision, F1, and final headline quality within the annotated scope. |
+| `structured_weak` | Labels derived from source fields or deterministic rules, such as parsed sender/recipient addresses. They may be accurate but are not independent of source structure or heuristics. | Coverage and class diagnostics, candidate discovery on train, and explicitly weak validation/test slices. Never relabeled as independent recall. |
+| `synthetic_conformance` | Positive, negative, boundary, normalization, overlap, and adversarial cases derived from the frozen active bank contract. | Catalog conformance and canonical-mapping guarantees. Not catalog coverage or open-world recall. |
+| `unlabeled` | Text with no exhaustive gold spans. Absence of a label is not evidence that a prediction is wrong. | Throughput, memory, robustness, and qualitative inspection only; no precision, recall, or F1. |
+
+Independent person-name evidence may use the published
+[CMU Enron Meetings XML archive](https://www.cs.cmu.edu/~einat/EnronMeetings-XML.zip), pinned by SHA-256
+`e7d8dbd9e066eddd6d706a041e379ca93daf9e441a73009646ead41e94a60202`. Its published split and annotation scope must be
+preserved and reported; its labels do not prove quality for email addresses, domains, or other classes. The large email
+source remains [`corbt/enron-emails`](https://huggingface.co/datasets/corbt/enron-emails) at revision
+`cfc06c758093d90993abce1a43668fb7357258a6` unless a future benchmark version deliberately changes it. Source identity
+alone is not sufficient: downloaded content hashes are mandatory.
+
+## Sealed Train, Validation, And Test Policy
+
+V2 uses three immutable roles, created before candidate tuning:
+
+- **Train:** available for profiling, candidate mining, bank construction, and curation.
+- **Validation:** available for error analysis and tuning construction policy, thresholds, and generic fallbacks. It is not
+  a literal alias feed.
+- **Final test:** content, labels, and per-document outputs remain sealed from builders and autoresearch until the bank,
+  evaluator, thresholds, claims, and workload hashes are frozen.
+
+Split assignment is row-order independent and operates on leakage groups rather than individual rows. A group joins exact
+duplicates, normalized near duplicates, reply/forward/thread relatives, and other answer-sharing records identified by
+the frozen preparation policy. No group may cross roles. The manifest records group-policy digest, split seed, artifact
+hashes, row and group counts, cross-split audit results, and explicit temporal/future, seen-identity, unseen-identity,
+head/tail, and challenge cohorts where labels support them.
+
+Builders and autoresearch may read train and validation artifacts only. They may not read the final-test text, labels,
+per-document metrics, failure examples, or a scalar derived from final-test quality. The final test is run once for the
+frozen release candidate; it is never an optimization objective. If it fails, publish the failed result or create a new
+benchmark version with a newly sealed test. Repeatedly tuning against the same final test invalidates promotion.
+
+## Quality Metrics
+
+Metrics are computed per label-strength, entity-class, and cohort slice before any permitted aggregate. Exact-span
+matching is one-to-one and includes the declared entity class. Canonical identity correctness is measured separately.
+Let:
+
+- `G` be eligible gold sensitive spans in a slice;
+- `K` be spans in `G` whose actual occurrence qualifies under an approved active catalog pattern, determined without
+  looking at scan output;
+- `P` be predicted sensitive spans; and
+- `TP`, `FP`, and `FN` use deterministic one-to-one exact-span/class matching;
+- `U_G` be the union of Unicode scalar positions covered by gold-sensitive spans; and
+- `U_P` be the union of Unicode scalar positions covered by predictions that the declared redaction policy would remove.
+
+Empty denominators produce `not_evaluated`, never `0`, `1`, or a passing gate.
+
+### Coverage, Conformance, And Recall
+
+These terms are not interchangeable:
+
+- **Catalog coverage** is `|K| / |G|`. It asks how much labeled future sensitive text was knowable from the active bank,
+  independent of whether the engine found it.
+- **Natural-text cataloged PII recall** is `cataloged_TP / |K|`. Its complement is the count of **missed cataloged
+  sensitive spans**. A cataloged match mapped to the wrong identity is not a correct cataloged true positive.
+- **Catalog conformance** is `correctly_detected_and_mapped_approved_cases / all_approved_positive_cases` on exhaustive
+  synthetic conformance cases. Negative/adversarial cases are reported alongside it. Promotion requires `1.0` recall and
+  zero wrong canonical mappings.
+- **Open-world PII recall** is `TP / (TP + FN)` over all eligible independently labeled PII in scope, whether cataloged,
+  matched by a generic fallback, or unknown. This is the relevant total-leakage measure and is not guaranteed by the
+  catalog.
+
+For example, suppose independent labels contain 100 sensitive spans and 80 qualify as cataloged. Catalog coverage is
+80%. If NERB correctly finds and maps all 80 but has no fallback discoveries, catalog conformance and natural cataloged
+recall can both be 100% while open-world recall is only 80%. If it finds only 79, catalog coverage remains 80%, natural
+cataloged recall is 98.75%, and the run has one cataloged miss. No one of these numbers substitutes for another.
+
+### Privacy And Utility Measures
+
+Every promoted quality slice reports raw integer counts as well as derived values:
+
+| Measure | Definition |
+| --- | --- |
+| Missed sensitive spans | `FN`; shown for all eligible gold and separately for cataloged spans. Lower is better. |
+| Cataloged PII recall | `cataloged_TP / |K|`; accompanied by wrong-mapping count. Higher is better. |
+| Documents with any open-world miss (document leak rate) | Positive documents containing at least one `FN` divided by documents containing at least one eligible gold span. Report count and rate. Lower is better. |
+| Documents with any cataloged miss | Number and rate of catalog-positive documents containing at least one missed or wrongly mapped cataloged span. Denominator: documents containing at least one cataloged gold span. |
+| Leaked sensitive characters | `|U_G − U_P|`; report the count, rate over `|U_G|`, and documents with any uncovered sensitive character. This distinguishes residual text from an exact-span miss covered by a wider safe redaction. |
+| Sensitive-character recall | `|U_G ∩ U_P| / |U_G|`. Higher is better. It supplements rather than replaces exact-span/class recall and canonical-mapping checks. |
+| Open-world PII recall | `TP / (TP + FN)` on independent exhaustive labels. Higher is better. |
+| Catalog coverage | `|K| / |G|`, independent of predictions. Higher is better but is not matcher quality. |
+| Wrong canonical mappings | Correct-span cataloged predictions assigned to the wrong canonical identity. Promotion target: zero. |
+| Negative-document false-alarm rate | Negative documents with at least one prediction divided by exhaustively labeled negative documents. Lower is better. |
+| Precision | `TP / (TP + FP)`. Predictions in partially labeled or unlabeled text cannot be used as false positives. |
+| F1 | Harmonic mean of precision and recall. Secondary summary only; it cannot hide misses. |
+| Over-redacted characters | `|U_P − U_G|`; report the count and divide by all evaluated Unicode scalar positions for the rate. Overlaps count once. |
+
+The evidence also reports total positive/negative documents, gold/predicted spans, total evaluated characters, and the
+numerators and denominators for every rate. Per-class, head/tail, seen/unseen identity, temporal/future, document-size,
+hit-density, and challenge slices are required when applicable. Micro averages never replace these slices.
+
+## Performance And Scale Protocol
+
+The primary runtime measurement is the direct compiled-bank reuse path: construct one validated `Bank`, warm it under a
+declared policy, and call the same bank repeatedly. The following are separately named measurements and must not be
+combined into a single latency number:
+
+- one-time source profiling/build/curation;
+- cold validation and native compile in a fresh process;
+- helper/source-cache miss and helper/source-cache hit;
+- direct warm scan/project time;
+- input decode/read and any redaction/serialization post-processing; and
+- end-to-end application time.
+
+Workloads use frozen bank and document hashes and include realistic 1k, 10k, 25k, and 100k active-alias shapes; negative,
+sparse-hit, normal-hit, and dense-hit documents; small through huge documents; and declared concurrency levels. Relevant
+format-regex and forced-recompile/uncached baselines may show the value of cached canonical intelligence, but their
+different capabilities must be stated.
+
+Each workload records isolated warmups, raw timing samples or a content-addressed reference to them, sample count,
+median/p95/p99 and dispersion, documents/second, MiB/second, match count, bank/source bytes, peak RSS when available, and
+machine/runtime identity. Cold compile requires independent process samples. Tail latency requires enough document-level
+samples to make its percentile meaningful. Public evidence may not rely on one sample, mix quality text with injected
+inventories, or compare different workload/evaluator fingerprints.
+
+Absolute results are hardware-specific. Promotion uses thresholds frozen from validation and a same-machine repeated
+baseline, reports uncertainty/noise diagnostics, and fails closed when required samples or environment provenance are
+missing. CI smoke timing is robustness evidence, not a substitute for the decision-grade protocol.
+
+The value demonstration also records a parameterized break-even model rather than inventing hosted-model prices. Let
+`B` be one-time private source profiling/build/curation cost, `C` cold validation/compile cost, `S(n)` repeated NERB scan
+cost for `n` documents, and `A(n)` the measured or user-supplied cost of an explicitly scoped alternative. Report the
+smallest `n` for which `B + C + S(n) <= A(n)`, with every price, latency, labor, hardware, and reuse-frequency assumption
+visible. This economic model supplements privacy/quality gates; it never discounts a miss.
+
+## V2 Artifact Contract
+
+V2 has two versioned JSON contracts:
+
+- `nerb.enron_manifest.v2` binds evaluator ID/digest; source ID, revision, and content hashes; cleaning/group/split policy
+  hashes; the split-manifest hash; train/validation/test artifact hashes and counts; bank hash; label artifact references
+  and strengths; package, native-engine, commit, and schema identities; exact commands; environment; and privacy-safe
+  validation status.
+- `nerb.enron_evidence.v2` binds one manifest hash to evaluation status, aggregate quality slices, catalog-conformance
+  results, performance workloads and raw sample arrays/references, configured thresholds, promotion-gate results,
+  verifier status, and supportable claims.
+
+Paths and commands are sanitized but remain exact enough to reproduce in an authorized environment. Private artifact
+references use stable logical IDs and hashes, not workstation paths. Hash algorithms and canonicalization rules are part
+of the schema contract. Missing evaluator, source, split, bank, package/engine/commit, command, or environment provenance
+is an error.
+
+Quality is explicitly `evaluated` or `not_evaluated`. Missing slices, zero eligible gold, absent independent labels, and
+empty conformance cases cannot silently become zero-filled success. Non-finite numbers are invalid. A verifier recomputes
+all possible rates from integer counts, checks totals and slice identities, checks manifest/evidence hashes and version
+freshness, validates gate implications, and rejects any claim whose scope or label strength exceeds its evidence. This
+lets a clean clone verify arithmetic and claim consistency without access to private email text.
+
+The schema and synthetic fixtures are part of the v2 contract, but a schema-valid fixture is not real-corpus evidence.
+No v2 command or real artifact is claimed on this page until later implementation issues deliver and verify it.
+
+## Promotion Gates
+
+A result is promotable only when all applicable checks pass:
+
+1. provenance is complete; hashes, evaluator digest, split leakage audit, bank/runtime identities, and command/environment
+   records validate;
+2. quality evidence is present, non-empty, arithmetically consistent, and separated by label strength;
+3. all approved active patterns have non-empty synthetic coverage, 100% catalog conformance recall, zero wrong canonical
+   mappings, and zero unexpected matches on required synthetic negative/adversarial cases;
+4. natural cataloged misses and documents with any cataloged miss are zero in every gate-designated slice;
+5. minimum open-world span and sensitive-character recall, maximum document and sensitive-character leak rates, maximum
+   negative-document false-alarm rate, maximum over-redaction rate, and any per-class floors were frozen from validation
+   before final-test access and pass on the one-shot final evidence;
+6. required performance workloads satisfy predeclared latency, throughput, memory, and regression thresholds with valid
+   raw samples and matching fingerprints;
+7. privacy-safe serialization/scan passes and no raw text, aliases, addresses, per-document failures, or sensitive paths
+   appear in public artifacts; and
+8. an independent reviewer verifies the evidence/claim mapping at the final commit.
+
+A failed final gate is evidence, not permission to tune on the test. Claims must name the corpus revision, benchmark
+version, bank and evaluator hashes, label strength, class/cohort scope, and machine context for performance. “No known
+cataloged miss in this frozen evaluation” is supportable when true; “NERB catches all PII” is not.
+
+## Artifact Retention And Ethics
+
+Enron data contains real communications and personal information. Historical public availability does not imply consent
+to republish, contact, rank, or profile people. The benchmark is for aggregate software evaluation only. Known annotation
+gaps, historical-domain bias, source integrity limitations, access terms, and intended use must be recorded with every
+manifest.
+
+Raw downloads, cleaned text, annotations, split files, real banks, aliases, match records, failure examples, and
+autoresearch logs stay under ignored `.nerb/` paths or an equivalently access-controlled store. Encrypt them at rest where
+practical, grant least-privilege access, and record an owner, purpose, creation time, retention deadline, and deletion
+outcome. A production user's operational bank may have its own approved lifecycle; benchmark copies do not inherit
+indefinite retention.
+
+Git may contain only schemas, synthetic fixtures, source/policy hashes, aggregate evidence, and sanitized examples that
+pass automated privacy checks. Public evidence must omit raw strings, context snippets, addresses, names, local paths,
+and small slices that enable reconstruction. Charts are regenerated solely from the verified aggregate evidence bundle.
+
+## Historical V1 Quarantine
+
+V1 is useful as a record of what needed improvement, not as a baseline claim. Its two-way split fed held-out F1 back into
+autoresearch; evaluated text included injected address inventory; regex/structured derivations were treated as gold;
+catalog coverage was described as recall; public arithmetic drifted from stored counts; and public evidence was tied to
+stale runtime identities.
+
+| Historical validity problem | V2 control |
+| --- | --- |
+| Test score used for optimization | Train/validation-only tuning and one-shot sealed final test |
+| Answer-bearing address inventory in scan text | User-visible cleaned content is the only primary scan view |
+| Regex/structured labels presented as independent gold | Required `label_strength` and non-combinable evidence slices |
+| Catalog coverage called recall | Separate formulas and raw counts for coverage, conformance, cataloged recall, and open-world recall |
+| Two-way row split and duplicate/thread leakage risk | Immutable group-aware three-way split plus cross-split audit |
+| F1-first promotion | Miss counts, document leak rate, open-world recall, and catalog guarantees lead |
+| Stale runtime metadata and arithmetic drift | Versioned identities, integer numerators/denominators, and independent verification |
+| Public artifacts containing aggregate v1 numbers | Explicit historical label; no promotion until verified v2 evidence exists |
+
+Do not rerun the v1 command and relabel its output v2. Do not use its historical benchmark JSON, generated images, or
+autoresearch rows to claim current Enron quality or performance. Later v2 implementation must produce new artifacts under
+the contracts above.

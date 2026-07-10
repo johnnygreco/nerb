@@ -1,171 +1,130 @@
-# NERB Autoresearch Harness
+# Enron V2 Autoresearch Policy
 
-The autoresearch harness turns the Enron construction benchmark into a bounded optimization loop. It follows the
-Karpathy-style pattern: keep data prep and evaluation fixed, let an agent edit a small experiment surface, extract one
-scalar score, append a result row, and keep or discard the candidate based on measured evidence.
+> **Status: policy frozen; v2 runner staged.** The current `scripts/nerb_autoresearch.py` and
+> `nerb.autoresearch_result.v1` rows belong to the historical Enron v1 workflow. Its held-out F1 objective and v1
+> benchmark command do not satisfy the [v2 charter](enron-benchmark.md). Do not run them to produce a v2 result or use
+> their committed examples, plots, keep/discard decisions, or scores as public evidence.
 
-This is an experiment runner, not a merge gate bypass. A kept experiment still needs a focused PR, independent review,
-green CI, and a Review Record before it can merge.
+Autoresearch is useful after a benchmark contract is frozen: an agent makes one bounded construction change, evaluates
+it against unchanged train/validation artifacts, records the result, and keeps or discards it. It is not allowed to turn
+the final test into feedback or optimize a convenient scalar that hides privacy misses.
 
-## Fixed Evaluator
+No runnable v2 command is documented yet. Later implementation work must supply a runner that emits and verifies
+`nerb.enron_manifest.v2` and `nerb.enron_evidence.v2` artifacts before this page can describe an executable workflow.
 
-Use the Enron benchmark from `docs/enron-benchmark.md` as the evaluator. The candidate command should run
-`scripts/enron_bank_build_benchmark.py` with the same data source, split, seed, sample settings, benchmark settings, and
-stored baseline `benchmark.json`.
+## Experiment Boundary
 
-The candidate benchmark command should include baseline gates:
+A v2 experiment starts from a committed checkpoint and one frozen manifest family. It may read:
 
-```shell
-uv run python scripts/enron_bank_build_benchmark.py \
-  --input-jsonl tests/data/enron_sample.jsonl \
-  --output-dir .nerb/enron-benchmark/autoresearch-candidate \
-  --sample-fraction 1.0 \
-  --test-fraction 0.35 \
-  --seed fixture-seed \
-  --created-at 2026-06-09T00:00:00Z \
-  --min-address-count 1 \
-  --min-domain-count 1 \
-  --benchmark-documents 5 \
-  --quality-documents 5 \
-  --benchmark-iterations 1 \
-  --baseline-benchmark-json .nerb/enron-benchmark/autoresearch-baseline/benchmark.json \
-  --max-cold-compile-seconds-ratio 1.05 \
-  --max-warm-cached-compile-seconds-ratio 1.10 \
-  --min-target-bytes-per-second-ratio 0.95
-```
+- train text and train-derived candidate/provenance artifacts;
+- validation text, labels, and aggregate/per-slice validation failures;
+- synthetic catalog-conformance cases;
+- the current-best train/validation bank and evidence; and
+- public source code, synthetic fixtures, and aggregate historical experiment logs.
 
-For real-corpus runs, use the pinned Hugging Face command in `docs/enron-benchmark.md`; keep raw and cleaned artifacts
-under ignored `.nerb/` paths.
+It must not read or derive feedback from:
 
-## Editable Surface
+- sealed final-test text, labels, identities, per-document output, metrics, or failure examples;
+- a scalar or pass/fail bit computed from final-test quality;
+- another split's answer-bearing structured fields appended to scan text; or
+- raw private artifacts from a different authorized source or benchmark run.
 
-By default, the harness allows construction-related source edits in:
+Only construction surfaces are editable during an optimization series. The evaluator, preparation/grouping logic, split
+manifest, label artifacts, metric definitions, evidence verifier, conformance generator, and benchmark workloads stay
+frozen. A deliberate evaluator or split change starts a new baseline/version and cannot be compared as an optimizer win.
+The future runner must fail any candidate that changes a frozen or out-of-surface file.
 
-- `src/nerb/enron_bank_builder.py`
-- `src/nerb/bank.py`
-- `src/nerb/engine.py`
-- `src/nerb/engines.py`
-- `src/nerb/records.py`
-- `rust/Cargo.lock`
-- `rust/Cargo.toml`
-- `rust/src/bank.rs`
-- `rust/src/engine.rs`
-- `rust/src/flags.rs`
-- `rust/src/formats.rs`
-- `rust/src/ids.rs`
-- `rust/src/lib.rs`
-- `rust/src/match_buffer.rs`
+## Privacy-First Selection
 
-It freezes evaluator and large-source guidance files:
+V1 used held-out micro F1 as a primary scalar. V2 uses a lexicographic decision, because one additional sensitive miss
+cannot be traded invisibly for many easy true positives.
 
-- `scripts/enron_bank_build_benchmark.py`
-- `src/nerb/benchmarks.py`
-- `src/nerb/enron_benchmark.py`
-- `tests/nerb/test_enron_benchmark.py`
-- `tests/data/enron_sample.jsonl`
-- `docs/enron-benchmark.md`
-- `.agents/skills/nerb-large-source-bank-building`
+A candidate is considered only after these validity checks pass:
 
-Pass repeated `--editable-path` or `--frozen-path` values when an issue deliberately changes the boundary, including
-other Rust source files. Any custom values replace that default list, so pass the full intended boundary. If an experiment
-touches a frozen file or a file outside the editable surface, the result is logged and discarded.
+1. the command completed within its limit and wrote a fresh evidence artifact;
+2. the evaluator, source, cleaning, split, label, workload, package/engine, and checkpoint fingerprints are complete and
+   match the frozen experiment series;
+3. path/frozen-file checks pass;
+4. quality slices are non-empty where required, arithmetic is valid, and label strengths remain separate;
+5. privacy-safe serialization passes; and
+6. synthetic catalog conformance is 100% with zero wrong canonical mappings.
 
-## Scoring And Decisions
+Valid candidates are compared in this order:
 
-The primary scalar score is `quality.test.f1`; higher is better. The Enron evaluator computes exact-span NER precision,
-recall, and F1 against prepared train/test documents. Compile time, throughput, size, and path checks remain gates and
-context; they are not the reward.
+1. reject any nonzero cataloged misses, documents with a cataloged miss, or wrong canonical mappings;
+2. prefer fewer validation open-world false negatives and leaked sensitive characters, then higher open-world span and
+   sensitive-character recall, at the frozen class/cohort floors;
+3. require negative-document false-alarm and over-redaction ceilings, then prefer lower over-redacted characters;
+4. use precision and F1 as secondary diagnostics/tie-breakers, never as permission to accept more privacy misses;
+5. require bank-size, compile, direct-reuse throughput, tail-latency, and peak-memory gates; then use performance or size
+   improvements as tie-breakers among privacy-equivalent candidates.
 
-A candidate is kept only when all of these are true:
+Every threshold and tie-break rule is frozen before an experiment series. A reported win shows all raw counts and gate
+results, including regressions outside the primary target. If two candidates trade open-world misses across important
+classes or cohorts, keep neither automatically; require review rather than hiding the trade in a micro average.
 
-- the candidate command exits successfully within the timeout
-- no frozen or out-of-surface files changed relative to the resolved `--checkpoint-ref` SHA
-- the candidate benchmark JSON has configured gates and `gate.passed == true`
-- the candidate evaluator fingerprint independently matches the baseline dataset, split artifacts, sampling, and benchmark
-  tier sizes
-- evaluator, held-out quality, and configured performance gates pass
-- canonical and extractable JSON byte sizes stay within configured ratios
-- the primary held-out F1 score improves over the current-best baseline by at least `--min-improvement-ratio`
+## One Bounded Experiment
 
-Crashes, timeouts, evaluator fingerprint mismatches, held-out F1/precision/recall regressions, size ceiling failures,
-and insufficient score improvements against the current best are logged as `discard`.
+The future v2 loop follows this sequence:
 
-## Running One Experiment
+1. resolve and record the checkpoint commit and current-best bank/evidence hashes;
+2. state one construction hypothesis and the complete editable/frozen path boundary;
+3. let the agent make one bounded change without evaluator or split access;
+4. validate the bank, run conformance, quality, utility, and required performance workloads on train/validation only;
+5. independently verify the emitted manifest/evidence and changed paths;
+6. append a privacy-safe result row with the decision and rationale; and
+7. promote the current-best ignored artifact only after a keep decision. Git mutation remains an explicit opt-in on a
+   disposable experiment branch.
 
-First create a current-best benchmark JSON under `.nerb/`. Before the agent edits anything, capture the current
-previous-best commit:
+At least three bounded construction iterations should be recorded before the final candidate is frozen. A discarded or
+crashed attempt remains part of the aggregate experiment history; silent cherry-picking exaggerates confidence.
 
-```shell
-CHECKPOINT=$(git rev-parse HEAD)
-```
+## Required Result Record
 
-Then let the agent make one bounded, uncommitted change on an experiment branch. Score it with:
+The v2 runner's privacy-safe result record must reference, rather than duplicate, the authoritative v2 evidence. It
+includes:
 
-```shell
-uv run python scripts/nerb_autoresearch.py \
-  --baseline-benchmark-json .nerb/enron-benchmark/autoresearch-baseline/benchmark.json \
-  --candidate-benchmark-json .nerb/enron-benchmark/autoresearch-candidate/benchmark.json \
-  --results-jsonl .nerb/autoresearch/results.jsonl \
-  --description "try construction optimization idea" \
-  --checkpoint-ref "$CHECKPOINT" \
-  --timeout-seconds 1800 \
-  --min-improvement-ratio 0.01 \
-  --promote-kept-benchmark \
-  --candidate-command uv run python scripts/enron_bank_build_benchmark.py \
-    --input-jsonl tests/data/enron_sample.jsonl \
-    --output-dir .nerb/enron-benchmark/autoresearch-candidate \
-    --sample-fraction 1.0 \
-    --test-fraction 0.35 \
-    --seed fixture-seed \
-    --created-at 2026-06-09T00:00:00Z \
-    --min-address-count 1 \
-    --min-domain-count 1 \
-    --benchmark-documents 5 \
-    --quality-documents 5 \
-    --benchmark-iterations 1 \
-    --baseline-benchmark-json .nerb/enron-benchmark/autoresearch-baseline/benchmark.json \
-    --max-cold-compile-seconds-ratio 1.05 \
-    --max-warm-cached-compile-seconds-ratio 1.10 \
-    --min-target-bytes-per-second-ratio 0.95
-```
+- hypothesis, created time, checkpoint commit, changed/editable/frozen paths, and path-gate result;
+- exact sanitized process argv, timeout, exit status, elapsed time, and bounded **privacy-scanned** output metadata;
+- baseline and candidate manifest/evidence/bank hashes;
+- label-strength and evaluator/split/workload fingerprints;
+- cataloged and open-world miss counts, document miss counts, leaked/over-redacted characters, character recall, coverage,
+  conformance, wrong mappings, false alarms, and precision/F1 by required validation slice;
+- size, compile, direct-reuse latency/throughput, memory metrics, and raw-sample references;
+- every configured threshold, comparison result, final decision, and human-review requirement; and
+- whether ignored current-best artifacts or git state were changed.
 
-Put `--candidate-command` last; all remaining arguments belong to the evaluator command.
-The executable requires `--candidate-command` so a normal keep/discard decision is tied to a fresh evaluator run.
-Passing `--checkpoint-ref HEAD` is safe only when `HEAD` is still the previous-best commit. If a candidate was already
-committed, pass the prior SHA instead so path gating and discard cleanup compare against the correct baseline.
+Raw email, aliases, match strings, local paths, document IDs, failure context, and unfiltered stdout/stderr do not belong
+in a committed result. Private detailed logs remain under ignored `.nerb/` storage with the retention policy from the v2
+charter.
 
-By default the harness is dry-run safe: it logs the keep/discard decision but does not mutate git state or benchmark
-artifacts. Pass `--promote-kept-benchmark` when the baseline path is an ignored current-best artifact and a kept
-candidate should become the next comparison target. This copies the candidate `benchmark.json` over the baseline
-`benchmark.json` only after scoring succeeds, so the next run must beat the best kept candidate rather than the original
-starting point.
+## Promotion And Final Test
 
-To make non-improving or failed experiments reset to the previous best commit, also pass `--apply-git-decision`. This can
-run `git reset --hard <resolved-checkpoint-sha>` plus `git clean -fd` for the changed experiment paths on discard. The
-checkpoint ref is resolved once before the candidate command runs, so a command that moves `HEAD` cannot change the
-comparison or cleanup target. Use it only on an experiment branch with result logs and benchmark artifacts under ignored
-`.nerb/` paths.
+A kept experiment is only a candidate. It still needs a focused change, independent review, green checks, and a verified
+train/validation evidence bundle. Before final-test access, freeze:
 
-## Result Log
+- bank, evaluator, source/split/label, and workload hashes;
+- all privacy, utility, class/cohort, performance, and size gates;
+- the exact supportable claim templates; and
+- package, engine, commit, command, and environment identities.
 
-Each result is one compact JSON object per line. The schema version is `nerb.autoresearch_result.v1`. Rows include:
+The sealed final test is then evaluated once by the release workflow. Its score cannot be copied back into autoresearch,
+used to select another candidate, or converted into a keep/discard reward. A failed final gate is reported or requires a
+newly versioned benchmark with a new sealed test.
 
-- commit, checkpoint ref, changed paths, editable paths, frozen paths, and path-gate result
-- candidate benchmark output freshness fingerprints when a candidate command is required
-- evaluator baseline/candidate paths, bank hashes, and artifact hashes
-- process command, exit code, timeout flag, elapsed seconds, and stdout/stderr tails
-- independently recomputed evaluator fingerprints, primary score, timing metrics, gate status, and memory/size metadata
-- decision value and reason
-- optional git action and current-best benchmark promotion applied by the harness
+## Historical V1 Quarantine
 
-See `examples/artifacts/autoresearch/results.jsonl` for a redacted fixture-shaped row.
+The v1 harness remains in the repository only as historical implementation until later work replaces or removes it. Its
+default editable/frozen path lists, fixture command, F1 scoring rule, stored `benchmark.json` baseline, result schema,
+and optional git/promotion behavior are not the v2 contract. In particular:
 
-## Using The Bank-Building Skill
+- `quality.test.f1` is not a permitted v2 autoresearch objective;
+- the v1 two-way test is not a v2 validation split;
+- a v1 fingerprint does not prove v2 split or evaluator integrity;
+- the committed `examples/artifacts/autoresearch/results.jsonl` is synthetic historical documentation, not evidence of a
+  v2 experiment; and
+- a v1 `gate.passed == true` does not authorize any current public Enron claim.
 
-The large-source skill at `.agents/skills/nerb-large-source-bank-building/SKILL.md` remains the guide for corpus
-profiling, taxonomy design, candidate mining, curation, privacy, and eval integrity. The autoresearch harness should be
-used after the evaluator is frozen: it measures construction changes and keeps the loop honest, but it should not decide
-which entity classes matter or silently change train/test data.
-
-When a kept experiment is ready, open a normal PR with the result row, exact commands, candidate/baseline benchmark
-hashes, and a short explanation of why the result is not an evaluator artifact.
+Use the large-source bank-building skill at `.agents/skills/nerb-large-source-bank-building/SKILL.md` for corpus
+profiling, taxonomy, candidate curation, private-artifact handling, and handoff. That workflow remains broader than the
+optimizer: user value defines the taxonomy, and measured evidence decides promotion.

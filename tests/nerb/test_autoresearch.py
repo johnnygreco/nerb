@@ -11,7 +11,15 @@ from typing import Any, cast
 import pytest
 
 import nerb.autoresearch as autoresearch
-from nerb.autoresearch import PROCESS_OUTPUT_TAIL_CHARS, append_result_jsonl, run_autoresearch, score_candidate
+from nerb.autoresearch import PROCESS_OUTPUT_TAIL_CHARS, append_result_jsonl
+
+
+def run_autoresearch(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    return autoresearch.run_autoresearch(*args, **kwargs, allow_historical_v1=True)
+
+
+def score_candidate(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, str]]:
+    return autoresearch.score_candidate(*args, **kwargs, allow_historical_v1=True)
 
 
 def _benchmark_payload(
@@ -259,51 +267,6 @@ def test_run_autoresearch_keeps_improvement_in_dry_run_fixture_repo(tmp_path: Pa
     assert _jsonl_rows(results_path)[0]["decision"]["value"] == "keep"
 
 
-def test_run_autoresearch_promotes_kept_benchmark_for_next_experiment(tmp_path: Path) -> None:
-    _init_repo(tmp_path)
-    baseline_path = _write_json(tmp_path / ".nerb/best/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
-    candidate_path = tmp_path / ".nerb/candidate/benchmark.json"
-    _write_json(candidate_path, _benchmark_payload(cold_compile_seconds=8, test_f1=0.9))
-    results_path = tmp_path / ".nerb/autoresearch/results.jsonl"
-
-    first = run_autoresearch(
-        baseline_benchmark_json=baseline_path,
-        candidate_benchmark_json=candidate_path,
-        results_jsonl=results_path,
-        description="first improvement",
-        repo_root=tmp_path,
-        checkpoint_ref="HEAD",
-        editable_paths=("src/nerb/engine.py",),
-        frozen_paths=(),
-        min_improvement_ratio=0.0,
-        promote_kept_benchmark=True,
-    )
-    _write_json(candidate_path, _benchmark_payload(cold_compile_seconds=8, test_f1=0.85))
-    second = run_autoresearch(
-        baseline_benchmark_json=baseline_path,
-        candidate_benchmark_json=candidate_path,
-        results_jsonl=results_path,
-        description="loses to promoted best",
-        repo_root=tmp_path,
-        checkpoint_ref="HEAD",
-        editable_paths=("src/nerb/engine.py",),
-        frozen_paths=(),
-        min_improvement_ratio=0.0,
-        promote_kept_benchmark=True,
-    )
-
-    promoted = json.loads(baseline_path.read_text(encoding="utf-8"))
-    assert first["decision"]["value"] == "keep"
-    assert first["best_benchmark"]["action"] == "promote-candidate-benchmark"
-    assert promoted["quality"]["test"]["f1"] == 0.9
-    assert second["decision"] == {
-        "value": "discard",
-        "reason": "candidate did not improve the primary held-out F1 score enough",
-    }
-    assert second["best_benchmark"]["action"] == "skipped-discard"
-    assert [row["decision"]["value"] for row in _jsonl_rows(results_path)] == ["keep", "discard"]
-
-
 def test_run_autoresearch_discards_when_frozen_file_changes(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     (tmp_path / "src/nerb/enron_benchmark.py").write_text("changed evaluator\n", encoding="utf-8")
@@ -324,7 +287,6 @@ def test_run_autoresearch_discards_when_frozen_file_changes(tmp_path: Path) -> N
         editable_paths=("src/nerb/engine.py",),
         frozen_paths=("src/nerb/enron_benchmark.py",),
         min_improvement_ratio=0.05,
-        apply_git_decision=True,
         candidate_command=[
             sys.executable,
             "-c",
@@ -334,7 +296,7 @@ def test_run_autoresearch_discards_when_frozen_file_changes(tmp_path: Path) -> N
 
     assert result["decision"]["value"] == "discard"
     assert result["process"]["skipped"] is True
-    assert result["git"]["action"] == "blocked"
+    assert result["git"]["action"] == "none"
     assert result["repo"]["path_gate"]["frozen_touched"] == ["src/nerb/enron_benchmark.py"]
     assert not marker_path.exists()
     assert frozen_path.exists()
@@ -550,44 +512,13 @@ def test_run_autoresearch_logs_and_resets_malformed_candidate_json(tmp_path: Pat
         checkpoint_ref="HEAD",
         editable_paths=("src/nerb/engine.py",),
         frozen_paths=(),
-        apply_git_decision=True,
     )
 
     row = _jsonl_rows(results_path)[0]
     assert result["decision"] == {"value": "discard", "reason": "benchmark result could not be scored"}
     assert result["error"]["type"] == "JSONDecodeError"
     assert row["decision"]["reason"] == "benchmark result could not be scored"
-    assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
-
-
-def test_run_autoresearch_apply_git_decision_resets_failed_candidate(tmp_path: Path) -> None:
-    _init_repo(tmp_path)
-    engine_path = tmp_path / "src/nerb/engine.py"
-    scratch_path = tmp_path / "src/nerb/scratch.py"
-    engine_path.write_text("BEST = 3\n", encoding="utf-8")
-    scratch_path.write_text("temporary experiment file\n", encoding="utf-8")
-    baseline_path = _write_json(tmp_path / ".nerb/baseline/benchmark.json", _benchmark_payload(cold_compile_seconds=10))
-    candidate_path = _write_json(
-        tmp_path / ".nerb/candidate/benchmark.json", _benchmark_payload(cold_compile_seconds=9.8, test_f1=0.82)
-    )
-
-    result = run_autoresearch(
-        baseline_benchmark_json=baseline_path,
-        candidate_benchmark_json=candidate_path,
-        results_jsonl=tmp_path / ".nerb/autoresearch/results.jsonl",
-        description="not enough improvement",
-        repo_root=tmp_path,
-        checkpoint_ref="HEAD",
-        editable_paths=("src/nerb/engine.py", "src/nerb/scratch.py"),
-        frozen_paths=(),
-        min_improvement_ratio=0.05,
-        apply_git_decision=True,
-    )
-
-    assert result["decision"]["value"] == "discard"
-    assert result["git"]["action"] == "reset-hard-clean"
-    assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
-    assert not scratch_path.exists()
+    assert engine_path.read_text(encoding="utf-8") == "BEST = 9\n"
 
 
 def test_run_autoresearch_classifies_candidate_command_crash(tmp_path: Path) -> None:
@@ -633,7 +564,6 @@ def test_run_autoresearch_logs_missing_candidate_executable_and_applies_cleanup(
         editable_paths=("src/nerb/engine.py",),
         frozen_paths=(),
         candidate_command=["definitely-not-a-real-nerb-command"],
-        apply_git_decision=True,
     )
 
     row = _jsonl_rows(results_path)[0]
@@ -642,7 +572,7 @@ def test_run_autoresearch_logs_missing_candidate_executable_and_applies_cleanup(
     assert result["process"]["exit_code"] == 127
     assert "definitely-not-a-real-nerb-command" in result["process"]["stderr_tail"]
     assert row["decision"]["reason"] == "crash"
-    assert engine_path.read_text(encoding="utf-8") == "BEST = 1\n"
+    assert engine_path.read_text(encoding="utf-8") == "BEST = 4\n"
 
 
 def test_run_autoresearch_logs_timeout_row(tmp_path: Path) -> None:
@@ -877,6 +807,7 @@ def test_script_runs_candidate_command_and_logs_result(tmp_path: Path) -> None:
             "src/nerb/enron_benchmark.py",
             "--min-improvement-ratio",
             "0.05",
+            "--allow-historical-v1",
             "--candidate-command",
             sys.executable,
             ".nerb/write_candidate.py",
@@ -890,6 +821,9 @@ def test_script_runs_candidate_command_and_logs_result(tmp_path: Path) -> None:
 
     assert completed.returncode == 0, completed.stderr
     output = json.loads(completed.stdout)
+    assert output["claim_status"] == "historical_non_promotable"
     assert output["decision"]["value"] == "keep"
     assert output["score"]["primary"]["ratio"] == 1.125
-    assert _jsonl_rows(tmp_path / ".nerb/autoresearch/results.jsonl")[0]["decision"]["value"] == "keep"
+    durable_row = _jsonl_rows(tmp_path / ".nerb/autoresearch/results.jsonl")[0]
+    assert durable_row["claim_status"] == "historical_non_promotable"
+    assert durable_row["decision"]["value"] == "keep"

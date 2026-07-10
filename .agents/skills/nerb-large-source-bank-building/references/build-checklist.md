@@ -58,7 +58,9 @@ uv run nerb benchmark-bank --bank path/to/bank.json --benchmark-iterations 3
 uv run nerb regress-bank --old-bank baseline.json --new-bank candidate.json --benchmark-iterations 3
 ```
 
-For Enron benchmark work:
+The following command is a **retired v1 fixture diagnostic**, retained only while the v2 pipeline is staged. It injects
+answer-bearing address inventory text, has no validation split, and must not support a current benchmark or promotion
+claim:
 
 ```shell
 uv run python scripts/enron_bank_build_benchmark.py \
@@ -74,7 +76,9 @@ uv run python scripts/enron_bank_build_benchmark.py \
   --benchmark-iterations 1
 ```
 
-Use the real-corpus command in `docs/enron-benchmark.md` when validating against the pinned Hugging Face Enron dataset.
+Do not run a real-corpus v1 command for current goal work. `docs/enron-benchmark.md` now defines a v2 contract whose
+executable preparation, split, and evaluator surfaces land in later implementation issues. Never tune a builder or
+autoresearch loop on final-test quality.
 
 ## Handoff Summary
 
