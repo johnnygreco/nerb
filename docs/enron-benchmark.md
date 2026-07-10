@@ -99,14 +99,27 @@ kept inactive. Test observations never become candidates for the same benchmark 
 
 ## Evidence Strength
 
-Every quality slice carries exactly one `label_strength`. Counts from different strengths stay separate.
+Every quality slice carries exactly one `label_strength` for provenance and separately declares:
+
+- `annotation_scope`: the entity classes, span rules, included document regions, and exclusions the annotator attempted to
+  cover; and
+- `annotation_completeness`: exactly one of `exhaustive_within_scope`, `partial`, or `not_applicable`.
+
+Completeness is always relative to the declared scope; an `independent` label is not automatically exhaustive. Counts
+from different strengths, scopes, or completeness states stay separate.
 
 | Label strength | Meaning | Permitted use |
 | --- | --- | --- |
-| `independent` | Human or externally published annotations produced independently of the candidate bank and its output. Annotation scope and known omissions are recorded. | Open-world privacy recall, precision, F1, and final headline quality within the annotated scope. |
+| `independent` | Human or externally published annotations produced independently of the candidate bank and its output. Annotation scope and known omissions are recorded. | Final open-world quality only when `annotation_completeness` is `exhaustive_within_scope`; otherwise explicitly partial labeled-span diagnostics. |
 | `structured_weak` | Labels derived from source fields or deterministic rules, such as parsed sender/recipient addresses. They may be accurate but are not independent of source structure or heuristics. | Coverage and class diagnostics, candidate discovery on train, and explicitly weak validation/test slices. Never relabeled as independent recall. |
 | `synthetic_conformance` | Positive, negative, boundary, normalization, overlap, and adversarial cases derived from the frozen active bank contract. | Catalog conformance and canonical-mapping guarantees. Not catalog coverage or open-world recall. |
 | `unlabeled` | Text with no exhaustive gold spans. Absence of a label is not evidence that a prediction is wrong. | Throughput, memory, robustness, and qualitative inspection only; no precision, recall, or F1. |
+
+Only an `independent`, `exhaustive_within_scope` slice may support open-world PII recall, precision/F1, negative-document
+false-alarm rate, leaked-sensitive-character measures, or over-redaction measures. A `partial` independent slice may
+report raw labeled-span hits and misses as a partial diagnostic, but those values are not open-world recall and
+predictions outside its labels are not false positives. `structured_weak` and `synthetic_conformance` slices keep their
+limited uses even if their own declared scope is exhaustive. `unlabeled` slices use `not_applicable` completeness.
 
 Independent person-name evidence may use the published
 [CMU Enron Meetings XML archive](https://www.cs.cmu.edu/~einat/EnronMeetings-XML.zip), pinned by SHA-256
@@ -134,8 +147,11 @@ head/tail, and challenge cohorts where labels support them.
 
 Builders and autoresearch may read train and validation artifacts only. They may not read the final-test text, labels,
 per-document metrics, failure examples, or a scalar derived from final-test quality. The final test is run once for the
-frozen release candidate; it is never an optimization objective. If it fails, publish the failed result or create a new
-benchmark version with a newly sealed test. Repeatedly tuning against the same final test invalidates promotion.
+frozen release candidate; it is never an optimization objective. Every access and its privacy-safe aggregate outcome,
+including a failed or aborted run, enters an append-only public benchmark lineage. A failure may be followed by a new
+benchmark version and newly sealed test, but the successor must link the failed version and disclose the changes and
+decisions informed by its outcome; it never replaces or hides that result. Repeatedly tuning against the same final test
+or selectively surfacing only successful benchmark versions invalidates promotion.
 
 ## Quality Metrics
 
@@ -143,13 +159,15 @@ Metrics are computed per label-strength, entity-class, and cohort slice before a
 matching is one-to-one and includes the declared entity class. Canonical identity correctness is measured separately.
 Let:
 
+- `D` be the evaluated document IDs and `Omega = {(d, i) | d in D and i is a Unicode scalar index in d}` be the
+  document-disjoint universe of evaluated character positions;
 - `G` be eligible gold sensitive spans in a slice;
 - `K` be spans in `G` whose actual occurrence qualifies under an approved active catalog pattern, determined without
   looking at scan output;
 - `P` be predicted sensitive spans; and
 - `TP`, `FP`, and `FN` use deterministic one-to-one exact-span/class matching;
-- `U_G` be the union of Unicode scalar positions covered by gold-sensitive spans; and
-- `U_P` be the union of Unicode scalar positions covered by predictions that the declared redaction policy would remove.
+- `U_G` be the subset of `Omega` covered by gold-sensitive spans; and
+- `U_P` be the subset of `Omega` covered by predictions that the declared redaction policy would remove.
 
 Empty denominators produce `not_evaluated`, never `0`, `1`, or a passing gate.
 
@@ -185,13 +203,13 @@ Every promoted quality slice reports raw integer counts as well as derived value
 | Documents with any cataloged miss | Number and rate of catalog-positive documents containing at least one missed or wrongly mapped cataloged span. Denominator: documents containing at least one cataloged gold span. |
 | Leaked sensitive characters | `|U_G − U_P|`; report the count, rate over `|U_G|`, and documents with any uncovered sensitive character. This distinguishes residual text from an exact-span miss covered by a wider safe redaction. |
 | Sensitive-character recall | `|U_G ∩ U_P| / |U_G|`. Higher is better. It supplements rather than replaces exact-span/class recall and canonical-mapping checks. |
-| Open-world PII recall | `TP / (TP + FN)` on independent exhaustive labels. Higher is better. |
+| Open-world PII recall | `TP / (TP + FN)` on `independent`, `exhaustive_within_scope` labels. Higher is better. |
 | Catalog coverage | `|K| / |G|`, independent of predictions. Higher is better but is not matcher quality. |
 | Wrong canonical mappings | Correct-span cataloged predictions assigned to the wrong canonical identity. Promotion target: zero. |
 | Negative-document false-alarm rate | Negative documents with at least one prediction divided by exhaustively labeled negative documents. Lower is better. |
 | Precision | `TP / (TP + FP)`. Predictions in partially labeled or unlabeled text cannot be used as false positives. |
 | F1 | Harmonic mean of precision and recall. Secondary summary only; it cannot hide misses. |
-| Over-redacted characters | `|U_P − U_G|`; report the count and divide by all evaluated Unicode scalar positions for the rate. Overlaps count once. |
+| Over-redacted characters | `|U_P − U_G|`; report the count and divide by `|Omega|` for the rate. Positions are `(document_id, scalar_index)` pairs and overlaps within one document count once. |
 
 The evidence also reports total positive/negative documents, gold/predicted spans, total evaluated characters, and the
 numerators and denominators for every rate. Per-class, head/tail, seen/unseen identity, temporal/future, document-size,

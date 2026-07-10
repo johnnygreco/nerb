@@ -109,8 +109,10 @@ train/validation evidence bundle. Before final-test access, freeze:
 - package, engine, commit, command, and environment identities.
 
 The sealed final test is then evaluated once by the release workflow. Its score cannot be copied back into autoresearch,
-used to select another candidate, or converted into a keep/discard reward. A failed final gate is reported or requires a
-newly versioned benchmark with a new sealed test.
+used to select another candidate, or converted into a keep/discard reward. Every access and privacy-safe aggregate
+outcome remains in the append-only public benchmark lineage. A failed final gate may lead to a newly versioned benchmark
+with a new sealed test only after the failed version remains published and the successor discloses its lineage and any
+changes informed by that outcome.
 
 ## Historical V1 Quarantine
 
