@@ -1,0 +1,402 @@
+{
+  "schema_version": "nerb.enron_evidence.v2",
+  "charter_version": "2",
+  "artifact_kind": "synthetic_fixture",
+  "created_at": "2026-07-10T00:03:00Z",
+  "manifest_sha256": "sha256:7a24fcd5cc8a7a7b85a8f3014fd93829120b69e896903ee70b8a759ef7bc05ca",
+  "evaluator": {
+    "id": "synthetic_privacy_eval",
+    "version": "2.0.0",
+    "source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "label_schema_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "source": {
+    "id": "synthetic/messages",
+    "revision": "fixture-v1",
+    "owner": "fixture-owner",
+    "access": "synthetic-public",
+    "content_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "input_records": 30
+  },
+  "preparation": {
+    "cleaning_policy_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "grouping_policy_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "output_records": 30,
+    "prepared_artifact": {
+      "id": "prepared_records",
+      "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "bytes": 4096
+    }
+  },
+  "splits": {
+    "manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "policy_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "leakage_audit_sha256": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+    "leakage_groups_crossing": 0,
+    "test_sealed": true,
+    "seed": "synthetic-fixture-seed",
+    "roles": {
+      "train": {
+        "records": 20,
+        "groups": 18,
+        "artifact": {
+          "id": "train_records",
+          "sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+          "bytes": 2048
+        }
+      },
+      "validation": {
+        "records": 5,
+        "groups": 5,
+        "artifact": {
+          "id": "validation_records",
+          "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bytes": 512
+        }
+      },
+      "test": {
+        "records": 5,
+        "groups": 5,
+        "artifact": {
+          "id": "test_records",
+          "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 512
+        }
+      }
+    }
+  },
+  "bank": {
+    "id": "synthetic_intelligence_bank",
+    "canonical_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "artifact_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "active_entities": 3,
+    "active_names": 4,
+    "active_patterns": 5,
+    "canonical_json_bytes": 2048,
+    "native_source_bytes": 1024
+  },
+  "software": {
+    "package_version": "0.0.11",
+    "engine_version": "0.0.11",
+    "git_commit": "0000000000000000000000000000000000000000",
+    "git_dirty": false
+  },
+  "commands": [
+    {
+      "id": "fixture_evaluate",
+      "argv": ["nerb-fixture", "--evidence", "aggregate-only"],
+      "cwd": ".",
+      "timeout_seconds": 60.0,
+      "exit_status": 0,
+      "elapsed_seconds": 2.0
+    }
+  ],
+  "environment": {
+    "os": "fixture-os",
+    "architecture": "fixture-arch",
+    "python": "3.10.0",
+    "cpu_count": 4,
+    "cpu_model": "synthetic-cpu",
+    "memory_bytes": 8589934592
+  },
+  "privacy": {
+    "status": "passed",
+    "raw_text_included": false,
+    "direct_identifiers_included": false,
+    "scanner": "synthetic-privacy-scan-v1",
+    "scanner_source_sha256": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
+    "report_sha256": "sha256:1414141414141414141414141414141414141414141414141414141414141414",
+    "violation_count": 0
+  },
+  "quality": {
+    "evaluated": true,
+    "matching_semantics": "one_to_one_exact_span_and_class",
+    "character_position_semantics": "document_id_unicode_scalar_index",
+    "slices": [
+      {
+        "id": "independent_all_test",
+        "label_artifact_id": "independent_person_labels",
+        "label_strength": "independent",
+        "annotation_scope": {
+          "entity_classes": ["person"],
+          "document_regions": ["natural_body"],
+          "span_policy_sha256": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+          "exclusions": ["synthetic excluded headings"]
+        },
+        "annotation_completeness": "exhaustive_within_scope",
+        "entity_class": "person",
+        "cohort": "all",
+        "split_role": "test",
+        "text_view": "natural_body",
+        "promotion_gate": false,
+        "documents": 10,
+        "documents_with_sensitive_gold": 8,
+        "documents_with_any_miss": 1,
+        "documents_with_cataloged_gold": 7,
+        "documents_with_any_cataloged_miss": 0,
+        "documents_with_any_leaked_character": 1,
+        "gold_spans": 20,
+        "predicted_spans": 20,
+        "true_positive": 18,
+        "false_positive": 2,
+        "false_negative": 2,
+        "cataloged_gold_spans": 16,
+        "cataloged_true_positive": 16,
+        "cataloged_false_negative": 0,
+        "cataloged_wrong_canonical": 0,
+        "sensitive_gold_characters": 100,
+        "covered_sensitive_characters": 92,
+        "leaked_sensitive_characters": 8,
+        "predicted_characters": 105,
+        "over_redacted_characters": 13,
+        "evaluated_characters": 1000,
+        "negative_documents": 2,
+        "negative_documents_with_predictions": 1,
+        "metrics": {
+          "precision": 0.9,
+          "open_world_recall": 0.9,
+          "f1": 0.9,
+          "catalog_coverage": 0.8,
+          "cataloged_recall": 1.0,
+          "document_leak_rate": 0.125,
+          "cataloged_document_leak_rate": 0.0,
+          "sensitive_character_recall": 0.92,
+          "sensitive_character_leak_rate": 0.08,
+          "negative_document_false_alarm_rate": 0.5,
+          "over_redaction_rate": 0.013
+        }
+      }
+    ]
+  },
+  "catalog_conformance": {
+    "evaluated": true,
+    "label_artifact_id": "synthetic_conformance_labels",
+    "active_patterns": 5,
+    "patterns_with_positive_cases": 5,
+    "approved_positive_cases": 10,
+    "correctly_mapped": 10,
+    "missed": 0,
+    "wrong_canonical": 0,
+    "negative_cases": 10,
+    "unexpected_negative_matches": 0,
+    "positive_cases_artifact": {
+      "id": "synthetic_conformance_positive_cases",
+      "sha256": "sha256:1515151515151515151515151515151515151515151515151515151515151515",
+      "bytes": 1024
+    },
+    "negative_cases_artifact": {
+      "id": "synthetic_conformance_negative_cases",
+      "sha256": "sha256:1616161616161616161616161616161616161616161616161616161616161616",
+      "bytes": 1024
+    },
+    "recall": 1.0,
+    "passed": true
+  },
+  "test_access": {
+    "benchmark_version": "fixture-v2",
+    "optimization_roles": ["train", "validation"],
+    "current_version_access_count": 1,
+    "current_version_accessed_at": "2026-07-10T00:02:00Z",
+    "frozen_target": {
+      "frozen_at": "2026-07-10T00:01:00Z",
+      "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
+      "performance_manifest_sha256": "sha256:624cffe03e72ce01728d2e169554a7b3d9113e2fc596d216b16f4f83bd5ff0d8",
+      "git_commit": "0000000000000000000000000000000000000000"
+    },
+    "lineage": [
+      {
+        "sequence": 1,
+        "benchmark_version": "fixture-v2",
+        "accessed_at": "2026-07-10T00:02:00Z",
+        "outcome": "passed",
+        "aggregate_artifact": {
+          "id": "synthetic_final_test_aggregate",
+          "sha256": "sha256:1717171717171717171717171717171717171717171717171717171717171717",
+          "bytes": 512
+        },
+        "frozen_target": {
+          "frozen_at": "2026-07-10T00:01:00Z",
+          "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+          "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+          "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+          "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
+          "performance_manifest_sha256": "sha256:624cffe03e72ce01728d2e169554a7b3d9113e2fc596d216b16f4f83bd5ff0d8",
+          "git_commit": "0000000000000000000000000000000000000000"
+        },
+        "predecessor_benchmark_version": null,
+        "changes_informed_by_predecessor": [],
+        "previous_entry_sha256": null,
+        "entry_sha256": "sha256:0a3424572fe3e66fbb03e18fc60bea11217ed4b1af2ad7b34d9c083c3ed59601"
+      }
+    ],
+    "lineage_head_sha256": "sha256:0a3424572fe3e66fbb03e18fc60bea11217ed4b1af2ad7b34d9c083c3ed59601"
+  },
+  "performance": {
+    "evaluated": true,
+    "banks": [
+      {
+        "id": "evaluated_fixture_bank",
+        "kind": "evaluated_bank",
+        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "active_entities": 3,
+        "active_names": 4,
+        "active_patterns": 5,
+        "canonical_json_bytes": 2048,
+        "native_source_bytes": 1024
+      }
+    ],
+    "workloads": [
+      {
+        "id": "direct_bank_fixture",
+        "phase": "direct_bank_scan",
+        "promotion_gate": false,
+        "workload_sha256": "sha256:418de9d6c3680f1da2a4ec7b70b29afd3517dcc65fef3a529577a2eb05e0c088",
+        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "warmups": 2,
+        "documents": 100,
+        "bytes": 1048576,
+        "matches": 50,
+        "concurrency": 1,
+        "hit_density": "normal",
+        "process_model": "reused_process",
+        "median_method": "standard_even_average",
+        "percentile_method": "nearest_rank",
+        "samples_seconds": [0.01, 0.011, 0.012, 0.013, 0.014],
+        "samples_ref": null,
+        "stats": {
+          "sample_count": 5,
+          "median_seconds": 0.012,
+          "p95_seconds": null,
+          "p99_seconds": null,
+          "mad_seconds": 0.001,
+          "documents_per_second": 8333.333333333334,
+          "mib_per_second": 83.33333333333333
+        },
+        "peak_rss_bytes": 1048576
+      }
+    ]
+  },
+  "performance_manifest_sha256": "sha256:624cffe03e72ce01728d2e169554a7b3d9113e2fc596d216b16f4f83bd5ff0d8",
+  "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
+  "promotion": {
+    "passed": false,
+    "checks": [
+      {
+        "id": "catalog_conformance",
+        "category": "catalog_conformance",
+        "target": "/catalog_conformance/passed",
+        "operator": "eq",
+        "threshold": true,
+        "actual": true,
+        "passed": true
+      },
+      {
+        "id": "privacy_scan",
+        "category": "privacy",
+        "target": "/privacy/status",
+        "operator": "eq",
+        "threshold": "passed",
+        "actual": "passed",
+        "passed": true
+      },
+      {
+        "id": "clean_git",
+        "category": "provenance",
+        "target": "/software/git_dirty",
+        "operator": "eq",
+        "threshold": false,
+        "actual": false,
+        "passed": true
+      },
+      {
+        "id": "open_world_recall",
+        "category": "quality",
+        "target": "/quality/slices/0/metrics/open_world_recall",
+        "operator": "gte",
+        "threshold": 0.85,
+        "actual": 0.9,
+        "passed": true
+      },
+      {
+        "id": "direct_scan_median",
+        "category": "performance",
+        "target": "/performance/workloads/0/stats/median_seconds",
+        "operator": "lte",
+        "threshold": 0.02,
+        "actual": 0.012,
+        "passed": true
+      }
+    ],
+    "claims": [
+      {
+        "id": "catalog_conformance_recall",
+        "kind": "catalog_conformance",
+        "metric": "catalog_conformance_recall",
+        "value": 1.0,
+        "label_strength": "synthetic_conformance",
+        "annotation_completeness": "exhaustive_within_scope",
+        "quality_slice_id": null,
+        "performance_workload_id": null,
+        "scope": {
+          "entity_class": null,
+          "cohort": null,
+          "split_role": null,
+          "text_view": null
+        },
+        "source_revision": "fixture-v1",
+        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "environment_sha256": "sha256:1595cc289705b86895da4f5653f98d3f428fab6935cfcd4c07c8958360e6dd10"
+      },
+      {
+        "id": "open_world_recall",
+        "kind": "open_world_quality",
+        "metric": "open_world_recall",
+        "value": 0.9,
+        "label_strength": "independent",
+        "annotation_completeness": "exhaustive_within_scope",
+        "quality_slice_id": "independent_all_test",
+        "performance_workload_id": null,
+        "scope": {
+          "entity_class": "person",
+          "cohort": "all",
+          "split_role": "test",
+          "text_view": "natural_body"
+        },
+        "source_revision": "fixture-v1",
+        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "environment_sha256": "sha256:1595cc289705b86895da4f5653f98d3f428fab6935cfcd4c07c8958360e6dd10"
+      },
+      {
+        "id": "direct_scan_median",
+        "kind": "performance",
+        "metric": "direct_bank_scan_median_seconds",
+        "value": 0.012,
+        "label_strength": "unlabeled",
+        "annotation_completeness": "not_applicable",
+        "quality_slice_id": null,
+        "performance_workload_id": "direct_bank_fixture",
+        "scope": {
+          "entity_class": null,
+          "cohort": null,
+          "split_role": null,
+          "text_view": null
+        },
+        "source_revision": "fixture-v1",
+        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "environment_sha256": "sha256:1595cc289705b86895da4f5653f98d3f428fab6935cfcd4c07c8958360e6dd10"
+      }
+    ]
+  },
+  "verifier": {
+    "id": "nerb-enron-contract",
+    "version": "2.0.0",
+    "source_sha256": "sha256:abababababababababababababababababababababababababababababababab",
+    "passed": false
+  }
+}
