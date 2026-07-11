@@ -62,6 +62,12 @@ from .enron_annotations import (
     ingest_cmu_enron_annotations,
     verify_cmu_enron_annotations,
 )
+from .enron_bank_builder import BANK_BUILD_TIMESTAMP, EnronBankBuildError
+from .enron_bank_workflow import (
+    EnronBankBuildOptions,
+    build_enron_intelligence_bank,
+    verify_enron_bank_build,
+)
 from .enron_conformance import EnronConformanceError, evaluate_enron_conformance_files
 from .enron_preparation import (
     DEFAULT_DATASET_ID as DEFAULT_ENRON_DATASET_ID,
@@ -2620,6 +2626,62 @@ def verify_enron_annotations(
     try:
         payload = verify_cmu_enron_annotations(run_dir)
     except EnronAnnotationError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("build-enron-bank")
+def build_enron_bank(
+    development_run: Path = typer.Option(
+        ...,
+        "--development-run",
+        help="Committed private train/validation development bundle; no sealed-test path is accepted.",
+    ),
+    output_dir: Path = typer.Option(..., "--output-dir", help="New ignored private bank-build run directory."),
+    annotation_run: Path | None = typer.Option(
+        None,
+        "--annotation-run",
+        help="Optional verified private CMU bundle for auxiliary training-only person diagnostics.",
+    ),
+    benchmark_version: str = typer.Option("enron-v2", "--benchmark-version"),
+    created_at: str = typer.Option(BANK_BUILD_TIMESTAMP, "--created-at"),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit private output outside ignored repository paths.",
+    ),
+) -> None:
+    """Mine train-only candidates, run three validation iterations, and commit a private bank."""
+
+    options = EnronBankBuildOptions(
+        development_run=development_run,
+        output_dir=output_dir,
+        annotation_run=annotation_run,
+        benchmark_version=benchmark_version,
+        created_at=created_at,
+        allow_unignored_output=allow_unignored_output,
+    )
+    try:
+        payload = build_enron_intelligence_bank(options)
+    except EnronBankBuildError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("verify-enron-bank-build")
+def verify_enron_bank_build_command(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Committed private bank-build run directory."),
+    annotation_run: Path | None = typer.Option(
+        None,
+        "--annotation-run",
+        help="Optional verified CMU bundle for deep auxiliary evidence re-evaluation.",
+    ),
+) -> None:
+    """Deep-verify bank artifacts, all iterations, quality, conformance, and privacy-safe aggregates."""
+
+    try:
+        payload = verify_enron_bank_build(run_dir, annotation_run=annotation_run)
+    except EnronBankBuildError as exc:
         _exit_error(str(exc))
     _echo_json(payload)
 

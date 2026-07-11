@@ -1932,6 +1932,27 @@ class EnronDevelopmentSplit:
         descriptor = self.manifest["development_roles"]["validation"]["artifact"]
         return _iter_role_records(self._root / "validation.jsonl", int(descriptor["records"]))
 
+    def _iter_memberships(self) -> Iterator[dict[str, Any]]:
+        descriptor = self.manifest["artifacts"]["memberships"]
+        expected_by_role = {
+            role: int(self.manifest["development_roles"][role]["records"]) for role in ("train", "validation")
+        }
+        return _iter_development_memberships(
+            self._root / "memberships.jsonl",
+            expected_records=int(descriptor["records"]),
+            expected_by_role=expected_by_role,
+        )
+
+    def iter_train_memberships(self) -> Iterator[dict[str, Any]]:
+        """Iterate verified train memberships in train-record order."""
+
+        return (row for row in self._iter_memberships() if row["role"] == "train")
+
+    def iter_validation_memberships(self) -> Iterator[dict[str, Any]]:
+        """Iterate verified validation memberships in validation-record order."""
+
+        return (row for row in self._iter_memberships() if row["role"] == "validation")
+
 
 def load_enron_development_split(path: Path) -> EnronDevelopmentSplit:
     """Load a redacted development run without exposing any test selector."""
@@ -2037,6 +2058,32 @@ def _iter_canonical_objects(path: Path, expected_records: int, schema_version: s
         yield dict(row)
     if count != expected_records:
         raise EnronSplitError(f"{path.name} record count is invalid.")
+
+
+def _iter_development_memberships(
+    path: Path,
+    *,
+    expected_records: int,
+    expected_by_role: Mapping[str, int],
+) -> Iterator[dict[str, Any]]:
+    if set(expected_by_role) != {"train", "validation"} or expected_records != sum(expected_by_role.values()):
+        raise EnronSplitError("Development membership descriptor count is invalid.")
+
+    observed_by_role = {"train": 0, "validation": 0}
+    for row in _iter_canonical_objects(path, expected_records, SPLIT_MEMBERSHIP_SCHEMA_VERSION):
+        document_id = row.get("document_id")
+        role = row.get("role")
+        if (
+            not isinstance(document_id, str)
+            or not _DOCUMENT_ID_RE.fullmatch(document_id)
+            or role not in observed_by_role
+        ):
+            raise EnronSplitError("Development membership schema or role is invalid.")
+        observed_by_role[role] += 1
+        yield row
+
+    if observed_by_role != expected_by_role:
+        raise EnronSplitError("Development membership role counts are invalid.")
 
 
 def _verify_private_membership_artifacts(

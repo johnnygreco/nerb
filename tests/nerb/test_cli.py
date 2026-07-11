@@ -197,6 +197,8 @@ def test_help_shows_command_structure():
         "download-enron-annotations",
         "prepare-enron-annotations",
         "verify-enron-annotations",
+        "build-enron-bank",
+        "verify-enron-bank-build",
         "eval-enron-quality",
         "eval-enron-cmu-train",
         "eval-enron-conformance",
@@ -760,6 +762,85 @@ def test_enron_annotation_commands_route_fixture_gates_and_verification(monkeypa
     assert verify_result.exit_code == 0, verify_result.output
     assert json.loads(verify_result.output) == {"promotable": False, "verified": True}
     assert captured["verify"] == output_dir
+
+
+def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_build(options):
+        captured["build"] = options
+        return {"schema_version": "nerb.enron_bank_card.v2", "promotable": False}
+
+    def fake_verify(run_dir, **kwargs):
+        captured["verify"] = (run_dir, kwargs)
+        return {"schema_version": "nerb.enron_bank_build_verification.v2", "valid": True}
+
+    monkeypatch.setattr(cli_module, "build_enron_intelligence_bank", fake_build)
+    monkeypatch.setattr(cli_module, "verify_enron_bank_build", fake_verify)
+    development = tmp_path / "development"
+    output = tmp_path / "build"
+    annotations = tmp_path / "annotations"
+    build_result = runner.invoke(
+        app,
+        [
+            "build-enron-bank",
+            "--development-run",
+            str(development),
+            "--output-dir",
+            str(output),
+            "--annotation-run",
+            str(annotations),
+            "--benchmark-version",
+            "enron-v2-fixture",
+            "--created-at",
+            "2026-07-10T00:00:00Z",
+            "--allow-unignored-output",
+        ],
+    )
+
+    assert build_result.exit_code == 0, build_result.output
+    assert json.loads(build_result.output)["promotable"] is False
+    options = captured["build"]
+    assert options.development_run == development
+    assert options.output_dir == output
+    assert options.annotation_run == annotations
+    assert options.benchmark_version == "enron-v2-fixture"
+    assert options.allow_unignored_output is True
+
+    verify_result = runner.invoke(
+        app,
+        [
+            "verify-enron-bank-build",
+            "--run-dir",
+            str(output),
+            "--annotation-run",
+            str(annotations),
+        ],
+    )
+    assert verify_result.exit_code == 0, verify_result.output
+    assert json.loads(verify_result.output)["valid"] is True
+    assert captured["verify"] == (output, {"annotation_run": annotations})
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_enron_intelligence_bank",
+        lambda _options: (_ for _ in ()).throw(cli_module.EnronBankBuildError("private build failed")),
+    )
+    failed = runner.invoke(
+        app,
+        ["build-enron-bank", "--development-run", str(development), "--output-dir", str(output)],
+    )
+    assert failed.exit_code == 1
+    assert "private build failed" in failed.output
+
+
+def test_enron_bank_build_cli_has_no_sealed_or_role_selector() -> None:
+    help_result = runner.invoke(app, ["build-enron-bank", "--help"])
+
+    assert help_result.exit_code == 0
+    assert "--development-run" in help_result.output
+    assert "--sealed" not in help_result.output
+    assert "--role" not in help_result.output
 
 
 def test_enron_quality_commands_route_private_inputs_and_fail_closed(monkeypatch, tmp_path):

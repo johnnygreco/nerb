@@ -70,11 +70,25 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 7. Iterate with gates.
    - Add or change eval refs when they reveal a real quality gap, then refreeze before optimization claims.
    - Keep a result log with bank hash, artifact hashes, metrics, command lines, and the decision to keep or discard.
-   - For Enron-backed goal work, use the privacy-first contract in `docs/enron-benchmark.md`. The v2 implementation is
-     staged; `scripts/enron_bank_build_benchmark.py` and `src/nerb/enron_benchmark.py` emit retired v1 evidence and must
-     not support current quality, privacy, performance, or promotion claims.
-   - Do not optimize against an Enron test score. Until the v2 train/validation/sealed-test pipeline exists, stop after
-     contract or synthetic-fixture work. Historical v1 autoresearch requires explicit opt-in and is non-promotable.
+   - For Enron-backed work, follow `docs/enron-bank-building.md`: build from a committed development bundle, then deep
+     verify the output. Keep the complete run private.
+
+     ```shell
+     uv run nerb build-enron-bank \
+       --development-run .nerb/enron-splits/enron-v2-development \
+       --output-dir .nerb/enron-bank-builds/enron-v2 \
+       --benchmark-version enron-v2
+     uv run nerb verify-enron-bank-build \
+       --run-dir .nerb/enron-bank-builds/enron-v2
+     ```
+   - Treat the builder's structured-header validation as `structured_weak` labeled-span evidence. It is not open-world
+     recall; unsupported precision, false-alarm, and over-redaction metrics stay `null`. Perfect synthetic conformance
+     proves active-catalog behavior, not catalog completeness.
+   - Do not optimize against an Enron final-test score. Stop after train mining, validation-only policy selection,
+     optional auxiliary-train diagnostics, and catalog conformance. Only a release steward may use the one-shot sealed
+     final-test path after the bank, evaluator, thresholds, claims, and workloads are frozen.
+   - `scripts/enron_bank_build_benchmark.py` and historical v1 autoresearch remain quarantined and must not support a
+     current quality, privacy, performance, or promotion claim.
 
 8. Leave a handoff another agent can use.
    - Summarize entity classes, split policy, artifact locations, eval coverage, known false positives, and next candidate
@@ -88,7 +102,7 @@ Strict:
 - provenance, source revisions, split seeds, artifact hashes
 - privacy boundaries and ignored output locations
 - validation before extraction or benchmarking
-- held-out precision/recall/F1 checks before performance claims
+- evidence-strength-appropriate quality checks before quality claims; never infer precision from incomplete labels
 - regression evidence before merging bank or construction changes
 
 Flexible:

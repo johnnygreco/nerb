@@ -3,7 +3,8 @@
 This document describes the public JSON-compatible contracts for NERB banks, extraction records, replacement databases,
 anonymization responses, eval refs, YAML detector configs, and shared diagnostic objects. The runtime source of truth is
 the code in `src/nerb/schema.py`, `src/nerb/extraction.py`, `src/nerb/replacements_schema.py`,
-`src/nerb/deanonymization.py`, `src/nerb/reports.py`, and `src/nerb/evals.py`.
+`src/nerb/deanonymization.py`, `src/nerb/reports.py`, and `src/nerb/evals.py`. The purpose-specific Enron v2 bank-build
+contracts are implemented in `src/nerb/enron_bank_builder.py` and `src/nerb/enron_bank_workflow.py`.
 
 ## Shared Rules
 
@@ -447,6 +448,24 @@ Diagnostics are JSON objects with stable core fields:
 | `suggested_fix` | string | no | Optional fix guidance. |
 | `suggested_patch` | array | no | Optional RFC 6902 JSON Patch operations. |
 | `metadata` | object | no | Optional JSON-compatible metadata. |
+
+## Enron v2 bank-build artifacts
+
+The [Enron bank construction workflow](enron-bank-building.md) emits a strict, manifest-bound private run. These
+workflow contracts are separate from the general `nerb.bank.v1` schema:
+
+| Schema | Role | Publication boundary |
+| --- | --- | --- |
+| `nerb.enron_bank_build_manifest.v2` | Source, policy, artifact, and selected-bank commitments for the complete run. | Private; it describes sensitive artifact names and bindings. |
+| `nerb.enron_bank_candidate.v2` | One active, draft, or rejected candidate with evidence and bank references. | Private; candidate surfaces and provenance may be identifying. |
+| `nerb.enron_candidate_funnel.v2` | Conserved aggregate counts by decision, class, and reason. | Embedded in the scanned bank card; the standalone run file remains private. |
+| `nerb.enron_bank_build_iteration.v2` | Parent-linked policy, quality commitments, decision, and reason for one iteration. | Aggregate rows appear in the scanned bank card; private validation bindings remain private. |
+| `nerb.enron_bank_card.v2` | Aggregate source commitments, bank statistics, funnel, iterations, limited validation summaries, conformance, and privacy report. | Designed for possible public handoff only after deep verification and independent publication review; always non-promotable at the development stage. |
+| `nerb.enron_bank_build_verification.v2` | Aggregate result of replaying the private manifest, bank, iterations, conformance, and optional auxiliary evidence. | Contains no document text or direct identifier, but does not by itself authorize publication or promotion. |
+
+The bank card's structured-weak `labeled_span_recall` is not open-world recall. Unsupported open-world recall,
+precision, false-alarm, and over-redaction fields remain `null`. See the construction guide for the complete
+private-versus-public artifact policy.
 
 ## YAML Detector Config
 

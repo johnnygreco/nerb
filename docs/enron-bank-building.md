@@ -1,0 +1,217 @@
+---
+icon: lucide/database-zap
+description: "Train-only Enron v2 entity-bank construction, validation iterations, private artifacts, and verification."
+---
+
+# Enron v2 Bank Construction
+
+The v2 bank builder turns one committed [development split](enron-splits.md) into a deterministic private entity bank.
+It mines candidates from **train only**, evaluates three frozen construction policies on validation, selects the bounded
+email-recall policy, and generates catalog-conformance evidence for every active pattern. It never accepts a sealed-test
+path or role.
+
+The resulting bank build is development evidence, not a promoted benchmark result. The public bank card is marked
+`promotable: false` because the sealed final test remains unopened and the main validation corpus does not have
+independent exhaustive labels for open-world PII or utility metrics.
+
+## Build and verify
+
+Start with a committed private development bundle produced by `split-enron`. Keep the output under an ignored private
+path, and choose a new output directory: the transactional writer does not replace an existing run.
+
+```shell
+uv run nerb build-enron-bank \
+  --development-run .nerb/enron-splits/enron-v2-development \
+  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --benchmark-version enron-v2
+```
+
+An optional verified [CMU annotation bundle](enron-evaluation.md#private-ingestion) adds an independent,
+training-only person-name diagnostic. It remains auxiliary and non-promotable.
+
+```shell
+uv run nerb build-enron-bank \
+  --development-run .nerb/enron-splits/enron-v2-development \
+  --annotation-run .nerb/enron-annotations/cmu-v2 \
+  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --benchmark-version enron-v2
+```
+
+Deep verification rehashes the complete private inventory, validates and compiles the selected bank, replays all three
+validation runs, replays catalog conformance, checks candidate-funnel conservation, and rescans the public card for
+direct identifiers and private paths. Supply the same annotation run to re-evaluate optional CMU evidence rather than
+only checking its stored commitment.
+
+```shell
+uv run nerb verify-enron-bank-build \
+  --run-dir .nerb/enron-bank-builds/enron-v2 \
+  --annotation-run .nerb/enron-annotations/cmu-v2
+```
+
+Omit `--annotation-run` from both commands when no auxiliary bundle is available. The build command also supports a
+fixed `--created-at` value for reproducible metadata. `--allow-unignored-output` is an explicit escape hatch for a
+private destination outside an ignored Git path; it does not make that destination or its contents public-safe.
+
+## Train-only candidate policy
+
+The builder streams verified train records and their aligned leakage-group memberships into a private SQLite spool.
+Distinct leakage groups, not duplicate messages, are the support unit. Candidate evidence records observation and
+document counts, first and last observed dates, source type, collision decisions, private provenance commitments, and
+the curation reason.
+
+The initial taxonomy is deliberately narrow:
+
+| Class | Train evidence and selected-bank treatment |
+| --- | --- |
+| Contact | Valid structured-header addresses recur in at least two distinct train leakage groups before activation. The selected policy also activates one bounded, low-precedence unknown-email fallback. |
+| Person | Full names come from structured display names or a sender-local-part name that is also observed near the end of that sender's current body. An alias needs support from at least two train leakage groups, one unambiguous recurring contact-address anchor, and a locally compatible full-name anchor; compatible recurring nickname aliases may join that identity. The contact literal may remain draft only because of the compile-safe active cap. First-name-only aliases are prohibited. |
+| Organization domain | Observed domains are retained as draft because the current literal boundary model cannot express the intended exact domain span without unsafe expansion. |
+| Phone number | The bounded US phone fallback is an experiment only. It remains draft in the selected bank because independent negative and over-redaction evidence is unavailable. |
+
+Validation records never enter the candidate spool. Their labels or literal surfaces are not copied into the bank.
+Changing the development bundle, construction policy, source code, or benchmark version changes the corresponding
+commitments.
+
+## Candidate lifecycle
+
+Every selected-iteration candidate has one explicit decision:
+
+- **Active:** supported under the frozen policy and eligible for ordinary extraction in the selected bank.
+- **Draft:** preserved for review and future evidence, but inactive during ordinary scans.
+- **Rejected:** retained only in the private candidate ledger with a bounded reason code; it is not serialized as a bank
+  pattern.
+
+The aggregate candidate funnel conserves the ledger across active, draft, and rejected totals and breaks decisions down
+by candidate type and primary reason. A capacity limit is a rejection reason, not permission to silently truncate the
+evidence trail.
+
+## Three validation-only iterations
+
+The workflow always constructs and records the same three parent-linked policies. Only train-derived candidates differ
+between banks; validation is used to compare the frozen policies, never to create aliases.
+
+| Iteration | Change | Decision |
+| --- | --- | --- |
+| `iteration_01_catalog` | Activates recurring exact contacts and eligible person aliases; generic email and phone fallbacks remain draft. | Discarded after establishing the catalog-only baseline. |
+| `iteration_02_email_recall` | Activates the bounded unknown-email fallback at lower precedence than exact contacts. | Selected only when the structured-weak contact slice has no labeled miss, cataloged miss, or wrong canonical mapping. |
+| `iteration_03_phone_experiment` | Also activates the bounded phone fallback. | Discarded because validation lacks independent exhaustive phone-negative and over-redaction evidence. |
+
+The iteration ledger binds each policy, bank, validation protocol, catalog binding, quality run, decision, and reason by
+hash. The workflow fails closed instead of selecting a different iteration when the frozen selection conditions are not
+met.
+
+## What the validation metrics mean
+
+The main validation projection serializes parsed `from`, `to`, `cc`, and `bcc` fields into an answer-bearing structured
+header view. Address spans and plausible display-name spans are deterministic `structured_weak` labels. This view is not
+the primary natural message body, and its labels are not independent annotations.
+
+The bank card may therefore report raw labeled-span hits and misses, labeled-span recall, catalog coverage, cataloged
+recall, and wrong-canonical counts for the declared structured scope. These measures answer a limited question: how the
+bank behaves on the parsed header values the source already exposed. They do **not** establish open-world PII recall.
+
+The following main-validation metrics remain `null` and unsupported until an independent,
+`exhaustive_within_scope` annotation covers the complete scanned view:
+
+- open-world recall;
+- precision and F1;
+- negative-document false-alarm rate; and
+- over-redaction and leaked-sensitive-character rates.
+
+An unlabeled prediction cannot be counted as a false positive, and an absent structured label cannot prove that a
+document contains no PII. The optional CMU Meetings train diagnostic is independently labeled for its declared
+person-name scope, but it is auxiliary training evidence: it does not measure contacts, domains, phones, the main email
+corpus, or sealed-test performance.
+
+CMU labels count as cataloged only when their surface is case/whitespace-equivalent to an active literal and its actual
+document context satisfies that literal's word boundaries. Name-normalization conveniences such as reversing
+`Last, First` do not manufacture catalog coverage for a differently ordered pattern.
+
+## Catalog conformance
+
+After iteration 2 is selected, the builder compiles the whole active bank and generates:
+
+- exact/case/context witnesses for every active pattern and canonical identity, plus whitespace witnesses where the
+  pattern declares whitespace normalization; and
+- negative/adversarial cases covering boundaries, casing, HTML residue, malformed input, overlap, punctuation,
+  signatures, Unicode, and whitespace.
+
+The gate requires complete active-pattern support, conformance recall exactly `1.0`, zero wrong canonical mappings, and
+zero unexpected negative matches. It proves deterministic behavior for approved active catalog patterns. It does not
+prove that the catalog contains every real PII surface, so perfect conformance must never be presented as perfect privacy
+recall.
+
+## Private and public artifacts
+
+The output directory is a private, transactional run. It has private permissions, a manifest-bound file inventory, and
+a `COMMITTED` marker. It contains real names and contact information and must remain ignored and access controlled.
+
+Private artifacts include:
+
+- all three iteration banks and the selected `bank.json`;
+- the candidate ledger, collision report, aggregate funnel, and SQLite mining spool;
+- validation documents, weak labels, unsupported-dimension declarations, per-iteration gold bindings, quality results,
+  and structural reports;
+- generated conformance cases and results;
+- optional CMU catalog bindings and quality results; and
+- the private manifest and aggregate bank card.
+
+Do not publish an artifact merely because its filename sounds aggregate. The candidate ledger, bank, validation files,
+conformance witnesses, SQLite spool, manifest, and auxiliary bindings are private. Raw text, surfaces, document IDs,
+private paths, and direct identifiers must never be copied into Git, an issue, a PR description, or public evidence.
+
+`bank-card.json` is the only artifact designed as a possible public handoff after successful deep verification and an
+independent publication review. It contains aggregate source commitments, bank statistics, the aggregate candidate
+funnel, iteration decisions, supported validation summaries, explicit `null` metrics, conformance totals, optional
+auxiliary totals, and privacy declarations. Before committing the private run, the builder rejects a card containing an
+email shape or `@`, a phone shape, a document ID, or a private path. The card remains non-promotable until the separate
+freeze, one-shot sealed-test, privacy-verification, performance, and lineage requirements in the
+[v2 charter](enron-benchmark.md) are satisfied.
+
+## Scale and fail-closed caps
+
+The SQLite spool keeps raw candidate mining disk-backed and deterministic, while explicit ceilings prevent a malformed
+or unexpectedly large source from causing unbounded work. The default v2 policy uses these limits:
+
+| Resource | Limit |
+| --- | ---: |
+| Train records | 1,000,000 |
+| Validation records | 200,000 |
+| Validation structured header entries | 2,000,000 |
+| Validation structured labeled spans | 4,000,000 |
+| Validation structured-view UTF-8 bytes | 512 MiB |
+| Structured header entries per document | 8,192 |
+| Candidate observations | 20,000,000 |
+| Unique candidates | 1,000,000 |
+| UTF-8 bytes per candidate value | 4,096 |
+| Active contacts | 500 |
+| Active person identities | 500 |
+| Active person aliases | 500 |
+| Reserved active-domain capacity | 500 |
+| Observed draft candidates per class | 5,000 |
+| Active patterns in the selected bank | 25,000 |
+| Total active-pattern UTF-8 bytes | 5 MiB |
+| Canonical bank JSON | 64 MiB |
+| Private JSONL records per artifact | 3,000,000 |
+| Private JSONL bytes per line | 16 MiB |
+
+Ingestion, candidate-value, and bank-size limit violations abort the build. Curation overflow moves into draft or
+rejected decisions with aggregate funnel accounting; it is never silently dropped. These limits establish bounded
+construction behavior, not a latency or memory claim. Realistic compile-once/scan-many performance still needs the
+frozen workload and release evidence required by the charter.
+
+The per-class active ceilings include headroom beneath the current Rust entity-independent matcher construction limit;
+the builder proved larger single-class banks fail closed during deep compilation. The 25,000-pattern global ceiling is
+still a bank-wide safety limit, not permission for one entity class to consume that entire budget. Issue #152 measures
+and, if justified, improves larger realistic shapes without weakening this builder's compile-before-commit guarantee.
+
+## Sealed-test boundary
+
+The CLI deliberately accepts `--development-run`, not a role selector or sealed-test path. The source binding recorded
+in the private manifest and public card states `sealed_test_accessed: false`, and the verifier returns the same fact.
+Builders stop after train mining, validation policy selection, optional auxiliary-train diagnostics, and synthetic
+conformance.
+
+Do not inspect, copy, summarize, or derive a scalar from the final-test bundle while building or reviewing this bank.
+After the bank, evaluator, thresholds, claims, and workloads are frozen, a release steward—not the builder—may use the
+one-shot access path described in the [split guide](enron-splits.md#sealed-test-access).

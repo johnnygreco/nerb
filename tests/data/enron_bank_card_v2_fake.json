@@ -1,0 +1,235 @@
+{
+  "schema_version": "nerb.enron_bank_card.v2",
+  "benchmark_version": "enron-v2-synthetic-fixture",
+  "artifact_kind": "aggregate_private_bank_build",
+  "fixture_mode": true,
+  "promotable": false,
+  "nonpromotable_reasons": [
+    "fixture_mode",
+    "independent_exhaustive_validation_labels_unavailable",
+    "sealed_test_not_accessed"
+  ],
+  "source": {
+    "dataset_id": "synthetic_enron_fixture",
+    "dataset_revision": "fixture-v2",
+    "dataset_split": "fixture",
+    "development_manifest_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000001",
+    "full_split_manifest_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000002",
+    "split_policy_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000003",
+    "preparation_manifest_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000004",
+    "train_artifact_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000005",
+    "train_records": 16,
+    "train_groups": 16,
+    "validation_artifact_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000006",
+    "validation_records": 2,
+    "validation_groups": 2,
+    "development_memberships_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000007",
+    "sealed_test_accessed": false
+  },
+  "charter": {
+    "id": "privacy_first_enron_intelligence_v2",
+    "primary_user_value": "prevent_sensitive_contact_and_person_name_leakage",
+    "recall_priority": true,
+    "guarantee_boundary": "active_catalog_patterns_only",
+    "entity_classes": [
+      {
+        "id": "contact",
+        "user_value": "known_contact_identity_and_unknown_structured_email_discovery",
+        "label_source": "train_and_validation_structured_headers",
+        "active_scope": "recurring_exact_addresses_plus_bounded_unknown_email_fallback"
+      },
+      {
+        "id": "person",
+        "user_value": "canonical_person_identity_from_observed_full_name_aliases",
+        "label_source": "synthetic_train_aliases",
+        "active_scope": "recurring_unique_address_anchored_full_names"
+      },
+      {
+        "id": "organization_domain",
+        "user_value": "organization_domain_intelligence",
+        "label_source": "synthetic_train_structured_headers",
+        "active_scope": "draft_until_exact_domain_boundary_is_expressible"
+      },
+      {
+        "id": "phone_number",
+        "user_value": "unknown_structured_phone_discovery",
+        "label_source": "synthetic_only",
+        "active_scope": "draft_because_independent_negative_evidence_is_unavailable"
+      }
+    ]
+  },
+  "builder": {
+    "policy_sha256": "sha256:2000000000000000000000000000000000000000000000000000000000000001",
+    "source_sha256": "sha256:2000000000000000000000000000000000000000000000000000000000000002",
+    "candidate_source_sha256": "sha256:2000000000000000000000000000000000000000000000000000000000000003",
+    "candidate_ledger_sha256": "sha256:2000000000000000000000000000000000000000000000000000000000000004",
+    "train_records": 16,
+    "observations": 24,
+    "iteration_count": 3,
+    "selected_iteration_id": "iteration_02_email_recall"
+  },
+  "bank": {
+    "id": "enron_intelligence_v2_fixture",
+    "version": "2026.07.10",
+    "canonical_sha256": "sha256:2dee9a05ad1be4ea7ebf9f73c921c213c350e512cec9e19f3f4443470ee86916",
+    "artifact_sha256": "sha256:ec2b186a654339023ccda3967c008995799f107fc8d1065604d6ef30053b5deb",
+    "canonical_json_bytes": 7817,
+    "stats": {
+      "active_totals": {"entities": 2, "names": 3, "patterns": 3},
+      "by_kind": {"literal": 3, "regex": 2},
+      "by_status": {
+        "active": {"entities": 2, "names": 3, "patterns": 3},
+        "deprecated": {"entities": 0, "names": 0, "patterns": 0},
+        "draft": {"entities": 2, "names": 2, "patterns": 2},
+        "inactive": {"entities": 0, "names": 0, "patterns": 0}
+      },
+      "totals": {"entities": 4, "names": 5, "patterns": 5}
+    }
+  },
+  "candidate_funnel": {
+    "schema_version": "nerb.enron_candidate_funnel.v2",
+    "total_candidates": 5,
+    "by_decision": {"active": 3, "draft": 2, "rejected": 0},
+    "by_type": {
+      "contact": {"total": 1, "active": 1, "draft": 0, "rejected": 0},
+      "contact_fallback": {"total": 1, "active": 1, "draft": 0, "rejected": 0},
+      "organization_domain": {"total": 1, "active": 0, "draft": 1, "rejected": 0},
+      "person_alias": {"total": 1, "active": 1, "draft": 0, "rejected": 0},
+      "phone_fallback": {"total": 1, "active": 0, "draft": 1, "rejected": 0}
+    },
+    "by_primary_reason": {
+      "bounded_structured_email_fallback": 1,
+      "exact_domain_boundary_not_expressible": 1,
+      "independent_phone_negative_evidence_unavailable": 1,
+      "recurring_unique_full_name_alias": 1,
+      "recurring_valid_contact": 1
+    }
+  },
+  "iterations": [
+    {
+      "schema_version": "nerb.enron_bank_build_iteration.v2",
+      "id": "iteration_01_catalog",
+      "parent_id": null,
+      "active_patterns": 2,
+      "contact_labeled_spans": 12,
+      "contact_labeled_true_positive": 8,
+      "contact_labeled_false_negative": 4,
+      "contact_labeled_recall": 0.6666666666666666,
+      "contact_cataloged_false_negative": 0,
+      "contact_cataloged_wrong_canonical": 0,
+      "open_world_metrics_supported": false,
+      "utility_metrics_supported": false,
+      "decision": "discard",
+      "decision_reason_code": "superseded_by_bounded_email_fallback",
+      "selected": false
+    },
+    {
+      "schema_version": "nerb.enron_bank_build_iteration.v2",
+      "id": "iteration_02_email_recall",
+      "parent_id": "iteration_01_catalog",
+      "active_patterns": 3,
+      "contact_labeled_spans": 12,
+      "contact_labeled_true_positive": 12,
+      "contact_labeled_false_negative": 0,
+      "contact_labeled_recall": 1.0,
+      "contact_cataloged_false_negative": 0,
+      "contact_cataloged_wrong_canonical": 0,
+      "open_world_metrics_supported": false,
+      "utility_metrics_supported": false,
+      "decision": "keep",
+      "decision_reason_code": "best_supported_privacy_recall_without_unsupported_phone_activation",
+      "selected": true
+    },
+    {
+      "schema_version": "nerb.enron_bank_build_iteration.v2",
+      "id": "iteration_03_phone_experiment",
+      "parent_id": "iteration_02_email_recall",
+      "active_patterns": 4,
+      "contact_labeled_spans": 12,
+      "contact_labeled_true_positive": 12,
+      "contact_labeled_false_negative": 0,
+      "contact_labeled_recall": 1.0,
+      "contact_cataloged_false_negative": 0,
+      "contact_cataloged_wrong_canonical": 0,
+      "open_world_metrics_supported": false,
+      "utility_metrics_supported": false,
+      "decision": "discard",
+      "decision_reason_code": "independent_phone_negative_evidence_unavailable",
+      "selected": false
+    }
+  ],
+  "validation": {
+    "label_strength": "structured_weak",
+    "protocol_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000001",
+    "quality_run_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000002",
+    "contact": {
+      "documents": 2,
+      "documents_with_sensitive_gold": 2,
+      "gold_spans": 12,
+      "true_positive": 12,
+      "false_negative": 0,
+      "cataloged_gold_spans": 12,
+      "cataloged_true_positive": 12,
+      "cataloged_false_negative": 0,
+      "cataloged_wrong_canonical": 0,
+      "labeled_span_recall": 1.0,
+      "catalog_coverage": 1.0,
+      "cataloged_recall": 1.0,
+      "open_world_recall": null,
+      "precision": null,
+      "over_redaction_rate": null,
+      "negative_document_false_alarm_rate": null
+    },
+    "person": {
+      "evaluated": false,
+      "reason_code": "zero_labeled_person_spans",
+      "documents": 0,
+      "documents_with_sensitive_gold": 0,
+      "gold_spans": 0,
+      "true_positive": 0,
+      "false_negative": 0,
+      "cataloged_gold_spans": 0,
+      "cataloged_true_positive": 0,
+      "cataloged_false_negative": 0,
+      "cataloged_wrong_canonical": 0,
+      "labeled_span_recall": null,
+      "catalog_coverage": null,
+      "cataloged_recall": null,
+      "open_world_recall": null,
+      "precision": null,
+      "over_redaction_rate": null,
+      "negative_document_false_alarm_rate": null
+    },
+    "open_world_metrics_supported": false,
+    "utility_metrics_supported": false,
+    "unsupported_reason_code": "independent_exhaustive_validation_labels_unavailable"
+  },
+  "catalog_conformance": {
+    "evaluated": true,
+    "passed": true,
+    "active_patterns": 3,
+    "patterns_with_positive_cases": 3,
+    "approved_positive_cases": 10,
+    "correctly_mapped": 10,
+    "missed": 0,
+    "wrong_canonical": 0,
+    "recall": 1.0,
+    "negative_cases": 11,
+    "unexpected_negative_matches": 0
+  },
+  "independent_auxiliary": {
+    "evaluated": false,
+    "reason_code": "annotation_run_not_supplied"
+  },
+  "privacy": {
+    "status": "passed",
+    "raw_text_included": false,
+    "direct_identifiers_included": false,
+    "private_paths_included": false,
+    "scanner": "nerb.enron_bank_workflow.public_card_scan.v2",
+    "scanner_source_sha256": "sha256:4000000000000000000000000000000000000000000000000000000000000001",
+    "violation_count": 0,
+    "report_sha256": "sha256:4000000000000000000000000000000000000000000000000000000000000002"
+  },
+  "run_sha256": "sha256:a2e68aef1f57d858400d4604541aa498199e8f613ac5990ce0d3f2c234a6bd56"
+}

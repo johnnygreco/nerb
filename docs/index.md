@@ -27,6 +27,7 @@ nerb extract-text \
 [Enron v2 charter](enron-benchmark.md){ .md-button }
 [Prepare Enron v2](enron-preparation.md){ .md-button }
 [Split Enron v2](enron-splits.md){ .md-button }
+[Build an Enron v2 bank](enron-bank-building.md){ .md-button }
 [Evaluate Enron v2](enron-evaluation.md){ .md-button }
 </p>
 
@@ -44,13 +45,15 @@ so privacy evidence must report open-world recall and misses separately from cat
 </div>
 </section>
 
-!!! warning "Enron evidence is being rebuilt"
+!!! warning "Enron evidence is not yet promotable"
 
     The privacy-first Enron benchmark v2 contract, private preparation, immutable splits, independent quality executor,
-    and catalog-conformance gate are implemented; bank construction and real-corpus evidence remain staged work.
-    Historical v1 quality, autoresearch, and performance artifacts do not meet the v2 contract and do not support
-    current public claims. See the [v2 charter](enron-benchmark.md), [preparation guide](enron-preparation.md),
-    [split guide](enron-splits.md), and [evaluation guide](enron-evaluation.md).
+    train-only [bank construction](enron-bank-building.md), and catalog-conformance gate are implemented. A development
+    bank card remains non-promotable until the frozen one-shot sealed-test, privacy-verification, performance, and
+    lineage gates are completed. Historical v1 quality, autoresearch, and performance artifacts do not meet the v2
+    contract and do not support current public claims. See the [v2 charter](enron-benchmark.md),
+    [preparation guide](enron-preparation.md), [split guide](enron-splits.md), and
+    [evaluation guide](enron-evaluation.md).
 
 ## Why Teams Use NERB
 

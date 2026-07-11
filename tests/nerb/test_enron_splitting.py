@@ -775,6 +775,7 @@ def test_development_api_cannot_reach_test_and_aggregate_views_are_private(tmp_p
     public_callables = {
         name for name in dir(run.loaded) if not name.startswith("_") and callable(getattr(run.loaded, name))
     }
+    assert {"iter_train_memberships", "iter_validation_memberships"} <= public_callables
     assert not any("test" in name.casefold() for name in public_callables)
     assert not any("role" in name.casefold() for name in public_callables)
 
@@ -785,6 +786,49 @@ def test_development_api_cannot_reach_test_and_aggregate_views_are_private(tmp_p
     assert "sensitive-bob@secret.example" not in aggregate
     assert str(tmp_path) not in aggregate
     assert test_hash not in aggregate
+
+
+def test_development_membership_iterators_pair_exactly_with_fixed_role_records(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="membership-pairing"))
+    run = _split(tmp_path, preparation)
+
+    pairs = (
+        (
+            "train",
+            tuple(run.loaded.iter_train_records()),
+            tuple(run.loaded.iter_train_memberships()),
+        ),
+        (
+            "validation",
+            tuple(run.loaded.iter_validation_records()),
+            tuple(run.loaded.iter_validation_memberships()),
+        ),
+    )
+    for role, records, memberships in pairs:
+        expected = run.loaded.manifest["development_roles"][role]["records"]
+        assert len(records) == len(memberships) == expected
+        for record, membership in zip(records, memberships, strict=True):
+            assert membership["role"] == role
+            assert membership["document_id"] == record["document_id"]
+
+
+def test_development_membership_iterators_reject_tampered_schema_and_role(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="membership-tamper"))
+    run = _split(tmp_path, preparation)
+    membership_path = run.development / "memberships.jsonl"
+    original = _read_jsonl(membership_path)
+
+    wrong_schema = [dict(row) for row in original]
+    wrong_schema[0]["schema_version"] = "nerb.enron_split_membership.invalid"
+    _write_jsonl(membership_path, wrong_schema)
+    with pytest.raises(EnronSplitError, match=r"(?i)(canonical|schema)"):
+        tuple(run.loaded.iter_train_memberships())
+
+    forbidden_role = [dict(row) for row in original]
+    forbidden_role[0]["role"] = "test"
+    _write_jsonl(membership_path, forbidden_role)
+    with pytest.raises(EnronSplitError, match=r"(?i)(schema|role)"):
+        tuple(run.loaded.iter_train_memberships())
 
 
 def test_steward_projection_matches_the_closed_v2_split_contract(tmp_path: Path) -> None:
