@@ -2744,6 +2744,8 @@ def _cleanup_stale_receipt_stages(root: Path) -> None:
             stage_fd: int | None = None
             try:
                 before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) & 0o077:
+                    raise EnronSplitError("Stale private receipt staging entry is unsafe.")
                 if time.time_ns() - before.st_mtime_ns < 5_000_000_000:
                     raise EnronSplitError("Private receipt publication is still in progress; retry shortly.")
                 stage_fd = os.open(
@@ -2767,6 +2769,10 @@ def _cleanup_stale_receipt_stages(root: Path) -> None:
                 removed = True
             except FileNotFoundError:
                 continue
+            except EnronSplitError:
+                raise
+            except OSError as exc:
+                raise EnronSplitError("Stale private receipt staging entry could not be inspected safely.") from exc
             finally:
                 if stage_fd is not None:
                     os.close(stage_fd)

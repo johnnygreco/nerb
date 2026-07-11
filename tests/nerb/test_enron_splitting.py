@@ -955,6 +955,20 @@ def test_stale_internal_receipt_stage_is_recovered_before_inventory_validation(t
     assert not stage.exists()
 
 
+def test_unsafe_internal_receipt_stage_uses_stable_split_error_boundary(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="unsafe-receipt"))
+    run = _split(tmp_path, preparation)
+    stage = run.sealed / (".ACCESS_CLAIMED.json.stage-" + "b" * 24)
+    stage.symlink_to(run.sealed / "manifest.json")
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(stale|receipt|unsafe|stage)"):
+        enron_splitting._assert_committed_run(  # noqa: SLF001
+            run.sealed,
+            enron_splitting._SEALED_FILES,  # noqa: SLF001
+            allow_access_files=True,
+        )
+
+
 def test_crash_stranded_claim_can_be_finalized_as_aborted_without_reopening_test(tmp_path: Path) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="finalize-aborted"))
     run = _split(tmp_path, preparation)
