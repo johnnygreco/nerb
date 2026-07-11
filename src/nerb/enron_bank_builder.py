@@ -123,8 +123,8 @@ class EnronBankPolicy:
             "candidate_source": "train_structured_headers_plus_sender_body_confirmed_local_parts",
             "validation_source": "validation_structured_headers_only_no_literal_promotion",
             "person_alias_policy": (
-                "recurring_match_distinct_observed_surface_unique_address_owner_local_part_compatible_"
-                "resolvable_contact_anchor_no_unobserved_aliases"
+                "recurring_match_distinct_observed_surface_unique_address_owner_exact_normalized_full_identity_"
+                "local_part_compatible_resolvable_contact_anchor_no_unobserved_aliases"
             ),
             "contact_policy": "recurring_valid_exact_address",
             "organization_policy": "recurring_exact_at_domain_surface",
@@ -899,12 +899,15 @@ def curate_enron_iteration(
         if active_alias_values:
             active_people += 1
             active_person_patterns += len(active_alias_values)
-        name_id = _opaque_id("person", address)
-        patterns: dict[str, Any] = {}
-        name_decisions: list[str] = []
-        retained_aliases: list[CandidateEvidence] = []
+        patterns_by_identity: dict[str, dict[str, Any]] = defaultdict(dict)
+        decisions_by_identity: dict[str, list[str]] = defaultdict(list)
+        retained_aliases_by_identity: dict[str, list[CandidateEvidence]] = defaultdict(list)
         for alias in aliases:
             identity_value = _person_identity_value(alias)
+            if identity_value is None:
+                raise EnronBankBuildError("A retained person alias has no unambiguous normalized full identity.")
+            person_identity_key = f"{address}\n{identity_value}"
+            name_id = _opaque_id("person", person_identity_key)
             if address not in retained_contact_values:
                 decision = "rejected"
                 reason = "contact_anchor_not_retained"
@@ -947,12 +950,12 @@ def curate_enron_iteration(
                 reason_code=reason,
                 privacy_class="person_name",
                 extra={
-                    "identity_ref": _opaque_id("identity", address),
+                    "identity_ref": _opaque_id("identity", person_identity_key),
                     "contact_ref": _opaque_id("contact", address),
                     "contact_scope": _contact_scope(address, policy),
                 },
             )
-            patterns[pattern_id] = _literal_pattern(
+            patterns_by_identity[identity_value][pattern_id] = _literal_pattern(
                 alias.primary_surface,
                 status=decision,
                 priority=person_priorities[alias],
@@ -971,39 +974,43 @@ def curate_enron_iteration(
                     bank_ref,
                 )
             )
-            name_decisions.append(decision)
-            retained_aliases.append(alias)
-        if not retained_aliases:
-            continue
-        name_status = "active" if "active" in name_decisions else "draft"
-        canonical_alias = next(
-            (alias for alias in retained_aliases if alias.normalized_value in active_alias_values),
-            retained_aliases[0],
-        )
-        name_metadata = _evidence_metadata(
-            canonical_alias,
-            policy_sha256=policy_sha256,
-            source_binding=source_binding,
-            review_status=name_status,
-            reason_code=("recurring_unique_identity" if name_status == "active" else "identity_not_eligible"),
-            privacy_class="person_name",
-            extra={
-                "identity_ref": _opaque_id("identity", address),
-                "contact_ref": _opaque_id("contact", address),
-                "contact_scope": _contact_scope(address, policy),
-                "alias_count": len(patterns),
-                "active_alias_count": len(active_alias_values),
-                "evidence_scope": "canonical_alias_only",
-                "identity_aggregate_counts_supported": False,
-            },
-        )
-        person_names[name_id] = {
-            "canonical": canonical_alias.primary_surface,
-            "description": "Address-anchored train-observed person identity.",
-            "status": name_status,
-            "patterns": patterns,
-            "metadata": name_metadata,
-        }
+            decisions_by_identity[identity_value].append(decision)
+            retained_aliases_by_identity[identity_value].append(alias)
+        for identity_value in sorted(retained_aliases_by_identity):
+            retained_aliases = retained_aliases_by_identity[identity_value]
+            patterns = patterns_by_identity[identity_value]
+            name_status = "active" if "active" in decisions_by_identity[identity_value] else "draft"
+            canonical_alias = next(
+                (alias for alias in retained_aliases if alias.normalized_value in active_alias_values),
+                retained_aliases[0],
+            )
+            person_identity_key = f"{address}\n{identity_value}"
+            name_metadata = _evidence_metadata(
+                canonical_alias,
+                policy_sha256=policy_sha256,
+                source_binding=source_binding,
+                review_status=name_status,
+                reason_code=("recurring_unique_identity" if name_status == "active" else "identity_not_eligible"),
+                privacy_class="person_name",
+                extra={
+                    "identity_ref": _opaque_id("identity", person_identity_key),
+                    "contact_ref": _opaque_id("contact", address),
+                    "contact_scope": _contact_scope(address, policy),
+                    "alias_count": len(patterns),
+                    "active_alias_count": sum(
+                        alias.normalized_value in active_alias_values for alias in retained_aliases
+                    ),
+                    "evidence_scope": "canonical_alias_only",
+                    "identity_aggregate_counts_supported": False,
+                },
+            )
+            person_names[_opaque_id("person", person_identity_key)] = {
+                "canonical": canonical_alias.primary_surface,
+                "description": "Address-anchored train-observed person identity.",
+                "status": name_status,
+                "patterns": patterns,
+                "metadata": name_metadata,
+            }
 
     if not person_names:
         placeholder_metadata = _fallback_metadata(
@@ -1474,18 +1481,16 @@ def _regex_pattern(
 def _compatible_person_aliases(values: Sequence[CandidateEvidence]) -> list[CandidateEvidence]:
     if not values:
         return []
-    accepted = [values[0]]
     first_value = _person_identity_value(values[0])
     if first_value is None:
         return []
-    first_tokens = first_value.split()
-    first_initial = first_tokens[0][:1]
-    last = first_tokens[-1]
+    accepted = [values[0]]
+    accepted_match_surfaces = {values[0].normalized_value}
     for value in values[1:]:
         identity_value = _person_identity_value(value)
-        tokens = [] if identity_value is None else identity_value.split()
-        if tokens and tokens[0][:1] == first_initial and tokens[-1] == last:
+        if identity_value == first_value and value.normalized_value not in accepted_match_surfaces:
             accepted.append(value)
+            accepted_match_surfaces.add(value.normalized_value)
     return accepted
 
 

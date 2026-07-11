@@ -19,6 +19,7 @@ from typing import Any, cast
 from urllib.parse import quote
 
 from . import enron_bank_builder as _bank_builder_module
+from . import enron_contract as _enron_contract_module
 from .bank import bank_stats, hash_bank
 from .enron_annotations import EnronAnnotationError
 from .enron_bank_builder import (
@@ -111,6 +112,12 @@ _MAX_PRIVATE_JSON_BYTES = 64 * 1024 * 1024
 _MAX_PRIVATE_JSONL_BYTES = 256 * 1024 * 1024
 _MAX_PRIVATE_SQLITE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_PRIVATE_SQLITE_PROJECTION_BYTES = 16 * 1024 * 1024
+_MAX_MINING_DOCUMENT_ID_BYTES = 68
+_MAX_MINING_GROUP_ID_BYTES = 71
+_MAX_MINING_KIND_BYTES = 32
+_MAX_MINING_SOURCE_TYPE_BYTES = 32
+_MAX_MINING_OBSERVED_AT_BYTES = 128
+_MINING_SQLITE_LENGTH_LIMIT_HEADROOM = 64 * 1024
 _MAX_PRIVATE_JSONL_LINE_BYTES = 16 * 1024 * 1024
 _MAX_PRIVATE_JSONL_RECORDS = 750_000
 _MAX_PRIVATE_TREE_ENTRIES = 256
@@ -385,10 +392,28 @@ _CARD_AUXILIARY = {
                 "label_strength": _CARD_STRING,
                 "annotation_completeness": _CARD_STRING,
                 "documents": _CARD_POSITIVE_COUNT,
+                "documents_with_sensitive_gold": _CARD_COUNT,
+                "documents_with_any_miss": _CARD_COUNT,
+                "documents_with_cataloged_gold": _CARD_COUNT,
+                "documents_with_any_cataloged_miss": _CARD_COUNT,
+                "documents_with_any_leaked_character": _CARD_COUNT,
                 "gold_spans": _CARD_COUNT,
+                "predicted_spans": _CARD_COUNT,
                 "true_positive": _CARD_COUNT,
                 "false_negative": _CARD_COUNT,
                 "false_positive": _CARD_COUNT,
+                "cataloged_gold_spans": _CARD_COUNT,
+                "cataloged_true_positive": _CARD_COUNT,
+                "cataloged_false_negative": _CARD_COUNT,
+                "cataloged_wrong_canonical": _CARD_COUNT,
+                "sensitive_gold_characters": _CARD_COUNT,
+                "covered_sensitive_characters": _CARD_COUNT,
+                "leaked_sensitive_characters": _CARD_COUNT,
+                "predicted_characters": _CARD_COUNT,
+                "over_redacted_characters": _CARD_COUNT,
+                "evaluated_characters": _CARD_COUNT,
+                "negative_documents": _CARD_COUNT,
+                "negative_documents_with_predictions": _CARD_COUNT,
                 "metrics": _CARD_AUXILIARY_METRICS,
                 "protocol_sha256": _CARD_HASH,
                 "run_sha256": _CARD_HASH,
@@ -1565,10 +1590,28 @@ def _bank_card(
             "label_strength": cmu_slice["label_strength"],
             "annotation_completeness": cmu_slice["annotation_completeness"],
             "documents": cmu_slice["documents"],
+            "documents_with_sensitive_gold": cmu_slice["documents_with_sensitive_gold"],
+            "documents_with_any_miss": cmu_slice["documents_with_any_miss"],
+            "documents_with_cataloged_gold": cmu_slice["documents_with_cataloged_gold"],
+            "documents_with_any_cataloged_miss": cmu_slice["documents_with_any_cataloged_miss"],
+            "documents_with_any_leaked_character": cmu_slice["documents_with_any_leaked_character"],
             "gold_spans": cmu_slice["gold_spans"],
+            "predicted_spans": cmu_slice["predicted_spans"],
             "true_positive": cmu_slice["true_positive"],
             "false_negative": cmu_slice["false_negative"],
             "false_positive": cmu_slice["false_positive"],
+            "cataloged_gold_spans": cmu_slice["cataloged_gold_spans"],
+            "cataloged_true_positive": cmu_slice["cataloged_true_positive"],
+            "cataloged_false_negative": cmu_slice["cataloged_false_negative"],
+            "cataloged_wrong_canonical": cmu_slice["cataloged_wrong_canonical"],
+            "sensitive_gold_characters": cmu_slice["sensitive_gold_characters"],
+            "covered_sensitive_characters": cmu_slice["covered_sensitive_characters"],
+            "leaked_sensitive_characters": cmu_slice["leaked_sensitive_characters"],
+            "predicted_characters": cmu_slice["predicted_characters"],
+            "over_redacted_characters": cmu_slice["over_redacted_characters"],
+            "evaluated_characters": cmu_slice["evaluated_characters"],
+            "negative_documents": cmu_slice["negative_documents"],
+            "negative_documents_with_predictions": cmu_slice["negative_documents_with_predictions"],
             "metrics": cmu_slice["metrics"],
             "protocol_sha256": cmu_quality["protocol_sha256"],
             "run_sha256": cmu_quality["run_sha256"],
@@ -1647,7 +1690,7 @@ def _bank_card(
         "direct_identifiers_included": False,
         "private_paths_included": False,
         "scanner": "nerb.enron_bank_workflow.public_card_scan.v2",
-        "scanner_source_sha256": _hash_private_file(Path(__file__)),
+        "scanner_source_sha256": _public_card_scanner_sha256(),
         "violation_count": 0,
     }
     privacy_report["report_sha256"] = _canonical_hash(privacy_report)
@@ -1741,16 +1784,12 @@ def _validate_public_card(card: Mapping[str, Any]) -> None:
         raise EnronBankBuildError("Public bank card nested schema is invalid.")
 
     try:
-        mapping_keys, string_values = _public_card_string_inventory(card)
-        privacy_diagnostics = [
-            *_public_serialization_diagnostics(cast(dict[str, Any], card)),
-            *_public_serialization_diagnostics({"mapping_keys": mapping_keys}),
-        ]
+        privacy_diagnostics = _public_serialization_diagnostics(cast(dict[str, Any], card))
     except (RecursionError, TypeError, ValueError):
         raise EnronBankBuildError(
             "Public bank card privacy scanner could not inspect the serialization safely."
         ) from None
-    if privacy_diagnostics or any(_DOCUMENT_ID_RE.fullmatch(value) for value in (*mapping_keys, *string_values)):
+    if privacy_diagnostics:
         raise EnronBankBuildError(
             "Public bank card privacy scanner rejected a direct identifier or private path shape."
         )
@@ -1759,46 +1798,6 @@ def _validate_public_card(card: Mapping[str, Any]) -> None:
     expected_run = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
     if card.get("run_sha256") != expected_run:
         raise EnronBankBuildError("Public bank card run commitment is invalid.")
-
-
-def _public_card_string_inventory(value: Any) -> tuple[list[str], list[str]]:
-    mapping_keys: list[str] = []
-    string_values: list[str] = []
-    active_containers: set[int] = set()
-
-    def visit(item: Any, depth: int) -> None:
-        if depth > 100:
-            raise RecursionError
-        if type(item) is str:
-            string_values.append(item)
-            return
-        if type(item) is dict:
-            identity = id(item)
-            if identity in active_containers:
-                raise RecursionError
-            active_containers.add(identity)
-            try:
-                for key, child in item.items():
-                    if type(key) is not str:
-                        raise TypeError
-                    mapping_keys.append(key)
-                    visit(child, depth + 1)
-            finally:
-                active_containers.remove(identity)
-            return
-        if type(item) is list:
-            identity = id(item)
-            if identity in active_containers:
-                raise RecursionError
-            active_containers.add(identity)
-            try:
-                for child in item:
-                    visit(child, depth + 1)
-            finally:
-                active_containers.remove(identity)
-
-    visit(value, 0)
-    return mapping_keys, string_values
 
 
 def _validate_public_card_invariants(card: Mapping[str, Any]) -> None:
@@ -1837,6 +1836,8 @@ def _validate_public_card_invariants(card: Mapping[str, Any]) -> None:
     expected_privacy = _canonical_hash({key: value for key, value in privacy.items() if key != "report_sha256"})
     if privacy["report_sha256"] != expected_privacy:
         raise EnronBankBuildError("Public bank card privacy report commitment is invalid.")
+    if privacy["scanner_source_sha256"] != _public_card_scanner_sha256():
+        raise EnronBankBuildError("Public bank card privacy scanner implementation commitment is invalid.")
 
 
 def _card_stats_are_consistent(stats: Mapping[str, Any]) -> bool:
@@ -2027,18 +2028,60 @@ def _card_conformance_is_consistent(conformance: Mapping[str, Any], bank: Mappin
 def _card_auxiliary_is_consistent(auxiliary: Mapping[str, Any]) -> bool:
     if auxiliary["evaluated"] is False:
         return True
+    documents = cast(int, auxiliary["documents"])
+    sensitive_documents = cast(int, auxiliary["documents_with_sensitive_gold"])
+    miss_documents = cast(int, auxiliary["documents_with_any_miss"])
+    cataloged_documents = cast(int, auxiliary["documents_with_cataloged_gold"])
+    catalog_miss_documents = cast(int, auxiliary["documents_with_any_cataloged_miss"])
+    leaked_character_documents = cast(int, auxiliary["documents_with_any_leaked_character"])
     true_positive = cast(int, auxiliary["true_positive"])
     false_positive = cast(int, auxiliary["false_positive"])
     false_negative = cast(int, auxiliary["false_negative"])
     gold = cast(int, auxiliary["gold_spans"])
+    predicted = cast(int, auxiliary["predicted_spans"])
+    cataloged = cast(int, auxiliary["cataloged_gold_spans"])
+    cataloged_true = cast(int, auxiliary["cataloged_true_positive"])
+    cataloged_false = cast(int, auxiliary["cataloged_false_negative"])
+    cataloged_wrong = cast(int, auxiliary["cataloged_wrong_canonical"])
+    sensitive_characters = cast(int, auxiliary["sensitive_gold_characters"])
+    covered_characters = cast(int, auxiliary["covered_sensitive_characters"])
+    leaked_characters = cast(int, auxiliary["leaked_sensitive_characters"])
+    predicted_characters = cast(int, auxiliary["predicted_characters"])
+    over_redacted_characters = cast(int, auxiliary["over_redacted_characters"])
+    evaluated_characters = cast(int, auxiliary["evaluated_characters"])
+    negative_documents = cast(int, auxiliary["negative_documents"])
+    negative_documents_with_predictions = cast(int, auxiliary["negative_documents_with_predictions"])
     metrics = cast(Mapping[str, Any], auxiliary["metrics"])
     return bool(
         auxiliary["label_strength"] == "independent"
         and auxiliary["annotation_completeness"] == "exhaustive_within_scope"
+        and sensitive_documents <= documents
+        and miss_documents <= sensitive_documents
+        and cataloged_documents <= sensitive_documents
+        and catalog_miss_documents <= cataloged_documents
+        and leaked_character_documents <= sensitive_documents
+        and negative_documents == documents - sensitive_documents
+        and negative_documents_with_predictions <= negative_documents
         and gold == true_positive + false_negative
-        and metrics["precision"] == _ratio(true_positive, true_positive + false_positive)
+        and predicted == true_positive + false_positive
+        and cataloged <= gold
+        and cataloged == cataloged_true + cataloged_false + cataloged_wrong
+        and cataloged_true + cataloged_wrong <= true_positive
+        and sensitive_characters == covered_characters + leaked_characters
+        and predicted_characters == covered_characters + over_redacted_characters
+        and predicted_characters <= evaluated_characters
+        and metrics["precision"] == _ratio(true_positive, predicted)
         and metrics["open_world_recall"] == _ratio(true_positive, gold)
         and metrics["f1"] == _ratio(2 * true_positive, 2 * true_positive + false_positive + false_negative)
+        and metrics["catalog_coverage"] == _ratio(cataloged, gold)
+        and metrics["cataloged_recall"] == _ratio(cataloged_true, cataloged)
+        and metrics["document_leak_rate"] == _ratio(miss_documents, sensitive_documents)
+        and metrics["cataloged_document_leak_rate"] == _ratio(catalog_miss_documents, cataloged_documents)
+        and metrics["sensitive_character_recall"] == _ratio(covered_characters, sensitive_characters)
+        and metrics["sensitive_character_leak_rate"] == _ratio(leaked_characters, sensitive_characters)
+        and metrics["negative_document_false_alarm_rate"]
+        == _ratio(negative_documents_with_predictions, negative_documents)
+        and metrics["over_redaction_rate"] == _ratio(over_redacted_characters, evaluated_characters)
     )
 
 
@@ -2720,18 +2763,18 @@ def _replay_candidate_pool_snapshot(
     except sqlite3.Error:
         raise EnronBankBuildError("Private mining spool could not be opened read-only.") from None
     try:
+        _set_mining_sqlite_length_limit(connection)
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA trusted_schema=OFF")
+        _validate_mining_sqlite_schema(connection)
+        _preflight_mining_sqlite_cells(connection, policy)
         quick_check = connection.execute("PRAGMA quick_check(1)").fetchall()
         if quick_check != [("ok",)]:
             raise EnronBankBuildError("Private mining spool failed its integrity check.")
-        _validate_mining_sqlite_schema(connection)
 
         source_digest = hashlib.sha256(b"nerb/enron/bank-mining-source/v2\0")
         train_records = 0
-        for document_id, payload in connection.execute(
-            "SELECT document_id, payload FROM source_projections ORDER BY document_id"
-        ):
+        for document_id, payload in _iter_mining_source_projections(connection):
             train_records += 1
             if train_records > policy.max_train_records:
                 raise EnronBankBuildError("Private mining spool exceeds the train-record limit.")
@@ -2763,6 +2806,10 @@ def _replay_candidate_pool_snapshot(
                 or projection.get("document_id") != document_id
                 or not _is_sha256(projection.get("group_id"))
                 or (projection.get("observed_at") is not None and not isinstance(projection.get("observed_at"), str))
+                or (
+                    isinstance(projection.get("observed_at"), str)
+                    and len(cast(str, projection["observed_at"]).encode("utf-8")) > _MAX_MINING_OBSERVED_AT_BYTES
+                )
                 or type(projection.get("structured_entries")) is not int
                 or cast(int, projection["structured_entries"]) < 0
                 or type(projection.get("sender_body_aliases")) is not int
@@ -2892,6 +2939,96 @@ def _replay_candidate_pool_snapshot(
         raise EnronBankBuildError("Private mining spool could not be replayed safely.") from None
     finally:
         connection.close()
+
+
+def _preflight_mining_sqlite_cells(connection: sqlite3.Connection, policy: EnronBankPolicy) -> None:
+    """Reject unsafe cell types and sizes through scalar SQL before Python receives private cell contents."""
+
+    source_violation = connection.execute(
+        """
+        SELECT 1
+        FROM source_projections
+        WHERE typeof(document_id) != 'text'
+           OR length(CAST(document_id AS BLOB)) != ?
+           OR typeof(payload) != 'blob'
+           OR length(payload) > ?
+        LIMIT 1
+        """,
+        (_MAX_MINING_DOCUMENT_ID_BYTES, _MAX_PRIVATE_SQLITE_PROJECTION_BYTES),
+    ).fetchone()
+    candidate_violation = connection.execute(
+        """
+        SELECT 1
+        FROM candidate_values
+        WHERE typeof(kind) != 'text'
+           OR length(CAST(kind AS BLOB)) = 0
+           OR length(CAST(kind AS BLOB)) > ?
+           OR typeof(normalized_value) != 'text'
+           OR length(CAST(normalized_value AS BLOB)) = 0
+           OR length(CAST(normalized_value AS BLOB)) > ?
+        LIMIT 1
+        """,
+        (_MAX_MINING_KIND_BYTES, policy.max_candidate_value_bytes),
+    ).fetchone()
+    observation_violation = connection.execute(
+        """
+        SELECT 1
+        FROM observations
+        WHERE typeof(kind) != 'text'
+           OR length(CAST(kind AS BLOB)) = 0
+           OR length(CAST(kind AS BLOB)) > ?
+           OR typeof(normalized_value) != 'text'
+           OR length(CAST(normalized_value AS BLOB)) = 0
+           OR length(CAST(normalized_value AS BLOB)) > ?
+           OR typeof(surface) != 'text'
+           OR length(CAST(surface AS BLOB)) = 0
+           OR length(CAST(surface AS BLOB)) > ?
+           OR typeof(related) != 'text'
+           OR length(CAST(related AS BLOB)) > ?
+           OR typeof(source_type) != 'text'
+           OR length(CAST(source_type AS BLOB)) = 0
+           OR length(CAST(source_type AS BLOB)) > ?
+           OR typeof(document_id) != 'text'
+           OR length(CAST(document_id AS BLOB)) != ?
+           OR typeof(group_id) != 'text'
+           OR length(CAST(group_id AS BLOB)) != ?
+           OR (
+                observed_at IS NOT NULL
+                AND (
+                    typeof(observed_at) != 'text'
+                    OR length(CAST(observed_at AS BLOB)) > ?
+                )
+           )
+        LIMIT 1
+        """,
+        (
+            _MAX_MINING_KIND_BYTES,
+            policy.max_candidate_value_bytes,
+            policy.max_candidate_value_bytes,
+            policy.max_candidate_value_bytes,
+            _MAX_MINING_SOURCE_TYPE_BYTES,
+            _MAX_MINING_DOCUMENT_ID_BYTES,
+            _MAX_MINING_GROUP_ID_BYTES,
+            _MAX_MINING_OBSERVED_AT_BYTES,
+        ),
+    ).fetchone()
+    if any(item is not None for item in (source_violation, candidate_violation, observation_violation)):
+        raise EnronBankBuildError("Private mining spool cell exceeds its closed type or resource limit.")
+
+
+def _set_mining_sqlite_length_limit(connection: sqlite3.Connection) -> None:
+    setlimit = getattr(connection, "setlimit", None)
+    limit_category = getattr(sqlite3, "SQLITE_LIMIT_LENGTH", None)
+    if callable(setlimit) and isinstance(limit_category, int):
+        setlimit(
+            limit_category,
+            _MAX_PRIVATE_SQLITE_PROJECTION_BYTES + _MINING_SQLITE_LENGTH_LIMIT_HEADROOM,
+        )
+
+
+def _iter_mining_source_projections(connection: sqlite3.Connection) -> Iterator[tuple[Any, Any]]:
+    rows = connection.execute("SELECT document_id, payload FROM source_projections ORDER BY document_id")
+    yield from rows
 
 
 def _validate_mining_sqlite_schema(connection: sqlite3.Connection) -> None:
@@ -3442,6 +3579,22 @@ def _builder_implementation_sha256() -> str:
             payload = path.read_bytes()
         except OSError:
             raise EnronBankBuildError("Bank-builder implementation could not be fingerprinted safely.") from None
+        digest.update(label.encode("ascii") + b"\0")
+        digest.update(hashlib.sha256(payload).digest())
+    return _SHA256_PREFIX + digest.hexdigest()
+
+
+def _public_card_scanner_sha256() -> str:
+    digest = hashlib.sha256(b"nerb/enron/public-card-scanner/v2\0")
+    sources = (
+        ("contract_scanner", Path(_enron_contract_module.__file__)),
+        ("workflow_wrapper", Path(__file__)),
+    )
+    for label, path in sources:
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            raise EnronBankBuildError("Public-card scanner implementation could not be fingerprinted safely.") from None
         digest.update(label.encode("ascii") + b"\0")
         digest.update(hashlib.sha256(payload).digest())
     return _SHA256_PREFIX + digest.hexdigest()

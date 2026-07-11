@@ -152,14 +152,14 @@ def test_candidate_mining_is_row_order_independent(tmp_path: Path) -> None:
     assert first == second
 
 
-def test_compatible_full_name_aliases_share_one_active_identity(tmp_path: Path) -> None:
+def test_same_initial_names_at_one_address_do_not_share_an_active_identity(tmp_path: Path) -> None:
     rows = [
-        _display_name_record(1, name="Robert Smith", address="rsmith@example.invalid"),
-        _display_name_record(2, name="Robert Smith", address="rsmith@example.invalid"),
-        _display_name_record(3, name="Rob Smith", address="rsmith@example.invalid"),
-        _display_name_record(4, name="Rob Smith", address="rsmith@example.invalid"),
+        _display_name_record(1, name="John Smith", address="john.smith@example.invalid"),
+        _display_name_record(2, name="John Smith", address="john.smith@example.invalid"),
+        _display_name_record(3, name="Jane Smith", address="john.smith@example.invalid"),
+        _display_name_record(4, name="Jane Smith", address="john.smith@example.invalid"),
     ]
-    spool = tmp_path / "aliases.sqlite3"
+    spool = tmp_path / "same-initial-collision.sqlite3"
     spool.touch()
     policy = EnronBankPolicy()
     pool = mine_enron_candidates(
@@ -177,8 +177,20 @@ def test_compatible_full_name_aliases_share_one_active_identity(tmp_path: Path) 
 
     people = [item for item in curated.candidates if item["candidate_type"] == "person_alias"]
     assert len(people) == 2
-    assert {item["decision"] for item in people} == {"active"}
-    assert len({item["bank_ref"]["name_id"] for item in people}) == 1
+    assert {item["normalized_value"]: (item["decision"], item["primary_reason_code"]) for item in people} == {
+        "jane smith": ("draft", "address_local_part_incompatible"),
+        "john smith": ("active", "recurring_unique_full_name_alias"),
+    }
+    name_ids = {item["normalized_value"]: item["bank_ref"]["name_id"] for item in people}
+    assert name_ids["jane smith"] != name_ids["john smith"]
+    person_names = curated.bank["entities"]["person"]["names"]
+    identity_refs = {
+        normalized_value: person_names[name_id]["metadata"]["identity_ref"]
+        for normalized_value, name_id in name_ids.items()
+    }
+    assert identity_refs["jane smith"] != identity_refs["john smith"]
+    assert len({person_names[name_id]["metadata"]["contact_ref"] for name_id in name_ids.values()}) == 1
+    assert curated.collisions["by_reason"]["person_alias_incompatible_same_address"] == 1
 
 
 def test_person_draft_capacity_is_enforced_per_alias_pattern(tmp_path: Path) -> None:
@@ -295,7 +307,7 @@ def test_active_identity_canonical_uses_an_active_alias_not_higher_support_draft
     assert active_name["metadata"]["identity_aggregate_counts_supported"] is False
 
 
-def test_recurring_nickname_is_activated_through_a_local_compatible_anchor(tmp_path: Path) -> None:
+def test_recurring_nickname_remains_draft_beside_exact_full_name_anchor(tmp_path: Path) -> None:
     rows = [
         _display_name_record(1, name="Maribel Quill", address="maribel.quill@example.invalid"),
         _display_name_record(2, name="Maribel Quill", address="maribel.quill@example.invalid"),
@@ -320,8 +332,10 @@ def test_recurring_nickname_is_activated_through_a_local_compatible_anchor(tmp_p
 
     aliases = [item for item in curated.candidates if item["candidate_type"] == "person_alias"]
     assert {item["normalized_value"] for item in aliases} == {"mari quill", "maribel quill"}
-    assert {item["decision"] for item in aliases} == {"active"}
-    assert len({item["bank_ref"]["name_id"] for item in aliases}) == 1
+    assert {item["normalized_value"]: (item["decision"], item["primary_reason_code"]) for item in aliases} == {
+        "mari quill": ("draft", "address_local_part_incompatible"),
+        "maribel quill": ("active", "recurring_unique_full_name_alias"),
+    }
 
 
 def test_default_policy_bounds_large_contact_pool_and_keeps_selected_bank_compilable() -> None:

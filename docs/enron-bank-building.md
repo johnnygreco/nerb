@@ -68,13 +68,28 @@ The initial taxonomy is deliberately narrow:
 | Class | Train evidence and selected-bank treatment |
 | --- | --- |
 | Contact | Valid structured-header addresses recur in at least two distinct train leakage groups before activation. The selected policy also activates one bounded, low-precedence unknown-email fallback. |
-| Person | Full names come from structured display names or a sender-local-part name that is also observed near the end of that sender's current body. Support is counted separately for each matcher-equivalent case/whitespace surface, so reordered or punctuated forms do not pool recurrence; independently recurring compatible surfaces may still share one address identity. An alias needs support from at least two train leakage groups, one unambiguous recurring contact-address anchor retained as active or draft, and a locally compatible full-name anchor; compatible recurring nickname aliases may join that identity. The contact literal may remain draft only because of the compile-safe active cap. First-name-only aliases are prohibited. |
+| Person | Full names come from structured display names or a sender-local-part name that is also observed near the end of that sender's current body. Support is counted separately for each matcher-equivalent case/whitespace surface, so reordered or punctuated forms do not pool recurrence. Independently recurring matcher-distinct surfaces may share one address identity only when they normalize to the exact same full name; for example, `First Last` and `Last, First` can qualify separately. Nicknames, initials, and same-initial/same-last-name variants remain draft even when they recur. An active alias also needs one unambiguous recurring contact-address anchor retained as active or draft and local-part compatibility. The contact literal may remain draft only because of the compile-safe active cap. First-name-only aliases are prohibited. |
 | Organization domain | Observed domains are retained as draft because the current literal boundary model cannot express the intended exact domain span without unsafe expansion. |
 | Phone number | The bounded US phone fallback is an experiment only. It remains draft in the selected bank because independent negative and over-redaction evidence is unavailable. |
 
 Validation records never enter the candidate spool. Their labels or literal surfaces are not copied into the bank.
 Changing the development bundle, construction policy, source code, or benchmark version changes the corresponding
 commitments.
+
+## Deferred candidate pools
+
+The v2 builder does not mine the following pools, including as draft patterns. Structured headers do not provide enough
+independent semantic evidence for them, and opportunistic body-text mining would increase both false positives and the
+amount of private source material retained. Each pool needs a bounded train-only source plus independently reviewed
+validation before it can enter the lifecycle:
+
+| Deferred pool | Why it is not mined | Evidence required before inclusion |
+| --- | --- | --- |
+| Teams and projects | Names overlap ordinary phrases, person aliases, and organization names; project names can also be short-lived. | Exhaustive span and canonical-identity labels, time-aware aliases, and negative overlap cases from representative message bodies. |
+| Facilities | Office, site, room, plant, and geographic names are easily conflated, and headers contain no reliable facility relation. | A reviewed facility registry linked to labeled spans, location/facility disambiguation, and boundary/over-redaction negatives. |
+| Products and systems | Acronyms, code names, versions, and generic technical words are ambiguous and change over time. | Versioned authoritative catalogs, reviewed aliases, temporal bindings, and acronym/common-word negative evidence. |
+| Roles | Titles and desk functions are context-dependent, often generic, and do not identify a stable canonical entity. | A declared role taxonomy, exhaustive in-scope role spans, canonical labels, and person/organization collision tests. |
+| Counterparties | A counterparty may be a person, contact, organization, or legal entity, so name recurrence alone cannot establish the relationship. | An approved legal-entity or relationship source, canonical cross-class links, independently labeled spans, and ambiguity adjudication. |
 
 ## Candidate lifecycle
 

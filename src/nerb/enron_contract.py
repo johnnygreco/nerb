@@ -5557,8 +5557,13 @@ _STRUCTURED_PHONE_PATTERN = re.compile(
     r"\([0-9]{3}\)[ .+-]*[0-9]{3}[ .+-]*[0-9]{4}"
     r"|[0-9]{3}[ .+-]+[0-9]{3}[ .+-]+[0-9]{4})(?![0-9])"
 )
+_COMPACT_US_PHONE_PATTERN = re.compile(r"(?<![^\W_])(?:1[0-9]{10}|[0-9]{10})(?![^\W_])")
 _E164_PHONE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9]{8,15}(?![0-9])")
 _INTERNATIONAL_PHONE_CANDIDATE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9() .+-]+")
+_DOCUMENT_IDENTIFIER_PATTERN = re.compile(
+    r"(?<![^\W_])doc_[0-9a-f]{64}(?![^\W_])",
+    re.IGNORECASE,
+)
 _HTTP_URL_PATTERN = re.compile(
     r"(?i)https?://(?:\[[0-9a-f:.]+\]|[^/\s\"'<>,;\[\]{}]+)(?::[0-9]+)?"
     r"(?:(?:/|[?#])[^\s\"'<>,;\]}]*)?"
@@ -5648,7 +5653,7 @@ def _contains_international_phone(value: str) -> bool:
 
 def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
-    for path, text in _iter_strings(value):
+    for path, text in _iter_public_serialization_strings(value):
         normalized_text, converged = _normalize_public_text(text)
         if not converged:
             diagnostics.append(
@@ -5663,12 +5668,12 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
             continue
         _, url_payloads = _partition_http_url_text(normalized_text)
         identifier_texts = [_normalized_structured_identifier_text(item) for item in (normalized_text, *url_payloads)]
-        if any("@" in item for item in identifier_texts):
+        if any("@" in item or _DOCUMENT_IDENTIFIER_PATTERN.search(item) for item in identifier_texts):
             diagnostics.append(
                 _error(
                     "contract.public_direct_identifier",
                     path,
-                    "Public contract serialization contains an at-sign-shaped direct identifier.",
+                    "Public contract serialization contains a direct identifier shape.",
                 )
             )
             if len(diagnostics) > MAX_DIAGNOSTICS:
@@ -5676,6 +5681,7 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
         if any(
             _STRUCTURED_SSN_PATTERN.search(item)
             or _STRUCTURED_PHONE_PATTERN.search(item)
+            or _COMPACT_US_PHONE_PATTERN.search(item)
             or _E164_PHONE_PATTERN.search(item)
             or _contains_international_phone(item)
             for item in identifier_texts
@@ -5701,6 +5707,36 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
             if len(diagnostics) > MAX_DIAGNOSTICS:
                 return diagnostics
     return diagnostics
+
+
+def _iter_public_serialization_strings(value: Any) -> Iterable[tuple[str, str]]:
+    """Yield values with their JSON pointers and mapping keys with privacy-safe synthetic pointers."""
+
+    yield from _iter_strings(value)
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    containers: set[int] = set()
+    key_index = 0
+    while stack:
+        item, depth = stack.pop()
+        if depth > MAX_CONTRACT_DEPTH:
+            raise RecursionError
+        if type(item) is dict:
+            if id(item) in containers:
+                raise RecursionError
+            containers.add(id(item))
+            children = []
+            for key in sorted(item):
+                if type(key) is not str:
+                    raise TypeError
+                yield f"/@mapping-key/{key_index}", key
+                key_index += 1
+                children.append((item[key], depth + 1))
+            stack.extend(reversed(children))
+        elif type(item) is list:
+            if id(item) in containers:
+                raise RecursionError
+            containers.add(id(item))
+            stack.extend((child, depth + 1) for child in reversed(item))
 
 
 def _placeholder_hash_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:

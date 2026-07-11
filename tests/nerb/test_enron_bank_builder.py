@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -383,6 +384,21 @@ def test_public_card_scan_rejects_direct_identifiers(tmp_path: Path) -> None:
         _validate_public_card(changed)
 
 
+def test_public_card_scan_rejects_recommitted_stale_scanner_provenance(tmp_path: Path) -> None:
+    development, _sealed = _development_bundle(tmp_path)
+    card = build_enron_intelligence_bank(
+        EnronBankBuildOptions(development_run=development, output_dir=tmp_path / "build")
+    )
+    changed = json.loads(json.dumps(card))
+    privacy = changed["privacy"]
+    privacy["scanner_source_sha256"] = "sha256:" + "5" * 64
+    privacy["report_sha256"] = _canonical_hash({key: value for key, value in privacy.items() if key != "report_sha256"})
+    changed["run_sha256"] = _canonical_hash({key: value for key, value in changed.items() if key != "run_sha256"})
+
+    with pytest.raises(EnronBankBuildError, match="scanner implementation commitment"):
+        _validate_public_card(changed)
+
+
 @pytest.mark.parametrize(
     ("location", "unsafe"),
     [
@@ -518,6 +534,49 @@ def test_verifier_replays_rejected_candidate_evidence_from_mining_spool(tmp_path
 
     with pytest.raises(EnronBankBuildError, match="candidate ledger differs from replayed"):
         verify_enron_bank_build(output)
+
+
+@pytest.mark.parametrize("oversized_cell", ["projection_payload", "observation_surface"])
+def test_mining_replay_rejects_sparse_oversized_cells_before_private_cell_fetch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    oversized_cell: str,
+) -> None:
+    _pool, source_binding = _mine(tmp_path, _development_bundle(tmp_path)[0])
+    spool = tmp_path / "spool.sqlite3"
+    connection = sqlite3.connect(spool)
+    try:
+        if oversized_cell == "projection_payload":
+            monkeypatch.setattr(bank_workflow, "_MAX_PRIVATE_SQLITE_PROJECTION_BYTES", 64)
+            connection.execute(
+                "UPDATE source_projections SET payload = zeroblob(?) WHERE document_id = "
+                "(SELECT document_id FROM source_projections ORDER BY document_id LIMIT 1)",
+                (65,),
+            )
+        else:
+            connection.execute(
+                "UPDATE observations SET surface = CAST(zeroblob(?) AS TEXT) WHERE "
+                "(kind, normalized_value, surface, related, source_type, document_id) = "
+                "(SELECT kind, normalized_value, surface, related, source_type, document_id "
+                "FROM observations ORDER BY kind, normalized_value LIMIT 1)",
+                (EnronBankPolicy().max_candidate_value_bytes + 1,),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    def unexpected_private_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("SQL cell preflight must reject before private cell materialization")
+
+    monkeypatch.setattr(bank_workflow, "_iter_mining_source_projections", unexpected_private_fetch)
+    monkeypatch.setattr(bank_workflow, "_read_candidate_evidence", unexpected_private_fetch)
+
+    with pytest.raises(EnronBankBuildError, match="cell exceeds"):
+        bank_workflow._replay_candidate_pool_snapshot(
+            spool,
+            train_artifact_sha256=source_binding["train_artifact_sha256"],
+            policy=EnronBankPolicy(),
+        )
 
 
 @pytest.mark.parametrize("iteration_index", [0, 2])

@@ -12,6 +12,7 @@ import pytest
 
 import nerb.enron_bank_builder as bank_builder
 import nerb.enron_bank_workflow as bank_workflow
+import nerb.enron_contract as enron_contract
 from nerb.bank import bank_stats, hash_bank
 from nerb.enron_bank_builder import EnronBankBuildError, _canonical_hash, _canonical_json_bytes
 from nerb.enron_bank_workflow import (
@@ -150,6 +151,32 @@ def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_boun
     assert all(not value.startswith(("/", "~/", "file://")) for value in _strings((card, funnel)))
 
 
+@pytest.mark.parametrize(
+    "metric",
+    [
+        "precision",
+        "open_world_recall",
+        "f1",
+        "catalog_coverage",
+        "cataloged_recall",
+        "document_leak_rate",
+        "cataloged_document_leak_rate",
+        "sensitive_character_recall",
+        "sensitive_character_leak_rate",
+        "negative_document_false_alarm_rate",
+        "over_redaction_rate",
+    ],
+)
+def test_real_aggregate_card_rejects_impossible_auxiliary_metric_arithmetic(metric: str) -> None:
+    card = _load("enron_bank_card_v2_real_50000.json")
+    metrics = card["independent_auxiliary"]["metrics"]
+    metrics[metric] = 1.0 if metrics[metric] != 1.0 else 0.0
+    card["run_sha256"] = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
+
+    with pytest.raises(EnronBankBuildError, match="semantic invariants"):
+        _validate_public_card(card)
+
+
 def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tampering() -> None:
     card = _load("enron_bank_card_v2_fake.json")
     missing_iteration_field = copy.deepcopy(card)
@@ -193,6 +220,16 @@ def test_builder_implementation_commitment_binds_workflow_and_candidate_logic() 
         digest.update(hashlib.sha256(source_path.read_bytes()).digest())
 
     assert _builder_implementation_sha256() == "sha256:" + digest.hexdigest()
+
+
+def test_public_card_scanner_commitment_binds_wrapper_and_canonical_scanner() -> None:
+    digest = hashlib.sha256(b"nerb/enron/public-card-scanner/v2\0")
+    for label, module in (("contract_scanner", enron_contract), ("workflow_wrapper", bank_workflow)):
+        source_path = Path(str(module.__file__))
+        digest.update(label.encode("ascii") + b"\0")
+        digest.update(hashlib.sha256(source_path.read_bytes()).digest())
+
+    assert bank_workflow._public_card_scanner_sha256() == "sha256:" + digest.hexdigest()
 
 
 def test_generated_conformance_cases_exercise_case_whitespace_and_boundaries() -> None:
