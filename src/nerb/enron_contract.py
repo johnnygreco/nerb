@@ -4555,26 +4555,38 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
     performance_diagnostics, performance_gate_specs = _performance_promotion_diagnostics(evidence)
     diagnostics.extend(performance_diagnostics)
     required_gate_specs.update(performance_gate_specs)
-    headline_performance_bounds: dict[str, tuple[str, float]] = {}
+    practical_performance_bounds: dict[str, tuple[str, float]] = {}
+    performance_inputs = {str(item["id"]): item for item in evidence["performance"]["inputs"]}
     for index, workload in enumerate(evidence["performance"]["workloads"]):
-        if not workload["promotion_gate"]:
+        if (
+            not workload["decision_grade"]
+            or workload["baseline_id"] is not None
+            or workload["phase"] != "direct_bank_scan"
+        ):
             continue
         path = f"/performance/workloads/{index}"
-        headline_performance_bounds[f"{path}/peak_rss_bytes"] = ("lte", float(MAX_HEADLINE_PEAK_RSS_BYTES))
+        practical_performance_bounds[f"{path}/peak_rss_bytes"] = ("lte", float(MAX_HEADLINE_PEAK_RSS_BYTES))
         if workload["sample_unit"] == "document":
-            headline_performance_bounds[f"{path}/stats/p99_seconds"] = (
+            practical_performance_bounds[f"{path}/stats/p99_seconds"] = (
                 "lte",
                 MAX_HEADLINE_DOCUMENT_P99_SECONDS,
             )
         elif workload["sample_unit"] == "whole_input":
-            headline_performance_bounds[f"{path}/stats/documents_per_second"] = (
+            practical_performance_bounds[f"{path}/stats/documents_per_second"] = (
                 "gte",
                 MIN_HEADLINE_DOCUMENTS_PER_SECOND,
             )
-            headline_performance_bounds[f"{path}/stats/mib_per_second"] = (
+            practical_performance_bounds[f"{path}/stats/mib_per_second"] = (
                 "gte",
                 MIN_HEADLINE_MIB_PER_SECOND,
             )
+            input_descriptor = performance_inputs.get(str(workload["input_id"]))
+            if input_descriptor is not None:
+                tail_seconds_bound = min(
+                    float(input_descriptor["documents"]) / MIN_HEADLINE_DOCUMENTS_PER_SECOND,
+                    (float(input_descriptor["bytes"]) / (1024 * 1024)) / MIN_HEADLINE_MIB_PER_SECOND,
+                )
+                practical_performance_bounds[f"{path}/stats/p99_seconds"] = ("lte", tail_seconds_bound)
     checks_by_target = {str(item["target"]): item for item in promotion["checks"]}
     missing_targets = sorted(set(required_gate_specs) - set(checks_by_target))
     if missing_targets:
@@ -4640,8 +4652,8 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
                         "Decision-grade performance thresholds must be strictly positive.",
                     )
                 )
-            elif target in headline_performance_bounds:
-                policy_operator, policy_bound = headline_performance_bounds[target]
+            elif target in practical_performance_bounds:
+                policy_operator, policy_bound = practical_performance_bounds[target]
                 weak_policy = (policy_operator == "lte" and float(threshold) > policy_bound) or (
                     policy_operator == "gte" and float(threshold) < policy_bound
                 )
@@ -4650,8 +4662,8 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
                         _error(
                             "contract.performance_threshold_policy",
                             "/promotion/checks",
-                            "Headline thresholds may tighten but cannot weaken practical latency, throughput, "
-                            "or RSS bounds.",
+                            "Direct-scan thresholds may tighten but cannot weaken practical latency, throughput, "
+                            "or RSS bounds at any required scale.",
                         )
                     )
     return diagnostics

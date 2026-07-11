@@ -1151,6 +1151,7 @@ def _promotable(
                 quality["metrics"][metric],
             )
         )
+    performance_input_by_id = {item["id"]: item for item in value["performance"]["inputs"]}
     for workload_index, workload in enumerate(value["performance"]["workloads"]):
         if not workload["decision_grade"]:
             continue
@@ -1162,7 +1163,7 @@ def _promotable(
         }
         if workload["sample_unit"] == "document":
             fields["seconds_per_document"] = ("lte", 1.0)
-            if workload["promotion_gate"]:
+            if workload["phase"] == "direct_bank_scan":
                 fields["p99_seconds"] = ("lte", 0.05)
         elif workload["sample_unit"] == "whole_input":
             fields.update(
@@ -1174,6 +1175,17 @@ def _promotable(
             if workload["promotion_gate"]:
                 fields["documents_per_second"] = ("gte", 100.0)
                 fields["mib_per_second"] = ("gte", 1.0)
+            if workload["phase"] == "direct_bank_scan":
+                input_descriptor = performance_input_by_id[workload["input_id"]]
+                fields["documents_per_second"] = ("gte", 100.0)
+                fields["mib_per_second"] = ("gte", 1.0)
+                fields["p99_seconds"] = (
+                    "lte",
+                    min(
+                        input_descriptor["documents"] / 100.0,
+                        (input_descriptor["bytes"] / (1024 * 1024)) / 1.0,
+                    ),
+                )
         for field, (operator, threshold) in fields.items():
             target = f"/performance/workloads/{workload_index}/"
             target += f"stats/{field}" if field != "peak_rss_bytes" else field
@@ -2370,6 +2382,69 @@ def test_same_machine_baseline_cannot_authorize_impractical_headline_thresholds(
         )
     )
     assert check["passed"] is True
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_threshold_policy",
+    )
+
+
+def test_slower_exact_baseline_cannot_authorize_impractical_scale_performance(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
+    candidate = workloads["scale_100000_scan"]
+    baseline = workloads["baseline_scale_100000_scan"]
+    candidate["samples_seconds"] = [80_000.0 + index / 1_000_000 for index in range(100)]
+    baseline["samples_seconds"] = [85_000.0 + index / 1_000_000 for index in range(100)]
+    _refresh_workload(promoted, candidate)
+    _refresh_workload(promoted, baseline)
+
+    candidate_index = promoted["performance"]["workloads"].index(candidate)
+    target_prefix = f"/performance/workloads/{candidate_index}/"
+    for check in promoted["promotion"]["checks"]:
+        if not check["target"].startswith(target_prefix):
+            continue
+        actual = _resolve_pointer(promoted, check["target"])
+        threshold = check["threshold"]
+        if check["target"].endswith("_seconds"):
+            threshold = 90_000.0
+        elif check["operator"] == "gte":
+            threshold = 1e-9
+        check.update(_gate(check["id"], check["category"], check["target"], check["operator"], threshold, actual))
+        assert check["passed"] is True
+
+    for comparison in promoted["performance"]["comparisons"]:
+        if comparison["candidate_workload_id"] != candidate["id"]:
+            continue
+        metric = comparison["metric"]
+        candidate_value = candidate["stats"][metric]
+        baseline_value = baseline["stats"][metric]
+        relative_degradation = (
+            (candidate_value - baseline_value) / baseline_value
+            if comparison["direction"] == "lower_is_better"
+            else (baseline_value - candidate_value) / baseline_value
+        )
+        noise_floor = (
+            max(
+                candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
+                baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
+            )
+            * comparison["noise_multiplier"]
+        )
+        comparison.update(
+            {
+                "candidate_value": candidate_value,
+                "baseline_value": baseline_value,
+                "relative_degradation": relative_degradation,
+                "noise_floor": noise_floor,
+                "result": "improved",
+            }
+        )
+
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
 

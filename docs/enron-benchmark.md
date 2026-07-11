@@ -300,10 +300,10 @@ Absolute results are hardware-specific. Promotion uses thresholds frozen from va
 baseline, reports noise diagnostics, and fails closed when required samples, input inventories, RSS, or environment
 provenance are missing. Every decision cell gates median, p95, p99, and peak RSS; document cells also gate seconds per
 document, while whole-input cells gate documents/second and MiB/second. Validation may tighten but cannot weaken the
-deliberately conservative evaluated-bank headline policies: document p99 at most 50 ms, whole-input throughput at least
-100 documents/second and 1 MiB/second, and peak RSS at most 8 GiB. These absolute bounds prevent a similarly slow
-baseline from making an impractical candidate promotable. CI smoke timing is robustness evidence, not a substitute for
-the decision-grade protocol.
+deliberately conservative direct-scan policies at any required scale: document p99 at most 50 ms, whole-input median
+throughput at least 100 documents/second and 1 MiB/second, p99 no slower than those same per-input throughput floors,
+and peak RSS at most 8 GiB. These absolute bounds prevent a similarly slow baseline from making an impractical candidate
+promotable. CI smoke timing is robustness evidence, not a substitute for the decision-grade protocol.
 
 The value demonstration records an additive parameterized break-even model rather than inventing hosted-model prices.
 Candidate fixed costs separate declared source curation, measured source profiling, measured bank build, and measured
