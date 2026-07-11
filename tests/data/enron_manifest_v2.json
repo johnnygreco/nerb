@@ -1,0 +1,238 @@
+{
+  "schema_version": "nerb.enron_manifest.v2",
+  "charter_version": "2",
+  "artifact_kind": "synthetic_fixture",
+  "benchmark_version": "fixture-v2",
+  "created_at": "2026-07-10T00:00:00Z",
+  "evaluator": {
+    "id": "synthetic_privacy_eval",
+    "version": "2.0.0",
+    "source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "label_schema_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "verifier": {
+    "id": "nerb-enron-contract",
+    "version": "2.0.0",
+    "source_sha256": "sha256:abababababababababababababababababababababababababababababababab"
+  },
+  "source": {
+    "id": "synthetic/messages",
+    "revision": "fixture-v1",
+    "owner": "fixture-owner",
+    "access": "synthetic-public",
+    "content_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "input_records": 30
+  },
+  "preparation": {
+    "cleaning_policy_sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "grouping_policy_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "output_records": 30,
+    "prepared_artifact": {
+      "id": "prepared_records",
+      "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "bytes": 4096
+    },
+    "text_views": [
+      {
+        "id": "natural_body",
+        "artifact_sha256": "sha256:1818181818181818181818181818181818181818181818181818181818181818",
+        "content_policy_sha256": "sha256:1919191919191919191919191919191919191919191919191919191919191919",
+        "document_regions": ["natural_body"],
+        "primary_for_quality": true,
+        "answer_bearing_fields_included": false
+      }
+    ]
+  },
+  "splits": {
+    "manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+    "policy_sha256": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+    "leakage_audit_sha256": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+    "leakage_groups_crossing": 0,
+    "test_sealed": true,
+    "seed": "synthetic-fixture-seed",
+    "roles": {
+      "train": {
+        "records": 20,
+        "groups": 18,
+        "artifact": {
+          "id": "train_records",
+          "sha256": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+          "bytes": 2048
+        }
+      },
+      "validation": {
+        "records": 5,
+        "groups": 5,
+        "artifact": {
+          "id": "validation_records",
+          "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bytes": 512
+        }
+      },
+      "test": {
+        "records": 5,
+        "groups": 5,
+        "artifact": {
+          "id": "test_records",
+          "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "bytes": 512
+        }
+      }
+    }
+  },
+  "bank": {
+    "id": "synthetic_intelligence_bank",
+    "canonical_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "artifact_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "active_entities": 3,
+    "active_names": 4,
+    "active_aliases": 1,
+    "active_patterns": 5,
+    "canonical_json_bytes": 2048,
+    "native_source_bytes": 1024
+  },
+  "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
+  "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
+  "labels": [
+    {
+      "id": "independent_person_labels",
+      "label_strength": "independent",
+      "annotation_scope": {
+        "entity_classes": ["person"],
+        "document_regions": ["natural_body"],
+        "span_policy_sha256": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        "exclusions": ["synthetic excluded headings"]
+      },
+      "annotation_completeness": "exhaustive_within_scope",
+      "roles": ["test"],
+      "role_populations": [
+        {
+          "role": "test",
+          "documents": 5,
+          "spans": 20
+        }
+      ],
+      "annotation_provenance": {
+        "protocol_sha256": "sha256:2828282828282828282828282828282828282828282828282828282828282828",
+        "producer_id": "synthetic-independent-producer",
+        "reviewer_id": "synthetic-independent-reviewer",
+        "independently_reviewed": true,
+        "adjudication_artifact": {
+          "id": "synthetic_independent_adjudication",
+          "sha256": "sha256:2929292929292929292929292929292929292929292929292929292929292929",
+          "bytes": 512
+        }
+      },
+      "artifact": {
+        "id": "independent_labels",
+        "sha256": "sha256:3232323232323232323232323232323232323232323232323232323232323232",
+        "bytes": 1024
+      },
+      "span_count": 20
+    },
+    {
+      "id": "synthetic_conformance_labels",
+      "label_strength": "synthetic_conformance",
+      "annotation_scope": {
+        "entity_classes": ["approved_catalog_patterns"],
+        "document_regions": ["synthetic_cases"],
+        "span_policy_sha256": "sha256:2020202020202020202020202020202020202020202020202020202020202020",
+        "exclusions": []
+      },
+      "annotation_completeness": "exhaustive_within_scope",
+      "roles": ["conformance"],
+      "role_populations": [
+        {
+          "role": "conformance",
+          "documents": 10,
+          "spans": 10
+        }
+      ],
+      "annotation_provenance": {
+        "protocol_sha256": "sha256:3030303030303030303030303030303030303030303030303030303030303030",
+        "producer_id": "synthetic-conformance-producer",
+        "reviewer_id": "synthetic-conformance-reviewer",
+        "independently_reviewed": true,
+        "adjudication_artifact": {
+          "id": "synthetic_conformance_adjudication",
+          "sha256": "sha256:3131313131313131313131313131313131313131313131313131313131313131",
+          "bytes": 512
+        }
+      },
+      "artifact": {
+        "id": "synthetic_conformance_positive_cases",
+        "sha256": "sha256:1515151515151515151515151515151515151515151515151515151515151515",
+        "bytes": 1024
+      },
+      "span_count": 10
+    }
+  ],
+  "quality_plan": [
+    {
+      "id": "independent_all_test",
+      "label_artifact_id": "independent_person_labels",
+      "split_role": "test",
+      "entity_class": "person",
+      "cohort": "all",
+      "text_view": "natural_body",
+      "promotion_gate": false,
+      "documents": 5,
+      "documents_with_sensitive_gold": 4,
+      "negative_documents": 1,
+      "gold_spans": 20,
+      "cataloged_gold_spans": 16,
+      "documents_with_cataloged_gold": 4,
+      "sensitive_gold_characters": 100,
+      "evaluated_characters": 1000
+    }
+  ],
+  "conformance_plan": {
+    "label_artifact_id": "synthetic_conformance_labels",
+    "positive_cases_artifact": {
+      "id": "synthetic_conformance_positive_cases",
+      "sha256": "sha256:1515151515151515151515151515151515151515151515151515151515151515",
+      "bytes": 1024
+    },
+    "positive_cases": 10,
+    "negative_cases_artifact": {
+      "id": "synthetic_conformance_negative_cases",
+      "sha256": "sha256:1616161616161616161616161616161616161616161616161616161616161616",
+      "bytes": 1024
+    },
+    "negative_cases": 10,
+    "policy_sha256": "sha256:2727272727272727272727272727272727272727272727272727272727272727"
+  },
+  "software": {
+    "package_version": "0.0.11",
+    "engine_version": "0.0.11",
+    "git_commit": "0000000000000000000000000000000000000000",
+    "git_dirty": false
+  },
+  "commands": [
+    {
+      "id": "fixture_build",
+      "argv": ["nerb-fixture", "--source", "synthetic/messages"],
+      "cwd": ".",
+      "timeout_seconds": 60.0,
+      "exit_status": 0,
+      "elapsed_seconds": 1.0
+    }
+  ],
+  "environment": {
+    "os": "fixture-os",
+    "architecture": "fixture-arch",
+    "python": "3.10.0",
+    "cpu_count": 4,
+    "cpu_model": "synthetic-cpu",
+    "memory_bytes": 8589934592
+  },
+  "privacy": {
+    "status": "passed",
+    "raw_text_included": false,
+    "direct_identifiers_included": false,
+    "scanner": "synthetic-privacy-scan-v1",
+    "scanner_source_sha256": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
+    "report_sha256": "sha256:1414141414141414141414141414141414141414141414141414141414141414",
+    "violation_count": 0
+  }
+}
