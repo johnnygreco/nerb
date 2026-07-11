@@ -285,8 +285,8 @@ Key commitments are:
 - privacy scanner implementation: `sha256:7a49fa66eacff9b8b8bc9a656b5c1ed41e6aec9e33e2a588a8724ae8b446b2cf`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
 - canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:7c1e6013fdbefe45bf5b3167ddce8d70dd45ae15abd39d0c79c93bf683ec0b72`;
-- committed bank-card file: `sha256:b06ee961693890041727878822de094b4ff0bd8bc0cfbc08d6bd3c576e6b43cc`; and
+- bank-card run: `sha256:c32b54f6bb890b96951724a72465afd7d33b0b73fe391e8f04c31d7acdaa525e`;
+- committed bank-card file: `sha256:3a9297dcded41bc5ea5dcc96366dbb423e435fa663b840c2cc07ce3c8ca18767`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
 The exact private commands were:
