@@ -281,6 +281,7 @@ def _refresh_frozen_contract(evidence: JsonObject) -> None:
             "bank_hash": evidence["bank"]["canonical_hash"],
             "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
             "split_manifest_sha256": evidence["splits"]["manifest_sha256"],
+            "test_artifact_sha256": evidence["splits"]["roles"]["test"]["artifact"]["sha256"],
             "thresholds_sha256": evidence["thresholds_sha256"],
             "performance_manifest_sha256": evidence["performance_manifest_sha256"],
             "git_commit": evidence["software"]["git_commit"],
@@ -1286,6 +1287,7 @@ def _with_predecessor(evidence: JsonObject) -> list[JsonObject]:
         "bytes": 256,
     }
     predecessor["frozen_target"]["frozen_at"] = "2026-07-09T00:01:00Z"
+    predecessor["frozen_target"]["test_artifact_sha256"] = "sha256:" + "8" * 64
     access["lineage"] = [predecessor, current]
     _normalize_lineage(evidence)
     return copy.deepcopy(access["lineage"][:-1])
@@ -3299,6 +3301,7 @@ def test_manifest_hash_is_deterministic_and_content_sensitive(manifest: JsonObje
         "bank_hash",
         "evaluator_source_sha256",
         "split_manifest_sha256",
+        "test_artifact_sha256",
         "thresholds_sha256",
         "performance_manifest_sha256",
         "git_commit",
@@ -3430,6 +3433,27 @@ def test_successor_lineage_accepts_exact_trusted_append(manifest: JsonObject, ev
         inventories,
         trusted_lineage_prefix=trusted_prefix,
     ) == {"valid": True, "diagnostics": []}
+
+
+def test_successor_lineage_rejects_reused_final_test_artifact(
+    manifest: JsonObject,
+    evidence: JsonObject,
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    _with_predecessor(promoted)
+    lineage = promoted["test_access"]["lineage"]
+    lineage[0]["frozen_target"]["test_artifact_sha256"] = lineage[1]["frozen_target"]["test_artifact_sha256"]
+    _normalize_lineage(promoted)
+
+    _assert_code(
+        _validate_promoted(
+            promoted,
+            bound_manifest,
+            inventories,
+            trusted_lineage_prefix=copy.deepcopy(lineage[:-1]),
+        ),
+        "contract.test_population_reused",
+    )
 
 
 def test_successor_lineage_rejects_non_append_only_prefix(manifest: JsonObject, evidence: JsonObject) -> None:

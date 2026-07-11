@@ -215,6 +215,7 @@
       "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "test_artifact_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
       "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
       "git_commit": "0000000000000000000000000000000000000000"
@@ -236,6 +237,7 @@
           "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
           "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+          "test_artifact_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
           "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
           "git_commit": "0000000000000000000000000000000000000000"
@@ -243,10 +245,10 @@
         "predecessor_benchmark_version": null,
         "changes_informed_by_predecessor": [],
         "previous_entry_sha256": null,
-        "entry_sha256": "sha256:7915c0d94a879cf430471af59fe81f2b56c1f36413d3164a390fd5374f83fc5d"
+        "entry_sha256": "sha256:fbfd4e9302f30c6bf24ecb32b561943f55362c6bf7270ac109941291c284f738"
       }
     ],
-    "lineage_head_sha256": "sha256:7915c0d94a879cf430471af59fe81f2b56c1f36413d3164a390fd5374f83fc5d"
+    "lineage_head_sha256": "sha256:fbfd4e9302f30c6bf24ecb32b561943f55362c6bf7270ac109941291c284f738"
   },
   "performance": {
     "evaluated": true,

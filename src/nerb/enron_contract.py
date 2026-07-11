@@ -1050,6 +1050,7 @@ _FROZEN_TARGET = _closed_object(
         "bank_hash",
         "evaluator_source_sha256",
         "split_manifest_sha256",
+        "test_artifact_sha256",
         "thresholds_sha256",
         "performance_manifest_sha256",
         "git_commit",
@@ -1060,6 +1061,7 @@ _FROZEN_TARGET = _closed_object(
         "bank_hash": _HASH,
         "evaluator_source_sha256": _HASH,
         "split_manifest_sha256": _HASH,
+        "test_artifact_sha256": _HASH,
         "thresholds_sha256": _HASH,
         "performance_manifest_sha256": _HASH,
         "git_commit": {"type": "string", "pattern": GIT_COMMIT_PATTERN},
@@ -2732,6 +2734,7 @@ def _test_access_diagnostics(
         "bank_hash": evidence["bank"]["canonical_hash"],
         "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
         "split_manifest_sha256": evidence["splits"]["manifest_sha256"],
+        "test_artifact_sha256": evidence["splits"]["roles"]["test"]["artifact"]["sha256"],
         "thresholds_sha256": evidence["thresholds_sha256"],
         "performance_manifest_sha256": evidence["performance_manifest_sha256"],
         "git_commit": evidence["software"]["git_commit"],
@@ -2769,6 +2772,7 @@ def _test_access_diagnostics(
     lineage = access["lineage"]
     current_entries: list[Mapping[str, Any]] = []
     seen_versions: set[str] = set()
+    seen_test_artifacts: set[str] = set()
     previous_entry: Mapping[str, Any] | None = None
     previous_accessed_at: datetime | None = None
     for index, entry in enumerate(lineage):
@@ -2787,6 +2791,16 @@ def _test_access_diagnostics(
                 )
             )
         seen_versions.add(version)
+        test_artifact_sha256 = str(entry["frozen_target"]["test_artifact_sha256"])
+        if test_artifact_sha256 in seen_test_artifacts:
+            diagnostics.append(
+                _error(
+                    "contract.test_population_reused",
+                    f"{path}/frozen_target/test_artifact_sha256",
+                    "A sealed final-test artifact may be accessed by only one benchmark version.",
+                )
+            )
+        seen_test_artifacts.add(test_artifact_sha256)
         if version == access["benchmark_version"]:
             current_entries.append(entry)
         expected_entry_hash = hash_enron_test_lineage_entry(entry)

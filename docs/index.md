@@ -26,6 +26,7 @@ nerb extract-text \
 [Performance](performance.md){ .md-button }
 [Enron v2 charter](enron-benchmark.md){ .md-button }
 [Prepare Enron v2](enron-preparation.md){ .md-button }
+[Split Enron v2](enron-splits.md){ .md-button }
 </p>
 
 </div>
@@ -44,10 +45,10 @@ so privacy evidence must report open-world recall and misses separately from cat
 
 !!! warning "Enron evidence is being rebuilt"
 
-    The privacy-first Enron benchmark v2 contract and private preparation stage are implemented; grouping, immutable
-    splits, bank construction, evaluation, and real-corpus evidence remain staged work. Historical v1 quality,
+    The privacy-first Enron benchmark v2 contract, private preparation, leakage grouping, and immutable split stages are
+    implemented; bank construction, evaluation, and real-corpus evidence remain staged work. Historical v1 quality,
     autoresearch, and performance artifacts do not meet the v2 contract and do not support current public claims. See
-    the [v2 charter](enron-benchmark.md) and [preparation guide](enron-preparation.md).
+    the [v2 charter](enron-benchmark.md), [preparation guide](enron-preparation.md), and [split guide](enron-splits.md).
 
 ## Why Teams Use NERB
 

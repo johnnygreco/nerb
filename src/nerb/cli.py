@@ -68,6 +68,12 @@ from .enron_preparation import (
     DEFAULT_OUTPUT_DIR as DEFAULT_ENRON_OUTPUT_DIR,
 )
 from .enron_preparation import EnronPreparationOptions, load_enron_preparation_run, prepare_enron_source
+from .enron_splitting import (
+    DEFAULT_SPLIT_SEED,
+    EnronSplitOptions,
+    split_enron_preparation,
+    verify_enron_splits,
+)
 from .evals import eval_bank as _eval_bank
 from .extraction import ExtractionError
 from .extraction import (
@@ -2435,6 +2441,77 @@ def verify_enron_preparation(
     except OSError as exc:
         _exit_error(str(exc))
     _echo_json(payload)
+
+
+@app.command("split-enron")
+def split_enron(
+    preparation_run: Path = typer.Option(
+        ...,
+        "--preparation-run",
+        help="Committed private Enron preparation run directory.",
+    ),
+    development_output_dir: Path = typer.Option(
+        ...,
+        "--development-output-dir",
+        help="New private train/validation bundle directory.",
+    ),
+    sealed_output_dir: Path = typer.Option(
+        ...,
+        "--sealed-output-dir",
+        help="New steward-only sealed-test bundle directory.",
+    ),
+    benchmark_version: str = typer.Option("enron-v2", "--benchmark-version"),
+    seed: str = typer.Option(DEFAULT_SPLIT_SEED, "--seed"),
+    sample_per_role: int = typer.Option(
+        10_000,
+        "--sample-per-role",
+        min=1,
+        help="Maximum deterministic diagnostic sample size per role; quality gates still use full populations.",
+    ),
+    max_near_candidate_pairs: int = typer.Option(
+        100_000_000,
+        "--max-near-candidate-pairs",
+        min=1,
+        help="Fail-closed budget for raw band-join emissions and unique radius-3 near-duplicate comparisons.",
+    ),
+    fixture_mode: bool = typer.Option(
+        False,
+        "--fixture-mode",
+        help="Relax production support floors for synthetic tests; outputs are marked non-promotable.",
+    ),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit private bundles outside ignored repository paths; symlink checks remain enforced.",
+    ),
+) -> None:
+    """Create immutable leakage-audited development and sealed Enron split bundles."""
+    options = EnronSplitOptions(
+        preparation_run=preparation_run,
+        development_output_dir=development_output_dir,
+        sealed_output_dir=sealed_output_dir,
+        benchmark_version=benchmark_version,
+        seed=seed,
+        sample_per_role=sample_per_role,
+        max_near_candidate_pairs=max_near_candidate_pairs,
+        fixture_mode=fixture_mode,
+        allow_unignored_output=allow_unignored_output,
+    )
+    _echo_json(_run_json_helper(lambda: split_enron_preparation(options)))
+
+
+@app.command("verify-enron-splits")
+def verify_enron_split_bundles(
+    development_dir: Path = typer.Option(..., "--development-dir", help="Committed development split bundle."),
+    sealed_dir: Path = typer.Option(..., "--sealed-dir", help="Committed steward-only sealed-test bundle."),
+    seed: str = typer.Option(
+        DEFAULT_SPLIT_SEED,
+        "--seed",
+        help="Original split seed; verification checks it against the published seed commitment.",
+    ),
+) -> None:
+    """Deep-verify split conservation, leakage isolation, cohorts, samples, and sealing."""
+    _echo_json(_run_json_helper(lambda: verify_enron_splits(development_dir, sealed_dir, seed=seed)))
 
 
 @app.command("regress-bank")
