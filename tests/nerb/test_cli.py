@@ -526,6 +526,53 @@ def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_dat
     assert regress_payload["gates"]["passed"] == expected_regression["gates"]["passed"]
 
 
+def test_prepare_enron_command_writes_private_v2_run_and_returns_aggregate_json(tmp_path, test_data_path):
+    output_dir = tmp_path / "prepared-run"
+    result = runner.invoke(
+        app,
+        [
+            "prepare-enron",
+            "--input-jsonl",
+            str(test_data_path / "enron_preparation_v2.jsonl"),
+            "--dataset",
+            "synthetic/enron-preparation",
+            "--dataset-revision",
+            "fixture-v2",
+            "--output-dir",
+            str(output_dir),
+            "--max-jsonl-line-bytes",
+            str(64 * 1024),
+            "--max-body-chars",
+            str(8 * 1024),
+            "--max-body-bytes",
+            str(32 * 1024),
+            "--max-subject-chars",
+            "512",
+            "--max-subject-bytes",
+            str(2 * 1024),
+            "--max-recipients-per-field",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["committed"] is True
+    assert payload["source_records"] == 8
+    assert payload["prepared_records"] == 7
+    assert payload["prepared_occurrences"] == 8
+    assert "@" not in result.output
+    assert str(output_dir) not in result.output
+    assert (output_dir / "COMMITTED").is_file()
+
+    verify_result = runner.invoke(app, ["verify-enron-preparation", "--run-dir", str(output_dir)])
+    assert verify_result.exit_code == 0, verify_result.output
+    verified = json.loads(verify_result.output)
+    assert verified["valid"] is True
+    assert verified["profile"]["records"]["conservation_valid"] is True
+    assert "@" not in verify_result.output
+
+
 def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"
