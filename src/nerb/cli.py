@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import typer
 import yaml
@@ -55,6 +55,14 @@ from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
 from .engine import Bank
 from .engines import DEFAULT_MAX_TEXT_BYTES
+from .enron_annotations import (
+    EnronAnnotationError,
+    EnronAnnotationIngestOptions,
+    download_cmu_enron_annotations,
+    ingest_cmu_enron_annotations,
+    verify_cmu_enron_annotations,
+)
+from .enron_conformance import EnronConformanceError, evaluate_enron_conformance_files
 from .enron_preparation import (
     DEFAULT_DATASET_ID as DEFAULT_ENRON_DATASET_ID,
 )
@@ -68,6 +76,11 @@ from .enron_preparation import (
     DEFAULT_OUTPUT_DIR as DEFAULT_ENRON_OUTPUT_DIR,
 )
 from .enron_preparation import EnronPreparationOptions, load_enron_preparation_run, prepare_enron_source
+from .enron_quality import (
+    EnronQualityError,
+    evaluate_cmu_enron_training_quality_files,
+    evaluate_enron_quality_files,
+)
 from .enron_splitting import (
     DEFAULT_SPLIT_SEED,
     EnronSplitOptions,
@@ -2512,6 +2525,204 @@ def verify_enron_split_bundles(
 ) -> None:
     """Deep-verify split conservation, leakage isolation, cohorts, samples, and sealing."""
     _echo_json(_run_json_helper(lambda: verify_enron_splits(development_dir, sealed_dir, seed=seed)))
+
+
+@app.command("download-enron-annotations")
+def download_enron_annotations(
+    output_dir: Path = typer.Option(..., "--output-dir", help="New ignored private source directory."),
+    timeout_seconds: float = typer.Option(30.0, "--timeout-seconds", min=0.1, max=300.0),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit a private output outside ignored repository paths.",
+    ),
+) -> None:
+    """Download and hash-verify the one pinned CMU annotation archive."""
+
+    try:
+        payload = download_cmu_enron_annotations(
+            output_dir,
+            timeout_seconds=timeout_seconds,
+            allow_unignored_output=allow_unignored_output,
+        )
+    except EnronAnnotationError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("prepare-enron-annotations")
+def prepare_enron_annotations(
+    archive_path: Path = typer.Option(..., "--archive", help="Explicit local CMU Enron Meetings ZIP archive."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="New ignored private annotation-run directory."),
+    fixture_mode: bool = typer.Option(
+        False,
+        "--fixture-mode",
+        help="Permit a generated synthetic archive with explicit hash and population gates; never promotable.",
+    ),
+    fixture_expected_sha256: str | None = typer.Option(None, "--fixture-expected-sha256"),
+    fixture_train_documents: int | None = typer.Option(None, "--fixture-train-documents", min=1),
+    fixture_train_spans: int | None = typer.Option(None, "--fixture-train-spans", min=0),
+    fixture_test_documents: int | None = typer.Option(None, "--fixture-test-documents", min=1),
+    fixture_test_spans: int | None = typer.Option(None, "--fixture-test-spans", min=0),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit a private output outside ignored repository paths.",
+    ),
+) -> None:
+    """Verify and ingest independent CMU person-name annotations without extracting the ZIP."""
+
+    population_values = (
+        fixture_train_documents,
+        fixture_train_spans,
+        fixture_test_documents,
+        fixture_test_spans,
+    )
+    fixture_populations = None
+    if any(value is not None for value in population_values):
+        if any(value is None for value in population_values):
+            _exit_error("Fixture annotation population gates require all four document/span values.")
+        fixture_populations = {
+            "train": {
+                "documents": cast(int, fixture_train_documents),
+                "spans": cast(int, fixture_train_spans),
+            },
+            "test": {
+                "documents": cast(int, fixture_test_documents),
+                "spans": cast(int, fixture_test_spans),
+            },
+        }
+    options = EnronAnnotationIngestOptions(
+        archive_path=archive_path,
+        output_dir=output_dir,
+        fixture_mode=fixture_mode,
+        fixture_expected_sha256=fixture_expected_sha256,
+        fixture_expected_populations=fixture_populations,
+        allow_unignored_output=allow_unignored_output,
+    )
+    try:
+        payload = ingest_cmu_enron_annotations(options)
+    except EnronAnnotationError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("verify-enron-annotations")
+def verify_enron_annotations(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Committed private CMU annotation-run directory."),
+) -> None:
+    """Deep-verify annotation artifacts, spans, aggregate counts, and source bindings."""
+
+    try:
+        payload = verify_cmu_enron_annotations(run_dir)
+    except EnronAnnotationError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("eval-enron-quality")
+def eval_enron_quality(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    documents_path: Path = typer.Option(..., "--documents", help="Strict private document JSONL."),
+    gold_spans_path: Path = typer.Option(..., "--gold-spans", help="Strict private gold-span JSONL."),
+    slice_specs_path: Path = typer.Option(..., "--slice-plan", help="Frozen strict private slice-plan JSONL."),
+    unsupported_slice_specs_path: Path | None = typer.Option(
+        None,
+        "--unsupported-slices",
+        help="Optional strict JSONL declaring unavailable requested slice dimensions.",
+    ),
+) -> None:
+    """Run the compile-once aggregate-only Enron quality executor."""
+
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+    try:
+        payload = evaluate_enron_quality_files(
+            bank,
+            documents_path=documents_path,
+            gold_spans_path=gold_spans_path,
+            slice_specs_path=slice_specs_path,
+            unsupported_slice_specs_path=unsupported_slice_specs_path,
+        )
+    except EnronQualityError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+    if payload["evaluated"] is not True or payload["contract_validation"]["valid"] is not True:
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
+
+
+@app.command("eval-enron-cmu-train")
+def eval_enron_cmu_train(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    annotation_run_dir: Path = typer.Option(
+        ...,
+        "--annotation-run",
+        help="Verified private CMU annotation bundle; only the training role is accessible here.",
+    ),
+    catalog_bindings_path: Path = typer.Option(
+        ...,
+        "--catalog-bindings",
+        help="Strict private JSONL adjudicating every training gold span against this bank.",
+    ),
+) -> None:
+    """Evaluate the verifier-bound auxiliary CMU training population."""
+
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+    try:
+        payload = evaluate_cmu_enron_training_quality_files(
+            bank,
+            annotation_run_dir=annotation_run_dir,
+            catalog_bindings_path=catalog_bindings_path,
+        )
+    except (EnronAnnotationError, EnronQualityError) as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+    if payload["evaluated"] is not True or payload["contract_validation"]["valid"] is not True:
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
+
+
+@app.command("eval-enron-conformance")
+def eval_enron_conformance(
+    bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
+    positive_cases_path: Path = typer.Option(..., "--positive-cases", help="Approved positive case JSONL."),
+    negative_cases_path: Path = typer.Option(..., "--negative-cases", help="Approved adversarial/negative JSONL."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="New ignored private conformance audit directory."),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit a private output outside ignored repository paths.",
+    ),
+) -> None:
+    """Gate every active pattern against approved positives and adversarial negatives."""
+
+    bank, _path, invalid_payload = _load_json_bank_for_command(bank_path)
+    if invalid_payload is not None:
+        _echo_json(invalid_payload)
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
+    if bank is None:
+        _exit_error(f"Could not load bank at {bank_path}.")
+    try:
+        payload = evaluate_enron_conformance_files(
+            bank,
+            positive_cases_path,
+            negative_cases_path,
+            output_dir,
+            allow_unignored_output=allow_unignored_output,
+        )
+    except EnronConformanceError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+    if payload["catalog_conformance"]["passed"] is not True:
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
 
 
 @app.command("regress-bank")

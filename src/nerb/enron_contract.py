@@ -647,6 +647,16 @@ _CONFORMANCE = _closed_object(
         "passed": {"type": "boolean"},
     },
 )
+ENRON_QUALITY_OUTPUT_SCHEMA = _closed_object(
+    ("evaluated", "matching_semantics", "character_position_semantics", "slices"),
+    {
+        "evaluated": {"type": "boolean"},
+        "matching_semantics": {"const": MATCHING_SEMANTICS},
+        "character_position_semantics": {"const": CHARACTER_POSITION_SEMANTICS},
+        "slices": {"type": "array", "items": _QUALITY_SLICE},
+    },
+)
+ENRON_CONFORMANCE_OUTPUT_SCHEMA = _CONFORMANCE
 _PERFORMANCE_STATS = _closed_object(
     (
         "sample_count",
@@ -1340,11 +1350,17 @@ def _apply_schema_resource_limits(schema: Any, field_name: str | None = None) ->
 
 _apply_schema_resource_limits(ENRON_MANIFEST_SCHEMA)
 _apply_schema_resource_limits(ENRON_EVIDENCE_SCHEMA)
+_apply_schema_resource_limits(ENRON_QUALITY_OUTPUT_SCHEMA)
+_apply_schema_resource_limits(ENRON_CONFORMANCE_OUTPUT_SCHEMA)
 
 MANIFEST_VALIDATOR = EnronContractValidator(ENRON_MANIFEST_SCHEMA)
 EVIDENCE_VALIDATOR = EnronContractValidator(ENRON_EVIDENCE_SCHEMA)
+QUALITY_OUTPUT_VALIDATOR = EnronContractValidator(ENRON_QUALITY_OUTPUT_SCHEMA)
+CONFORMANCE_OUTPUT_VALIDATOR = EnronContractValidator(ENRON_CONFORMANCE_OUTPUT_SCHEMA)
 Draft202012Validator.check_schema(ENRON_MANIFEST_SCHEMA)
 Draft202012Validator.check_schema(ENRON_EVIDENCE_SCHEMA)
+Draft202012Validator.check_schema(ENRON_QUALITY_OUTPUT_SCHEMA)
+Draft202012Validator.check_schema(ENRON_CONFORMANCE_OUTPUT_SCHEMA)
 
 
 def _canonical_payload(value: Any) -> bytes:
@@ -1518,6 +1534,38 @@ def hash_enron_thresholds(checks: Sequence[Mapping[str, Any]]) -> str:
 
 def hash_enron_test_lineage_entry(entry: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in entry.items() if key != "entry_sha256"})
+
+
+def validate_enron_quality_output(quality: Any) -> dict[str, Any]:
+    """Validate a standalone quality executor projection and recompute every metric."""
+
+    diagnostics = _structure_diagnostics(quality)
+    if diagnostics:
+        return _result(diagnostics)
+    diagnostics = _schema_diagnostics(QUALITY_OUTPUT_VALIDATOR, quality)
+    if not diagnostics and isinstance(quality, Mapping):
+        diagnostics.extend(_quality_diagnostics(quality, manifest=None))
+    return _result(diagnostics)
+
+
+def validate_enron_conformance_output(conformance: Any, *, active_patterns: int) -> dict[str, Any]:
+    """Validate a standalone catalog-conformance projection against its active bank size."""
+
+    diagnostics = _structure_diagnostics(conformance)
+    if diagnostics:
+        return _result(diagnostics)
+    diagnostics = _schema_diagnostics(CONFORMANCE_OUTPUT_VALIDATOR, conformance)
+    if type(active_patterns) is not int or active_patterns < 0 or active_patterns > MAX_SAFE_INTEGER:
+        diagnostics.append(
+            _error(
+                "contract.invalid_active_pattern_count",
+                "/active_patterns",
+                "Standalone conformance validation requires a bounded nonnegative active-pattern count.",
+            )
+        )
+    elif not diagnostics and isinstance(conformance, Mapping):
+        diagnostics.extend(_conformance_diagnostics(conformance, {"active_patterns": active_patterns}, manifest=None))
+    return _result(diagnostics)
 
 
 def validate_enron_manifest(manifest: Any) -> dict[str, Any]:
@@ -6351,10 +6399,12 @@ __all__ = [
     "ANNOTATION_COMPLETENESS",
     "CHARACTER_POSITION_SEMANTICS",
     "ENRON_CHARTER_VERSION",
+    "ENRON_CONFORMANCE_OUTPUT_SCHEMA",
     "ENRON_EVIDENCE_SCHEMA",
     "ENRON_EVIDENCE_SCHEMA_VERSION",
     "ENRON_MANIFEST_SCHEMA",
     "ENRON_MANIFEST_SCHEMA_VERSION",
+    "ENRON_QUALITY_OUTPUT_SCHEMA",
     "ENRON_VERIFIER_ID",
     "ENRON_VERIFIER_VERSION",
     "MATCHING_SEMANTICS",
@@ -6375,5 +6425,7 @@ __all__ = [
     "load_enron_evidence",
     "load_enron_manifest",
     "validate_enron_evidence",
+    "validate_enron_conformance_output",
     "validate_enron_manifest",
+    "validate_enron_quality_output",
 ]

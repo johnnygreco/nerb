@@ -420,7 +420,7 @@ Example eval ref:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `summary` | object | `passed`, positive and negative totals, and failure counts. |
+| `summary` | object | `evaluated`, `passed`, positive and negative totals, and failure counts. Empty/provenance-only evidence is not evaluated and cannot pass. |
 | `by_entity` | object | Counts keyed by entity ID. |
 | `by_name` | object | Counts keyed by `entity_id/name_id`. |
 | `by_pattern` | object | Counts keyed by `entity_id/name_id/pattern_id`. |

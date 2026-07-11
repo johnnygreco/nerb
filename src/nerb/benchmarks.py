@@ -1094,7 +1094,12 @@ def _quality_delta(old_eval: Mapping[str, Any], new_eval: Mapping[str, Any]) -> 
     negative_failed_delta = int(new_summary["negative_failed"]) - int(old_summary["negative_failed"])
     failure_count_delta = len(new_eval["failures"]) - len(old_eval["failures"])
     return {
+        "evaluated": {"old": bool(old_summary["evaluated"]), "new": bool(new_summary["evaluated"])},
         "passed": {"old": bool(old_summary["passed"]), "new": bool(new_summary["passed"])},
+        "eval_suite_sha256": {
+            "old": old_eval["evidence"]["suite_sha256"],
+            "new": new_eval["evidence"]["suite_sha256"],
+        },
         "positive_total_delta": int(new_summary["positive_total"]) - int(old_summary["positive_total"]),
         "positive_failed_delta": positive_failed_delta,
         "negative_total_delta": int(new_summary["negative_total"]) - int(old_summary["negative_total"]),
@@ -1188,6 +1193,42 @@ def _regression_gates(deltas: Mapping[str, Any], options: Mapping[str, Any]) -> 
     quality_delta = deltas["quality"]
     quality_checks = [
         _gate_check(
+            "old_eval_evaluated",
+            quality_delta["evaluated"]["old"],
+            "==",
+            True,
+        ),
+        _gate_check(
+            "new_eval_evaluated",
+            quality_delta["evaluated"]["new"],
+            "==",
+            True,
+        ),
+        _gate_check(
+            "new_eval_passed",
+            quality_delta["passed"]["new"],
+            "==",
+            True,
+        ),
+        _gate_check(
+            "eval_suite_sha256_match",
+            quality_delta["eval_suite_sha256"]["new"],
+            "==",
+            quality_delta["eval_suite_sha256"]["old"],
+        ),
+        _gate_check(
+            "positive_total_delta",
+            quality_delta["positive_total_delta"],
+            "==",
+            0,
+        ),
+        _gate_check(
+            "negative_total_delta",
+            quality_delta["negative_total_delta"],
+            "==",
+            0,
+        ),
+        _gate_check(
             "positive_failed_delta",
             quality_delta["positive_failed_delta"],
             "<=",
@@ -1253,13 +1294,15 @@ def _regression_gates(deltas: Mapping[str, Any], options: Mapping[str, Any]) -> 
     }
 
 
-def _gate_check(name: str, actual: Any, operator: str, threshold: float | int) -> dict[str, Any]:
+def _gate_check(name: str, actual: Any, operator: str, threshold: float | int | bool | str) -> dict[str, Any]:
     if actual is None:
         passed = False
     elif operator == "<=":
         passed = actual <= threshold
     elif operator == ">=":
         passed = actual >= threshold
+    elif operator == "==":
+        passed = actual == threshold
     else:
         raise ValueError(f"Unsupported gate operator: {operator}.")
     return {"name": name, "actual": actual, "operator": operator, "threshold": threshold, "passed": passed}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -101,14 +102,37 @@ def eval_bank(
     canonical_bank = canonicalize_bank(bank)
     resolved_base_path = _resolve_base_path(base_path, options)
     result = _empty_result()
+    suite_entries: list[dict[str, Any]] = []
 
     for scope in _iter_eval_scopes(canonical_bank):
         for eval_ref in scope.eval_refs:
-            for record_index, record in _load_eval_ref(scope, eval_ref, resolved_base_path, eval_options, result):
+            suite_entry = _eval_suite_entry(scope, eval_ref)
+            suite_entries.append(suite_entry)
+            for record_index, record in _load_eval_ref(
+                scope,
+                eval_ref,
+                resolved_base_path,
+                eval_options,
+                result,
+                suite_entry=suite_entry,
+            ):
                 _evaluate_record(canonical_bank, scope, eval_ref, record_index, record, options, result)
 
     summary = result["summary"]
-    summary["passed"] = summary["positive_failed"] == 0 and summary["negative_failed"] == 0 and not result["failures"]
+    summary["evaluated"] = summary["positive_total"] + summary["negative_total"] > 0
+    summary["passed"] = (
+        summary["evaluated"]
+        and summary["positive_failed"] == 0
+        and summary["negative_failed"] == 0
+        and not result["failures"]
+    )
+    result["evidence"] = {
+        "ref_count": len(suite_entries),
+        "suite_sha256": "sha256:"
+        + hashlib.sha256(
+            json.dumps(suite_entries, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        ).hexdigest(),
+    }
     _strip_empty_buckets(result["by_entity"])
     _strip_empty_buckets(result["by_name"])
     _strip_empty_buckets(result["by_pattern"])
@@ -142,7 +166,8 @@ def _resolve_base_path(base_path: str | Path | None, options: Mapping[str, Any] 
 def _empty_result() -> dict[str, Any]:
     return {
         "summary": {
-            "passed": True,
+            "evaluated": False,
+            "passed": False,
             "positive_total": 0,
             "positive_failed": 0,
             "negative_total": 0,
@@ -152,7 +177,22 @@ def _empty_result() -> dict[str, Any]:
         "by_name": {},
         "by_pattern": {},
         "provenance": {"total": 0, "by_source_type": {}},
+        "evidence": {"ref_count": 0, "suite_sha256": "sha256:" + hashlib.sha256(b"[]").hexdigest()},
         "failures": [],
+    }
+
+
+def _eval_suite_entry(scope: EvalScope, eval_ref: str) -> dict[str, Any]:
+    return {
+        "scope": {
+            "kind": scope.kind,
+            "entity_id": scope.entity_id,
+            "name_id": scope.name_id,
+            "pattern_id": scope.pattern_id,
+        },
+        "eval_ref": _sanitize_failure_string(eval_ref),
+        "content_sha256": None,
+        "bytes": None,
     }
 
 
@@ -275,6 +315,8 @@ def _load_eval_ref(
     base_path: Path | None,
     options: EvalOptions,
     result: dict[str, Any],
+    *,
+    suite_entry: dict[str, Any],
 ) -> Iterable[tuple[int, Mapping[str, Any]]]:
     path, resolution_diagnostic = _resolve_eval_ref_path(eval_ref, base_path)
     if resolution_diagnostic is not None:
@@ -447,6 +489,9 @@ def _load_eval_ref(
             ],
         )
         return
+
+    suite_entry["content_sha256"] = "sha256:" + hashlib.sha256(data).hexdigest()
+    suite_entry["bytes"] = len(data)
 
     try:
         text = data.decode("utf-8")

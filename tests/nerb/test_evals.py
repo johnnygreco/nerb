@@ -69,6 +69,42 @@ def _add_customer_name(bank: dict[str, Any], name_id: str, canonical: str, patte
     }
 
 
+def test_eval_bank_without_behavioral_evidence_fails_closed(minimal_bank):
+    result = eval_bank(minimal_bank)
+
+    assert result["summary"] == {
+        "evaluated": False,
+        "passed": False,
+        "positive_total": 0,
+        "positive_failed": 0,
+        "negative_total": 0,
+        "negative_failed": 0,
+    }
+    assert result["failures"] == []
+
+
+def test_eval_bank_provenance_only_is_not_behavioral_evidence(tmp_path, minimal_bank):
+    eval_ref = _write_jsonl(
+        tmp_path / "provenance.jsonl",
+        [
+            {
+                "type": "provenance",
+                "source_type": "fixture",
+                "observed_at": "2026-07-10T00:00:00Z",
+                "evidence": "Synthetic provenance without a behavioral assertion.",
+                "metadata": {},
+            }
+        ],
+    )
+    minimal_bank["eval_refs"] = [eval_ref]
+
+    result = eval_bank(minimal_bank, base_path=tmp_path)
+
+    assert result["summary"]["evaluated"] is False
+    assert result["summary"]["passed"] is False
+    assert result["provenance"] == {"total": 1, "by_source_type": {"fixture": 1}}
+
+
 def test_eval_bank_pattern_ref_infers_ids_and_summarizes_provenance(minimal_bank, test_data_path):
     pattern = minimal_bank["entities"]["customer"]["names"]["acme_corp"]["patterns"]["primary"]
     pattern["eval_refs"] = ["evals/acme_pattern.jsonl"]
@@ -76,6 +112,7 @@ def test_eval_bank_pattern_ref_infers_ids_and_summarizes_provenance(minimal_bank
     result = eval_bank(minimal_bank, base_path=test_data_path)
 
     assert result["summary"] == {
+        "evaluated": True,
         "passed": True,
         "positive_total": 1,
         "positive_failed": 0,
@@ -120,6 +157,7 @@ def test_eval_bank_positive_refs_cover_bank_entity_and_name_scopes(tmp_path, min
     result = eval_bank(minimal_bank, base_path=tmp_path)
 
     assert result["summary"] == {
+        "evaluated": True,
         "passed": True,
         "positive_total": 3,
         "positive_failed": 0,
@@ -142,6 +180,7 @@ def test_eval_bank_positive_refs_use_utf8_byte_offsets(tmp_path, minimal_bank):
     result = eval_bank(minimal_bank, base_path=tmp_path)
 
     assert result["summary"] == {
+        "evaluated": True,
         "passed": True,
         "positive_total": 1,
         "positive_failed": 0,
@@ -163,6 +202,7 @@ def test_eval_bank_jsonl_lines_do_not_split_on_unicode_line_separators(tmp_path,
     result = eval_bank(minimal_bank, base_path=tmp_path)
 
     assert result["summary"] == {
+        "evaluated": True,
         "passed": True,
         "positive_total": 1,
         "positive_failed": 0,
@@ -240,6 +280,7 @@ def test_eval_bank_negative_records_are_scoped_to_attachment_point(tmp_path, min
     result = eval_bank(minimal_bank, base_path=tmp_path)
 
     assert result["summary"] == {
+        "evaluated": True,
         "passed": True,
         "positive_total": 0,
         "positive_failed": 0,

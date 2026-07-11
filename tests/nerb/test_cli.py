@@ -194,6 +194,12 @@ def test_help_shows_command_structure():
         "deanonymize-text",
         "deanonymize-file",
         "eval-bank",
+        "download-enron-annotations",
+        "prepare-enron-annotations",
+        "verify-enron-annotations",
+        "eval-enron-quality",
+        "eval-enron-cmu-train",
+        "eval-enron-conformance",
         "benchmark-bank",
         "regress-bank",
         "extract",
@@ -644,6 +650,271 @@ def test_split_enron_commands_create_and_verify_redacted_and_sealed_bundles(tmp_
     assert verified["test_sealed"] is True
     assert str(tmp_path) not in verify_result.output
     assert "@" not in verify_result.output
+
+
+def test_enron_annotation_commands_route_fixture_gates_and_verification(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_download(output_dir, **kwargs):
+        captured["download"] = (output_dir, kwargs)
+        return {"verified": True, "artifact": {"bytes": 568_012}}
+
+    def fake_ingest(options):
+        captured["ingest"] = options
+        return {"verified": True, "promotable": False}
+
+    def fake_verify(run_dir):
+        captured["verify"] = run_dir
+        return {"verified": True, "promotable": False}
+
+    monkeypatch.setattr(cli_module, "download_cmu_enron_annotations", fake_download)
+    monkeypatch.setattr(cli_module, "ingest_cmu_enron_annotations", fake_ingest)
+    monkeypatch.setattr(cli_module, "verify_cmu_enron_annotations", fake_verify)
+    archive_path = tmp_path / "annotations.zip"
+    output_dir = tmp_path / "annotation-run"
+    digest = "sha256:" + "a" * 64
+    download_result = runner.invoke(
+        app,
+        [
+            "download-enron-annotations",
+            "--output-dir",
+            str(tmp_path / "source-run"),
+            "--timeout-seconds",
+            "12.5",
+            "--allow-unignored-output",
+        ],
+    )
+    assert download_result.exit_code == 0, download_result.output
+    assert json.loads(download_result.output)["verified"] is True
+    assert captured["download"] == (
+        tmp_path / "source-run",
+        {"timeout_seconds": 12.5, "allow_unignored_output": True},
+    )
+
+    prepare_result = runner.invoke(
+        app,
+        [
+            "prepare-enron-annotations",
+            "--archive",
+            str(archive_path),
+            "--output-dir",
+            str(output_dir),
+            "--fixture-mode",
+            "--fixture-expected-sha256",
+            digest,
+            "--fixture-train-documents",
+            "2",
+            "--fixture-train-spans",
+            "3",
+            "--fixture-test-documents",
+            "1",
+            "--fixture-test-spans",
+            "0",
+            "--allow-unignored-output",
+        ],
+    )
+
+    assert prepare_result.exit_code == 0, prepare_result.output
+    assert json.loads(prepare_result.output) == {"promotable": False, "verified": True}
+    options = captured["ingest"]
+    assert options.archive_path == archive_path
+    assert options.output_dir == output_dir
+    assert options.fixture_mode is True
+    assert options.fixture_expected_sha256 == digest
+    assert options.fixture_expected_populations == {
+        "train": {"documents": 2, "spans": 3},
+        "test": {"documents": 1, "spans": 0},
+    }
+    assert options.allow_unignored_output is True
+
+    verify_result = runner.invoke(app, ["verify-enron-annotations", "--run-dir", str(output_dir)])
+    assert verify_result.exit_code == 0, verify_result.output
+    assert json.loads(verify_result.output) == {"promotable": False, "verified": True}
+    assert captured["verify"] == output_dir
+
+
+def test_enron_quality_commands_route_private_inputs_and_fail_closed(monkeypatch, tmp_path):
+    bank_path = _write_json(tmp_path / "bank.json", _person_json_bank())
+    captured = {}
+
+    def fake_quality(bank, **kwargs):
+        captured["quality"] = (bank, kwargs)
+        return {
+            "evaluated": True,
+            "quality": {"slices": [{"gold_spans": 1}]},
+            "contract_validation": {"valid": True},
+        }
+
+    def fake_cmu(bank, **kwargs):
+        captured["cmu"] = (bank, kwargs)
+        return {
+            "evaluated": False,
+            "quality": {"slices": []},
+            "contract_validation": {"valid": True},
+        }
+
+    monkeypatch.setattr(cli_module, "evaluate_enron_quality_files", fake_quality)
+    monkeypatch.setattr(cli_module, "evaluate_cmu_enron_training_quality_files", fake_cmu)
+    documents_path = tmp_path / "documents.jsonl"
+    gold_path = tmp_path / "gold.jsonl"
+    plan_path = tmp_path / "plan.jsonl"
+    unsupported_path = tmp_path / "unsupported.jsonl"
+    quality_result = runner.invoke(
+        app,
+        [
+            "eval-enron-quality",
+            "--bank",
+            str(bank_path),
+            "--documents",
+            str(documents_path),
+            "--gold-spans",
+            str(gold_path),
+            "--slice-plan",
+            str(plan_path),
+            "--unsupported-slices",
+            str(unsupported_path),
+        ],
+    )
+
+    assert quality_result.exit_code == 0, quality_result.output
+    assert json.loads(quality_result.output)["evaluated"] is True
+    assert captured["quality"][1] == {
+        "documents_path": documents_path,
+        "gold_spans_path": gold_path,
+        "slice_specs_path": plan_path,
+        "unsupported_slice_specs_path": unsupported_path,
+    }
+
+    annotation_dir = tmp_path / "annotation-run"
+    bindings_path = tmp_path / "bindings.jsonl"
+    cmu_result = runner.invoke(
+        app,
+        [
+            "eval-enron-cmu-train",
+            "--bank",
+            str(bank_path),
+            "--annotation-run",
+            str(annotation_dir),
+            "--catalog-bindings",
+            str(bindings_path),
+        ],
+    )
+
+    assert cmu_result.exit_code == 1
+    assert json.loads(cmu_result.output)["evaluated"] is False
+    assert captured["cmu"][1] == {
+        "annotation_run_dir": annotation_dir,
+        "catalog_bindings_path": bindings_path,
+    }
+
+
+def test_enron_quality_command_exits_nonzero_for_contract_invalid_output(monkeypatch, tmp_path):
+    bank_path = _write_json(tmp_path / "bank.json", _person_json_bank())
+    monkeypatch.setattr(
+        cli_module,
+        "evaluate_enron_quality_files",
+        lambda *_args, **_kwargs: {
+            "evaluated": True,
+            "quality": {"slices": [{"gold_spans": 1}]},
+            "contract_validation": {"valid": False},
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "eval-enron-quality",
+            "--bank",
+            str(bank_path),
+            "--documents",
+            str(tmp_path / "documents.jsonl"),
+            "--gold-spans",
+            str(tmp_path / "gold.jsonl"),
+            "--slice-plan",
+            str(tmp_path / "plan.jsonl"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["contract_validation"]["valid"] is False
+
+
+def test_enron_conformance_command_commits_audit_and_exits_nonzero_on_gate_failure(monkeypatch, tmp_path):
+    bank_path = _write_json(tmp_path / "bank.json", _person_json_bank())
+    captured = {}
+
+    def fake_conformance(bank, positive_path, negative_path, output_dir, **kwargs):
+        captured["call"] = (bank, positive_path, negative_path, output_dir, kwargs)
+        return {"committed": True, "catalog_conformance": {"evaluated": True, "passed": False}}
+
+    monkeypatch.setattr(cli_module, "evaluate_enron_conformance_files", fake_conformance)
+    positive_path = tmp_path / "positive.jsonl"
+    negative_path = tmp_path / "negative.jsonl"
+    output_dir = tmp_path / "conformance-run"
+    result = runner.invoke(
+        app,
+        [
+            "eval-enron-conformance",
+            "--bank",
+            str(bank_path),
+            "--positive-cases",
+            str(positive_path),
+            "--negative-cases",
+            str(negative_path),
+            "--output-dir",
+            str(output_dir),
+            "--allow-unignored-output",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["catalog_conformance"]["passed"] is False
+    assert captured["call"][1:] == (
+        positive_path,
+        negative_path,
+        output_dir,
+        {"allow_unignored_output": True},
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [
+            "eval-enron-quality",
+            "--documents",
+            "documents.jsonl",
+            "--gold-spans",
+            "gold.jsonl",
+            "--slice-plan",
+            "plan.jsonl",
+        ],
+        [
+            "eval-enron-cmu-train",
+            "--annotation-run",
+            "annotation-run",
+            "--catalog-bindings",
+            "bindings.jsonl",
+        ],
+        [
+            "eval-enron-conformance",
+            "--positive-cases",
+            "positive.jsonl",
+            "--negative-cases",
+            "negative.jsonl",
+            "--output-dir",
+            "conformance-run",
+        ],
+    ],
+)
+def test_enron_evaluation_commands_exit_nonzero_for_an_invalid_bank(arguments, tmp_path):
+    invalid_bank_path = tmp_path / "invalid-bank.json"
+    invalid_bank_path.write_text('{"schema_version":"nerb.bank.v1"}', encoding="utf-8")
+
+    result = runner.invoke(app, [arguments[0], "--bank", str(invalid_bank_path), *arguments[1:]])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["valid"] is False
 
 
 def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
