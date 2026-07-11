@@ -557,6 +557,18 @@ class _PrivateFileFingerprint:
     records: int | None = None
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _VerifiedEnronBankBuildSnapshot:
+    """Race-safe private inputs captured inside one completed deep verification."""
+
+    summary: dict[str, Any]
+    card: dict[str, Any]
+    bank: dict[str, Any]
+    bank_payload: bytes
+    validation_documents: tuple[dict[str, Any], ...]
+    build_created_at: str
+
+
 def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, Any]:
     """Build three validation-only iterations and commit one private selected run."""
 
@@ -2368,12 +2380,12 @@ def _validate_build_commitments(
     return False
 
 
-def verify_enron_bank_build(
+def _verify_enron_bank_build_snapshot(
     run_dir: Path,
     *,
     annotation_run: Path | None = None,
-) -> dict[str, Any]:
-    """Deep-verify a committed private build and return aggregate-only evidence."""
+) -> _VerifiedEnronBankBuildSnapshot:
+    """Deep-verify a committed private build and capture its consumed inputs."""
 
     root = _assert_private_run(Path(run_dir))
     initial_tree = _snapshot_private_tree(root)
@@ -2433,6 +2445,12 @@ def verify_enron_bank_build(
     )
     if not isinstance(bank, Mapping):
         raise EnronBankBuildError("Selected private bank is invalid.")
+    bank_payload = _read_verified_private_bytes(
+        root / "bank.json",
+        expected_fingerprint=artifact_fingerprints["selected_bank"],
+        max_bytes=_MAX_PRIVATE_JSON_BYTES,
+        description="selected bank",
+    )
     structural = validate_bank(bank, level="deep", strict=True, check_engine_compile=True)
     if structural["valid"] is not True or structural["engine_compatibility"]["compatible"] is not True:
         raise EnronBankBuildError("Selected private bank failed deep verification.")
@@ -2682,7 +2700,7 @@ def verify_enron_bank_build(
     if final_tree != initial_tree or final_marker != initial_marker or final_manifest != initial_manifest:
         raise EnronBankBuildError("Private bank-build tree changed during verification.")
 
-    return {
+    verification = {
         "schema_version": "nerb.enron_bank_build_verification.v2",
         "valid": True,
         "benchmark_version": manifest["benchmark_version"],
@@ -2699,6 +2717,24 @@ def verify_enron_bank_build(
         "sealed_test_accessed": sealed_test_accessed,
         "privacy": card["privacy"],
     }
+    return _VerifiedEnronBankBuildSnapshot(
+        summary=verification,
+        card=cast(dict[str, Any], card),
+        bank=cast(dict[str, Any], bank),
+        bank_payload=bank_payload,
+        validation_documents=documents,
+        build_created_at=cast(str, manifest["created_at"]),
+    )
+
+
+def verify_enron_bank_build(
+    run_dir: Path,
+    *,
+    annotation_run: Path | None = None,
+) -> dict[str, Any]:
+    """Deep-verify a committed private build and return aggregate-only evidence."""
+
+    return _verify_enron_bank_build_snapshot(run_dir, annotation_run=annotation_run).summary
 
 
 _MINING_SQLITE_SCHEMA = {

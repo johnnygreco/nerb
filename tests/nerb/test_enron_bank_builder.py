@@ -105,6 +105,26 @@ def _mine(tmp_path: Path, development_path: Path):
     return pool, source_binding
 
 
+def test_verified_snapshot_stays_private_and_public_wrapper_returns_only_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    marker = "sensitive-marker@example.invalid"
+    summary = {"schema_version": "nerb.enron_bank_build_verification.v2", "valid": True}
+    snapshot = bank_workflow._VerifiedEnronBankBuildSnapshot(
+        summary=summary,
+        card={"private": marker},
+        bank={"private": marker},
+        bank_payload=marker.encode(),
+        validation_documents=({"text": marker},),
+        build_created_at="2026-07-10T00:00:00Z",
+    )
+    monkeypatch.setattr(bank_workflow, "_verify_enron_bank_build_snapshot", lambda *_args, **_kwargs: snapshot)
+
+    assert marker not in repr(snapshot)
+    assert verify_enron_bank_build(tmp_path) == summary
+
+
 def test_source_binding_rejects_same_byte_manifest_aba_replacement(tmp_path: Path) -> None:
     development_path, _sealed = _development_bundle(tmp_path)
     development = load_enron_development_split(development_path)
@@ -260,10 +280,33 @@ def test_private_builder_runs_three_iterations_and_verifies_without_sealed_acces
     assert not (sealed / "ACCESS_CLAIMED.json").exists()
     assert not (sealed / "ACCESS_OUTCOME.json").exists()
 
-    verification = verify_enron_bank_build(output)
+    snapshot = bank_workflow._verify_enron_bank_build_snapshot(output)
+    verification = snapshot.summary
+    assert set(verification) == {
+        "schema_version",
+        "valid",
+        "benchmark_version",
+        "fixture_mode",
+        "promotable",
+        "bank_sha256",
+        "bank_card_run_sha256",
+        "candidate_count",
+        "iteration_count",
+        "selected_iteration_id",
+        "catalog_conformance_passed",
+        "validation_reverified",
+        "cmu_reverified",
+        "sealed_test_accessed",
+        "privacy",
+    }
     assert verification["valid"] is True
     assert verification["validation_reverified"] is True
     assert verification["sealed_test_accessed"] is False
+    assert snapshot.card == card
+    assert snapshot.bank_payload == (output / "bank.json").read_bytes()
+    assert snapshot.bank["metadata"]["sealed_test_accessed"] is False
+    assert len(snapshot.validation_documents) == card["source"]["validation_records"]
+    assert snapshot.build_created_at == "2026-07-10T00:00:00Z"
 
 
 @pytest.mark.parametrize("supply_annotation", [False, True])

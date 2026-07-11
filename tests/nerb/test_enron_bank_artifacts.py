@@ -111,14 +111,14 @@ def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_boun
 
     _validate_public_card(card)
     assert hashlib.sha256(card_path.read_bytes()).hexdigest() == (
-        "3a9297dcded41bc5ea5dcc96366dbb423e435fa663b840c2cc07ce3c8ca18767"
+        "8805d8498e5470ee93f329397e1f53c41ee2c6d338c0fbaa13880bcdb9ee1282"
     )
     assert hashlib.sha256(funnel_path.read_bytes()).hexdigest() == (
         "3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f"
     )
-    assert card["run_sha256"] == "sha256:c32b54f6bb890b96951724a72465afd7d33b0b73fe391e8f04c31d7acdaa525e"
+    assert card["run_sha256"] == "sha256:90ea3ca4a690ed8a7d0736810fe1a9c8b5d35edb44c2689843f10922b8971ae8"
     assert card["bank"]["canonical_sha256"] == (
-        "sha256:f8a08d0a1c4cfcd36aabe956f3024d749b9fed2f7b1ce59dd7baa8be53e79232"
+        "sha256:a38ea885243ab00c9f90d2a8024fb6cf2e4cb3fbcdd7f4c837de58630deb95a4"
     )
     assert card["builder"]["candidate_ledger_sha256"] == (
         "sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448"

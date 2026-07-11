@@ -278,15 +278,15 @@ latency claims; #152 owns runtime benchmarks.
 
 Key commitments are:
 
-- selected bank: `sha256:f8a08d0a1c4cfcd36aabe956f3024d749b9fed2f7b1ce59dd7baa8be53e79232`;
-- bank artifact: `sha256:19b32bce6bff90423f524305661b3f07e12756ec295e68ff676f5af81f245082`;
+- selected bank: `sha256:a38ea885243ab00c9f90d2a8024fb6cf2e4cb3fbcdd7f4c837de58630deb95a4`;
+- bank artifact: `sha256:403a8e760e22166dba42e8381bbdbe781e1e4613281b14e2d55d6b0147f59037`;
 - candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
-- builder implementation: `sha256:f4dee1922eef085e2c73d83c3f97e46dea5426dbda981f7ff53d4fef1657b061`;
-- privacy scanner implementation: `sha256:7a49fa66eacff9b8b8bc9a656b5c1ed41e6aec9e33e2a588a8724ae8b446b2cf`;
+- builder implementation: `sha256:802671dd6d4775f7e22ce8e4565d74cb261bbacbd5632f077c111a628007d82e`;
+- privacy scanner implementation: `sha256:1a1bfe706e2efc2c243bf0758e96f34dbb572a4f3e2cd9006b0776d166347cd0`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
 - canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:c32b54f6bb890b96951724a72465afd7d33b0b73fe391e8f04c31d7acdaa525e`;
-- committed bank-card file: `sha256:3a9297dcded41bc5ea5dcc96366dbb423e435fa663b840c2cc07ce3c8ca18767`; and
+- bank-card run: `sha256:90ea3ca4a690ed8a7d0736810fe1a9c8b5d35edb44c2689843f10922b8971ae8`;
+- committed bank-card file: `sha256:8805d8498e5470ee93f329397e1f53c41ee2c6d338c0fbaa13880bcdb9ee1282`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
 The exact private commands were:

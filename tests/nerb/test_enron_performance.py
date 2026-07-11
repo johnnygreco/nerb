@@ -646,16 +646,12 @@ def _prepare_run(
     *,
     name: str,
     real_fixtures: bool = False,
+    snapshot_bank_payload: bytes | None = None,
 ) -> Path:
     bank_run = tmp_path / f"{name}-bank-build"
     bank_run.mkdir()
     bank = json.loads((test_data_path / "enron_bank_v2_fake.json").read_text(encoding="utf-8"))
     bank_payload = _canonical(bank)
-    (bank_run / "bank.json").write_bytes(bank_payload)
-    (bank_run / "manifest.json").write_text(
-        json.dumps({"created_at": "2026-07-11T00:00:00Z"}),
-        encoding="utf-8",
-    )
     development_run = tmp_path / f"{name}-development"
     development_run.mkdir()
     train_payload = b'{"safe":"train"}\n'
@@ -663,10 +659,14 @@ def _prepare_run(
     stats = bank_stats(bank)
     card = {
         "benchmark_version": "safe-benchmark-v2",
+        "fixture_mode": False,
+        "promotable": False,
+        "run_sha256": _HASH_1,
         "source": {
             "development_manifest_sha256": _HASH_2,
             "train_artifact_sha256": _sha256(train_payload),
             "train_records": 1,
+            "sealed_test_accessed": False,
         },
         "builder": {
             "candidate_source_sha256": _HASH_1,
@@ -698,6 +698,7 @@ def _prepare_run(
             "unexpected_negative_matches": 0,
             "passed": True,
         },
+        "privacy": {"status": "passed"},
     }
     development = SimpleNamespace(
         manifest={
@@ -719,7 +720,31 @@ def _prepare_run(
         def scan_bytes(self, _document: bytes) -> list[Any]:
             return []
 
-    monkeypatch.setattr(performance_module, "verify_enron_bank_build", lambda *_args, **_kwargs: card)
+    verification = {
+        "valid": True,
+        "benchmark_version": card["benchmark_version"],
+        "fixture_mode": card["fixture_mode"],
+        "promotable": card["promotable"],
+        "bank_sha256": card["bank"]["canonical_sha256"],
+        "bank_card_run_sha256": card.get("run_sha256"),
+        "sealed_test_accessed": card["source"]["sealed_test_accessed"],
+        "privacy": card["privacy"],
+    }
+    bank_snapshot = SimpleNamespace(
+        summary=verification,
+        card=card,
+        bank=bank,
+        bank_payload=bank_payload if snapshot_bank_payload is None else snapshot_bank_payload,
+        validation_documents=tuple(
+            {"document_id": f"doc_{index:03d}", "text": f"safe validation text {index}"} for index in range(100)
+        ),
+        build_created_at="2026-07-11T00:00:00Z",
+    )
+    monkeypatch.setattr(
+        performance_module,
+        "_verify_enron_bank_build_snapshot",
+        lambda *_args, **_kwargs: bank_snapshot,
+    )
     monkeypatch.setattr(performance_module, "load_enron_development_split", lambda _path: development)
     monkeypatch.setattr(
         performance_module,
@@ -729,11 +754,6 @@ def _prepare_run(
             False,
             {"source": {"extractable_json_bytes": 321}},
         ),
-    )
-    monkeypatch.setattr(
-        performance_module,
-        "_select_real_documents",
-        lambda _path, *, count, seed: tuple(b"safe validation text" for _ in range(count)),
     )
     if not real_fixtures:
         bank_fixtures = _fake_bank_fixtures()
@@ -764,6 +784,23 @@ def _prepare_run(
     assert summary["decision_workloads"] == 40
     assert summary["sealed_test_accessed"] is False
     return output
+
+
+def test_prepare_rejects_snapshot_bank_bytes_that_do_not_match_verified_card(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(EnronPerformanceError, match="differs from its verified bank card"):
+        _prepare_run(
+            tmp_path,
+            test_data_path,
+            monkeypatch,
+            name="mismatched-snapshot-bank",
+            snapshot_bank_payload=b"{}",
+        )
+
+    assert not (tmp_path / "mismatched-snapshot-bank-prepared-output").exists()
 
 
 def _aggregate_observations(

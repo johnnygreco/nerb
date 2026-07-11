@@ -34,8 +34,8 @@ from .enron_bank_workflow import (
     EnronBankBuildError,
     EnronBankBuildOptions,
     _builder_implementation_sha256,
+    _verify_enron_bank_build_snapshot,
     build_enron_intelligence_bank,
-    verify_enron_bank_build,
 )
 from .enron_contract import (
     PERFORMANCE_PHASE_PROCESS_MODELS,
@@ -69,7 +69,7 @@ from .enron_performance_worker import (
     RESULT_SCHEMA_VERSION,
     normalize_peak_rss,
 )
-from .enron_private_io import EnronPrivateIOError, PrivateRun, iter_strict_jsonl, open_private_binary_input
+from .enron_private_io import EnronPrivateIOError, PrivateRun, open_private_binary_input
 from .enron_splitting import EnronSplitError, load_enron_development_split
 
 PERFORMANCE_PLAN_SCHEMA_VERSION = "nerb.enron_performance_plan.v1"
@@ -537,35 +537,31 @@ def _evaluated_bank_descriptor(
 
 
 def _select_real_documents(
-    path: Path,
+    rows: Sequence[Mapping[str, Any]],
     *,
     count: int,
     seed: str,
 ) -> tuple[bytes, ...]:
     selected: list[tuple[int, str, bytes]] = []
     eligible = 0
-    try:
-        rows = iter_strict_jsonl(path, 16 * 1024 * 1024)
-        for _line_number, _raw_line, row in rows:
-            document_id = row.get("document_id")
-            text = row.get("text")
-            if not isinstance(document_id, str) or not document_id or not isinstance(text, str):
-                raise EnronPerformanceError("Real performance input row has an invalid private shape.")
-            try:
-                text_bytes = text.encode("utf-8")
-            except UnicodeEncodeError:
-                raise EnronPerformanceError("Real performance input contains invalid Unicode.") from None
-            if not text_bytes or len(text_bytes) > MAX_DOCUMENT_BYTES:
-                continue
-            eligible += 1
-            rank = int.from_bytes(hashlib.sha256(f"{seed}\0{document_id}".encode()).digest(), "big")
-            candidate = (-rank, document_id, text_bytes)
-            if len(selected) < count:
-                heapq.heappush(selected, candidate)
-            elif rank < -selected[0][0]:
-                heapq.heapreplace(selected, candidate)
-    except EnronPrivateIOError:
-        raise EnronPerformanceError("Real performance input could not be read safely.") from None
+    for row in rows:
+        document_id = row.get("document_id")
+        text = row.get("text")
+        if not isinstance(document_id, str) or not document_id or not isinstance(text, str):
+            raise EnronPerformanceError("Real performance input row has an invalid private shape.")
+        try:
+            text_bytes = text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise EnronPerformanceError("Real performance input contains invalid Unicode.") from None
+        if not text_bytes or len(text_bytes) > MAX_DOCUMENT_BYTES:
+            continue
+        eligible += 1
+        rank = int.from_bytes(hashlib.sha256(f"{seed}\0{document_id}".encode()).digest(), "big")
+        candidate = (-rank, document_id, text_bytes)
+        if len(selected) < count:
+            heapq.heappush(selected, candidate)
+        elif rank < -selected[0][0]:
+            heapq.heapreplace(selected, candidate)
     if eligible < count or len(selected) != count:
         raise EnronPerformanceError("Real performance input does not have enough eligible documents.")
     ordered = sorted(selected, key=lambda item: (-item[0], item[1]))
@@ -1416,29 +1412,40 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
         "Source curation scenario",
         maximum=MAX_SOURCE_BUILD_SECONDS,
     )
+    bank_root = Path(options.bank_build_run).expanduser()
     try:
-        card = verify_enron_bank_build(options.bank_build_run, annotation_run=options.annotation_run)
+        bank_snapshot = _verify_enron_bank_build_snapshot(
+            options.bank_build_run,
+            annotation_run=options.annotation_run,
+        )
+        verification = bank_snapshot.summary
+        card = bank_snapshot.card
+        bank_payload = bank_snapshot.bank_payload
+        bank_value = bank_snapshot.bank
+        validation_documents = bank_snapshot.validation_documents
+        build_created_at = bank_snapshot.build_created_at
+        del bank_snapshot
         development = load_enron_development_split(options.development_run)
     except (EnronBankBuildError, EnronPrivateIOError, EnronSplitError):
         raise EnronPerformanceError("Performance source runs did not pass deep verification.") from None
+    if (
+        verification.get("valid") is not True
+        or card.get("run_sha256") != verification.get("bank_card_run_sha256")
+        or card.get("benchmark_version") != verification.get("benchmark_version")
+        or card.get("fixture_mode") != verification.get("fixture_mode")
+        or card.get("promotable") != verification.get("promotable")
+        or cast(Mapping[str, Any], card.get("bank", {})).get("canonical_sha256") != verification.get("bank_sha256")
+        or card.get("privacy") != verification.get("privacy")
+        or cast(Mapping[str, Any], card.get("source", {})).get("sealed_test_accessed")
+        != verification.get("sealed_test_accessed")
+    ):
+        raise EnronPerformanceError("Verified bank card differs from its deep-verification result.")
     benchmark_version = str(card.get("benchmark_version", ""))
     if options.benchmark_version is not None and options.benchmark_version != benchmark_version:
         raise EnronPerformanceError("Requested benchmark version does not match the verified bank build.")
     if not benchmark_version or len(benchmark_version) > 256:
         raise EnronPerformanceError("Verified benchmark version is invalid.")
 
-    bank_root = Path(options.bank_build_run).expanduser()
-    bank_payload = _read_bounded_bytes(
-        bank_root / "bank.json",
-        maximum_bytes=MAX_PRIVATE_JSON_BYTES,
-        description="Evaluated bank artifact",
-    )
-    try:
-        bank_value = _strict_json_loads(bank_payload)
-    except (json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
-        raise EnronPerformanceError("Evaluated bank artifact is not valid JSON.") from None
-    if not isinstance(bank_value, dict):
-        raise EnronPerformanceError("Evaluated bank artifact must be a JSON object.")
     bank_card = card.get("bank")
     if not isinstance(bank_card, Mapping):
         raise EnronPerformanceError("Verified bank card is missing its bank binding.")
@@ -1457,10 +1464,11 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
     evaluated_descriptor = _evaluated_bank_descriptor(bank_value, evaluated_artifact, native_source_bytes)
 
     documents = _select_real_documents(
-        bank_root / "validation" / "documents.jsonl",
+        validation_documents,
         count=real_input_documents,
         seed=f"{benchmark_version}:performance-real-input-v1",
     )
+    del validation_documents
     real_input, real_input_bytes, real_inventory_bytes, _real_inventory = _real_input_fixture(
         documents,
         bank_descriptor=evaluated_descriptor,
@@ -1513,11 +1521,7 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
             if options.annotation_run is not None
             else None
         ),
-        "build_created_at": _read_json_object(
-            bank_root / "manifest.json",
-            maximum_bytes=MAX_PLAN_BYTES,
-            description="Bank-build manifest",
-        ).get("created_at"),
+        "build_created_at": build_created_at,
         "source_build_projection_sha256": _canonical_hash(_source_build_projection(card)),
     }
     plan_payload = _pretty_json_bytes(plan)
