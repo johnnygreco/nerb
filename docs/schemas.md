@@ -425,11 +425,13 @@ Example eval ref:
 | `by_name` | object | Counts keyed by `entity_id/name_id`. |
 | `by_pattern` | object | Counts keyed by `entity_id/name_id/pattern_id`. |
 | `provenance` | object | Total provenance count and counts by `source_type`. |
+| `evidence` | object | `ref_count` plus a deterministic `suite_sha256` commitment to every attachment scope, eval-ref identity, exact readable content hash, and byte size. |
 | `failures` | array | Eval ref, record index, record type, expected/actual data, and diagnostics. |
 
 `nerb eval-bank` exits nonzero when the bank is invalid, no behavioral records were evaluated, or any eval failed.
 `nerb regress-bank` exits nonzero when either bank is invalid or any aggregate regression gate fails; JSON is still
-printed so CI can retain the evidence.
+printed so CI can retain the evidence. Regression requires old and new `evidence.suite_sha256` values to match, in
+addition to unchanged behavioral populations, so replacing an eval suite with equal-sized easier content fails closed.
 
 ## Diagnostic Objects
 
