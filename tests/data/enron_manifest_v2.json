@@ -92,7 +92,7 @@
     "native_source_bytes": 1024
   },
   "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
-  "performance_manifest_sha256": "sha256:47755560fcafac7a50bdf7455b47bf2229a977a8a725ef656fcd87d32b3da68c",
+  "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
   "labels": [
     {
       "id": "independent_person_labels",

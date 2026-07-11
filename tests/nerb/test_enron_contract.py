@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from statistics import median
 from typing import Any, cast
@@ -23,6 +23,7 @@ from nerb.enron_contract import (
     hash_enron_performance_bank,
     hash_enron_performance_baseline,
     hash_enron_performance_comparison_plan,
+    hash_enron_performance_harness,
     hash_enron_performance_input,
     hash_enron_performance_inventory,
     hash_enron_performance_manifest,
@@ -38,6 +39,17 @@ from nerb.enron_contract import (
 
 JsonObject = dict[str, Any]
 JsonPath = tuple[str | int, ...]
+
+
+class _ExplodingMapping(Mapping[str, Any]):
+    def __getitem__(self, key: str) -> Any:
+        raise RuntimeError(f"unexpected resolver access: {key}")
+
+    def __iter__(self) -> Iterator[str]:
+        raise RuntimeError("unexpected resolver iteration")
+
+    def __len__(self) -> int:
+        raise RuntimeError("unexpected resolver length access")
 
 
 @pytest.fixture
@@ -478,6 +490,42 @@ def _make_scale_bank(active_aliases: int, *, number: int) -> JsonObject:
     return descriptor
 
 
+def _make_performance_harnesses(evidence: Mapping[str, Any]) -> list[JsonObject]:
+    harnesses: list[JsonObject] = []
+    for number, phase in enumerate(enron_contract.PERFORMANCE_PHASES, start=1):
+        descriptor: JsonObject = {
+            "id": f"{phase}_harness",
+            "phase": phase,
+            "command_id": "fixture_build",
+            "source_sha256": _sha256_number(680 + number),
+            "operation_spec_sha256": _sha256_number(700 + number),
+            "source_artifact": (
+                {
+                    "id": "synthetic_profile_source",
+                    "sha256": evidence["source"]["content_sha256"],
+                    "bytes": 4096,
+                }
+                if phase == "source_profile"
+                else copy.deepcopy(evidence["splits"]["roles"]["train"]["artifact"])
+                if phase == "source_build"
+                else None
+            ),
+            "descriptor_sha256": _sha256_number(0),
+        }
+        descriptor["descriptor_sha256"] = hash_enron_performance_harness(descriptor)
+        harnesses.append(descriptor)
+    return sorted(harnesses, key=lambda item: item["id"])
+
+
+def _refresh_harness_dependents(evidence: JsonObject, harness: JsonObject) -> None:
+    harness["descriptor_sha256"] = hash_enron_performance_harness(harness)
+    for workload in evidence["performance"]["workloads"]:
+        if workload["harness_id"] != harness["id"]:
+            continue
+        workload["harness_sha256"] = harness["descriptor_sha256"]
+        workload["workload_sha256"] = hash_enron_workload(workload)
+
+
 def _make_decision_workload(
     evidence: JsonObject,
     template: JsonObject,
@@ -491,6 +539,7 @@ def _make_decision_workload(
     concurrency: int = 1,
 ) -> JsonObject:
     process_model = {
+        "source_profile": "fresh_process_per_sample",
         "source_build": "fresh_process_per_sample",
         "cold_compile": "fresh_process_per_sample",
         "helper_cache_miss": "fresh_process_per_sample",
@@ -498,9 +547,10 @@ def _make_decision_workload(
         "direct_bank_scan": "reused_process",
         "end_to_end": "fresh_process_per_sample",
     }[phase]
-    setup_phase = phase in {"source_build", "cold_compile"}
+    setup_phase = phase in {"source_profile", "source_build", "cold_compile"}
     if setup_phase:
         sample_unit = "operation"
+    harness = next(item for item in evidence["performance"]["harnesses"] if item["phase"] == phase)
     workload = copy.deepcopy(template)
     workload.update(
         {
@@ -508,6 +558,8 @@ def _make_decision_workload(
             "phase": phase,
             "promotion_gate": promotion_gate,
             "decision_grade": True,
+            "harness_id": harness["id"],
+            "harness_sha256": harness["descriptor_sha256"],
             "bank_id": bank["id"],
             "bank_hash": bank["bank_hash"],
             "input_id": None if setup_phase else input_descriptor["id"],
@@ -611,6 +663,7 @@ def _add_baseline_comparisons_and_breakeven(
             comparisons.append(comparison)
     performance["comparisons"] = sorted(comparisons, key=lambda item: item["id"])
 
+    candidate_profile = next(item for item in candidate_workloads if item["phase"] == "source_profile")
     candidate_setup = next(item for item in candidate_workloads if item["phase"] == "source_build")
     candidate_compile = next(item for item in candidate_workloads if item["phase"] == "cold_compile")
     candidate_marginal = next(item for item in candidate_workloads if item["id"] == "direct_bank_latency")
@@ -674,6 +727,17 @@ def _add_baseline_comparisons_and_breakeven(
             "value": 0.001,
         },
         {
+            "id": "candidate_fixed_source_profiling",
+            "side": "candidate",
+            "application": "fixed",
+            "category": "source_profiling",
+            "source": "workload_median_seconds",
+            "description": "Measured candidate source-profiling time.",
+            "workload_id": candidate_profile["id"],
+            "assumption_sha256": None,
+            "value": candidate_profile["stats"]["median_seconds"],
+        },
+        {
             "id": "candidate_per_document_scan",
             "side": "candidate",
             "application": "per_unit",
@@ -685,8 +749,13 @@ def _add_baseline_comparisons_and_breakeven(
             "value": candidate_marginal["stats"]["seconds_per_document"],
         },
     ]
-    candidate_fixed_value = (
-        candidate_setup["stats"]["median_seconds"] + candidate_compile["stats"]["median_seconds"] + 0.001
+    candidate_fixed_value = sum(
+        (
+            candidate_profile["stats"]["median_seconds"],
+            candidate_setup["stats"]["median_seconds"],
+            candidate_compile["stats"]["median_seconds"],
+            0.001,
+        )
     )
     baseline_fixed_value = baseline_setup["stats"]["median_seconds"]
     candidate_value_per_unit = candidate_marginal["stats"]["seconds_per_document"]
@@ -715,10 +784,44 @@ def _add_baseline_comparisons_and_breakeven(
     return baseline_workloads
 
 
+def _refresh_breakeven_outputs(model: JsonObject) -> None:
+    totals = {
+        (side, application): sum(
+            float(item["value"])
+            for item in model["components"]
+            if item["side"] == side and item["application"] == application
+        )
+        for side in ("candidate", "baseline")
+        for application in ("fixed", "per_unit")
+    }
+    result = enron_contract._breakeven_result(
+        totals[("candidate", "fixed")],
+        totals[("baseline", "fixed")],
+        totals[("candidate", "per_unit")],
+        totals[("baseline", "per_unit")],
+        model["minimum_units"],
+        model["maximum_units"],
+    )
+    assert result is not None
+    outcome, units = result
+    model.update(
+        {
+            "candidate_fixed_value": totals[("candidate", "fixed")],
+            "baseline_fixed_value": totals[("baseline", "fixed")],
+            "candidate_value_per_unit": totals[("candidate", "per_unit")],
+            "baseline_value_per_unit": totals[("baseline", "per_unit")],
+            "result": outcome,
+            "breakeven_units": units,
+        }
+    )
+    model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
+
+
 def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[JsonObject]]:
     performance = evidence["performance"]
     inventories: dict[str, list[JsonObject]] = {}
     evaluated_bank = performance["banks"][0]
+    performance["harnesses"] = _make_performance_harnesses(evidence)
     real_input, inventory = _make_performance_input(
         evaluated_bank,
         identifier="real_scan_input",
@@ -751,7 +854,14 @@ def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[Jso
             promotion_gate=True,
         ),
     ]
-    for phase in ("source_build", "cold_compile", "helper_cache_miss", "helper_cache_hit", "end_to_end"):
+    for phase in (
+        "source_profile",
+        "source_build",
+        "cold_compile",
+        "helper_cache_miss",
+        "helper_cache_hit",
+        "end_to_end",
+    ):
         workloads.append(
             _make_decision_workload(
                 evidence,
@@ -765,43 +875,137 @@ def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[Jso
             )
         )
 
-    for index, (active_aliases, hit_density, bytes_per_document) in enumerate(
-        zip(
-            (1_000, 10_000, 25_000, 100_000),
-            ("negative", "sparse", "normal", "dense"),
-            (512, 10_240, 65_536, 300_000),
-            strict=True,
-        ),
-        start=1,
-    ):
+    scale_banks: dict[int, JsonObject] = {}
+    for index, active_aliases in enumerate((1_000, 10_000, 25_000, 100_000), start=1):
         bank = _make_scale_bank(active_aliases, number=800 + index * 10)
-        input_descriptor, inventory = _make_performance_input(
-            bank,
-            identifier=f"scale_{active_aliases}_input",
-            artifact_number=850 + index * 10,
-            kind="synthetic_input",
-            hit_density=hit_density,
-            bytes_per_document=bytes_per_document,
-        )
+        scale_banks[active_aliases] = bank
         performance["banks"].append(bank)
+
+    scale_anchor, scale_inventory = _make_performance_input(
+        scale_banks[1_000],
+        identifier="scale_1000_input",
+        artifact_number=850,
+        kind="synthetic_input",
+        hit_density="negative",
+        bytes_per_document=10_240,
+    )
+    scale_anchor["generator"].update(
+        {
+            "id": "controlled_sweep_input_generator",
+            "version": "1.0.0",
+            "source_sha256": _sha256_number(1020),
+        }
+    )
+    _refresh_input_descriptor(scale_anchor)
+    scale_inputs = {1_000: scale_anchor}
+    inventories[scale_anchor["inventory_ref"]["id"]] = scale_inventory
+    for active_aliases in (10_000, 25_000, 100_000):
+        input_descriptor = copy.deepcopy(scale_anchor)
+        input_descriptor.update(
+            {
+                "id": f"scale_{active_aliases}_input",
+                "bank_id": scale_banks[active_aliases]["id"],
+                "bank_hash": scale_banks[active_aliases]["bank_hash"],
+            }
+        )
+        _refresh_input_descriptor(input_descriptor)
+        scale_inputs[active_aliases] = input_descriptor
+    for active_aliases, input_descriptor in scale_inputs.items():
         performance["inputs"].append(input_descriptor)
-        inventories[input_descriptor["inventory_ref"]["id"]] = inventory
         workloads.append(
             _make_decision_workload(
                 evidence,
                 template,
                 identifier=f"scale_{active_aliases}_scan",
-                bank=bank,
+                bank=scale_banks[active_aliases],
                 input_descriptor=input_descriptor,
                 phase="direct_bank_scan",
                 sample_unit="whole_input",
-                concurrency=4 if active_aliases == 100_000 else 1,
             )
         )
+
+    for index, hit_density in enumerate(("sparse", "normal", "dense"), start=1):
+        input_descriptor, density_inventory = _make_performance_input(
+            scale_banks[1_000],
+            identifier=f"density_{hit_density}_input",
+            artifact_number=1000 + index,
+            kind="synthetic_input",
+            hit_density=hit_density,
+            bytes_per_document=10_240,
+        )
+        input_descriptor["generator"].update(
+            {
+                "id": "controlled_sweep_input_generator",
+                "version": "1.0.0",
+                "source_sha256": _sha256_number(1020),
+            }
+        )
+        _refresh_input_descriptor(input_descriptor)
+        performance["inputs"].append(input_descriptor)
+        inventories[input_descriptor["inventory_ref"]["id"]] = density_inventory
+        workloads.append(
+            _make_decision_workload(
+                evidence,
+                template,
+                identifier=f"density_{hit_density}_scan",
+                bank=scale_banks[1_000],
+                input_descriptor=input_descriptor,
+                phase="direct_bank_scan",
+                sample_unit="whole_input",
+            )
+        )
+
+    for index, (size_cohort, bytes_per_document) in enumerate(
+        (("small", 512), ("large", 65_536), ("huge", 300_000)),
+        start=1,
+    ):
+        input_descriptor, size_inventory = _make_performance_input(
+            scale_banks[1_000],
+            identifier=f"size_{size_cohort}_input",
+            artifact_number=1010 + index,
+            kind="synthetic_input",
+            hit_density="negative",
+            bytes_per_document=bytes_per_document,
+        )
+        input_descriptor["generator"].update(
+            {
+                "id": "controlled_sweep_input_generator",
+                "version": "1.0.0",
+                "source_sha256": _sha256_number(1020),
+            }
+        )
+        _refresh_input_descriptor(input_descriptor)
+        performance["inputs"].append(input_descriptor)
+        inventories[input_descriptor["inventory_ref"]["id"]] = size_inventory
+        workloads.append(
+            _make_decision_workload(
+                evidence,
+                template,
+                identifier=f"size_{size_cohort}_scan",
+                bank=scale_banks[1_000],
+                input_descriptor=input_descriptor,
+                phase="direct_bank_scan",
+                sample_unit="whole_input",
+            )
+        )
+
+    workloads.append(
+        _make_decision_workload(
+            evidence,
+            template,
+            identifier="concurrency_4_scan",
+            bank=scale_banks[1_000],
+            input_descriptor=scale_anchor,
+            phase="direct_bank_scan",
+            sample_unit="whole_input",
+            concurrency=4,
+        )
+    )
     baseline_workloads = _add_baseline_comparisons_and_breakeven(evidence, workloads)
     workloads.extend(baseline_workloads)
     performance["banks"].sort(key=lambda item: item["id"])
     performance["inputs"].sort(key=lambda item: item["id"])
+    performance["harnesses"].sort(key=lambda item: item["id"])
     performance["workloads"] = sorted(workloads, key=lambda item: item["id"])
     return inventories
 
@@ -824,10 +1028,15 @@ def _promotable(
     natural_label = bound_manifest["labels"][0]
     natural_label["role_populations"][0].update({"documents": 120, "spans": 200})
     natural_label["span_count"] = 200
+    natural_label["annotation_scope"]["document_regions"] = copy.deepcopy(
+        bound_manifest["preparation"]["text_views"][0]["document_regions"]
+    )
+    natural_label["annotation_scope"]["exclusions"] = []
     value["source"] = copy.deepcopy(bound_manifest["source"])
     value["preparation"] = copy.deepcopy(bound_manifest["preparation"])
     value["splits"] = copy.deepcopy(bound_manifest["splits"])
     quality = value["quality"]["slices"][0]
+    quality["annotation_scope"] = copy.deepcopy(natural_label["annotation_scope"])
     quality.update(
         {
             "promotion_gate": True,
@@ -953,14 +1162,18 @@ def _promotable(
         }
         if workload["sample_unit"] == "document":
             fields["seconds_per_document"] = ("lte", 1.0)
+            if workload["promotion_gate"]:
+                fields["p99_seconds"] = ("lte", 0.05)
         elif workload["sample_unit"] == "whole_input":
             fields.update(
                 {
                     "documents_per_second": ("gte", 1.0),
                     "mib_per_second": ("gte", 0.001),
-                    "records_per_second": ("gte", 0.0),
                 }
             )
+            if workload["promotion_gate"]:
+                fields["documents_per_second"] = ("gte", 100.0)
+                fields["mib_per_second"] = ("gte", 1.0)
         for field, (operator, threshold) in fields.items():
             target = f"/performance/workloads/{workload_index}/"
             target += f"stats/{field}" if field != "peak_rss_bytes" else field
@@ -1095,6 +1308,7 @@ def _unevaluated(evidence: JsonObject) -> JsonObject:
         "evaluated": False,
         "banks": [],
         "inputs": [],
+        "harnesses": [],
         "workloads": [],
         "baselines": [],
         "comparisons": [],
@@ -1419,6 +1633,32 @@ def test_quality_gate_must_label_the_entire_frozen_final_test_population(manifes
     )
 
     _assert_code(validate_enron_manifest(manifest), "contract.quality_gate_test_population")
+
+
+def test_promoted_quality_gate_rejects_annotation_region_subset(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    primary_view = bound_manifest["preparation"]["text_views"][0]
+    primary_view["document_regions"].append("natural_subject")
+    bound_manifest["labels"][0]["annotation_scope"]["document_regions"].append("natural_subject")
+    promoted["preparation"] = copy.deepcopy(bound_manifest["preparation"])
+    promoted["quality"]["slices"][0]["annotation_scope"]["document_regions"].append("natural_subject")
+    _sync_bound_manifest(bound_manifest, promoted)
+    promoted["quality"]["slices"][0]["annotation_scope"]["document_regions"] = ["natural_body"]
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.quality_gate_annotation_scope",
+    )
+
+
+def test_promoted_quality_gate_rejects_annotation_exclusions(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    promoted["quality"]["slices"][0]["annotation_scope"]["exclusions"] = ["natural_subject"]
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.quality_gate_annotation_scope",
+    )
 
 
 def test_answer_bearing_nonprimary_view_cannot_replace_promoted_natural_view(
@@ -2105,6 +2345,40 @@ def test_decision_grade_recall_threshold_cannot_weaken_privacy_policy_floor(
     )
 
 
+@pytest.mark.parametrize(
+    ("check_id", "threshold"),
+    [
+        ("performance_direct_bank_latency_p99_seconds", 0.051),
+        ("performance_direct_bank_throughput_documents_per_second", 99.0),
+        ("performance_direct_bank_throughput_mib_per_second", 0.99),
+        ("performance_direct_bank_latency_peak_rss_bytes", 8 * 1024**3 + 1),
+    ],
+)
+def test_same_machine_baseline_cannot_authorize_impractical_headline_thresholds(
+    manifest: JsonObject, evidence: JsonObject, check_id: str, threshold: float
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    check = next(item for item in promoted["promotion"]["checks"] if item["id"] == check_id)
+    check.update(
+        _gate(
+            check["id"],
+            check["category"],
+            check["target"],
+            check["operator"],
+            threshold,
+            check["actual"],
+        )
+    )
+    assert check["passed"] is True
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_threshold_policy",
+    )
+
+
 def test_gate_rejects_incompatible_typed_comparison(evidence: JsonObject) -> None:
     check = evidence["promotion"]["checks"][1]
     check["operator"] = "gte"
@@ -2137,6 +2411,10 @@ def test_real_promotable_evidence_requires_and_accepts_manifest_and_trusted_line
         "valid": True,
         "diagnostics": [],
     }
+    candidate_workloads = [item for item in promoted["performance"]["workloads"] if item["baseline_id"] is None]
+    baseline_workloads = [item for item in promoted["performance"]["workloads"] if item["baseline_id"] is not None]
+    assert len(promoted["performance"]["harnesses"]) == 7
+    assert len(candidate_workloads) == len(baseline_workloads) == 19
 
     _assert_code(
         validate_enron_evidence(promoted, trusted_lineage_prefix=[]),
@@ -2204,9 +2482,6 @@ def test_promotion_requires_mandated_gate_operator_semantics(manifest: JsonObjec
     [
         ("phase", "contract.missing_performance_phase"),
         ("scale", "contract.missing_scale_shape"),
-        ("density", "contract.missing_hit_density"),
-        ("size", "contract.missing_document_size_cohort"),
-        ("concurrency", "contract.missing_concurrency_shape"),
         ("unused_bank", "contract.unused_performance_bank"),
     ],
 )
@@ -2221,21 +2496,6 @@ def test_promotion_requires_full_phase_scale_density_and_concurrency_matrix(
         removed_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_aliases"] == 1_000)
         performance["banks"] = [item for item in performance["banks"] if item["bank_hash"] != removed_hash]
         performance["workloads"] = [item for item in performance["workloads"] if item["bank_hash"] != removed_hash]
-    elif mutation in {"density", "size"}:
-        for input_descriptor in performance["inputs"]:
-            field = "hit_density" if mutation == "density" else "size_cohort"
-            input_descriptor[field] = "normal" if mutation == "density" else "medium"
-            _refresh_input_descriptor(input_descriptor)
-        for workload in performance["workloads"]:
-            if workload["input_id"] is None:
-                continue
-            input_descriptor = next(item for item in performance["inputs"] if item["id"] == workload["input_id"])
-            workload["input_sha256"] = input_descriptor["descriptor_sha256"]
-            workload["workload_sha256"] = hash_enron_workload(workload)
-    elif mutation == "concurrency":
-        for workload in performance["workloads"]:
-            workload["concurrency"] = 1
-            workload["workload_sha256"] = hash_enron_workload(workload)
     else:
         unused_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_aliases"] == 100_000)
         performance["workloads"] = [item for item in performance["workloads"] if item["bank_hash"] != unused_hash]
@@ -2246,6 +2506,146 @@ def test_promotion_requires_full_phase_scale_density_and_concurrency_matrix(
         _validate_promoted(promoted, bound_manifest, inventories),
         code,
     )
+
+
+@pytest.mark.parametrize(
+    ("axis", "code"),
+    [
+        ("scale", "contract.uncontrolled_scale_sweep"),
+        ("density", "contract.uncontrolled_density_sweep"),
+        ("size", "contract.uncontrolled_size_sweep"),
+        ("concurrency", "contract.uncontrolled_concurrency_sweep"),
+    ],
+)
+def test_global_axis_coverage_cannot_hide_confounded_performance_sweeps(
+    manifest: JsonObject, evidence: JsonObject, axis: str, code: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    performance = promoted["performance"]
+    workloads = {item["id"]: item for item in performance["workloads"]}
+    if axis == "concurrency":
+        anchor = next(item for item in performance["inputs"] if item["id"] == "scale_1000_input")
+        concurrent_only = copy.deepcopy(anchor)
+        concurrent_only["id"] = "concurrency_only_input"
+        _refresh_input_descriptor(concurrent_only)
+        performance["inputs"].append(concurrent_only)
+        performance["inputs"].sort(key=lambda item: item["id"])
+        for workload_id in ("concurrency_4_scan", "baseline_concurrency_4_scan"):
+            workload = workloads[workload_id]
+            workload["input_id"] = concurrent_only["id"]
+            _refresh_workload(promoted, workload)
+    else:
+        candidate_id = {
+            "scale": "scale_100000_scan",
+            "density": "density_dense_scan",
+            "size": "size_huge_scan",
+        }[axis]
+        for workload_id in (candidate_id, f"baseline_{candidate_id}"):
+            workload = workloads[workload_id]
+            workload["concurrency"] = 2
+            workload["workload_sha256"] = hash_enron_workload(workload)
+
+    direct_cells = [
+        item
+        for item in performance["workloads"]
+        if item["decision_grade"] and item["baseline_id"] is None and item["phase"] == "direct_bank_scan"
+    ]
+    input_by_id = {item["id"]: item for item in performance["inputs"]}
+    bank_by_id = {item["id"]: item for item in performance["banks"]}
+    assert {bank_by_id[item["bank_id"]]["active_aliases"] for item in direct_cells} >= {
+        1_000,
+        10_000,
+        25_000,
+        100_000,
+    }
+    assert {input_by_id[item["input_id"]]["hit_density"] for item in direct_cells} >= {
+        "negative",
+        "sparse",
+        "normal",
+        "dense",
+    }
+    assert {input_by_id[item["input_id"]]["size_cohort"] for item in direct_cells} >= {
+        "small",
+        "medium",
+        "large",
+        "huge",
+    }
+    concurrencies = {item["concurrency"] for item in direct_cells}
+    assert 1 in concurrencies and any(value > 1 for value in concurrencies)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(_validate_promoted(promoted, bound_manifest, inventories), code)
+
+
+def test_unrelated_generator_family_cannot_masquerade_as_controlled_density_sweep(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    performance = promoted["performance"]
+    input_descriptor = next(item for item in performance["inputs"] if item["id"] == "density_dense_input")
+    input_descriptor["generator"].update(
+        {
+            "id": "unrelated_generator_family",
+            "version": "9.0.0",
+            "source_sha256": _sha256_number(1110),
+        }
+    )
+    _refresh_input_descriptor(input_descriptor)
+    for workload in performance["workloads"]:
+        if workload["input_id"] == input_descriptor["id"]:
+            _refresh_workload(promoted, workload)
+    assert {item["hit_density"] for item in performance["inputs"]} >= {
+        "negative",
+        "sparse",
+        "normal",
+        "dense",
+    }
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.uncontrolled_density_sweep",
+    )
+
+
+@pytest.mark.parametrize(
+    ("axis", "input_ids", "code"),
+    [
+        (
+            "density",
+            ("scale_1000_input", "density_sparse_input", "density_normal_input", "density_dense_input"),
+            "contract.uncontrolled_density_sweep",
+        ),
+        (
+            "size",
+            ("scale_1000_input", "size_small_input", "size_large_input", "size_huge_input"),
+            "contract.uncontrolled_size_sweep",
+        ),
+    ],
+)
+def test_unrelated_real_inputs_cannot_masquerade_as_a_controlled_generated_sweep(
+    manifest: JsonObject,
+    evidence: JsonObject,
+    axis: str,
+    input_ids: tuple[str, ...],
+    code: str,
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    inputs = {item["id"]: item for item in promoted["performance"]["inputs"]}
+    for input_id in input_ids:
+        inputs[input_id]["kind"] = "real_input"
+        inputs[input_id]["generator"] = None
+        _refresh_input_descriptor(inputs[input_id])
+    for workload in promoted["performance"]["workloads"]:
+        if workload["input_id"] in input_ids:
+            _refresh_workload(promoted, workload)
+    assert axis in {"density", "size"}
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(_validate_promoted(promoted, bound_manifest, inventories), code)
 
 
 def test_required_scale_axis_is_exact_active_alias_count_not_pattern_count(
@@ -2332,7 +2732,7 @@ def test_scale_descriptor_without_a_decision_workload_cannot_promote(
 ) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     promoted["performance"]["workloads"] = [
-        item for item in promoted["performance"]["workloads"] if item["id"] != "scale_1000_scan"
+        item for item in promoted["performance"]["workloads"] if item["id"] != "scale_100000_scan"
     ]
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
@@ -2358,6 +2758,59 @@ def test_every_decision_cell_requires_full_exact_baseline_regression_coverage(
     _assert_code(
         _validate_promoted(promoted, bound_manifest, inventories),
         "contract.performance_regression_coverage",
+    )
+
+
+@pytest.mark.parametrize("mutation", ["warmups", "sample_count"])
+def test_exact_baseline_comparison_requires_identical_sampling_protocol(
+    manifest: JsonObject, evidence: JsonObject, mutation: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    candidate = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_100000_scan")
+    baseline = next(item for item in promoted["performance"]["workloads"] if item["id"] == "baseline_scale_100000_scan")
+    if mutation == "warmups":
+        baseline["warmups"] = candidate["warmups"] + 1
+        baseline["workload_sha256"] = hash_enron_workload(baseline)
+    else:
+        baseline["samples_seconds"].append(0.0152)
+        _refresh_workload(promoted, baseline)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.incomparable_performance_baseline",
+    )
+
+
+def test_exact_setup_baseline_requires_same_source_artifact(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    performance = promoted["performance"]
+    candidate_harness = next(item for item in performance["harnesses"] if item["phase"] == "source_build")
+    baseline_harness = copy.deepcopy(candidate_harness)
+    baseline_harness.update(
+        {
+            "id": "baseline_source_build_harness",
+            "source_artifact": {
+                "id": "different_profiled_source",
+                "sha256": _sha256_number(1111),
+                "bytes": 8192,
+            },
+        }
+    )
+    baseline_harness["descriptor_sha256"] = hash_enron_performance_harness(baseline_harness)
+    performance["harnesses"].append(baseline_harness)
+    performance["harnesses"].sort(key=lambda item: item["id"])
+    baseline = next(item for item in performance["workloads"] if item["id"] == "baseline_source_build_fixture")
+    baseline["harness_id"] = baseline_harness["id"]
+    baseline["harness_sha256"] = baseline_harness["descriptor_sha256"]
+    baseline["workload_sha256"] = hash_enron_workload(baseline)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.incomparable_performance_baseline",
     )
 
 
@@ -2416,6 +2869,43 @@ def test_promotion_requires_a_finite_additive_breakeven_value_model(manifest: Js
     )
 
 
+def test_promoted_value_model_requires_measured_source_profiling(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    model["components"] = [item for item in model["components"] if item["id"] != "candidate_fixed_source_profiling"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_synthetic_scale_scan_pair_cannot_stand_in_for_evaluated_bank_value_model(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
+    for component_id, workload_id in (
+        ("candidate_per_document_scan", "scale_1000_scan"),
+        ("baseline_per_document_scan", "baseline_scale_1000_scan"),
+    ):
+        component = next(item for item in model["components"] if item["id"] == component_id)
+        workload = workloads[workload_id]
+        component["workload_id"] = workload_id
+        component["value"] = workload["stats"]["seconds_per_document"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+
+    assert {"contract.invalid_breakeven_model", "contract.missing_breakeven_value_model"} <= _codes(result)
+
+
 def test_slow_decision_cell_fails_its_frozen_performance_thresholds(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     index = next(
@@ -2436,7 +2926,7 @@ def test_scale_decision_cell_cannot_disguise_itself_as_the_wrong_phase(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
-    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_1000_scan")
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_100000_scan")
     workload["phase"] = "helper_cache_hit"
     workload["workload_sha256"] = hash_enron_workload(workload)
     _refresh_frozen_contract(promoted)
@@ -2624,6 +3114,22 @@ def test_failed_or_aborted_current_outcome_cannot_promote(manifest: JsonObject, 
     )
 
 
+@pytest.mark.parametrize("outcome", ["failed", "aborted"])
+def test_failed_current_outcome_can_publish_full_nonpromoted_aggregate(
+    manifest: JsonObject, evidence: JsonObject, outcome: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    promoted["promotion"].update({"passed": False, "claims": []})
+    promoted["verifier"]["passed"] = False
+    promoted["test_access"]["lineage"][-1]["outcome"] = outcome
+    _rehash_lineage(promoted)
+
+    assert _validate_promoted(promoted, bound_manifest, inventories) == {
+        "valid": True,
+        "diagnostics": [],
+    }
+
+
 def test_successor_lineage_accepts_exact_trusted_append(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     trusted_prefix = _with_predecessor(promoted)
@@ -2655,6 +3161,24 @@ def test_trusted_lineage_prefix_rejects_scalar_shape_without_type_error(
         promoted,
         manifest=bound_manifest,
         trusted_lineage_prefix=cast(Any, 42),
+        referenced_input_inventories=inventories,
+    )
+
+    _assert_code(result, "contract.trusted_lineage_shape")
+
+
+def test_trusted_lineage_prefix_rejects_container_subclasses_without_invoking_overrides(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    class ExplodingList(list[Any]):
+        def __len__(self) -> int:
+            raise RuntimeError("unexpected lineage-prefix length access")
+
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    result = validate_enron_evidence(
+        promoted,
+        manifest=bound_manifest,
+        trusted_lineage_prefix=cast(Any, ExplodingList()),
         referenced_input_inventories=inventories,
     )
 
@@ -2732,12 +3256,122 @@ def test_workload_descriptor_and_performance_manifest_hashes_are_bound(evidence:
     _assert_code(validate_enron_evidence(evidence), "contract.performance_manifest_hash")
 
 
+def test_harness_descriptor_and_performance_manifest_hashes_are_bound(evidence: JsonObject) -> None:
+    harness = evidence["performance"]["harnesses"][0]
+    harness["source_sha256"] = _sha256_number(1100)
+    _assert_code(validate_enron_evidence(evidence), "contract.performance_harness_hash")
+
+    _refresh_harness_dependents(evidence, harness)
+    _assert_code(validate_enron_evidence(evidence), "contract.performance_manifest_hash")
+
+
+@pytest.mark.parametrize("mutation", ["identifier", "hash", "phase"])
+def test_workload_must_bind_exact_phase_harness(evidence: JsonObject, mutation: str) -> None:
+    workload = evidence["performance"]["workloads"][0]
+    if mutation == "identifier":
+        workload["harness_id"] = "missing_harness"
+    elif mutation == "hash":
+        workload["harness_sha256"] = _sha256_number(1101)
+    else:
+        workload["phase"] = "helper_cache_hit"
+    workload["workload_sha256"] = hash_enron_workload(workload)
+    _refresh_frozen_contract(evidence)
+
+    _assert_code(validate_enron_evidence(evidence), "contract.unknown_performance_harness")
+
+
+def test_performance_harness_command_must_be_declared(evidence: JsonObject) -> None:
+    harness = evidence["performance"]["harnesses"][0]
+    harness["command_id"] = "missing_command"
+    _refresh_harness_dependents(evidence, harness)
+    _refresh_frozen_contract(evidence)
+
+    _assert_code(validate_enron_evidence(evidence), "contract.performance_harness_command")
+
+
+@pytest.mark.parametrize("phase", ["source_profile", "source_build", "direct_bank_scan"])
+def test_harness_source_artifact_presence_is_phase_bound(
+    manifest: JsonObject, evidence: JsonObject, phase: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    harness = next(item for item in promoted["performance"]["harnesses"] if item["phase"] == phase)
+    harness["source_artifact"] = (
+        {"id": "unexpected_source", "sha256": _sha256_number(1102), "bytes": 64}
+        if phase == "direct_bank_scan"
+        else None
+    )
+    _refresh_harness_dependents(promoted, harness)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_harness_source_artifact",
+    )
+
+
+@pytest.mark.parametrize("phase", ["source_profile", "source_build"])
+def test_setup_harness_source_artifact_must_match_its_frozen_role(
+    manifest: JsonObject, evidence: JsonObject, phase: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    harness = next(item for item in promoted["performance"]["harnesses"] if item["phase"] == phase)
+    harness["source_artifact"]["sha256"] = _sha256_number(1105)
+    _refresh_harness_dependents(promoted, harness)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_harness_source_binding",
+    )
+
+
+def test_performance_harness_ids_are_unique(evidence: JsonObject) -> None:
+    evidence["performance"]["harnesses"].append(copy.deepcopy(evidence["performance"]["harnesses"][0]))
+
+    _assert_code(validate_enron_evidence(evidence), "contract.duplicate_id")
+
+
+def test_performance_harnesses_require_canonical_order(manifest: JsonObject, evidence: JsonObject) -> None:
+    _, promoted, _ = _promotable(manifest, evidence)
+    promoted["performance"]["harnesses"].reverse()
+
+    _assert_code(validate_enron_evidence(promoted), "contract.performance_descriptor_order")
+
+
+def test_unused_performance_harness_cannot_be_frozen(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    harness = copy.deepcopy(promoted["performance"]["harnesses"][0])
+    harness.update(
+        {
+            "id": "unused_direct_harness",
+            "source_sha256": _sha256_number(1103),
+            "operation_spec_sha256": _sha256_number(1104),
+        }
+    )
+    harness["descriptor_sha256"] = hash_enron_performance_harness(harness)
+    promoted["performance"]["harnesses"].append(harness)
+    promoted["performance"]["harnesses"].sort(key=lambda item: item["id"])
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.unused_performance_harness",
+    )
+
+
 @pytest.mark.parametrize(
     ("collection", "field"),
     [
         ("banks", "composition"),
         ("banks", "active_aliases"),
         ("inputs", "inventory_ref"),
+        ("harnesses", "command_id"),
+        ("harnesses", "operation_spec_sha256"),
+        ("workloads", "harness_id"),
+        ("workloads", "harness_sha256"),
         ("workloads", "sample_unit"),
         ("workloads", "rss_samples_bytes"),
     ],
@@ -3043,6 +3677,20 @@ def test_referenced_input_inventory_hash_mismatch_is_rejected(manifest: JsonObje
     )
 
 
+@pytest.mark.parametrize("payload", [None, 42, {}, [{"bytes": 1}]])
+def test_malformed_inventory_resolver_entries_fail_closed_for_promotion(
+    manifest: JsonObject, evidence: JsonObject, payload: Any
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    changed = cast(dict[str, Any], copy.deepcopy(inventories))
+    inventory_id = next(iter(changed))
+    changed[inventory_id] = payload
+
+    result = _validate_promoted(promoted, bound_manifest, cast(Any, changed))
+
+    assert {"contract.performance_inventory_shape", "contract.performance_inventory_unavailable"} <= _codes(result)
+
+
 def test_document_sample_unit_cannot_report_aggregate_throughput(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
@@ -3066,9 +3714,12 @@ def test_non_scan_phase_cannot_use_ambiguous_document_sample_units(evidence: Jso
     _assert_code(validate_enron_evidence(evidence), "contract.performance_phase_sample_unit")
 
 
-def test_setup_operation_cells_cannot_borrow_scan_denominators(manifest: JsonObject, evidence: JsonObject) -> None:
+@pytest.mark.parametrize("workload_id", ["source_profile_fixture", "source_build_fixture", "cold_compile_fixture"])
+def test_setup_operation_cells_cannot_borrow_scan_denominators(
+    manifest: JsonObject, evidence: JsonObject, workload_id: str
+) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
-    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "source_build_fixture")
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == workload_id)
     assert workload["sample_unit"] == "operation"
     assert workload["input_id"] is workload["input_sha256"] is None
     assert all(
@@ -3200,6 +3851,64 @@ def test_external_resolver_top_level_shape_is_validated(evidence: JsonObject, re
     _assert_code(validate_enron_evidence(evidence, **kwargs), code)
 
 
+@pytest.mark.parametrize(
+    ("resolver", "code"),
+    [
+        ("samples", "contract.performance_sample_resolver_shape"),
+        ("inventories", "contract.performance_inventory_resolver_shape"),
+    ],
+)
+def test_custom_mapping_resolvers_fail_closed_without_invoking_hostile_methods(
+    evidence: JsonObject, resolver: str, code: str
+) -> None:
+    hostile = _ExplodingMapping()
+    kwargs: dict[str, Any] = (
+        {"referenced_samples": hostile} if resolver == "samples" else {"referenced_input_inventories": hostile}
+    )
+
+    _assert_code(validate_enron_evidence(evidence, **kwargs), code)
+
+
+def test_custom_mapping_inventory_rows_fail_closed_without_invoking_hostile_methods(evidence: JsonObject) -> None:
+    inventory_id = evidence["performance"]["inputs"][0]["inventory_ref"]["id"]
+
+    _assert_code(
+        validate_enron_evidence(
+            evidence,
+            referenced_input_inventories={inventory_id: [_ExplodingMapping()]},
+        ),
+        "contract.performance_inventory_shape",
+    )
+
+
+def test_numeric_subclasses_in_external_resolvers_fail_closed_without_invoking_overrides(evidence: JsonObject) -> None:
+    class EvilFloat(float):
+        def __float__(self) -> float:
+            raise RuntimeError("unexpected float conversion")
+
+    class EvilInt(int):
+        def __ge__(self, other: object) -> bool:
+            raise RuntimeError(f"unexpected integer comparison: {other}")
+
+    samples_evidence = copy.deepcopy(evidence)
+    workload = samples_evidence["performance"]["workloads"][0]
+    workload["samples_seconds"] = []
+    workload["samples_ref"] = {"id": "hostile_samples", "sha256": _sha256_number(995), "bytes": 1}
+    _assert_code(
+        validate_enron_evidence(samples_evidence, referenced_samples={"hostile_samples": [EvilFloat(0.01)]}),
+        "contract.performance_sample_support",
+    )
+
+    inventory_id = evidence["performance"]["inputs"][0]["inventory_ref"]["id"]
+    _assert_code(
+        validate_enron_evidence(
+            evidence,
+            referenced_input_inventories={inventory_id: [{"bytes": EvilInt(1), "records": 0}]},
+        ),
+        "contract.performance_inventory_shape",
+    )
+
+
 def test_scalar_referenced_sample_fails_closed_without_type_error(evidence: JsonObject) -> None:
     workload = evidence["performance"]["workloads"][0]
     workload["samples_seconds"] = []
@@ -3234,6 +3943,7 @@ def test_referenced_samples_can_support_promotion(manifest: JsonObject, evidence
     ("phase", "process_model", "code"),
     [
         ("direct_bank_scan", "fresh_process_per_sample", "contract.performance_phase_process_model"),
+        ("source_profile", "reused_process", "contract.performance_phase_process_model"),
         ("cold_compile", "reused_process", "contract.performance_phase_process_model"),
     ],
 )
@@ -3344,6 +4054,17 @@ def test_real_artifacts_reject_placeholder_all_zero_content_hashes(
         "/tmp/source.jsonl",
         "FOO=/tmp/source.jsonl",
         "sh -c python /tmp/source.jsonl",
+        "--config:/tmp/private.json",
+        "--output,/workspace/data.json",
+        "artifact(/tmp/private.json)",
+        "-I/Volumes/ClientAcme/secret/include",
+        "-L/srv/customer-alpha/private-lib",
+        "--sysroot/tmp/build",
+        r"-IC:\Users\fixture\private\include",
+        "-I//server/private/include",
+        "--root//server/private",
+        "-I~/private/include",
+        "-I../private/include",
         "file:///private/source.jsonl",
         "~/source.jsonl",
         "../source.jsonl",
@@ -3360,9 +4081,33 @@ def test_commands_reject_private_or_traversing_paths(manifest: JsonObject, unsaf
     [
         ("owner", "fixture@example.test", "contract.public_direct_identifier"),
         ("owner", "person@internal", "contract.public_direct_identifier"),
+        ("owner", '"δοκιμή@παράδειγμα.test"', "contract.public_direct_identifier"),
+        ("owner", "alice＠example.test", "contract.public_direct_identifier"),
+        ("owner", "alice%2540example.test", "contract.public_direct_identifier"),
+        ("owner", "123-45-6789", "contract.public_structured_identifier"),
+        ("owner", "123‐45‐6789", "contract.public_structured_identifier"),
+        ("owner", "１２３-４５-６７８９", "contract.public_structured_identifier"),
+        ("owner", "+1 (713) 555-0199", "contract.public_structured_identifier"),
+        ("owner", "+1(713)555-0199", "contract.public_structured_identifier"),
+        ("owner", "(713)5550199", "contract.public_structured_identifier"),
+        ("owner", "＋１（７１３）５５５－０１９９", "contract.public_structured_identifier"),
+        ("owner", "+17135550199", "contract.public_structured_identifier"),
+        ("owner", "+447911123456", "contract.public_structured_identifier"),
+        ("owner", "+44 7911 123456", "contract.public_structured_identifier"),
+        ("owner", "+33 1 42 68 53 00", "contract.public_structured_identifier"),
+        ("owner", "+91 98765 43210", "contract.public_structured_identifier"),
+        ("owner", "+١٧١٣٥٥٥٠١٩٩", "contract.public_structured_identifier"),
+        ("owner", "١٢٣-٤٥-٦٧٨٩", "contract.public_structured_identifier"),
         ("access", "/Users/fixture/private/source", "contract.public_private_path"),
         ("access", "FOO=/tmp/source.jsonl", "contract.public_private_path"),
         ("access", "python /tmp/source.jsonl --safe", "contract.public_private_path"),
+        ("access", "--config:/tmp/private.json", "contract.public_private_path"),
+        ("access", "--output,/workspace/data.json", "contract.public_private_path"),
+        ("access", "artifact(/tmp/private.json)", "contract.public_private_path"),
+        ("access", "artifact%2528%252Ftmp%252Fprivate.json%2529", "contract.public_private_path"),
+        ("access", "／Users／alice／secret.json", "contract.public_private_path"),
+        ("access", "file：／／／Users／alice／secret.json", "contract.public_private_path"),
+        ("access", "..／secret.json", "contract.public_private_path"),
     ],
 )
 def test_entire_public_serialization_is_scanned_for_identifiers_and_paths(
@@ -3386,6 +4131,55 @@ def test_public_serialization_rejects_windows_local_path_variants(manifest: Json
     manifest["source"]["access"] = unsafe
 
     _assert_code(validate_enron_manifest(manifest), "contract.public_private_path")
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "https://example.test/run?source=/Users/alice/private.json",
+        "https://example.test/run#file=/home/alice/corpus.jsonl",
+        "https://example.test/redirect?next=file:///private/source.jsonl",
+        "https://example.test/run?source=%252FUsers%252Falice%252Fprivate.json",
+    ],
+)
+def test_http_url_exemption_does_not_hide_private_query_or_fragment_values(manifest: JsonObject, unsafe: str) -> None:
+    manifest["source"]["access"] = unsafe
+
+    _assert_code(validate_enron_manifest(manifest), "contract.public_private_path")
+
+
+@pytest.mark.parametrize(
+    ("unsafe", "code"),
+    [
+        ("https://example.test/run?contact=alice%40example.test", "contract.public_direct_identifier"),
+        ("https://example.test/alice%2540example.test", "contract.public_direct_identifier"),
+        ("https://example.test/run?phone=%2B1%28713%29555-0199", "contract.public_structured_identifier"),
+        ("https://example.test/run#ssn=123%2D45%2D6789", "contract.public_structured_identifier"),
+    ],
+)
+def test_http_url_exemption_does_not_hide_encoded_identifiers(manifest: JsonObject, unsafe: str, code: str) -> None:
+    manifest["source"]["access"] = unsafe
+
+    _assert_code(validate_enron_manifest(manifest), code)
+
+
+@pytest.mark.parametrize(
+    "safe_url",
+    [
+        "https://example.test/a(b)/c?view=public#summary",
+        "https://[2001:db8::1]:8443/a(b)/c?view=public#summary",
+        "https://example.test/redirect?next=https://other.test/docs",
+        "https://example.test/redirect?next=https%3A%2F%2Fother.test%2Fdocs",
+    ],
+)
+def test_http_urls_and_gate_json_pointers_are_public_path_exemptions(
+    manifest: JsonObject, evidence: JsonObject, safe_url: str
+) -> None:
+    manifest["source"]["access"] = safe_url
+
+    assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
+    assert validate_enron_evidence(evidence) == {"valid": True, "diagnostics": []}
+    assert all(item["target"].startswith("/") for item in evidence["promotion"]["checks"])
 
 
 def test_diagnostics_do_not_echo_direct_identifiers_or_offending_values(manifest: JsonObject) -> None:
@@ -3423,6 +4217,37 @@ def test_diagnostics_are_deterministically_capped(manifest: JsonObject) -> None:
 
     assert len(result["diagnostics"]) == enron_contract.MAX_DIAGNOSTICS + 1
     assert result["diagnostics"][-1]["code"] == "contract.diagnostics_truncated"
+    assert result == validate_enron_manifest(manifest)
+
+
+def test_expensive_diagnostic_collectors_stop_early_and_never_echo_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command_diagnostics = enron_contract._command_diagnostics(
+        [{"cwd": "/tmp/private", "argv": []} for _ in range(enron_contract.MAX_COLLECTION_ITEMS)],
+        "/commands",
+    )
+    assert len(command_diagnostics) == enron_contract.MAX_DIAGNOSTICS + 1
+
+    placeholder_diagnostics = enron_contract._placeholder_hash_diagnostics(
+        {f"key_{index:04d}": enron_contract.ZERO_SHA256 for index in range(1000)}
+    )
+    assert len(placeholder_diagnostics) == enron_contract.MAX_DIAGNOSTICS + 1
+    assert [item["path"] for item in placeholder_diagnostics[:2]] == ["/key_0000", "/key_0001"]
+
+    consumed: list[int] = []
+    secret = "private-value@internal"
+
+    def strings(_value: Any) -> Any:
+        for index in range(enron_contract.MAX_COLLECTION_ITEMS):
+            consumed.append(index)
+            yield f"/value_{index:04d}", secret
+
+    monkeypatch.setattr(enron_contract, "_iter_strings", strings)
+    public_diagnostics = enron_contract._public_serialization_diagnostics({})
+
+    assert len(consumed) == len(public_diagnostics) == enron_contract.MAX_DIAGNOSTICS + 1
+    assert secret not in json.dumps(public_diagnostics, sort_keys=True)
 
 
 @pytest.mark.parametrize("shape", ["depth", "cycle", "collection"])

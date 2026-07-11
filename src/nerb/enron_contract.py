@@ -19,6 +19,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISREG
 from statistics import median
 from typing import Any
+from unicodedata import decimal as unicode_decimal
+from unicodedata import normalize as normalize_unicode
+from urllib.parse import unquote, urlsplit
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
@@ -69,6 +72,7 @@ ANNOTATION_COMPLETENESS = ("exhaustive_within_scope", "partial", "not_applicable
 CHARACTER_POSITION_SEMANTICS = "document_id_unicode_scalar_index"
 MATCHING_SEMANTICS = "one_to_one_exact_span_and_class"
 PERFORMANCE_PHASES = (
+    "source_profile",
     "source_build",
     "cold_compile",
     "helper_cache_miss",
@@ -77,6 +81,7 @@ PERFORMANCE_PHASES = (
     "end_to_end",
 )
 PERFORMANCE_PHASE_PROCESS_MODELS = {
+    "source_profile": "fresh_process_per_sample",
     "source_build": "fresh_process_per_sample",
     "cold_compile": "fresh_process_per_sample",
     "helper_cache_miss": "fresh_process_per_sample",
@@ -88,6 +93,10 @@ PERFORMANCE_SCALE_ALIASES = (1_000, 10_000, 25_000, 100_000)
 MIN_DECISION_GRADE_SAMPLES = 100
 MIN_DECISION_GRADE_WARMUPS = 3
 MAX_COMPARISON_NOISE_FLOOR = 0.25
+MAX_HEADLINE_DOCUMENT_P99_SECONDS = 0.05
+MIN_HEADLINE_DOCUMENTS_PER_SECOND = 100.0
+MIN_HEADLINE_MIB_PER_SECOND = 1.0
+MAX_HEADLINE_PEAK_RSS_BYTES = 8 * 1024**3
 
 
 def _is_json_array(_checker: Any, value: Any) -> bool:
@@ -95,15 +104,13 @@ def _is_json_array(_checker: Any, value: Any) -> bool:
 
 
 def _is_json_integer(_checker: Any, value: Any) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+    return type(value) is int
 
 
 def _is_json_number(_checker: Any, value: Any) -> bool:
-    if isinstance(value, bool):
-        return False
-    if isinstance(value, int):
+    if type(value) is int:
         return True
-    return isinstance(value, float) and math.isfinite(value)
+    return type(value) is float and math.isfinite(value)
 
 
 def _is_json_object(_checker: Any, value: Any) -> bool:
@@ -783,6 +790,26 @@ _OPTIONAL_PERFORMANCE_ID = {
     "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
 }
 _OPTIONAL_HASH = {"anyOf": [_HASH, {"type": "null"}]}
+_PERFORMANCE_HARNESS = _closed_object(
+    (
+        "id",
+        "phase",
+        "command_id",
+        "source_sha256",
+        "operation_spec_sha256",
+        "source_artifact",
+        "descriptor_sha256",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "phase": {"type": "string", "enum": list(PERFORMANCE_PHASES)},
+        "command_id": {"type": "string", "minLength": 1},
+        "source_sha256": _HASH,
+        "operation_spec_sha256": _HASH,
+        "source_artifact": _OPTIONAL_ARTIFACT_REF,
+        "descriptor_sha256": _HASH,
+    },
+)
 _PERFORMANCE_WORKLOAD = _closed_object(
     (
         "id",
@@ -790,6 +817,8 @@ _PERFORMANCE_WORKLOAD = _closed_object(
         "promotion_gate",
         "decision_grade",
         "workload_sha256",
+        "harness_id",
+        "harness_sha256",
         "bank_id",
         "bank_hash",
         "input_id",
@@ -814,6 +843,8 @@ _PERFORMANCE_WORKLOAD = _closed_object(
         "promotion_gate": {"type": "boolean"},
         "decision_grade": {"type": "boolean"},
         "workload_sha256": _HASH,
+        "harness_id": {"type": "string", "minLength": 1},
+        "harness_sha256": _HASH,
         "bank_id": {"type": "string", "minLength": 1},
         "bank_hash": _HASH,
         "input_id": _OPTIONAL_PERFORMANCE_ID,
@@ -933,6 +964,7 @@ _PERFORMANCE_VALUE_COMPONENT = _closed_object(
             "type": "string",
             "enum": [
                 "source_curation",
+                "source_profiling",
                 "bank_build",
                 "cold_compile",
                 "scan",
@@ -1222,11 +1254,21 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "catalog_conformance": _CONFORMANCE,
             "test_access": _TEST_ACCESS,
             "performance": _closed_object(
-                ("evaluated", "banks", "inputs", "workloads", "baselines", "comparisons", "breakeven_models"),
+                (
+                    "evaluated",
+                    "banks",
+                    "inputs",
+                    "harnesses",
+                    "workloads",
+                    "baselines",
+                    "comparisons",
+                    "breakeven_models",
+                ),
                 {
                     "evaluated": {"type": "boolean"},
                     "banks": {"type": "array", "items": _PERFORMANCE_BANK},
                     "inputs": {"type": "array", "items": _PERFORMANCE_INPUT},
+                    "harnesses": {"type": "array", "items": _PERFORMANCE_HARNESS},
                     "workloads": {"type": "array", "items": _PERFORMANCE_WORKLOAD},
                     "baselines": {"type": "array", "items": _PERFORMANCE_BASELINE},
                     "comparisons": {"type": "array", "items": _PERFORMANCE_COMPARISON},
@@ -1328,6 +1370,10 @@ def hash_enron_performance_input(input_descriptor: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in input_descriptor.items() if key != "descriptor_sha256"})
 
 
+def hash_enron_performance_harness(harness: Mapping[str, Any]) -> str:
+    return _canonical_hash({key: value for key, value in harness.items() if key != "descriptor_sha256"})
+
+
 def hash_enron_performance_baseline(baseline: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in baseline.items() if key != "descriptor_sha256"})
 
@@ -1379,6 +1425,8 @@ def hash_enron_workload(workload: Mapping[str, Any]) -> str:
         "phase",
         "promotion_gate",
         "decision_grade",
+        "harness_id",
+        "harness_sha256",
         "bank_id",
         "bank_hash",
         "input_id",
@@ -1404,6 +1452,10 @@ def hash_enron_performance_manifest(performance: Mapping[str, Any]) -> str:
         {"id": item["id"], "descriptor_sha256": hash_enron_performance_input(item)}
         for item in sorted(performance["inputs"], key=lambda value: str(value["id"]))
     ]
+    harnesses = [
+        {"id": item["id"], "descriptor_sha256": hash_enron_performance_harness(item)}
+        for item in sorted(performance["harnesses"], key=lambda value: str(value["id"]))
+    ]
     workloads = [
         {"id": item["id"], "workload_sha256": hash_enron_workload(item)}
         for item in sorted(performance["workloads"], key=lambda value: str(value["id"]))
@@ -1424,6 +1476,7 @@ def hash_enron_performance_manifest(performance: Mapping[str, Any]) -> str:
         {
             "banks": banks,
             "inputs": inputs,
+            "harnesses": harnesses,
             "workloads": workloads,
             "baselines": baselines,
             "comparisons": comparisons,
@@ -1486,8 +1539,8 @@ def validate_enron_evidence(
     conformance = evidence["catalog_conformance"]
     performance = evidence["performance"]
     promotion = evidence["promotion"]
-    sample_resolver = referenced_samples if isinstance(referenced_samples, Mapping) else None
-    inventory_resolver = referenced_input_inventories if isinstance(referenced_input_inventories, Mapping) else None
+    sample_resolver = referenced_samples if _is_external_resolver(referenced_samples) else None
+    inventory_resolver = referenced_input_inventories if _is_external_resolver(referenced_input_inventories) else None
     if referenced_samples is not None and sample_resolver is None:
         diagnostics.append(
             _error(
@@ -1519,6 +1572,9 @@ def validate_enron_evidence(
         _performance_diagnostics(
             performance,
             evidence["bank"],
+            evidence["source"],
+            evidence["splits"],
+            evidence["commands"],
             sample_resolver,
             inventory_resolver,
             promotion_passed=promotion["passed"] or evidence["verifier"]["passed"],
@@ -1547,6 +1603,14 @@ def validate_enron_evidence(
             _error("contract.forged_promotion", "/promotion/passed", "Promotion cannot pass with contract errors.")
         )
     return _result(diagnostics)
+
+
+def _is_external_resolver(value: Any) -> bool:
+    return (
+        type(value) is dict
+        and len(value) <= MAX_COLLECTION_ITEMS
+        and all(type(key) is str and len(key) <= MAX_STRING_CHARS for key in value)
+    )
 
 
 def load_enron_manifest(path: str | Path) -> dict[str, Any]:
@@ -1726,6 +1790,8 @@ def _manifest_quality_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diag
     diagnostics: list[Diagnostic] = []
     labels = {str(item["id"]): item for item in manifest["labels"]}
     text_views = {str(item["id"]): item for item in manifest["preparation"]["text_views"]}
+    primary_views = [item for item in text_views.values() if item["primary_for_quality"]]
+    primary_view = primary_views[0] if len(primary_views) == 1 else None
     descriptor_keys: set[tuple[str, str, str, str, str]] = set()
     planned_label_ids: set[str] = set()
     for index, item in enumerate(manifest["quality_plan"]):
@@ -1848,6 +1914,19 @@ def _manifest_quality_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diag
                     "Prepared text view does not contain every region in the bound annotation scope.",
                 )
             )
+        if item["promotion_gate"] and label is not None and primary_view is not None:
+            annotation_scope = label["annotation_scope"]
+            if (
+                set(annotation_scope["document_regions"]) != set(primary_view["document_regions"])
+                or annotation_scope["exclusions"]
+            ):
+                diagnostics.append(
+                    _error(
+                        "contract.quality_gate_annotation_scope",
+                        f"{path}/label_artifact_id",
+                        "A quality-plan gate must annotate every region in the exact primary view without exclusions.",
+                    )
+                )
         if item["promotion_gate"] and (
             label is None
             or label["label_strength"] != "independent"
@@ -2842,14 +2921,6 @@ def _test_access_diagnostics(
                     "Failed or aborted final-test outcomes cannot be promoted.",
                 )
             )
-        if has_test_aggregate and current["outcome"] != "passed":
-            diagnostics.append(
-                _error(
-                    "contract.test_aggregate_failed_lineage",
-                    f"/test_access/lineage/{len(lineage) - 1}/outcome",
-                    "Published final-test aggregates require the matching current lineage outcome to be passed.",
-                )
-            )
 
     if trusted_lineage_prefix is None:
         if evidence["promotion"]["passed"] or evidence["verifier"]["passed"]:
@@ -2862,10 +2933,11 @@ def _test_access_diagnostics(
             )
     else:
         expected_prefix_length = len(lineage) - count
+        prefix_values = list(trusted_lineage_prefix) if type(trusted_lineage_prefix) in (list, tuple) else None
         prefix_valid = (
-            isinstance(trusted_lineage_prefix, (list, tuple))
-            and len(trusted_lineage_prefix) <= MAX_COLLECTION_ITEMS
-            and all(type(item) is dict for item in trusted_lineage_prefix)
+            prefix_values is not None
+            and not _structure_diagnostics(prefix_values)
+            and all(type(item) is dict for item in prefix_values)
         )
         if not prefix_valid:
             diagnostics.append(
@@ -2875,8 +2947,8 @@ def _test_access_diagnostics(
                     "Trusted lineage prefix must be a bounded sequence of JSON objects.",
                 )
             )
-        elif len(trusted_lineage_prefix) != expected_prefix_length or list(trusted_lineage_prefix) != list(
-            lineage[:expected_prefix_length]
+        elif prefix_values is not None and (
+            len(prefix_values) != expected_prefix_length or prefix_values != list(lineage[:expected_prefix_length])
         ):
             diagnostics.append(
                 _error(
@@ -2899,6 +2971,9 @@ def _has_test_role_aggregate(evidence: Mapping[str, Any], manifest: Mapping[str,
 def _performance_diagnostics(
     performance: Mapping[str, Any],
     bank: Mapping[str, Any],
+    source: Mapping[str, Any],
+    splits: Mapping[str, Any],
+    commands: Sequence[Mapping[str, Any]],
     referenced_samples: Mapping[str, Sequence[float]] | None,
     referenced_input_inventories: Mapping[str, Sequence[Mapping[str, int]]] | None,
     *,
@@ -2906,11 +2981,12 @@ def _performance_diagnostics(
 ) -> list[Diagnostic]:
     banks = performance["banks"]
     inputs = performance["inputs"]
+    harnesses = performance["harnesses"]
     workloads = performance["workloads"]
     baselines = performance["baselines"]
     comparisons = performance["comparisons"]
     breakeven_models = performance["breakeven_models"]
-    collections = (banks, inputs, workloads, baselines, comparisons, breakeven_models)
+    collections = (banks, inputs, harnesses, workloads, baselines, comparisons, breakeven_models)
     if not performance["evaluated"]:
         return (
             []
@@ -2923,17 +2999,18 @@ def _performance_diagnostics(
                 )
             ]
         )
-    if not workloads or not banks or not inputs:
+    if not workloads or not banks or not inputs or not harnesses:
         return [
             _error(
                 "contract.empty_performance",
                 "/performance",
-                "Evaluated performance requires declared banks, inputs, and workloads.",
+                "Evaluated performance requires declared banks, inputs, harnesses, and workloads.",
             )
         ]
     diagnostics: list[Diagnostic] = []
     diagnostics.extend(_duplicate_id_diagnostics(banks, "/performance/banks", "performance bank"))
     diagnostics.extend(_duplicate_id_diagnostics(inputs, "/performance/inputs", "performance input"))
+    diagnostics.extend(_duplicate_id_diagnostics(harnesses, "/performance/harnesses", "performance harness"))
     diagnostics.extend(_duplicate_id_diagnostics(workloads, "/performance/workloads", "performance workload"))
     diagnostics.extend(_duplicate_id_diagnostics(baselines, "/performance/baselines", "performance baseline"))
     diagnostics.extend(_duplicate_id_diagnostics(comparisons, "/performance/comparisons", "performance comparison"))
@@ -2941,6 +3018,7 @@ def _performance_diagnostics(
     for collection, path in (
         (banks, "/performance/banks"),
         (inputs, "/performance/inputs"),
+        (harnesses, "/performance/harnesses"),
         (workloads, "/performance/workloads"),
         (baselines, "/performance/baselines"),
         (comparisons, "/performance/comparisons"),
@@ -3013,16 +3091,20 @@ def _performance_diagnostics(
                 )
             )
     input_by_id = {str(item["id"]): item for item in inputs}
+    resolved_inventory_ids: set[str] = set()
     for index, input_descriptor in enumerate(inputs):
         path = f"/performance/inputs/{index}"
         diagnostics.extend(_performance_input_diagnostics(input_descriptor, bank_by_id, path))
-        inventory = (
-            None
-            if referenced_input_inventories is None
-            else referenced_input_inventories.get(str(input_descriptor["inventory_ref"]["id"]))
-        )
-        if inventory is not None:
-            diagnostics.extend(_performance_inventory_diagnostics(input_descriptor, inventory, path))
+        inventory_id = str(input_descriptor["inventory_ref"]["id"])
+        if referenced_input_inventories is not None and inventory_id in referenced_input_inventories:
+            inventory_diagnostics = _performance_inventory_diagnostics(
+                input_descriptor,
+                referenced_input_inventories[inventory_id],
+                path,
+            )
+            diagnostics.extend(inventory_diagnostics)
+            if not inventory_diagnostics:
+                resolved_inventory_ids.add(inventory_id)
     baseline_by_id = {str(item["id"]): item for item in baselines}
     for index, baseline in enumerate(baselines):
         path = f"/performance/baselines/{index}"
@@ -3042,8 +3124,69 @@ def _performance_diagnostics(
                     "Exact baselines must support every benchmark literal, regex, alias, mapping, and Unicode feature.",
                 )
             )
+    command_ids = {str(item["id"]) for item in commands}
+    harness_by_id = {str(item["id"]): item for item in harnesses}
+    for index, harness in enumerate(harnesses):
+        path = f"/performance/harnesses/{index}"
+        if harness["descriptor_sha256"] != hash_enron_performance_harness(harness):
+            diagnostics.append(
+                _error(
+                    "contract.performance_harness_hash",
+                    f"{path}/descriptor_sha256",
+                    "Harness hash does not match its command, source, operation specification, and phase.",
+                )
+            )
+        if harness["command_id"] not in command_ids:
+            diagnostics.append(
+                _error(
+                    "contract.performance_harness_command",
+                    f"{path}/command_id",
+                    "Performance harness must bind an exact declared command.",
+                )
+            )
+        source_artifact = harness["source_artifact"]
+        phase = str(harness["phase"])
+        source_artifact_required = phase in {"source_profile", "source_build"}
+        if (source_artifact is not None) != source_artifact_required:
+            diagnostics.append(
+                _error(
+                    "contract.performance_harness_source_artifact",
+                    f"{path}/source_artifact",
+                    "Source profiling and source building require a content-addressed source artifact; "
+                    "other phases do not.",
+                )
+            )
+        elif phase == "source_profile" and source_artifact["sha256"] != source["content_sha256"]:
+            diagnostics.append(
+                _error(
+                    "contract.performance_harness_source_binding",
+                    f"{path}/source_artifact",
+                    "Source profiling must bind the exact declared corpus content hash.",
+                )
+            )
+        elif phase == "source_build" and source_artifact != splits["roles"]["train"]["artifact"]:
+            diagnostics.append(
+                _error(
+                    "contract.performance_harness_source_binding",
+                    f"{path}/source_artifact",
+                    "Source building must bind the exact frozen train-split artifact.",
+                )
+            )
     for index, workload in enumerate(workloads):
         path = f"/performance/workloads/{index}"
+        harness = harness_by_id.get(str(workload["harness_id"]))
+        if (
+            harness is None
+            or harness["descriptor_sha256"] != workload["harness_sha256"]
+            or harness["phase"] != workload["phase"]
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.unknown_performance_harness",
+                    f"{path}/harness_id",
+                    "Workload must bind the exact frozen harness descriptor for its measured phase.",
+                )
+            )
         workload_bank = bank_by_id.get(str(workload["bank_id"]))
         if workload_bank is None or workload_bank["bank_hash"] != workload["bank_hash"]:
             diagnostics.append(
@@ -3053,14 +3196,14 @@ def _performance_diagnostics(
                     "Performance workload bank id and hash must reference the same declared descriptor.",
                 )
             )
-        setup_phase = workload["phase"] in {"source_build", "cold_compile"}
+        setup_phase = workload["phase"] in {"source_profile", "source_build", "cold_compile"}
         input_descriptor = None if workload["input_id"] is None else input_by_id.get(str(workload["input_id"]))
         if setup_phase and (workload["input_id"] is not None or workload["input_sha256"] is not None):
             diagnostics.append(
                 _error(
                     "contract.setup_phase_input",
                     f"{path}/input_id",
-                    "Bank source-build and cold-compile workloads cannot borrow scan-input denominators.",
+                    "Source-profile, bank-build, and cold-compile workloads cannot borrow scan-input denominators.",
                 )
             )
         if not setup_phase and (
@@ -3258,6 +3401,15 @@ def _performance_diagnostics(
                 "Every declared performance input must be exercised by at least one workload.",
             )
         )
+    used_harness_ids = {str(item["harness_id"]) for item in workloads}
+    if set(harness_by_id) - used_harness_ids:
+        diagnostics.append(
+            _error(
+                "contract.unused_performance_harness",
+                "/performance/harnesses",
+                "Every frozen performance harness must be exercised by at least one workload.",
+            )
+        )
     used_baseline_ids = {str(item["baseline_id"]) for item in workloads if item["baseline_id"] is not None}
     if set(baseline_by_id) - used_baseline_ids:
         diagnostics.append(
@@ -3276,8 +3428,7 @@ def _performance_diagnostics(
         missing_inventories = sorted(
             item_id
             for item_id in decision_input_ids
-            if referenced_input_inventories is None
-            or str(input_by_id[item_id]["inventory_ref"]["id"]) not in referenced_input_inventories
+            if str(input_by_id[item_id]["inventory_ref"]["id"]) not in resolved_inventory_ids
         )
         if missing_inventories:
             diagnostics.append(
@@ -3287,7 +3438,7 @@ def _performance_diagnostics(
                     "Promoted decision-grade denominators require all referenced input inventories.",
                 )
             )
-    diagnostics.extend(_performance_comparison_diagnostics(comparisons, workloads, baseline_by_id))
+    diagnostics.extend(_performance_comparison_diagnostics(comparisons, workloads, baseline_by_id, harness_by_id))
     diagnostics.extend(_performance_breakeven_diagnostics(breakeven_models, workloads))
     return diagnostics
 
@@ -3478,6 +3629,7 @@ def _performance_comparison_diagnostics(
     comparisons: Sequence[Mapping[str, Any]],
     workloads: Sequence[Mapping[str, Any]],
     baseline_by_id: Mapping[str, Mapping[str, Any]],
+    harness_by_id: Mapping[str, Mapping[str, Any]],
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     workload_by_id = {str(item["id"]): item for item in workloads}
@@ -3504,15 +3656,21 @@ def _performance_comparison_diagnostics(
         candidate = workload_by_id.get(str(comparison["candidate_workload_id"]))
         baseline = workload_by_id.get(str(comparison["baseline_workload_id"]))
         baseline_identity = None if baseline is None else baseline_by_id.get(str(baseline["baseline_id"]))
+        candidate_harness = None if candidate is None else harness_by_id.get(str(candidate["harness_id"]))
+        baseline_harness = None if baseline is None else harness_by_id.get(str(baseline["harness_id"]))
         comparable_fields = (
             "phase",
             "bank_id",
             "bank_hash",
             "input_id",
             "input_sha256",
+            "warmups",
             "sample_unit",
             "work_per_sample",
             "concurrency",
+            "process_model",
+            "median_method",
+            "percentile_method",
         )
         if (
             candidate is None
@@ -3521,13 +3679,19 @@ def _performance_comparison_diagnostics(
             or baseline["baseline_id"] is None
             or baseline_identity is None
             or baseline_identity["semantic_equivalence"] != "exact"
+            or candidate_harness is None
+            or baseline_harness is None
+            or candidate_harness["operation_spec_sha256"] != baseline_harness["operation_spec_sha256"]
+            or candidate_harness["source_artifact"] != baseline_harness["source_artifact"]
+            or candidate["stats"]["sample_count"] != baseline["stats"]["sample_count"]
             or any(candidate[field] != baseline[field] for field in comparable_fields)
         ):
             diagnostics.append(
                 _error(
                     "contract.incomparable_performance_baseline",
                     path,
-                    "Baseline comparison requires exact implementations on identical bank, input, work, and phase.",
+                    "Baseline comparison requires identical operation/source artifacts, bank, input, sampling, "
+                    "and phase.",
                 )
             )
             continue
@@ -3725,7 +3889,17 @@ def _breakeven_component_value(
     workload_id = component["workload_id"]
     assumption_sha256 = component["assumption_sha256"]
     if source == "declared_assumption":
-        if workload_id is not None or assumption_sha256 is None or category in {"bank_build", "cold_compile", "scan"}:
+        if (
+            workload_id is not None
+            or assumption_sha256 is None
+            or category
+            in {
+                "source_profiling",
+                "bank_build",
+                "cold_compile",
+                "scan",
+            }
+        ):
             return None
         return float(component["value"])
     if model["value_unit"] != "seconds" or workload_id is None or assumption_sha256 is not None:
@@ -3737,7 +3911,11 @@ def _breakeven_component_value(
     if candidate_side != (workload["baseline_id"] is None):
         return None
     if source == "workload_median_seconds":
-        expected_phase = {"bank_build": "source_build", "cold_compile": "cold_compile"}.get(category)
+        expected_phase = {
+            "source_profiling": "source_profile",
+            "bank_build": "source_build",
+            "cold_compile": "cold_compile",
+        }.get(category)
         if component["application"] != "fixed" or expected_phase is None or workload["phase"] != expected_phase:
             return None
         return float(workload["stats"]["median_seconds"])
@@ -3972,45 +4150,134 @@ def _performance_promotion_diagnostics(
                     "Every required scale bank needs a direct decision-grade workload cell.",
                 )
             )
-    candidate_inputs = {
-        str(item["input_id"])
+    direct_cells = [
+        (item, inputs[str(item["input_id"])])
         for item in workloads
         if item["decision_grade"]
         and item["baseline_id"] is None
         and item["phase"] == "direct_bank_scan"
         and str(item["input_id"]) in inputs
+    ]
+    scale_aliases_by_bank_id = {
+        str(item["id"]): int(item["active_aliases"]) for item in banks if item["kind"] == "synthetic_scale"
     }
-    hit_densities = {str(inputs[item_id]["hit_density"]) for item_id in candidate_inputs}
-    if not {"negative", "sparse", "normal", "dense"} <= hit_densities:
-        diagnostics.append(
-            _error(
-                "contract.missing_hit_density",
-                "/performance/inputs",
-                "Promoted workloads require negative, sparse, normal, and dense content-addressed inputs.",
-            )
+    scale_families: dict[tuple[Any, ...], set[int]] = {}
+    concurrency_families: dict[tuple[Any, ...], set[int]] = {}
+    density_families: dict[tuple[Any, ...], set[str]] = {}
+    size_families: dict[tuple[Any, ...], set[str]] = {}
+    for item, input_descriptor in direct_cells:
+        generator = input_descriptor["generator"]
+        generator_family = (
+            input_descriptor["kind"],
+            None if generator is None else (generator["id"], generator["version"], generator["source_sha256"]),
         )
-    size_cohorts = {str(inputs[item_id]["size_cohort"]) for item_id in candidate_inputs}
-    if not {"small", "medium", "large", "huge"} <= size_cohorts:
-        diagnostics.append(
-            _error(
-                "contract.missing_document_size_cohort",
-                "/performance/inputs",
-                "Promoted direct scans require small, medium, large, and huge document-size cohorts.",
-            )
+        sample_shape = (
+            item["harness_id"],
+            item["harness_sha256"],
+            item["sample_unit"],
+            int(item["work_per_sample"]),
+            item["process_model"],
+            int(item["warmups"]),
+            int(item["stats"]["sample_count"]),
         )
-    concurrencies = {
-        int(item["concurrency"])
-        for item in workloads
-        if item["decision_grade"] and item["baseline_id"] is None and item["phase"] == "direct_bank_scan"
-    }
-    if 1 not in concurrencies or not any(value > 1 for value in concurrencies):
+        scale_alias_count = scale_aliases_by_bank_id.get(str(item["bank_id"]))
+        if (
+            scale_alias_count is not None
+            and input_descriptor["kind"] == "synthetic_input"
+            and input_descriptor["hit_density"] == "negative"
+            and input_descriptor["size_cohort"] == "medium"
+            and item["sample_unit"] == "whole_input"
+            and item["concurrency"] == 1
+        ):
+            input_shape = _canonical_hash(
+                {
+                    "artifact": {
+                        "sha256": input_descriptor["artifact"]["sha256"],
+                        "bytes": input_descriptor["artifact"]["bytes"],
+                    },
+                    "inventory_ref": {
+                        "sha256": input_descriptor["inventory_ref"]["sha256"],
+                        "bytes": input_descriptor["inventory_ref"]["bytes"],
+                    },
+                    "documents": input_descriptor["documents"],
+                    "bytes": input_descriptor["bytes"],
+                    "records": input_descriptor["records"],
+                    "document_length_distribution": input_descriptor["document_length_distribution"],
+                    "hit_distribution": input_descriptor["hit_distribution"],
+                }
+            )
+            scale_families.setdefault((input_shape, int(item["concurrency"]), *sample_shape), set()).add(
+                scale_alias_count
+            )
+        concurrency_key = (
+            item["bank_id"],
+            item["bank_hash"],
+            item["input_id"],
+            item["input_sha256"],
+            *sample_shape,
+        )
+        concurrency_families.setdefault(concurrency_key, set()).add(int(item["concurrency"]))
+        if input_descriptor["kind"] == "synthetic_input":
+            density_key = (
+                item["bank_id"],
+                item["bank_hash"],
+                input_descriptor["size_cohort"],
+                int(input_descriptor["documents"]),
+                int(input_descriptor["bytes"]),
+                _canonical_hash(input_descriptor["document_length_distribution"]),
+                generator_family,
+                int(item["concurrency"]),
+                *sample_shape,
+            )
+            density_families.setdefault(density_key, set()).add(str(input_descriptor["hit_density"]))
+            size_key = (
+                item["bank_id"],
+                item["bank_hash"],
+                input_descriptor["hit_density"],
+                int(input_descriptor["documents"]),
+                int(input_descriptor["records"]),
+                _canonical_hash(input_descriptor["hit_distribution"]),
+                generator_family,
+                int(item["concurrency"]),
+                *sample_shape,
+            )
+            size_families.setdefault(size_key, set()).add(str(input_descriptor["size_cohort"]))
+
+    if not any(set(PERFORMANCE_SCALE_ALIASES) <= values for values in scale_families.values()):
         diagnostics.append(
             _error(
-                "contract.missing_concurrency_shape",
+                "contract.uncontrolled_scale_sweep",
                 "/performance/workloads",
-                "Promoted evidence requires both serial and concurrent NERB workloads.",
+                "Scale evidence must hold one canonical negative, medium, serial whole-input workload shape constant.",
             )
         )
+    if not any(1 in values and any(value > 1 for value in values) for values in concurrency_families.values()):
+        diagnostics.append(
+            _error(
+                "contract.uncontrolled_concurrency_sweep",
+                "/performance/workloads",
+                "Concurrency evidence must pair serial and concurrent cells on the exact same bank, input, and work.",
+            )
+        )
+    if not any({"negative", "sparse", "normal", "dense"} <= values for values in density_families.values()):
+        diagnostics.append(
+            _error(
+                "contract.uncontrolled_density_sweep",
+                "/performance/workloads",
+                "Density evidence requires generated inputs with one bank, size, generator family, concurrency, "
+                "and work.",
+            )
+        )
+    if not any({"small", "medium", "large", "huge"} <= values for values in size_families.values()):
+        diagnostics.append(
+            _error(
+                "contract.uncontrolled_size_sweep",
+                "/performance/workloads",
+                "Size evidence requires generated inputs with one bank, density, generator family, concurrency, "
+                "and work.",
+            )
+        )
+    concurrencies = {int(item["concurrency"]) for item, _ in direct_cells}
     if any(value > evidence["environment"]["cpu_count"] for value in concurrencies):
         diagnostics.append(
             _error(
@@ -4052,6 +4319,7 @@ def _performance_promotion_diagnostics(
     value_models = performance["breakeven_models"]
     required_component_roles = {
         ("candidate", "fixed", "source_curation"),
+        ("candidate", "fixed", "source_profiling"),
         ("candidate", "fixed", "bank_build"),
         ("candidate", "fixed", "cold_compile"),
         ("candidate", "per_unit", "scan"),
@@ -4068,10 +4336,12 @@ def _performance_promotion_diagnostics(
         if any(len(items) != 1 for items in required_components.values()):
             continue
         curation = required_components[("candidate", "fixed", "source_curation")][0]
+        source_profiling = required_components[("candidate", "fixed", "source_profiling")][0]
         bank_build = required_components[("candidate", "fixed", "bank_build")][0]
         cold_compile = required_components[("candidate", "fixed", "cold_compile")][0]
         candidate_scan = required_components[("candidate", "per_unit", "scan")][0]
         baseline_scan = required_components[("baseline", "per_unit", "scan")][0]
+        source_profiling_workload = workload_by_id.get(str(source_profiling["workload_id"]))
         bank_build_workload = workload_by_id.get(str(bank_build["workload_id"]))
         cold_compile_workload = workload_by_id.get(str(cold_compile["workload_id"]))
         candidate_scan_workload = workload_by_id.get(str(candidate_scan["workload_id"]))
@@ -4085,22 +4355,44 @@ def _performance_promotion_diagnostics(
             "work_per_sample",
             "concurrency",
         )
+        scan_pair_comparisons = (
+            []
+            if candidate_scan_workload is None or baseline_scan_workload is None
+            else [
+                item
+                for item in comparisons
+                if item["candidate_workload_id"] == candidate_scan_workload["id"]
+                and item["baseline_workload_id"] == baseline_scan_workload["id"]
+                and item["metric"] == "p99_seconds"
+            ]
+        )
         has_scan_pair_comparison = (
             candidate_scan_workload is not None
             and baseline_scan_workload is not None
-            and any(
-                item["candidate_workload_id"] == candidate_scan_workload["id"]
-                and item["baseline_workload_id"] == baseline_scan_workload["id"]
-                and item["metric"] == "p99_seconds"
-                and item["result"] != "regressed"
-                for item in comparisons
-            )
+            and len(scan_pair_comparisons) == 1
+            and scan_pair_comparisons[0]["result"] != "regressed"
         )
+        measured_workloads = [
+            workload_by_id.get(str(component["workload_id"]))
+            for component in model["components"]
+            if component["source"] != "declared_assumption"
+        ]
+        all_measured_on_evaluated_bank = evaluated_bank is not None and all(
+            item is not None
+            and item["bank_id"] == evaluated_bank["id"]
+            and item["bank_hash"] == evaluated_bank["bank_hash"]
+            for item in measured_workloads
+        )
+        promoted_latency_workload = workloads[latency_indices[0]] if len(latency_indices) == 1 else None
         if (
             model["parameter_unit"] == "document"
             and model["value_unit"] == "seconds"
             and curation["source"] == "declared_assumption"
             and curation["value"] > 0
+            and source_profiling_workload is not None
+            and str(source_profiling_workload["id"]) in decision_workload_ids
+            and source_profiling_workload["phase"] == "source_profile"
+            and source_profiling["source"] == "workload_median_seconds"
             and bank_build_workload is not None
             and str(bank_build_workload["id"]) in decision_workload_ids
             and bank_build_workload["phase"] == "source_build"
@@ -4111,6 +4403,8 @@ def _performance_promotion_diagnostics(
             and str(candidate_scan_workload["id"]) in decision_workload_ids
             and candidate_scan_workload["phase"] == "direct_bank_scan"
             and candidate_scan_workload["sample_unit"] == "document"
+            and promoted_latency_workload is not None
+            and candidate_scan_workload["id"] == promoted_latency_workload["id"]
             and candidate_scan["source"] == "workload_seconds_per_document"
             and baseline_scan_workload is not None
             and baseline_scan_workload["phase"] == "direct_bank_scan"
@@ -4119,6 +4413,7 @@ def _performance_promotion_diagnostics(
             and baseline_by_id[str(baseline_scan_workload["baseline_id"])]["semantic_equivalence"] == "exact"
             and baseline_scan["source"] == "workload_seconds_per_document"
             and has_scan_pair_comparison
+            and all_measured_on_evaluated_bank
             and model["result"] in {"candidate_already_better", "finite_breakeven"}
         ):
             acceptable_value_model = True
@@ -4128,8 +4423,8 @@ def _performance_promotion_diagnostics(
             _error(
                 "contract.missing_breakeven_value_model",
                 "/performance/breakeven_models",
-                "Promotion requires a finite additive document-value model separating curation, build, compile, "
-                "and scan.",
+                "Promotion requires an evaluated-bank document-value model separating curation, profiling, build, "
+                "compile, and the exact promoted scan pair.",
             )
         )
     return diagnostics, required_gate_specs
@@ -4260,6 +4555,26 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
     performance_diagnostics, performance_gate_specs = _performance_promotion_diagnostics(evidence)
     diagnostics.extend(performance_diagnostics)
     required_gate_specs.update(performance_gate_specs)
+    headline_performance_bounds: dict[str, tuple[str, float]] = {}
+    for index, workload in enumerate(evidence["performance"]["workloads"]):
+        if not workload["promotion_gate"]:
+            continue
+        path = f"/performance/workloads/{index}"
+        headline_performance_bounds[f"{path}/peak_rss_bytes"] = ("lte", float(MAX_HEADLINE_PEAK_RSS_BYTES))
+        if workload["sample_unit"] == "document":
+            headline_performance_bounds[f"{path}/stats/p99_seconds"] = (
+                "lte",
+                MAX_HEADLINE_DOCUMENT_P99_SECONDS,
+            )
+        elif workload["sample_unit"] == "whole_input":
+            headline_performance_bounds[f"{path}/stats/documents_per_second"] = (
+                "gte",
+                MIN_HEADLINE_DOCUMENTS_PER_SECOND,
+            )
+            headline_performance_bounds[f"{path}/stats/mib_per_second"] = (
+                "gte",
+                MIN_HEADLINE_MIB_PER_SECOND,
+            )
     checks_by_target = {str(item["target"]): item for item in promotion["checks"]}
     missing_targets = sorted(set(required_gate_specs) - set(checks_by_target))
     if missing_targets:
@@ -4325,6 +4640,20 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
                         "Decision-grade performance thresholds must be strictly positive.",
                     )
                 )
+            elif target in headline_performance_bounds:
+                policy_operator, policy_bound = headline_performance_bounds[target]
+                weak_policy = (policy_operator == "lte" and float(threshold) > policy_bound) or (
+                    policy_operator == "gte" and float(threshold) < policy_bound
+                )
+                if weak_policy:
+                    diagnostics.append(
+                        _error(
+                            "contract.performance_threshold_policy",
+                            "/promotion/checks",
+                            "Headline thresholds may tighten but cannot weaken practical latency, throughput, "
+                            "or RSS bounds.",
+                        )
+                    )
     return diagnostics
 
 
@@ -4474,6 +4803,17 @@ def _quality_decision_grade_diagnostics(
                     "contract.quality_gate_primary_view",
                     f"{path}/text_view",
                     "Decision-grade quality must use the manifest's exact primary prepared natural-content view.",
+                )
+            )
+        if primary_view is not None and (
+            set(item["annotation_scope"]["document_regions"]) != set(primary_view["document_regions"])
+            or item["annotation_scope"]["exclusions"]
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.quality_gate_annotation_scope",
+                    f"{path}/annotation_scope",
+                    "Decision-grade quality must annotate every region in the exact primary view without exclusions.",
                 )
             )
         if (
@@ -4745,15 +5085,39 @@ def _command_diagnostics(commands: Sequence[Mapping[str, Any]], path: str) -> li
                         "Public commands must use sanitized repository-relative paths without traversal or file URIs.",
                     )
                 )
+                if len(diagnostics) > MAX_DIAGNOSTICS:
+                    return diagnostics
     return diagnostics
 
 
 def _contains_unsafe_command_path(value: str) -> bool:
-    candidates = [value, *re.split(r"[\s=]+", value)]
+    return _contains_unsafe_path_text(value)
+
+
+def _contains_unsafe_path_text(value: str, *, depth: int = 0) -> bool:
+    decoded = _decode_url_component(value)
+    local_path_text, url_payloads = _partition_http_url_text(decoded)
+    if _contains_unsafe_local_path(local_path_text):
+        return True
+    nested_payloads = [payload for payload in url_payloads if payload]
+    if depth >= 4:
+        return bool(nested_payloads)
+    return any(_contains_unsafe_path_text(payload, depth=depth + 1) for payload in nested_payloads)
+
+
+def _contains_unsafe_local_path(value: str) -> bool:
+    value = normalize_unicode("NFKC", value).translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
+    if _EMBEDDED_POSIX_PATH_PATTERN.search(value):
+        return True
+    if _ATTACHED_OPTION_PATH_PATTERN.search(value):
+        return True
+    if "file://" in value.lower():
+        return True
+    candidates = [value, *re.split(r"[\s=,:;\[\](){}]+", value)]
     for candidate in candidates:
         candidate = candidate.strip().strip("\"'")
         lowered = candidate.lower()
-        if lowered.startswith(("file://", "~/", "~\\")):
+        if lowered.startswith(("~/", "~\\")):
             return True
         if _WINDOWS_LOCAL_PATH_PATTERN.search(candidate):
             return True
@@ -4765,40 +5129,127 @@ def _contains_unsafe_command_path(value: str) -> bool:
     return False
 
 
-_EMAIL_PATTERN = re.compile(
-    r"(?i)(?<![\w.+-])[a-z0-9](?:[a-z0-9._%+-]{0,62}[a-z0-9])?@"
-    r"[a-z0-9](?:[a-z0-9.-]{0,252}[a-z0-9])?(?![\w.-])"
+_STRUCTURED_SSN_PATTERN = re.compile(r"(?<![0-9])[0-9]{3}[- ][0-9]{2}[- ][0-9]{4}(?![0-9])")
+_STRUCTURED_PHONE_PATTERN = re.compile(
+    r"(?<![0-9])(?:\+?1[ .-]*)?(?:"
+    r"\([0-9]{3}\)[ .-]*[0-9]{3}[ .-]*[0-9]{4}"
+    r"|[0-9]{3}[ .-]+[0-9]{3}[ .-]+[0-9]{4})(?![0-9])"
 )
-_PRIVATE_PATH_PATTERN = re.compile(
-    r"(?i)(?:file://|/(?:users|home|private|var/folders)/[^\s\"']+|[a-z]:\\users\\[^\s\"']+|\\\\[^\s\"']+)"
+_E164_PHONE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9]{8,15}(?![0-9])")
+_INTERNATIONAL_PHONE_CANDIDATE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9() .-]+")
+_HTTP_URL_PATTERN = re.compile(
+    r"(?i)https?://(?:\[[0-9a-f:.]+\]|[^/\s\"'<>,;\[\]{}]+)(?::[0-9]+)?"
+    r"(?:(?:/|[?#])[^\s\"'<>,;\]}]*)?"
 )
 _WINDOWS_LOCAL_PATH_PATTERN = re.compile(
     r"(?i)(?:(?<![a-z0-9_])[a-z]:(?:[\\/][^\s\"']*|[^\s\"']*)|\\\\[^\s\"']+|"
     r"(?<![\\a-z0-9_])\\[a-z0-9_.-][^\s\"']*)"
 )
-_EMBEDDED_POSIX_PATH_PATTERN = re.compile(r"(?:^|[\s=])/(?!/)[^\s\"']+")
+_EMBEDDED_POSIX_PATH_PATTERN = re.compile(r"(?<![A-Za-z0-9._~%+\-/])/(?!/)[^\s\"']+")
+_ATTACHED_OPTION_PATH_PATTERN = re.compile(
+    r"(?:^|[\s=,:;\[\](){}])(?:-[A-Za-z][A-Za-z0-9_-]*?|--[A-Za-z][A-Za-z0-9_-]*?)"
+    r"(?:/|~[/\\]|\.\.[/\\]|[A-Za-z]:[/\\]|\\\\)[^\s\"']*"
+)
+_STRUCTURED_IDENTIFIER_TRANSLATION = str.maketrans(
+    {
+        "\u00a0": " ",
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u202f": " ",
+        "\u2212": "-",
+    }
+)
+_ZERO_WIDTH_SEPARATORS = "\u200b\u200c\u200d\u2060\ufeff"
+
+
+def _partition_http_url_text(value: str) -> tuple[str, list[str]]:
+    """Remove remote paths but retain decoded URL query and fragment text for local-path checks."""
+    pieces: list[str] = []
+    payloads: list[str] = []
+    offset = 0
+    for match in _HTTP_URL_PATTERN.finditer(value):
+        url = match.group(0)
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            continue
+        pieces.extend((value[offset : match.start()], " "))
+        offset = match.end()
+        payloads.extend((_decode_url_component(parsed.query), _decode_url_component(parsed.fragment)))
+    pieces.append(value[offset:])
+    return "".join(pieces), payloads
+
+
+def _decode_url_component(value: str) -> str:
+    for _ in range(3):
+        decoded = unquote(value)
+        if decoded == value:
+            break
+        value = decoded
+    return value
+
+
+def _normalized_structured_identifier_text(value: str) -> str:
+    compatible = normalize_unicode("NFKC", value)
+    without_zero_width = compatible.translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
+    translated = without_zero_width.translate(_STRUCTURED_IDENTIFIER_TRANSLATION)
+    normalized: list[str] = []
+    for character in translated:
+        try:
+            normalized.append(str(unicode_decimal(character)))
+        except ValueError:
+            normalized.append(character)
+    return "".join(normalized)
+
+
+def _contains_international_phone(value: str) -> bool:
+    return any(
+        8 <= sum(character.isdigit() for character in match.group(0)) <= 15
+        for match in _INTERNATIONAL_PHONE_CANDIDATE_PATTERN.finditer(value)
+    )
 
 
 def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     for path, text in _iter_strings(value):
-        if _EMAIL_PATTERN.search(text):
+        _, url_payloads = _partition_http_url_text(text)
+        identifier_texts = [
+            _normalized_structured_identifier_text(_decode_url_component(item)) for item in (text, *url_payloads)
+        ]
+        if any("@" in item for item in identifier_texts):
             diagnostics.append(
                 _error(
                     "contract.public_direct_identifier",
                     path,
-                    "Public contract serialization contains an email-address-shaped direct identifier.",
+                    "Public contract serialization contains an at-sign-shaped direct identifier.",
                 )
             )
-        is_gate_pointer = bool(re.fullmatch(r"/promotion/checks/\d+/target", path))
-        is_posix_absolute = PurePosixPath(text).is_absolute() and not is_gate_pointer
-        has_embedded_posix_path = bool(_EMBEDDED_POSIX_PATH_PATTERN.search(text)) and not is_gate_pointer
-        if (
-            is_posix_absolute
-            or has_embedded_posix_path
-            or _PRIVATE_PATH_PATTERN.search(text)
-            or _WINDOWS_LOCAL_PATH_PATTERN.search(text)
+            if len(diagnostics) > MAX_DIAGNOSTICS:
+                return diagnostics
+        if any(
+            _STRUCTURED_SSN_PATTERN.search(item)
+            or _STRUCTURED_PHONE_PATTERN.search(item)
+            or _E164_PHONE_PATTERN.search(item)
+            or _contains_international_phone(item)
+            for item in identifier_texts
         ):
+            diagnostics.append(
+                _error(
+                    "contract.public_structured_identifier",
+                    path,
+                    "Public contract serialization contains a conservative SSN- or phone-shaped identifier.",
+                )
+            )
+            if len(diagnostics) > MAX_DIAGNOSTICS:
+                return diagnostics
+        is_gate_pointer = bool(re.fullmatch(r"/promotion/checks/\d+/target", path))
+        if not is_gate_pointer and _contains_unsafe_path_text(text):
             diagnostics.append(
                 _error(
                     "contract.public_private_path",
@@ -4806,19 +5257,25 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
                     "Public contract serialization contains a private local-path shape.",
                 )
             )
+            if len(diagnostics) > MAX_DIAGNOSTICS:
+                return diagnostics
     return diagnostics
 
 
 def _placeholder_hash_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:
-    return [
-        _error(
-            "contract.placeholder_content_hash",
-            path,
-            "Real benchmark artifacts cannot use an all-zero content hash.",
-        )
-        for path, text in _iter_strings(value)
-        if text == ZERO_SHA256
-    ]
+    diagnostics: list[Diagnostic] = []
+    for path, text in _iter_strings(value):
+        if text == ZERO_SHA256:
+            diagnostics.append(
+                _error(
+                    "contract.placeholder_content_hash",
+                    path,
+                    "Real benchmark artifacts cannot use an all-zero content hash.",
+                )
+            )
+            if len(diagnostics) > MAX_DIAGNOSTICS:
+                return diagnostics
+    return diagnostics
 
 
 def _iter_strings(value: Any, path: str = "") -> Iterable[tuple[str, str]]:
@@ -4828,14 +5285,15 @@ def _iter_strings(value: Any, path: str = "") -> Iterable[tuple[str, str]]:
         item, item_path, depth = stack.pop()
         if depth > MAX_CONTRACT_DEPTH:
             raise RecursionError
-        if isinstance(item, str):
+        if type(item) is str:
             yield item_path, item
         elif type(item) is dict:
             if id(item) in containers:
                 raise RecursionError
             containers.add(id(item))
             children = []
-            for key, child in item.items():
+            for key in sorted(item):
+                child = item[key]
                 escaped = key.replace("~", "~0").replace("/", "~1")
                 children.append((child, f"{item_path}/{escaped}", depth + 1))
             stack.extend(reversed(children))
@@ -4847,7 +5305,7 @@ def _iter_strings(value: Any, path: str = "") -> Iterable[tuple[str, str]]:
 
 
 def _normalize_samples(samples: Sequence[Any]) -> list[float] | None:
-    if not isinstance(samples, (list, tuple)):
+    if type(samples) not in (list, tuple):
         return None
     try:
         if len(samples) > MAX_COLLECTION_ITEMS:
@@ -4856,7 +5314,7 @@ def _normalize_samples(samples: Sequence[Any]) -> list[float] | None:
         return None
     normalized: list[float] = []
     for value in samples:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if type(value) not in (int, float):
             return None
         try:
             parsed = float(value)
@@ -4871,7 +5329,7 @@ def _normalize_samples(samples: Sequence[Any]) -> list[float] | None:
 def _normalize_performance_inventory(
     inventory: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, int]] | None:
-    if not isinstance(inventory, (list, tuple)):
+    if type(inventory) not in (list, tuple):
         return None
     try:
         if len(inventory) > MAX_COLLECTION_ITEMS:
@@ -4880,15 +5338,13 @@ def _normalize_performance_inventory(
         return None
     normalized: list[dict[str, int]] = []
     for row in inventory:
-        if not isinstance(row, Mapping) or set(row) != {"bytes", "records"}:
+        if type(row) is not dict or set(row) != {"bytes", "records"}:
             return None
         byte_count = row["bytes"]
         record_count = row["records"]
         if (
-            isinstance(byte_count, bool)
-            or not isinstance(byte_count, int)
-            or isinstance(record_count, bool)
-            or not isinstance(record_count, int)
+            type(byte_count) is not int
+            or type(record_count) is not int
             or not 0 <= byte_count <= MAX_SAFE_INTEGER
             or not 0 <= record_count <= MAX_SAFE_INTEGER
         ):
@@ -5158,18 +5614,18 @@ def _structure_diagnostics(value: Any) -> list[Diagnostic]:
         node_count += 1
         if depth > MAX_CONTRACT_DEPTH or node_count > MAX_CONTRACT_NODES:
             return [_resource_limit_error()]
-        if isinstance(item, str):
+        if type(item) is str:
             string_chars += len(item)
             if len(item) > MAX_STRING_CHARS or string_chars > MAX_TOTAL_STRING_CHARS:
                 return [_resource_limit_error()]
             continue
-        if item is None or isinstance(item, bool):
+        if item is None or type(item) is bool:
             continue
-        if isinstance(item, int):
+        if type(item) is int:
             if abs(item) > MAX_FINITE_CONTRACT_NUMBER:
                 return [_resource_limit_error()]
             continue
-        if isinstance(item, float):
+        if type(item) is float:
             if not math.isfinite(item) or abs(item) > MAX_FINITE_CONTRACT_NUMBER:
                 return [_resource_limit_error()]
             continue
@@ -5185,7 +5641,7 @@ def _structure_diagnostics(value: Any) -> list[Diagnostic]:
             containers.add(id(item))
             children: list[Any] = []
             for key, child in item.items():
-                if not isinstance(key, str):
+                if type(key) is not str:
                     return [_resource_limit_error()]
                 string_chars += len(key)
                 if len(key) > MAX_STRING_CHARS or string_chars > MAX_TOTAL_STRING_CHARS:
@@ -5343,6 +5799,7 @@ __all__ = [
     "hash_enron_performance_bank",
     "hash_enron_performance_baseline",
     "hash_enron_performance_comparison_plan",
+    "hash_enron_performance_harness",
     "hash_enron_performance_input",
     "hash_enron_performance_inventory",
     "hash_enron_performance_manifest",

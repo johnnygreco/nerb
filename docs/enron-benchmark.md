@@ -171,7 +171,8 @@ content policy. A promoted quality run must attest that this view contains no an
 freezes each quality slice's label artifact, role, class, cohort, text view, gate status, and exact document, span,
 cataloged-span, sensitive-positive, catalog-positive, negative-document, sensitive-character, and evaluated-character
 denominators. Evidence must preserve the plan's order and membership; each gate slice is the complete independently and
-exhaustively labeled final-test role, not a favorable subsample.
+exhaustively labeled final-test role, not a favorable subsample. Its annotation regions must equal the complete primary
+view, and its annotation scope cannot exclude any part of that view.
 
 The conformance plan separately freezes content-addressed positive and negative/adversarial case artifacts, their
 counts, the exhaustive synthetic label artifact, and the conformance policy hash. It requires positive support for every
@@ -260,8 +261,11 @@ combined into a single latency number:
 Every workload declares one timing unit. `operation` measures a bank setup operation and has no document-throughput
 denominator. `document` measures document-level latency. `whole_input` measures a complete bound input and supports
 documents/second, MiB/second, and records/second. Setup phases cannot borrow an input denominator; every scan-bearing
-phase binds the exact bank and input descriptor. Workload hashes freeze the phase, bank/input identities, unit, warmups,
-work per sample, concurrency, process model, and statistic methods without hashing observed timings into the plan.
+phase binds the exact bank and input descriptor. Every workload also binds a frozen harness descriptor containing its
+declared command, harness-source digest, operation-specification digest, and phase. Profiling and source-build harnesses
+bind the declared corpus content and frozen train-split artifact, respectively. Workload hashes freeze that harness plus
+the phase, bank/input identities, unit, warmups, work per sample, concurrency, process model, and statistic methods
+without hashing observed timings into the plan.
 
 Each real or generated input descriptor binds a content-addressed artifact and a bank-specific, content-addressed
 privacy-safe inventory containing only byte and detected-record counts per document. The verifier recomputes the
@@ -271,35 +275,46 @@ message text.
 
 Bank descriptors freeze taxonomy composition as well as entity, name, alias, literal-pattern, regex-pattern, and byte
 counts. Promotion exercises distinct 1k, 10k, 25k, and 100k active-alias banks whose taxonomy and alias/regex
-proportions track the evaluated bank within the contract tolerance. Direct-scan inputs cover negative, sparse, normal,
-and dense hits; small, medium, large, and huge documents; and both serial and machine-bounded concurrent execution.
+proportions track the evaluated bank within the contract tolerance. These are controlled measurements, not four
+unrelated cells: every scale uses the same canonical negative, medium, serial whole-input shape; density varies on a
+fixed bank, size, and synthetic generator family; size varies on a fixed bank, density, and synthetic generator family;
+and serial/concurrent cells use the exact same bank, input, sample unit, and work. Unrelated real inputs cannot stand in
+for controlled generated sweeps. Direct-scan inputs cover negative, sparse, normal, and dense hits; small, medium, large,
+and huge documents; and both serial and machine-bounded concurrent execution.
 
-Each lifecycle phase—source build, cold compile, helper cache miss, helper cache hit, direct bank scan, and end to
-end—has an evaluated-bank decision cell. Decision-grade cells use one work unit and at least 100 raw timing samples
-(inline or by verified content-addressed reference), plus one positive RSS sample per timing sample with peak RSS equal
-to their maximum. Fresh-process phases use zero warmups; reused-process phases use at least three. Median and median
-absolute deviation use the declared conventional methods; nearest-rank p95 requires 20 samples and p99 requires 100.
+Each lifecycle phase—source profile, source build, cold compile, helper cache miss, helper cache hit, direct bank scan,
+and end to end—has an evaluated-bank decision cell. Decision-grade cells use one work unit and at least 100 raw timing
+samples (inline or by verified content-addressed reference), plus one positive RSS sample per timing sample with peak RSS
+equal to their maximum. Fresh-process phases use zero warmups; reused-process phases use at least three. Median and
+median absolute deviation use the declared conventional methods; nearest-rank p95 requires 20 samples and p99 requires
+100.
 
-Every decision cell has same-machine comparisons against an exact semantic baseline on identical phase, bank, input,
-sample unit, work, and concurrency. At minimum it compares p99, plus MiB/second for whole-input cells, and promotion
-rejects a regression beyond the frozen noise multiplier and tolerance. Comparison hashes commit only the candidate and
-baseline cell IDs, metric, direction, and noise policy, not observed values or outcomes. Capability differences must
-still be stated for non-equivalent exploratory baseline measurements, which are not exact regression comparisons.
+Every decision cell has same-machine comparisons against an exact semantic baseline on an identical operation
+specification, source artifact, phase, bank, input, warmup policy, sample count, sample unit, work, and concurrency. At
+minimum it compares p99, plus MiB/second for whole-input cells, and promotion rejects a regression beyond the frozen
+noise multiplier and tolerance. Comparison hashes commit only the candidate and baseline cell IDs, metric, direction,
+and noise policy, not observed values or outcomes. Capability differences must still be stated for non-equivalent
+exploratory baseline measurements, which are not exact regression comparisons.
 
 Absolute results are hardware-specific. Promotion uses thresholds frozen from validation and a same-machine repeated
 baseline, reports noise diagnostics, and fails closed when required samples, input inventories, RSS, or environment
 provenance are missing. Every decision cell gates median, p95, p99, and peak RSS; document cells also gate seconds per
-document, while whole-input cells gate documents/second and MiB/second. CI smoke timing is robustness evidence, not a
-substitute for the decision-grade protocol.
+document, while whole-input cells gate documents/second and MiB/second. Validation may tighten but cannot weaken the
+deliberately conservative evaluated-bank headline policies: document p99 at most 50 ms, whole-input throughput at least
+100 documents/second and 1 MiB/second, and peak RSS at most 8 GiB. These absolute bounds prevent a similarly slow
+baseline from making an impractical candidate promotable. CI smoke timing is robustness evidence, not a substitute for
+the decision-grade protocol.
 
 The value demonstration records an additive parameterized break-even model rather than inventing hosted-model prices.
-Candidate fixed costs separate declared source curation, measured bank build, and measured cold compile; marginal scan
-cost comes from a decision-grade document workload and is paired with a comparable exact-baseline scan. Other fixed or
-marginal assumptions remain explicit. Let `B` be private curation/build cost, `C` cold compile cost, `S(n)` repeated
-NERB scan cost for `n` documents, and `A(n)` the alternative's additive cost. Report the smallest `n` for which
-`B + C + S(n) <= A(n)`. The value-plan hash commits component roles and sources, units, range, and declared assumption
-values, but not later measured workload values or the derived result. Promotion requires a finite supported advantage or
-break-even. This model supplements privacy/quality gates; it never discounts a miss.
+Candidate fixed costs separate declared source curation, measured source profiling, measured bank build, and measured
+cold compile; marginal scan cost comes from the promoted real-input document-latency workload and is paired with its
+comparable exact-baseline scan. Every measured component uses the unique evaluated bank, never a convenient synthetic
+scale bank. Other fixed or marginal assumptions remain explicit. Let `P` be profiling, `B` be private curation/build
+cost, `C` cold compile cost, `S(n)` repeated NERB scan cost for `n` documents, and `A(n)` the alternative's additive cost.
+Report the smallest `n` for which `P + B + C + S(n) <= A(n)`. The value-plan hash commits component roles and sources,
+units, range, and declared assumption values, but not later measured workload values or the derived result. Promotion
+requires a finite supported advantage or break-even. This model supplements privacy/quality gates; it never discounts a
+miss.
 
 ## V2 Artifact Contract
 
@@ -312,8 +327,8 @@ V2 has two versioned JSON contracts:
   environment; and privacy-safe validation status.
 - `nerb.enron_evidence.v2` binds one manifest hash to evaluation status, aggregate quality slices, catalog-conformance
   results, the final-test frozen target and lineage, performance banks and inputs, raw timing samples or references plus
-  raw RSS samples, exact baseline comparisons and additive value models, configured thresholds, promotion-gate results,
-  verifier status, and supportable claims.
+  raw RSS samples, frozen command/spec/source-bound performance harnesses, exact baseline comparisons and additive value
+  models, configured thresholds, promotion-gate results, verifier status, and supportable claims.
 
 Paths and commands are sanitized but remain exact enough to reproduce in an authorized environment. Private artifact
 references use stable logical IDs and hashes, not workstation paths. Hash algorithms and canonicalization rules are part
@@ -343,7 +358,8 @@ A result is promotable only when all applicable checks pass:
    negative-document false-alarm rate, maximum over-redaction rate, and any per-class floors were frozen from validation
    before final-test access and pass on the one-shot final evidence;
 6. required performance workloads satisfy predeclared latency, throughput, memory, and regression thresholds with valid
-   raw samples and matching fingerprints;
+   raw samples and matching fingerprints, and the evaluated-bank headline thresholds meet the conservative absolute
+   latency, throughput, and memory policies;
 7. privacy-safe serialization/scan passes and no raw text, aliases, addresses, per-document failures, or sensitive paths
    appear in public artifacts; and
 8. an independent reviewer verifies the evidence/claim mapping at the final commit.
@@ -364,6 +380,9 @@ A failed final gate is evidence, not permission to tune on the test. Claims must
 version, bank and evaluator hashes, label strength, class/cohort scope, and machine context for performance. “No known
 cataloged miss in this frozen evaluation” is supportable when true; “NERB catches all PII” is not.
 
+Failed or aborted aggregate outcomes remain publishable in the append-only lineage when promotion and verifier success
+are false. Recording a failure is mandatory evidence; it is never itself a passing claim.
+
 ## Artifact Retention And Ethics
 
 Enron data contains real communications and personal information. Historical public availability does not imply consent
@@ -379,7 +398,14 @@ indefinite retention.
 
 Git may contain only schemas, synthetic fixtures, source/policy hashes, aggregate evidence, and sanitized examples that
 pass automated privacy checks. Public evidence must omit raw strings, context snippets, addresses, names, local paths,
-and small slices that enable reconstruction. Charts are regenerated solely from the verified aggregate evidence bundle.
+and small slices that enable reconstruction. The public-contract scan deliberately rejects any at-sign, common SSN or
+phone shape, and punctuation-wrapped local path; diagnostics are deterministic and bounded without echoing rejected
+values. This includes compatibility-normalized/fullwidth identifier forms, canonical E.164 numbers, common Unicode
+separators and decimal digits, formatted international numbers, compatibility-normalized path punctuation, UNC shares,
+and local paths attached to command options. HTTP(S) remote paths, nested remote links, and promotion-gate JSON pointers
+remain permitted, but recursively partitioned and repeatedly decoded URL payloads cannot smuggle an identifier, local
+path, or file URI. External sample and inventory resolvers and trusted-lineage prefixes must use bounded exact JSON-like
+built-in containers and scalar types. Charts are regenerated solely from the verified aggregate evidence bundle.
 
 ## Historical V1 Quarantine
 

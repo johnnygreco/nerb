@@ -3,7 +3,7 @@
   "charter_version": "2",
   "artifact_kind": "synthetic_fixture",
   "created_at": "2026-07-10T00:03:00Z",
-  "manifest_sha256": "sha256:bb07ed3eca0e8418b9b7fe1b92cc4847e862470873b083f097f66613571a9339",
+  "manifest_sha256": "sha256:9a964aec320dcf79b32e7055602249575754030bec3a9138942da4c3d5253059",
   "evaluator": {
     "id": "synthetic_privacy_eval",
     "version": "2.0.0",
@@ -211,12 +211,12 @@
     "current_version_accessed_at": "2026-07-10T00:02:00Z",
     "frozen_target": {
       "frozen_at": "2026-07-10T00:01:00Z",
-      "manifest_sha256": "sha256:bb07ed3eca0e8418b9b7fe1b92cc4847e862470873b083f097f66613571a9339",
+      "manifest_sha256": "sha256:9a964aec320dcf79b32e7055602249575754030bec3a9138942da4c3d5253059",
       "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
       "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
-      "performance_manifest_sha256": "sha256:47755560fcafac7a50bdf7455b47bf2229a977a8a725ef656fcd87d32b3da68c",
+      "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
       "git_commit": "0000000000000000000000000000000000000000"
     },
     "lineage": [
@@ -232,21 +232,21 @@
         },
         "frozen_target": {
           "frozen_at": "2026-07-10T00:01:00Z",
-          "manifest_sha256": "sha256:bb07ed3eca0e8418b9b7fe1b92cc4847e862470873b083f097f66613571a9339",
+          "manifest_sha256": "sha256:9a964aec320dcf79b32e7055602249575754030bec3a9138942da4c3d5253059",
           "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
           "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
           "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
-          "performance_manifest_sha256": "sha256:47755560fcafac7a50bdf7455b47bf2229a977a8a725ef656fcd87d32b3da68c",
+          "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
           "git_commit": "0000000000000000000000000000000000000000"
         },
         "predecessor_benchmark_version": null,
         "changes_informed_by_predecessor": [],
         "previous_entry_sha256": null,
-        "entry_sha256": "sha256:93db230a618bad238f651888cb45fa75ff394770fadd7b707da30d367a754a54"
+        "entry_sha256": "sha256:7915c0d94a879cf430471af59fe81f2b56c1f36413d3164a390fd5374f83fc5d"
       }
     ],
-    "lineage_head_sha256": "sha256:93db230a618bad238f651888cb45fa75ff394770fadd7b707da30d367a754a54"
+    "lineage_head_sha256": "sha256:7915c0d94a879cf430471af59fe81f2b56c1f36413d3164a390fd5374f83fc5d"
   },
   "performance": {
     "evaluated": true,
@@ -331,13 +331,26 @@
         "descriptor_sha256": "sha256:b6f194f27de755bbf0450a44fb8ee273c04666edaa0a43572e575dfd15aff96a"
       }
     ],
+    "harnesses": [
+      {
+        "id": "direct_bank_fixture_harness",
+        "phase": "direct_bank_scan",
+        "command_id": "fixture_build",
+        "source_sha256": "sha256:3434343434343434343434343434343434343434343434343434343434343434",
+        "operation_spec_sha256": "sha256:3535353535353535353535353535353535353535353535353535353535353535",
+        "source_artifact": null,
+        "descriptor_sha256": "sha256:95184cfc0e12ce2ef22f431239611ea8e514a4c08a15a4db49503959123d6923"
+      }
+    ],
     "workloads": [
       {
         "id": "direct_bank_fixture",
         "phase": "direct_bank_scan",
         "promotion_gate": false,
         "decision_grade": false,
-        "workload_sha256": "sha256:6da8c0f481c8ebb47a16c539009692dac6c8e998e1eb2247695137c683a3ec27",
+        "workload_sha256": "sha256:f3b6fd0fe7303e24c99367840891ef9d98e060dfcf9195fd8187fb55f5689d22",
+        "harness_id": "direct_bank_fixture_harness",
+        "harness_sha256": "sha256:95184cfc0e12ce2ef22f431239611ea8e514a4c08a15a4db49503959123d6923",
         "bank_id": "evaluated_fixture_bank",
         "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "input_id": "synthetic_scan_input",
@@ -371,7 +384,7 @@
     "comparisons": [],
     "breakeven_models": []
   },
-  "performance_manifest_sha256": "sha256:47755560fcafac7a50bdf7455b47bf2229a977a8a725ef656fcd87d32b3da68c",
+  "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
   "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
   "promotion": {
     "passed": false,
