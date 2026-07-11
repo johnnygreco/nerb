@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import tempfile
@@ -33,7 +34,13 @@ from .enron_preparation import (
     _verify_prepared_record,
     load_enron_preparation_run,
 )
-from .enron_private_io import EnronPrivateIOError, PrivateRun, _iter_strict_jsonl, open_private_binary_input
+from .enron_private_io import (
+    EnronPrivateIOError,
+    PrivateRun,
+    _iter_strict_jsonl,
+    _rename_noreplace_at,
+    open_private_binary_input,
+)
 
 SPLIT_MANIFEST_SCHEMA_VERSION = "nerb.enron_split_manifest.v2"
 SPLIT_FREEZE_RECEIPT_SCHEMA_VERSION = "nerb.enron_split_freeze_receipt.v2"
@@ -268,6 +275,16 @@ def _hash_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return "sha256:" + digest.hexdigest()
+
+
+def _utc_instant(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise EnronSplitError("Prepared temporal timestamp is invalid.") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise EnronSplitError("Prepared temporal timestamp is not timezone-aware.")
+    return parsed.astimezone(timezone.utc)
 
 
 def _artifact_descriptor(path: Path, *, records: int, artifact_id: str | None = None) -> dict[str, Any]:
@@ -744,7 +761,7 @@ def _components(connection: sqlite3.Connection, union_find: _UnionFind) -> tuple
                 records=len(nodes),
                 occurrences=sum(metadata[node][1] for node in nodes),
                 temporal=bool(eligible_dates),
-                anchor_utc=max(str(value) for value in eligible_dates) if eligible_dates else None,
+                anchor_utc=max((str(value) for value in eligible_dates), key=_utc_instant) if eligible_dates else None,
             )
         )
     return tuple(sorted(result, key=lambda component: component.group_id))
@@ -773,7 +790,7 @@ def _assign_components(
 ) -> tuple[tuple[str, ...], tuple[str, ...], Counter[str], Counter[str]]:
     temporal = sorted(
         (component for component in components if component.temporal),
-        key=lambda component: (component.anchor_utc or "", component.group_id),
+        key=lambda component: (_utc_instant(str(component.anchor_utc)), component.group_id),
     )
     non_temporal = [component for component in components if not component.temporal]
     roles: dict[str, str] = {}
@@ -1011,6 +1028,27 @@ def _sample_stratum(membership: _Membership) -> str:
     )
 
 
+def _sample_margins(membership: _Membership) -> tuple[str, ...]:
+    margins = {
+        f"date_status:{membership.date_status}",
+        f"natural:{'present' if membership.natural else 'empty'}",
+        f"structured:{'present' if membership.structured else 'empty'}",
+    }
+    margins.update(f"identity_frequency:{name}" for name in membership.identity_frequencies)
+    margins.update(f"challenge:{name}" for name in membership.challenges)
+    return tuple(sorted(margins))
+
+
+def _sample_rank(membership: _Membership, options: EnronSplitOptions) -> tuple[str, str]:
+    return (
+        _hash_value(
+            "nerb/enron/split-sample/v2",
+            options.benchmark_version + "\0" + options.seed + "\0" + membership.document_id,
+        ),
+        membership.document_id,
+    )
+
+
 def _select_samples(
     memberships: Sequence[_Membership], options: EnronSplitOptions
 ) -> tuple[frozenset[int], dict[str, int]]:
@@ -1018,18 +1056,28 @@ def _select_samples(
     sample_counts: dict[str, int] = {}
     for role in _ROLE_NAMES:
         strata: dict[str, list[int]] = defaultdict(list)
+        margins: dict[str, list[int]] = defaultdict(list)
         role_nodes = [index for index, membership in enumerate(memberships) if membership.role == role]
+        ranks = {node: _sample_rank(memberships[node], options) for node in role_nodes}
         for node in role_nodes:
             strata[_sample_stratum(memberships[node])].append(node)
+            for margin in _sample_margins(memberships[node]):
+                margins[margin].append(node)
+
+        role_selected: set[int] = set()
+        for nodes in (*strata.values(), *margins.values()):
+            role_selected.add(min(nodes, key=ranks.__getitem__))
         target = min(options.sample_per_role, len(role_nodes))
-        if target < len(strata):
+        if target < len(role_selected):
             if not options.fixture_mode:
-                raise EnronSplitError("Representative sample budget cannot cover every non-empty stratum.")
-            target = len(strata)
-        quotas = {stratum: 1 for stratum in strata}
-        remaining = target - len(strata)
-        capacities = {stratum: len(nodes) - 1 for stratum, nodes in strata.items()}
+                raise EnronSplitError(
+                    "Representative sample budget cannot cover every base stratum and named marginal cohort."
+                )
+            target = len(role_selected)
+        remaining = target - len(role_selected)
+        capacities = {stratum: sum(node not in role_selected for node in nodes) for stratum, nodes in strata.items()}
         capacity_total = sum(capacities.values())
+        quotas = {stratum: 0 for stratum in strata}
         if remaining and capacity_total:
             floors: dict[str, int] = {}
             remainders: list[tuple[int, str]] = []
@@ -1044,17 +1092,14 @@ def _select_samples(
                 quotas[stratum] += 1
         for stratum, nodes in sorted(strata.items()):
             ranked = sorted(
-                nodes,
-                key=lambda node: (
-                    _hash_value(
-                        "nerb/enron/split-sample/v2",
-                        options.benchmark_version + "\0" + options.seed + "\0" + memberships[node].document_id,
-                    ),
-                    memberships[node].document_id,
-                ),
+                (node for node in nodes if node not in role_selected),
+                key=ranks.__getitem__,
             )
-            selected.update(ranked[: quotas[stratum]])
-        sample_counts[role] = sum(1 for node in selected if memberships[node].role == role)
+            role_selected.update(ranked[: quotas[stratum]])
+        if len(role_selected) != target:
+            raise EnronSplitError("Representative sample allocation did not fill its deterministic budget.")
+        selected.update(role_selected)
+        sample_counts[role] = len(role_selected)
     return frozenset(selected), sample_counts
 
 
@@ -1119,9 +1164,12 @@ def _allocation_audit(
     options: EnronSplitOptions,
 ) -> dict[str, Any]:
     component_by_group = {component.group_id: component for component in components}
+    component_anchor_instants = {
+        component.group_id: _utc_instant(str(component.anchor_utc)) for component in components if component.temporal
+    }
     temporal_components = sorted(
         (component for component in components if component.temporal),
-        key=lambda component: (component.anchor_utc or "", component.group_id),
+        key=lambda component: (_utc_instant(str(component.anchor_utc)), component.group_id),
     )
     cumulative = 0
     boundary_rows: dict[str, dict[str, Any] | None] = {"train": None, "validation": None}
@@ -1151,7 +1199,9 @@ def _allocation_audit(
         key = "eligible" if bool(record_temporal) else "non_temporal"
         eligibility[role][f"{key}_records"] += 1
         date_status[role][str(record_date_status)] += 1
-        if component.temporal and (not bool(record_temporal) or str(date_utc) < str(component.anchor_utc)):
+        if component.temporal and (
+            not bool(record_temporal) or _utc_instant(str(date_utc)) < component_anchor_instants[component.group_id]
+        ):
             boundary_promoted_records += 1
     for component in components:
         role = node_roles[component.nodes[0]]
@@ -1256,9 +1306,9 @@ def _split_policy(options: EnronSplitOptions) -> dict[str, Any]:
         },
         "sampling": {
             "per_role": options.sample_per_role,
-            "allocation": "hamilton_with_one_per_nonempty_stratum",
+            "allocation": "named_marginal_reservations_then_hamilton_over_base_strata",
             "selection": "seeded_min_hash",
-            "strata": [
+            "base_strata": [
                 "role",
                 "temporal",
                 "mailbox",
@@ -1266,6 +1316,13 @@ def _split_policy(options: EnronSplitOptions) -> dict[str, Any]:
                 "size",
                 "group_size",
                 "identity_recurrence",
+            ],
+            "marginal_reservations": [
+                "date_status",
+                "identity_frequency",
+                "natural_availability",
+                "structured_availability",
+                "challenge_family",
             ],
         },
         "cohorts": {
@@ -1767,7 +1824,10 @@ def _read_json_object(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[
 
 
 def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_access_files: bool = False) -> Path:
-    root = root.expanduser()
+    try:
+        root = root.expanduser().absolute()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise EnronSplitError("Split run path is invalid.") from exc
     try:
         root_info = root.lstat()
     except OSError as exc:
@@ -1789,7 +1849,12 @@ def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_ac
         raise EnronSplitError("Split run file inventory is invalid.")
     for name in actual:
         info = (root / name).lstat()
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) & 0o077
+        ):
             raise EnronSplitError("Split run contains an unsafe file.")
     if stat.S_IMODE(root_info.st_mode) & 0o077:
         raise EnronSplitError("Split run directory is not private.")
@@ -2568,30 +2633,99 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _write_exclusive_private_json(root: Path, name: str, value: Mapping[str, Any]) -> None:
-    directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
-    file_fd: int | None = None
+def _open_pinned_private_root(root: Path) -> tuple[int, int]:
+    if root.parent == root or not root.name:
+        raise EnronSplitError("Private receipt root is invalid.")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        file_fd = os.open(
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=directory_fd,
-        )
-        payload = _canonical_line(value)
+        before = root.lstat()
+        parent_fd = os.open(root.parent, flags)
+    except OSError as exc:
+        raise EnronSplitError("Private receipt root could not be opened safely.") from exc
+    directory_fd: int | None = None
+    try:
+        directory_fd = os.open(root.name, flags, dir_fd=parent_fd)
+        after = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(after.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise EnronSplitError("Private receipt root changed while it was opened.")
+        return parent_fd, directory_fd
+    except BaseException as exc:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        os.close(parent_fd)
+        if isinstance(exc, EnronSplitError):
+            raise
+        raise EnronSplitError("Private receipt root could not be pinned safely.") from exc
+
+
+def _write_exclusive_private_json_at(
+    root: Path,
+    parent_fd: int,
+    directory_fd: int,
+    name: str,
+    value: Mapping[str, Any],
+) -> None:
+    if Path(name).name != name or name in {"", ".", ".."}:
+        raise EnronSplitError("Private receipt name is invalid.")
+    payload = _canonical_line(value)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    temporary_name: str | None = None
+    file_fd: int | None = None
+    published = False
+    try:
+        for _ in range(128):
+            candidate = f".{root.name}.{name}.stage-{secrets.token_hex(12)}"
+            try:
+                file_fd = os.open(candidate, flags, 0o600, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if file_fd is None or temporary_name is None:
+            raise EnronSplitError("A unique private receipt staging file could not be created.")
+        os.fchmod(file_fd, 0o600)
         offset = 0
         while offset < len(payload):
-            offset += os.write(file_fd, payload[offset:])
+            written = os.write(file_fd, payload[offset:])
+            if written <= 0:
+                raise OSError("Private receipt write made no progress.")
+            offset += written
         os.fsync(file_fd)
         os.close(file_fd)
         file_fd = None
+        _rename_noreplace_at(parent_fd, temporary_name, directory_fd, name)
+        published = True
         os.fsync(directory_fd)
+        os.fsync(parent_fd)
     except FileExistsError:
         raise EnronSplitError("Final-test access has already been claimed; retries are forbidden.") from None
+    except EnronPrivateIOError as exc:
+        raise EnronSplitError(str(exc)) from exc
+    except OSError as exc:
+        raise EnronSplitError("Private receipt could not be published atomically.") from exc
     finally:
         if file_fd is not None:
             os.close(file_fd)
+        if temporary_name is not None and not published:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _write_exclusive_private_json(root: Path, name: str, value: Mapping[str, Any]) -> None:
+    normalized = root.expanduser().absolute()
+    parent_fd, directory_fd = _open_pinned_private_root(normalized)
+    try:
+        _write_exclusive_private_json_at(normalized, parent_fd, directory_fd, name, value)
+    finally:
         os.close(directory_fd)
+        os.close(parent_fd)
 
 
 class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
@@ -2607,6 +2741,8 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         "_benchmark_version",
         "_accessed_at",
         "_claim_sha256",
+        "_parent_fd",
+        "_directory_fd",
         "_entered",
         "_iterated",
         "_exhausted",
@@ -2622,6 +2758,8 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         self._benchmark_version = ""
         self._accessed_at = ""
         self._claim_sha256 = ""
+        self._parent_fd: int | None = None
+        self._directory_fd: int | None = None
         self._entered = False
         self._iterated = False
         self._exhausted = False
@@ -2631,6 +2769,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             raise EnronSplitError("Final-test access context cannot be entered twice.")
         self._entered = True
         root = _assert_committed_run(self._root, _SEALED_FILES, allow_access_files=True)
+        self._root = root
         if (root / "ACCESS_CLAIMED.json").exists() or (root / "ACCESS_OUTCOME.json").exists():
             raise EnronSplitError("Final-test access has already been claimed; retries are forbidden.")
         manifest = _read_json_object(root / "manifest.json")
@@ -2677,8 +2816,10 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         if manifest.get("artifacts", {}).get("test") != role["artifact"]:
             raise EnronSplitError("Sealed test artifact binding is invalid.")
         _verify_descriptor(root, role["artifact"], "test.jsonl", int(role["records"]))
-        handle = open_private_binary_input(root / "test.jsonl")
+        parent_fd, directory_fd = _open_pinned_private_root(root)
+        handle: BinaryIO | None = None
         try:
+            handle = open_private_binary_input(root / "test.jsonl")
             digest = hashlib.sha256()
             byte_count = 0
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -2692,6 +2833,8 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             self._expected_sha256 = str(artifact["sha256"])
             self._expected_bytes = int(artifact["bytes"])
             self._handle = handle
+            self._parent_fd = parent_fd
+            self._directory_fd = directory_fd
             self._target = target
             self._benchmark_version = str(manifest["benchmark_version"])
             self._accessed_at = _utc_now()
@@ -2703,10 +2846,15 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             }
             self._claim_sha256 = _hash_bytes(_canonical_json(claim_core).encode("utf-8"))
             claim = {**claim_core, "claim_sha256": self._claim_sha256}
-            _write_exclusive_private_json(root, "ACCESS_CLAIMED.json", claim)
+            _write_exclusive_private_json_at(root, parent_fd, directory_fd, "ACCESS_CLAIMED.json", claim)
         except BaseException:
-            handle.close()
+            if handle is not None:
+                handle.close()
             self._handle = None
+            self._parent_fd = None
+            self._directory_fd = None
+            os.close(directory_fd)
+            os.close(parent_fd)
             raise
         return self
 
@@ -2766,11 +2914,26 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             "frozen_target_sha256": _hash_bytes(_canonical_json(self._target).encode("utf-8")),
             "claim_sha256": self._claim_sha256,
         }
+        parent_fd = self._parent_fd
+        directory_fd = self._directory_fd
+        if parent_fd is None or directory_fd is None:
+            raise EnronSplitError("Final-test access directory is no longer pinned.")
         try:
-            _write_exclusive_private_json(self._root, "ACCESS_OUTCOME.json", outcome)
+            _write_exclusive_private_json_at(
+                self._root,
+                parent_fd,
+                directory_fd,
+                "ACCESS_OUTCOME.json",
+                outcome,
+            )
         except EnronSplitError:
             if exc is None:
                 raise
+        finally:
+            os.close(directory_fd)
+            os.close(parent_fd)
+            self._directory_fd = None
+            self._parent_fd = None
 
 
 def begin_enron_final_test_access(
@@ -2781,3 +2944,29 @@ def begin_enron_final_test_access(
     """Return the one-shot steward context; no test byte is read before entering it."""
 
     return EnronFinalTestAccess(sealed_path, frozen_target)
+
+
+def finalize_aborted_enron_final_test_access(sealed_path: Path) -> dict[str, Any]:
+    """Record an aborted outcome for a valid crash-stranded claim without reopening test data."""
+
+    root = _assert_committed_run(sealed_path, _SEALED_FILES, allow_access_files=True)
+    manifest = _read_json_object(root / "manifest.json")
+    manifest_sha256 = _hash_file(root / "manifest.json")
+    _verify_pair_receipt(root, manifest_sha256, str(manifest.get("benchmark_version")))
+    access_state = _verify_access_state(root, manifest, manifest_sha256)
+    if access_state.get("status") != "claimed":
+        raise EnronSplitError("Final-test access does not have a valid claim awaiting an outcome.")
+    claim = _read_json_object(root / "ACCESS_CLAIMED.json")
+    frozen_target = claim["frozen_target"]
+    outcome = {
+        "schema_version": FINAL_TEST_ACCESS_SCHEMA_VERSION,
+        "benchmark_version": claim["benchmark_version"],
+        "accessed_at": claim["accessed_at"],
+        "status": "aborted",
+        "frozen_target_sha256": _hash_bytes(_canonical_json(frozen_target).encode("utf-8")),
+        "claim_sha256": claim["claim_sha256"],
+    }
+    _write_exclusive_private_json(root, "ACCESS_OUTCOME.json", outcome)
+    result = _verify_access_state(root, manifest, manifest_sha256)
+    _validate_aggregate_privacy(result)
+    return result

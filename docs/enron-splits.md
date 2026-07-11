@@ -42,7 +42,8 @@ private-permission, synchronization, and atomic no-replace requirements.
 The sealed transaction commits first and the development transaction commits second. Only after both commits succeed
 does the splitter create `PAIR_COMMITTED.json` in the sealed root, binding both manifests and the development freeze
 receipt. Steward verification and final-test access reject a missing or mismatched pair receipt, so an orphaned sealed
-transaction cannot become an access capability after a partial two-directory commit.
+transaction cannot become an access capability after a partial two-directory commit. Pair, claim, and outcome receipts
+are written to private sibling staging files, synchronized, and then published atomically without replacement.
 
 - The **development bundle** contains train and validation records, their private group membership and cohort material,
   and bounded diagnostic samples. Candidate miners, bank builders, reviewers, and validation experiments may use this
@@ -59,7 +60,9 @@ evidence, and those still require the benchmark privacy verifier.
 The separation is an operational and capability boundary, not cryptographic protection from the same operating-system
 user. A user who can bypass the API and read both directories can read the sealed bytes. Use filesystem ownership,
 least privilege, encryption at rest where practical, and a distinct steward account or machine when the threat model
-requires protection from builders.
+requires protection from builders. The verifier rejects hard-linked run files, but an ordinary byte-for-byte directory
+copy can still create another local claim namespace; an external append-only custody/lineage ledger remains mandatory
+when the same OS principal can copy the steward bundle.
 
 ## Leakage components
 
@@ -117,10 +120,13 @@ prediction is not evidence that a message contains no PII. A later evaluator may
 independently and exhaustively labeled population with a declared annotation scope.
 
 Bounded review samples are diagnostics, not the quality population. The sampler apportions its per-role budget across
-declared non-empty strata with deterministic Hamilton largest-remainder allocation, then selects records by seeded
-minimum hash. The default ceiling is 10,000 records per role. This makes the sample representative and row-order
-independent without exposing arbitrary first rows. It does not authorize sample-only recall, precision, false-alarm,
-or promotion claims: quality gates use every applicable document in the frozen full role/cohort population.
+declared non-empty base strata with deterministic Hamilton largest-remainder allocation, then selects records by seeded
+minimum hash. Before that allocation it reserves deterministic coverage for every non-empty date-status,
+identity-frequency, natural/structured-availability, and challenge-family margin. This guarantees rare named cohorts a
+review surface without creating a potentially explosive Cartesian stratum. The default ceiling is 10,000 records per
+role; a production run fails if that budget cannot cover all required reservations. This makes the sample representative
+and row-order independent without exposing arbitrary first rows. It does not authorize sample-only recall, precision,
+false-alarm, or promotion claims: quality gates use every applicable document in the frozen full role/cohort population.
 
 ## Production support floors
 
@@ -150,6 +156,10 @@ the benchmark's single access. There is no retry for that benchmark version, bec
 failures into selective test access. An aborted or failed outcome enters the append-only benchmark lineage; further
 tuning requires a disclosed successor benchmark version and a newly sealed test whose artifact hash has not already
 appeared in the trusted lineage.
+
+If a steward process dies after the valid claim is durable but before an outcome is written, the claim still consumes
+the one permitted access. `finalize_aborted_enron_final_test_access` can append an `aborted` outcome after validating the
+claim and pair receipt; it never opens the test artifact and cannot authorize a retry.
 
 Run `verify-enron-splits` before freezing the bank, evaluator, thresholds, claims, and workload for release. Once the
 frozen target has been bound and access is claimed, treat every result as final-test evidence rather than development

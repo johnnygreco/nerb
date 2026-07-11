@@ -784,6 +784,15 @@ def _write_commit_marker(stage_fd: int, stage_path: Path) -> None:
 
 
 def _rename_noreplace(parent_fd: int, parent_path: Path, source_name: str, destination_name: str) -> None:
+    _rename_noreplace_at(parent_fd, source_name, parent_fd, destination_name)
+
+
+def _rename_noreplace_at(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
     source = os.fsencode(source_name)
     destination = os.fsencode(destination_name)
     if sys.platform.startswith("linux"):
@@ -792,7 +801,7 @@ def _rename_noreplace(parent_fd: int, parent_path: Path, source_name: str, desti
         if renameat2 is not None:
             renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
             renameat2.restype = ctypes.c_int
-            if renameat2(parent_fd, source, parent_fd, destination, 1) == 0:  # RENAME_NOREPLACE
+            if renameat2(source_parent_fd, source, destination_parent_fd, destination, 1) == 0:  # RENAME_NOREPLACE
                 return
             error = ctypes.get_errno()
             if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
@@ -803,7 +812,16 @@ def _rename_noreplace(parent_fd: int, parent_path: Path, source_name: str, desti
         if renameatx_np is not None:
             renameatx_np.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
             renameatx_np.restype = ctypes.c_int
-            if renameatx_np(parent_fd, source, parent_fd, destination, 0x00000004) == 0:  # RENAME_EXCL
+            if (
+                renameatx_np(
+                    source_parent_fd,
+                    source,
+                    destination_parent_fd,
+                    destination,
+                    0x00000004,
+                )
+                == 0
+            ):  # RENAME_EXCL
                 return
             error = ctypes.get_errno()
             if error not in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:

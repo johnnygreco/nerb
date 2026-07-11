@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -569,6 +571,36 @@ def test_latest_group_member_controls_temporal_role_and_invalid_dates_are_audita
     assert "temporal" in aggregate.casefold()
 
 
+def test_fractional_second_timestamp_is_chronologically_later_than_whole_second(tmp_path: Path) -> None:
+    shared_subject = "Fractional timestamp anchor"
+    shared_body = "Two exact copies exercise chronological rather than lexical timestamp ordering."
+    rows = [
+        _row(
+            "fractional-whole",
+            date="2000-01-01T00:00:00Z",
+            subject=shared_subject,
+            body=shared_body,
+        ),
+        _row(
+            "fractional-later",
+            date="2000-01-01T00:00:00.500000Z",
+            subject=shared_subject,
+            body=shared_body,
+        ),
+        *_dated_rows(16, prefix="fractional-island", start=datetime(2000, 2, 1, tzinfo=timezone.utc)),
+    ]
+    preparation = _prepare(tmp_path, rows)
+    run = _split(tmp_path, preparation)
+    group_rows = _read_jsonl(run.sealed / "group-assignments.jsonl")
+    prepared_ids = {
+        str(row["document_id"]) for row in _prepared_rows(preparation) if row["headers"]["subject"] == shared_subject
+    }
+    group = next(row for row in group_rows if prepared_ids <= set(row["member_document_ids"]))
+
+    assert group["records"] == 2
+    assert group["anchor_utc"] == "2000-01-01T00:00:00.500000Z"
+
+
 def test_non_temporal_components_use_stable_seeded_assignment_independent_of_temporal_population(
     tmp_path: Path,
 ) -> None:
@@ -651,6 +683,78 @@ def test_representative_samples_are_deterministic_stratified_and_not_a_source_pr
     train_ids = sorted(str(row["document_id"]) for row in roles["train"])
     assert set(samples["train"]) != set(train_ids[: len(samples["train"])])
     assert max(train_ids.index(document_id) for document_id in samples["train"]) >= len(samples["train"])
+
+
+def test_representative_sampler_reserves_named_marginal_cohorts_before_hamilton_allocation(
+    tmp_path: Path,
+) -> None:
+    def membership(
+        index: int,
+        *,
+        date_status: str = "missing",
+        frequency: str = "mid",
+        natural: bool = True,
+        challenge: str | None = None,
+    ) -> enron_splitting._Membership:  # noqa: SLF001
+        return enron_splitting._Membership(  # noqa: SLF001
+            document_id=f"doc_{index:064x}",
+            group_id="sha256:" + f"{index:064x}",
+            role="validation",
+            occurrence_count=1,
+            temporal_eligible=False,
+            date_status=date_status,
+            anchor_utc=None,
+            mailbox="inbox",
+            mailbox_recurrence="known",
+            size="medium",
+            group_size="2",
+            identity_recurrence="all_known",
+            identity_count=1,
+            identity_frequencies=(frequency,),
+            natural=natural,
+            structured=True,
+            challenges=() if challenge is None else (challenge,),
+        )
+
+    memberships = [
+        membership(0, date_status="invalid", frequency="head", challenge="near_duplicate_group"),
+        membership(1, frequency="tail", challenge="thread_or_reply_group"),
+        membership(
+            2,
+            date_status="out_of_range",
+            natural=False,
+            challenge="exact_duplicate_group",
+        ),
+        *(membership(index) for index in range(3, 20)),
+    ]
+    options = EnronSplitOptions(
+        preparation_run=tmp_path / "unused-preparation",
+        development_output_dir=tmp_path / "unused-development",
+        sealed_output_dir=tmp_path / "unused-sealed",
+        benchmark_version="enron-v2-sample-reservations",
+        seed="sample-gap",
+        sample_per_role=4,
+        fixture_mode=True,
+    )
+    selected, counts = enron_splitting._select_samples(memberships, options)  # noqa: SLF001
+    selected_documents = {memberships[node].document_id for node in selected}
+
+    assert {memberships[index].document_id for index in (0, 1, 2)} <= selected_documents
+    assert counts["validation"] == 4
+    reversed_selected, _ = enron_splitting._select_samples(tuple(reversed(memberships)), options)  # noqa: SLF001
+    assert selected_documents == {tuple(reversed(memberships))[node].document_id for node in reversed_selected}
+
+    production = EnronSplitOptions(
+        preparation_run=tmp_path / "production-preparation",
+        development_output_dir=tmp_path / "production-development",
+        sealed_output_dir=tmp_path / "production-sealed",
+        benchmark_version="enron-v2-sample-reservations-production",
+        seed="sample-gap",
+        sample_per_role=2,
+        fixture_mode=False,
+    )
+    with pytest.raises(EnronSplitError, match=r"(?i)(sample|budget|cohort|stratum)"):
+        enron_splitting._select_samples(memberships, production)  # noqa: SLF001
 
 
 def test_development_api_cannot_reach_test_and_aggregate_views_are_private(tmp_path: Path) -> None:
@@ -746,6 +850,89 @@ def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_pa
         verify_enron_splits(run.development, run.sealed, seed=run.seed)
 
 
+def test_final_test_access_pins_directory_across_rename_and_cwd_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "original-parent"
+    preparation = _prepare(parent, _dated_rows(24, prefix="pinned"))
+    run = _split(parent, preparation)
+    target = _frozen_target(run)
+    expected = _role_rows(run)["test"]
+    renamed = parent / "renamed-sealed"
+    other = tmp_path / "other-parent"
+    other.mkdir(mode=0o700)
+
+    monkeypatch.chdir(parent)
+    with enron_splitting.begin_enron_final_test_access(Path(run.sealed.name), frozen_target=target) as access:
+        accessed = tuple(access.iter_records())
+        run.sealed.rename(renamed)
+        monkeypatch.chdir(other)
+
+    assert accessed == expected
+    assert (renamed / "ACCESS_CLAIMED.json").is_file()
+    assert (renamed / "ACCESS_OUTCOME.json").is_file()
+    assert verify_enron_splits(run.development, renamed, seed=run.seed)["access"]["status"] == "completed"
+
+
+def test_hard_linked_sealed_clone_is_not_an_independent_access_capability(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="hard-link"))
+    run = _split(tmp_path, preparation)
+    clone = tmp_path / "hard-linked-sealed"
+    shutil.copytree(run.sealed, clone, copy_function=os.link)
+    assert (clone / "test.jsonl").stat().st_nlink == 2
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(unsafe|link|private|file)"):
+        with enron_splitting.begin_enron_final_test_access(clone, frozen_target=_frozen_target(run)):
+            pass
+    assert not (clone / "ACCESS_CLAIMED.json").exists()
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+
+
+def test_private_receipt_publication_is_atomic_after_interrupted_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "private-receipts"
+    root.mkdir(mode=0o700)
+    real_write = os.write
+    writes = 0
+
+    def interrupted_write(file_descriptor: int, payload: bytes) -> int:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            return real_write(file_descriptor, payload[:12])
+        raise OSError("simulated interrupted receipt write")
+
+    monkeypatch.setattr(os, "write", interrupted_write)
+    with pytest.raises(EnronSplitError, match=r"(?i)(receipt|atomic|publish)"):
+        enron_splitting._write_exclusive_private_json(  # noqa: SLF001
+            root,
+            "ACCESS_CLAIMED.json",
+            {"schema_version": "test", "commitment": "sha256:" + "1" * 64},
+        )
+
+    assert list(root.iterdir()) == []
+    assert not tuple(tmp_path.glob(".private-receipts.ACCESS_CLAIMED.json.stage-*"))
+
+
+def test_crash_stranded_claim_can_be_finalized_as_aborted_without_reopening_test(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="finalize-aborted"))
+    run = _split(tmp_path, preparation)
+    with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=_frozen_target(run)) as access:
+        tuple(access.iter_records())
+    (run.sealed / "ACCESS_OUTCOME.json").unlink()
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "claimed"
+
+    finalized = enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
+    assert finalized["status"] == "aborted"
+    assert finalized["access_count"] == 1
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "aborted"
+    with pytest.raises(EnronSplitError, match=r"(?i)(claim|outcome|awaiting|access)"):
+        enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
+
+
 def test_missing_pair_commit_receipt_blocks_sealed_access_without_creating_claim(tmp_path: Path) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="unpaired"))
     run = _split(tmp_path, preparation)
@@ -778,6 +965,93 @@ def test_small_corpora_require_explicit_non_promotable_fixture_mode(tmp_path: Pa
     assert fixture.summary["fixture_mode"] is True
     assert fixture.summary["promotable"] is False
     assert all(_role_rows(fixture).values())
+
+
+def test_production_support_floors_enforce_each_frozen_boundary(tmp_path: Path) -> None:
+    options = EnronSplitOptions(
+        preparation_run=tmp_path / "unused-preparation",
+        development_output_dir=tmp_path / "unused-development",
+        sealed_output_dir=tmp_path / "unused-sealed",
+        fixture_mode=False,
+    )
+
+    def components(largest: int = 9_999) -> tuple[enron_splitting._Component, ...]:  # noqa: SLF001
+        return tuple(
+            enron_splitting._Component(  # noqa: SLF001
+                group_id="sha256:" + f"{index:064x}",
+                nodes=(),
+                records=largest if index == 0 else 1,
+                occurrences=largest if index == 0 else 1,
+                temporal=False,
+                anchor_utc=None,
+            )
+            for index in range(3)
+        )
+
+    role_records = {"train": 160_000, "validation": 20_000, "test": 20_000}
+    role_groups = {"train": 1_000, "validation": 1_000, "test": 1_000}
+    enron_splitting._enforce_support(  # noqa: SLF001
+        components(), 200_000, role_records, role_groups, 0, options
+    )
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(truncation|grouping|production)"):
+        enron_splitting._enforce_support(  # noqa: SLF001
+            components(), 200_000, role_records, role_groups, 1, options
+        )
+    with pytest.raises(EnronSplitError, match=r"(?i)(five percent|10000|record)"):
+        enron_splitting._enforce_support(  # noqa: SLF001
+            components(),
+            200_000,
+            {**role_records, "test": 9_999},
+            role_groups,
+            0,
+            options,
+        )
+    with pytest.raises(EnronSplitError, match=r"(?i)(five percent|10000|record)"):
+        enron_splitting._enforce_support(  # noqa: SLF001
+            components(),
+            300_000,
+            {"train": 270_001, "validation": 15_000, "test": 14_999},
+            role_groups,
+            0,
+            options,
+        )
+    with pytest.raises(EnronSplitError, match=r"(?i)(1000|group)"):
+        enron_splitting._enforce_support(  # noqa: SLF001
+            components(),
+            200_000,
+            role_records,
+            {**role_groups, "validation": 999},
+            0,
+            options,
+        )
+    with pytest.raises(EnronSplitError, match=r"(?i)(five percent|component)"):
+        enron_splitting._enforce_support(  # noqa: SLF001
+            components(10_000), 200_000, role_records, role_groups, 0, options
+        )
+
+
+def test_production_cohort_support_accepts_exact_floor_and_rejects_one_below(tmp_path: Path) -> None:
+    options = EnronSplitOptions(
+        preparation_run=tmp_path / "unused-preparation",
+        development_output_dir=tmp_path / "unused-development",
+        sealed_output_dir=tmp_path / "unused-sealed",
+        fixture_mode=False,
+    )
+    required = {
+        "identity:all_known": 100,
+        "identity:all_novel": 100,
+        "frequency:head": 100,
+        "frequency:tail": 100,
+        "natural:present": 100,
+        "structured:present": 100,
+    }
+    counts = {"train": {}, "validation": dict(required), "test": dict(required)}
+    enron_splitting._enforce_cohort_support(counts, options)  # noqa: SLF001
+
+    counts["test"]["frequency:tail"] = 99
+    with pytest.raises(EnronSplitError, match=r"(?i)(cohort|head|tail|100)"):
+        enron_splitting._enforce_cohort_support(counts, options)  # noqa: SLF001
 
 
 @pytest.mark.parametrize("nested_target", ["sealed_below_development", "development_below_preparation"])
