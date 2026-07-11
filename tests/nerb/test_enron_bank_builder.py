@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -152,6 +153,60 @@ def _rewrite_private_artifact(
     manifest_path.chmod(0o600)
 
 
+def _synthetic_cmu_quality() -> dict[str, Any]:
+    return {
+        "evaluated": True,
+        "contract_validation": {"valid": True},
+        "protocol_sha256": "sha256:" + "1" * 64,
+        "run_sha256": "sha256:" + "2" * 64,
+        "quality": {
+            "slices": [
+                {
+                    "id": "cmu_person_all_train",
+                    "label_strength": "independent",
+                    "annotation_completeness": "exhaustive_within_scope",
+                    "documents": 2,
+                    "documents_with_sensitive_gold": 1,
+                    "documents_with_any_miss": 1,
+                    "documents_with_cataloged_gold": 1,
+                    "documents_with_any_cataloged_miss": 0,
+                    "documents_with_any_leaked_character": 1,
+                    "gold_spans": 2,
+                    "predicted_spans": 1,
+                    "true_positive": 1,
+                    "false_negative": 1,
+                    "false_positive": 0,
+                    "cataloged_gold_spans": 1,
+                    "cataloged_true_positive": 1,
+                    "cataloged_false_negative": 0,
+                    "cataloged_wrong_canonical": 0,
+                    "sensitive_gold_characters": 10,
+                    "covered_sensitive_characters": 5,
+                    "leaked_sensitive_characters": 5,
+                    "predicted_characters": 5,
+                    "over_redacted_characters": 0,
+                    "evaluated_characters": 20,
+                    "negative_documents": 1,
+                    "negative_documents_with_predictions": 0,
+                    "metrics": {
+                        "precision": 1.0,
+                        "open_world_recall": 0.5,
+                        "f1": 2 / 3,
+                        "catalog_coverage": 0.5,
+                        "cataloged_recall": 1.0,
+                        "document_leak_rate": 1.0,
+                        "cataloged_document_leak_rate": 0.0,
+                        "sensitive_character_recall": 0.5,
+                        "sensitive_character_leak_rate": 0.5,
+                        "negative_document_false_alarm_rate": 0.0,
+                        "over_redaction_rate": 0.0,
+                    },
+                }
+            ]
+        },
+    }
+
+
 def test_private_builder_runs_three_iterations_and_verifies_without_sealed_access(tmp_path: Path) -> None:
     development, sealed = _development_bundle(tmp_path)
     output = tmp_path / "build"
@@ -233,6 +288,55 @@ def test_cmu_auxiliary_evaluates_an_exact_private_copy_of_reviewed_bindings(
     assert quality == {"evaluated": True, "contract_validation": {"valid": True}}
     assert observed["bank"] is bank
     assert observed["annotation_run"] == annotation_run
+
+
+def test_verifier_rejects_coherently_tampered_public_cmu_aggregate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    development, _sealed = _development_bundle(tmp_path)
+    reviewed = tmp_path / "reviewed-bindings.jsonl"
+    reviewed.write_text(
+        json.dumps({"document_id": "reviewed_document", "start": 0, "end": 1, "catalog_identity": None}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        bank_workflow,
+        "evaluate_cmu_enron_training_quality_files",
+        lambda *_args, **_kwargs: _synthetic_cmu_quality(),
+    )
+    output = tmp_path / "build"
+    build_enron_intelligence_bank(
+        EnronBankBuildOptions(
+            development_run=development,
+            output_dir=output,
+            annotation_run=tmp_path / "annotations",
+            cmu_catalog_bindings_path=reviewed,
+        )
+    )
+
+    card = json.loads((output / "bank-card.json").read_text(encoding="utf-8"))
+    auxiliary = card["independent_auxiliary"]
+    auxiliary["documents_with_any_miss"] = 0
+    auxiliary["metrics"]["document_leak_rate"] = 0.0
+    card["run_sha256"] = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
+    _validate_public_card(card)
+    _rewrite_private_artifact(
+        output,
+        artifact_id="bank_card",
+        relative_path="bank-card.json",
+        value=card,
+    )
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["bank_card_run_sha256"] = card["run_sha256"]
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    manifest_path.chmod(0o600)
+
+    with pytest.raises(EnronBankBuildError, match="Public auxiliary summary differs"):
+        verify_enron_bank_build(output)
 
 
 def test_private_builder_is_deterministic_for_same_frozen_development_bundle(tmp_path: Path) -> None:
@@ -447,6 +551,7 @@ def test_verifier_rejects_tampered_private_bank(tmp_path: Path) -> None:
     "payload",
     [
         b'{"overflow":1e999}\n',
+        b'{"oversized_integer":' + b"9" * 257 + b"}\n",
         b"[" * 10_000 + b"0" + b"]" * 10_000,
     ],
 )
@@ -457,6 +562,44 @@ def test_private_json_reader_normalizes_nonfinite_and_recursive_input(tmp_path: 
 
     with pytest.raises(EnronBankBuildError, match="invalid"):
         bank_workflow._read_private_json(path)
+
+
+def test_private_jsonl_reader_rejects_oversized_integer(tmp_path: Path) -> None:
+    path = tmp_path / "private.jsonl"
+    path.write_bytes(b'{"oversized_integer":' + b"9" * 257 + b"}\n")
+    path.chmod(0o600)
+
+    with pytest.raises(EnronBankBuildError, match="invalid"):
+        bank_workflow._read_private_jsonl(path)
+
+
+def test_private_sqlite_projection_reader_rejects_oversized_integer(tmp_path: Path) -> None:
+    development, _sealed = _development_bundle(tmp_path)
+    _pool, source_binding = _mine(tmp_path, development)
+    spool = tmp_path / "spool.sqlite3"
+    with sqlite3.connect(spool) as connection:
+        document_id, payload = connection.execute(
+            "SELECT document_id, payload FROM source_projections ORDER BY document_id LIMIT 1"
+        ).fetchone()
+        assert isinstance(payload, bytes)
+        changed = re.sub(
+            rb'("structured_entries":)[0-9]+',
+            lambda match: match.group(1) + b"9" * 257,
+            payload,
+            count=1,
+        )
+        assert changed != payload
+        connection.execute(
+            "UPDATE source_projections SET payload = ? WHERE document_id = ?",
+            (changed, document_id),
+        )
+
+    with pytest.raises(EnronBankBuildError, match="source projection payload is invalid"):
+        bank_workflow._replay_candidate_pool_snapshot(
+            spool,
+            train_artifact_sha256=source_binding["train_artifact_sha256"],
+            policy=EnronBankPolicy(),
+        )
 
 
 def test_verifier_rejects_oversized_descriptor_before_hashing(
@@ -572,6 +715,42 @@ def test_mining_replay_rejects_sparse_oversized_cells_before_private_cell_fetch(
     monkeypatch.setattr(bank_workflow, "_read_candidate_evidence", unexpected_private_fetch)
 
     with pytest.raises(EnronBankBuildError, match="cell exceeds"):
+        bank_workflow._replay_candidate_pool_snapshot(
+            spool,
+            train_artifact_sha256=source_binding["train_artifact_sha256"],
+            policy=EnronBankPolicy(),
+        )
+
+
+def test_mining_sqlite_length_limit_reports_legacy_api_unavailable() -> None:
+    legacy_connection: Any = object()
+
+    assert bank_workflow._set_mining_sqlite_length_limit(legacy_connection) is False
+
+
+def test_mining_replay_preflights_schema_text_without_connection_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _pool, source_binding = _mine(tmp_path, _development_bundle(tmp_path)[0])
+    spool = tmp_path / "spool.sqlite3"
+    with sqlite3.connect(spool) as connection:
+        schema_sql = connection.execute("SELECT sql FROM sqlite_schema WHERE name = 'source_projections'").fetchone()[0]
+        assert isinstance(schema_sql, str)
+        connection.execute("PRAGMA writable_schema=ON")
+        connection.execute(
+            "UPDATE sqlite_schema SET sql = ? WHERE name = 'source_projections'",
+            (schema_sql + " " * (bank_workflow._MAX_MINING_SQLITE_SCHEMA_CELL_BYTES + 1),),
+        )
+
+    monkeypatch.setattr(bank_workflow, "_set_mining_sqlite_length_limit", lambda _connection: False)
+
+    def unexpected_schema_fetch(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("schema preflight must reject before private schema text materialization")
+
+    monkeypatch.setattr(bank_workflow, "_iter_mining_sqlite_schema_rows", unexpected_schema_fetch)
+
+    with pytest.raises(EnronBankBuildError, match="schema cell exceeds"):
         bank_workflow._replay_candidate_pool_snapshot(
             spool,
             train_artifact_sha256=source_binding["train_artifact_sha256"],

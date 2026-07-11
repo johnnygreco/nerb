@@ -5528,7 +5528,7 @@ def _contains_unsafe_path_text(value: str, *, depth: int = 0) -> bool:
 
 
 def _contains_unsafe_local_path(value: str) -> bool:
-    value = normalize_unicode("NFKC", value).translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
+    value = normalize_unicode("NFKC", value).translate(_DEFAULT_IGNORABLE_TRANSLATION)
     if _EMBEDDED_POSIX_PATH_PATTERN.search(value):
         return True
     if _ATTACHED_OPTION_PATH_PATTERN.search(value):
@@ -5590,7 +5590,28 @@ _STRUCTURED_IDENTIFIER_TRANSLATION = str.maketrans(
         "\u2212": "-",
     }
 )
-_ZERO_WIDTH_SEPARATORS = "\u200b\u200c\u200d\u2060\ufeff"
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_DEFAULT_IGNORABLE_TRANSLATION = dict.fromkeys(
+    codepoint for start, end in _DEFAULT_IGNORABLE_RANGES for codepoint in range(start, end + 1)
+)
 
 
 def _partition_http_url_text(value: str) -> tuple[str, list[str]]:
@@ -5615,8 +5636,8 @@ def _partition_http_url_text(value: str) -> tuple[str, list[str]]:
 
 def _public_text_transform(value: str) -> str:
     compatible = normalize_unicode("NFKC", value)
-    without_zero_width = compatible.translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
-    return unquote(unescape_html(without_zero_width))
+    without_ignorables = compatible.translate(_DEFAULT_IGNORABLE_TRANSLATION)
+    return unquote(unescape_html(without_ignorables))
 
 
 def _normalize_public_text(value: str) -> tuple[str, bool]:
@@ -5633,8 +5654,8 @@ def _normalize_public_text(value: str) -> tuple[str, bool]:
 
 def _normalized_structured_identifier_text(value: str) -> str:
     compatible = normalize_unicode("NFKC", value)
-    without_zero_width = compatible.translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
-    translated = without_zero_width.translate(_STRUCTURED_IDENTIFIER_TRANSLATION)
+    without_ignorables = compatible.translate(_DEFAULT_IGNORABLE_TRANSLATION)
+    translated = without_ignorables.translate(_STRUCTURED_IDENTIFIER_TRANSLATION)
     normalized: list[str] = []
     for character in translated:
         try:

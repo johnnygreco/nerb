@@ -267,9 +267,9 @@
     "direct_identifiers_included": false,
     "private_paths_included": false,
     "scanner": "nerb.enron_bank_workflow.public_card_scan.v2",
-    "scanner_source_sha256": "sha256:e9d024ed4301eda5daf52a2c72e5813c8b3f73bdae49321430244ce21acdbc25",
+    "scanner_source_sha256": "sha256:5a4539b01a6cb4a42622db935c1fe78f9eac226e2a1aea3ac535ca5ecd5fdd61",
     "violation_count": 0,
-    "report_sha256": "sha256:3befea83e57400b6db3e44a67f07c514f934b7384493fc1722db672e48f2ede4"
+    "report_sha256": "sha256:7c822c84531c97650894534743f64af36e3bd564374f9666f7225a5de3b291b3"
   },
-  "run_sha256": "sha256:441f3a1b6d888e675947c4ae35c93fe4d5079dd50d1faad5153b0a060d9306fe"
+  "run_sha256": "sha256:97d8a93885d0592ec0d93b1d6bbde7c74099d689efc470ae312b4a614036cf5f"
 }

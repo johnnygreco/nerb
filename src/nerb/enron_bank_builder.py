@@ -124,7 +124,7 @@ class EnronBankPolicy:
             "validation_source": "validation_structured_headers_only_no_literal_promotion",
             "person_alias_policy": (
                 "recurring_match_distinct_observed_surface_unique_address_owner_exact_normalized_full_identity_"
-                "local_part_compatible_resolvable_contact_anchor_no_unobserved_aliases"
+                "non_initial_unambiguous_local_part_compatible_resolvable_contact_anchor_no_unobserved_aliases"
             ),
             "contact_policy": "recurring_valid_exact_address",
             "organization_policy": "recurring_exact_at_domain_surface",
@@ -871,11 +871,16 @@ def curate_enron_iteration(
             alias
             for alias in recurring
             if (identity_value := _person_identity_value(alias)) is not None
+            and not _person_identity_starts_with_initial(identity_value)
             and _name_matches_address(identity_value, address)
         ]
+        anchor_identity_values = {
+            identity_value for alias in anchors if (identity_value := _person_identity_value(alias)) is not None
+        }
+        ambiguous_address_local_part = len(anchor_identity_values) > 1
         compatible = (
             _compatible_person_aliases([anchors[0], *(alias for alias in recurring if alias is not anchors[0])])
-            if anchors
+            if len(anchor_identity_values) == 1
             else []
         )
         if len(compatible) < len(recurring):
@@ -919,6 +924,10 @@ def curate_enron_iteration(
                 draft_person_patterns += 1
                 if alias.leakage_group_count < policy.minimum_person_alias_groups:
                     reason = "insufficient_distinct_group_support"
+                elif _person_identity_starts_with_initial(identity_value):
+                    reason = "first_initial_identity"
+                elif ambiguous_address_local_part and _name_matches_address(identity_value, address):
+                    reason = "ambiguous_address_local_part"
                 elif alias not in compatible:
                     reason = (
                         "address_local_part_incompatible"
@@ -1582,6 +1591,11 @@ def _name_matches_address(normalized_name: str, address: str) -> bool:
             or compact.startswith(last + first[:1])
         )
     )
+
+
+def _person_identity_starts_with_initial(normalized_name: str) -> bool:
+    tokens = normalized_name.split()
+    return bool(tokens and len(tokens[0]) == 1)
 
 
 def _validate_policy(policy: EnronBankPolicy) -> None:

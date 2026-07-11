@@ -193,6 +193,69 @@ def test_same_initial_names_at_one_address_do_not_share_an_active_identity(tmp_p
     assert curated.collisions["by_reason"]["person_alias_incompatible_same_address"] == 1
 
 
+def test_recurring_first_initial_identity_remains_draft(tmp_path: Path) -> None:
+    rows = [
+        _display_name_record(1, name="J. Smith", address="j.smith@example.invalid"),
+        _display_name_record(2, name="J. Smith", address="j.smith@example.invalid"),
+    ]
+    spool = tmp_path / "first-initial.sqlite3"
+    spool.touch()
+    policy = EnronBankPolicy()
+    pool = mine_enron_candidates(
+        rows,
+        sqlite_path=spool,
+        train_artifact_sha256="sha256:" + "d" * 64,
+        policy=policy,
+    )
+    curated = curate_enron_iteration(
+        pool,
+        policy=policy,
+        iteration=ITERATION_POLICIES[1],
+        source_binding={"fixture_mode": True},
+    )
+
+    person = next(item for item in curated.candidates if item["candidate_type"] == "person_alias")
+    assert person["normalized_value"] == "j. smith"
+    assert (person["decision"], person["primary_reason_code"]) == ("draft", "first_initial_identity")
+    name = curated.bank["entities"]["person"]["names"][person["bank_ref"]["name_id"]]
+    assert name["status"] == "draft"
+
+
+def test_full_names_sharing_an_ambiguous_initial_address_remain_distinct_and_draft(tmp_path: Path) -> None:
+    rows = [
+        _display_name_record(1, name="Jane Smith", address="j.smith@example.invalid"),
+        _display_name_record(2, name="Jane Smith", address="j.smith@example.invalid"),
+        _display_name_record(3, name="John Smith", address="j.smith@example.invalid"),
+        _display_name_record(4, name="John Smith", address="j.smith@example.invalid"),
+    ]
+    spool = tmp_path / "ambiguous-initial-address.sqlite3"
+    spool.touch()
+    policy = EnronBankPolicy()
+    pool = mine_enron_candidates(
+        rows,
+        sqlite_path=spool,
+        train_artifact_sha256="sha256:" + "e" * 64,
+        policy=policy,
+    )
+    curated = curate_enron_iteration(
+        pool,
+        policy=policy,
+        iteration=ITERATION_POLICIES[1],
+        source_binding={"fixture_mode": True},
+    )
+
+    people = [item for item in curated.candidates if item["candidate_type"] == "person_alias"]
+    assert {item["normalized_value"] for item in people} == {"jane smith", "john smith"}
+    assert {(item["decision"], item["primary_reason_code"]) for item in people} == {
+        ("draft", "ambiguous_address_local_part")
+    }
+    name_ids = {item["bank_ref"]["name_id"] for item in people}
+    assert len(name_ids) == 2
+    person_names = curated.bank["entities"]["person"]["names"]
+    assert len({person_names[name_id]["metadata"]["identity_ref"] for name_id in name_ids}) == 2
+    assert len({person_names[name_id]["metadata"]["contact_ref"] for name_id in name_ids}) == 1
+
+
 def test_person_draft_capacity_is_enforced_per_alias_pattern(tmp_path: Path) -> None:
     rows = [
         _display_name_record(1, name="Robert Smith", address="rsmith@example.invalid"),

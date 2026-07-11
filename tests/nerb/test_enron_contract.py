@@ -4699,6 +4699,29 @@ def test_canonical_public_scanner_rejects_obfuscated_document_ids_and_compact_ph
     assert code in {item["code"] for item in diagnostics}
 
 
+@pytest.mark.parametrize("location", ["key", "value"])
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "do\u00adc_" + "a" * 64,
+        "do\U000e0001c_" + "b" * 64,
+        "71355\u180e50199",
+        "alice%4\u20620example.test",
+        "artifact(.\ufe0f./private.json)",
+    ],
+)
+def test_canonical_public_scanner_removes_default_ignorables_in_keys_and_values(
+    location: str,
+    unsafe: str,
+) -> None:
+    payload = {unsafe: "aggregate"} if location == "key" else {"safe": unsafe}
+
+    diagnostics = enron_contract._public_serialization_diagnostics(payload)
+
+    assert diagnostics
+    assert unsafe not in json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)
+
+
 @pytest.mark.parametrize(
     "unsafe_key",
     [

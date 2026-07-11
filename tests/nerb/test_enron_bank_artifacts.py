@@ -14,7 +14,7 @@ import nerb.enron_bank_builder as bank_builder
 import nerb.enron_bank_workflow as bank_workflow
 import nerb.enron_contract as enron_contract
 from nerb.bank import bank_stats, hash_bank
-from nerb.enron_bank_builder import EnronBankBuildError, _canonical_hash, _canonical_json_bytes
+from nerb.enron_bank_builder import EnronBankBuildError, EnronBankPolicy, _canonical_hash, _canonical_json_bytes
 from nerb.enron_bank_workflow import (
     _builder_implementation_sha256,
     _conformance_cases,
@@ -111,18 +111,20 @@ def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_boun
 
     _validate_public_card(card)
     assert hashlib.sha256(card_path.read_bytes()).hexdigest() == (
-        "2dbbee2c255b02dadd37d9525469075d6f725d4a1aa48a9e98b32d7bde9ea073"
+        "39ab2bbcd1a9e0cb07c426dfc59152747d2b6bfb817c4c6a90a1b238e22809d5"
     )
     assert hashlib.sha256(funnel_path.read_bytes()).hexdigest() == (
         "3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f"
     )
-    assert card["run_sha256"] == "sha256:57b32fb2a32a73470d89454bffd300ef092b6ba7b772e3c8a59ea0012b0e3ea3"
+    assert card["run_sha256"] == "sha256:b8ae85712406ff5f0a043b3abc14a9bde728c9f0c6d241ea957774c8a75704cb"
     assert card["bank"]["canonical_sha256"] == (
-        "sha256:58fc2453723e6ec6e5749ecc4da07a27eebc1923b8584adfc3728e226d8b591c"
+        "sha256:02753288b5073beb8605a35735012ff3fb9cc64fc14e7be882ef3196198b629f"
     )
     assert card["builder"]["candidate_ledger_sha256"] == (
-        "sha256:9bdbe4be768dac541597cdc621fd479f7f879e43478c2a88cd9617e7cfaa6914"
+        "sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448"
     )
+    assert card["builder"]["source_sha256"] == _builder_implementation_sha256()
+    assert card["builder"]["policy_sha256"] == EnronBankPolicy().sha256
     assert card["candidate_funnel"] == funnel
     assert sum(funnel["by_decision"].values()) == funnel["total_candidates"] == 15_171
     assert sum(item["total"] for item in funnel["by_type"].values()) == funnel["total_candidates"]

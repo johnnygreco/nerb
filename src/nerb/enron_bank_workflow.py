@@ -112,6 +112,8 @@ _MAX_PRIVATE_JSON_BYTES = 64 * 1024 * 1024
 _MAX_PRIVATE_JSONL_BYTES = 256 * 1024 * 1024
 _MAX_PRIVATE_SQLITE_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_PRIVATE_SQLITE_PROJECTION_BYTES = 16 * 1024 * 1024
+_MAX_MINING_SQLITE_SCHEMA_CELL_BYTES = 16 * 1024
+_MAX_PRIVATE_JSON_INTEGER_DIGITS = 256
 _MAX_MINING_DOCUMENT_ID_BYTES = 68
 _MAX_MINING_GROUP_ID_BYTES = 71
 _MAX_MINING_KIND_BYTES = 32
@@ -1577,46 +1579,7 @@ def _bank_card(
     ]
     if source_binding["fixture_mode"] is True:
         nonpromotable.append("fixture_development_split")
-    if cmu_quality is None:
-        auxiliary: dict[str, Any] = {
-            "evaluated": False,
-            "reason_code": "annotation_run_not_supplied",
-        }
-    else:
-        cmu_slice = _slice_by_id(cmu_quality, "cmu_person_all_train")
-        auxiliary = {
-            "evaluated": True,
-            "scope": "cmu_meetings_person_train_auxiliary_nonpromotable",
-            "label_strength": cmu_slice["label_strength"],
-            "annotation_completeness": cmu_slice["annotation_completeness"],
-            "documents": cmu_slice["documents"],
-            "documents_with_sensitive_gold": cmu_slice["documents_with_sensitive_gold"],
-            "documents_with_any_miss": cmu_slice["documents_with_any_miss"],
-            "documents_with_cataloged_gold": cmu_slice["documents_with_cataloged_gold"],
-            "documents_with_any_cataloged_miss": cmu_slice["documents_with_any_cataloged_miss"],
-            "documents_with_any_leaked_character": cmu_slice["documents_with_any_leaked_character"],
-            "gold_spans": cmu_slice["gold_spans"],
-            "predicted_spans": cmu_slice["predicted_spans"],
-            "true_positive": cmu_slice["true_positive"],
-            "false_negative": cmu_slice["false_negative"],
-            "false_positive": cmu_slice["false_positive"],
-            "cataloged_gold_spans": cmu_slice["cataloged_gold_spans"],
-            "cataloged_true_positive": cmu_slice["cataloged_true_positive"],
-            "cataloged_false_negative": cmu_slice["cataloged_false_negative"],
-            "cataloged_wrong_canonical": cmu_slice["cataloged_wrong_canonical"],
-            "sensitive_gold_characters": cmu_slice["sensitive_gold_characters"],
-            "covered_sensitive_characters": cmu_slice["covered_sensitive_characters"],
-            "leaked_sensitive_characters": cmu_slice["leaked_sensitive_characters"],
-            "predicted_characters": cmu_slice["predicted_characters"],
-            "over_redacted_characters": cmu_slice["over_redacted_characters"],
-            "evaluated_characters": cmu_slice["evaluated_characters"],
-            "negative_documents": cmu_slice["negative_documents"],
-            "negative_documents_with_predictions": cmu_slice["negative_documents_with_predictions"],
-            "metrics": cmu_slice["metrics"],
-            "protocol_sha256": cmu_quality["protocol_sha256"],
-            "run_sha256": cmu_quality["run_sha256"],
-            "nonpromotable": True,
-        }
+    auxiliary = _independent_auxiliary_summary(cmu_quality)
     card: dict[str, Any] = {
         "schema_version": BANK_CARD_SCHEMA_VERSION,
         "benchmark_version": options.benchmark_version,
@@ -1697,6 +1660,53 @@ def _bank_card(
     card["privacy"] = privacy_report
     card["run_sha256"] = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
     return card
+
+
+def _independent_auxiliary_summary(cmu_quality: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Project one private CMU quality run into its canonical public aggregate."""
+
+    if cmu_quality is None:
+        return {
+            "evaluated": False,
+            "reason_code": "annotation_run_not_supplied",
+        }
+    cmu_slice = _slice_by_id(cmu_quality, "cmu_person_all_train")
+    metrics = cmu_slice.get("metrics")
+    if not isinstance(metrics, Mapping):
+        raise EnronBankBuildError("Auxiliary CMU quality metrics are invalid.")
+    return {
+        "evaluated": True,
+        "scope": "cmu_meetings_person_train_auxiliary_nonpromotable",
+        "label_strength": cmu_slice["label_strength"],
+        "annotation_completeness": cmu_slice["annotation_completeness"],
+        "documents": cmu_slice["documents"],
+        "documents_with_sensitive_gold": cmu_slice["documents_with_sensitive_gold"],
+        "documents_with_any_miss": cmu_slice["documents_with_any_miss"],
+        "documents_with_cataloged_gold": cmu_slice["documents_with_cataloged_gold"],
+        "documents_with_any_cataloged_miss": cmu_slice["documents_with_any_cataloged_miss"],
+        "documents_with_any_leaked_character": cmu_slice["documents_with_any_leaked_character"],
+        "gold_spans": cmu_slice["gold_spans"],
+        "predicted_spans": cmu_slice["predicted_spans"],
+        "true_positive": cmu_slice["true_positive"],
+        "false_negative": cmu_slice["false_negative"],
+        "false_positive": cmu_slice["false_positive"],
+        "cataloged_gold_spans": cmu_slice["cataloged_gold_spans"],
+        "cataloged_true_positive": cmu_slice["cataloged_true_positive"],
+        "cataloged_false_negative": cmu_slice["cataloged_false_negative"],
+        "cataloged_wrong_canonical": cmu_slice["cataloged_wrong_canonical"],
+        "sensitive_gold_characters": cmu_slice["sensitive_gold_characters"],
+        "covered_sensitive_characters": cmu_slice["covered_sensitive_characters"],
+        "leaked_sensitive_characters": cmu_slice["leaked_sensitive_characters"],
+        "predicted_characters": cmu_slice["predicted_characters"],
+        "over_redacted_characters": cmu_slice["over_redacted_characters"],
+        "evaluated_characters": cmu_slice["evaluated_characters"],
+        "negative_documents": cmu_slice["negative_documents"],
+        "negative_documents_with_predictions": cmu_slice["negative_documents_with_predictions"],
+        "metrics": dict(metrics),
+        "protocol_sha256": cmu_quality["protocol_sha256"],
+        "run_sha256": cmu_quality["run_sha256"],
+        "nonpromotable": True,
+    }
 
 
 def _safe_slice_summary(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -2581,11 +2591,15 @@ def verify_enron_bank_build(
         raise EnronBankBuildError("Private promotion ledger differs from the replayed decision.")
 
     cmu_reverified = False
+    stored_cmu: Mapping[str, Any] | None = None
     if "cmu_quality" in artifacts:
-        stored_cmu = _read_private_json(
+        raw_stored_cmu = _read_private_json(
             root / "auxiliary/cmu-train-quality.json",
             expected_fingerprint=artifact_fingerprints["cmu_quality"],
         )
+        if not isinstance(raw_stored_cmu, Mapping):
+            raise EnronBankBuildError("Auxiliary CMU evidence is invalid.")
+        stored_cmu = raw_stored_cmu
         bindings = _read_private_jsonl(
             root / "auxiliary/cmu-train-catalog-bindings.jsonl",
             expected_fingerprint=artifact_fingerprints["cmu_catalog_bindings"],
@@ -2602,6 +2616,8 @@ def verify_enron_bank_build(
             if actual_cmu != stored_cmu:
                 raise EnronBankBuildError("Auxiliary CMU evidence changed during verification.")
             cmu_reverified = True
+    if card.get("independent_auxiliary") != _independent_auxiliary_summary(stored_cmu):
+        raise EnronBankBuildError("Public auxiliary summary differs from private CMU evidence.")
 
     replayed_selected = replayed_curated[1]
 
@@ -2766,6 +2782,7 @@ def _replay_candidate_pool_snapshot(
         _set_mining_sqlite_length_limit(connection)
         connection.execute("PRAGMA query_only=ON")
         connection.execute("PRAGMA trusted_schema=OFF")
+        _preflight_mining_sqlite_schema_cells(connection)
         _validate_mining_sqlite_schema(connection)
         _preflight_mining_sqlite_cells(connection, policy)
         quick_check = connection.execute("PRAGMA quick_check(1)").fetchall()
@@ -2790,6 +2807,7 @@ def _replay_candidate_pool_snapshot(
                     object_pairs_hook=_reject_duplicate_keys,
                     parse_constant=_reject_constant,
                     parse_float=_parse_finite_float,
+                    parse_int=_parse_bounded_private_int,
                 )
             except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
                 raise EnronBankBuildError("Private mining source projection payload is invalid.") from None
@@ -3016,7 +3034,7 @@ def _preflight_mining_sqlite_cells(connection: sqlite3.Connection, policy: Enron
         raise EnronBankBuildError("Private mining spool cell exceeds its closed type or resource limit.")
 
 
-def _set_mining_sqlite_length_limit(connection: sqlite3.Connection) -> None:
+def _set_mining_sqlite_length_limit(connection: sqlite3.Connection) -> bool:
     setlimit = getattr(connection, "setlimit", None)
     limit_category = getattr(sqlite3, "SQLITE_LIMIT_LENGTH", None)
     if callable(setlimit) and isinstance(limit_category, int):
@@ -3024,6 +3042,8 @@ def _set_mining_sqlite_length_limit(connection: sqlite3.Connection) -> None:
             limit_category,
             _MAX_PRIVATE_SQLITE_PROJECTION_BYTES + _MINING_SQLITE_LENGTH_LIMIT_HEADROOM,
         )
+        return True
+    return False
 
 
 def _iter_mining_source_projections(connection: sqlite3.Connection) -> Iterator[tuple[Any, Any]]:
@@ -3031,10 +3051,37 @@ def _iter_mining_source_projections(connection: sqlite3.Connection) -> Iterator[
     yield from rows
 
 
-def _validate_mining_sqlite_schema(connection: sqlite3.Connection) -> None:
-    rows = connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").fetchmany(
+def _preflight_mining_sqlite_schema_cells(connection: sqlite3.Connection) -> None:
+    """Bound schema text through scalar SQL before Python receives private schema cells."""
+
+    violation = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_schema
+        WHERE typeof(type) != 'text'
+           OR length(CAST(type AS BLOB)) > ?
+           OR typeof(name) != 'text'
+           OR length(CAST(name AS BLOB)) > ?
+           OR typeof(tbl_name) != 'text'
+           OR length(CAST(tbl_name AS BLOB)) > ?
+           OR typeof(sql) != 'text'
+           OR length(CAST(sql AS BLOB)) > ?
+        LIMIT 1
+        """,
+        (_MAX_MINING_KIND_BYTES,) * 3 + (_MAX_MINING_SQLITE_SCHEMA_CELL_BYTES,),
+    ).fetchone()
+    if violation is not None:
+        raise EnronBankBuildError("Private mining spool schema cell exceeds its closed type or resource limit.")
+
+
+def _iter_mining_sqlite_schema_rows(connection: sqlite3.Connection) -> list[tuple[Any, ...]]:
+    return connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").fetchmany(
         len(_MINING_SQLITE_SCHEMA) + 1
     )
+
+
+def _validate_mining_sqlite_schema(connection: sqlite3.Connection) -> None:
+    rows = _iter_mining_sqlite_schema_rows(connection)
     if len(rows) != len(_MINING_SQLITE_SCHEMA):
         raise EnronBankBuildError("Private mining spool schema inventory is invalid.")
     expected_sql = {name: " ".join(statement.split()) for name, statement in _MINING_SQLITE_SCHEMA.items()}
@@ -3684,6 +3731,7 @@ def _read_private_json(
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_constant,
             parse_float=_parse_finite_float,
+            parse_int=_parse_bounded_private_int,
         )
     except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
         raise EnronBankBuildError("Private JSON artifact is invalid.") from None
@@ -3758,6 +3806,7 @@ def _read_private_jsonl(
                         object_pairs_hook=_reject_duplicate_keys,
                         parse_constant=_reject_constant,
                         parse_float=_parse_finite_float,
+                        parse_int=_parse_bounded_private_int,
                     )
                 except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
                     raise EnronBankBuildError("Private JSONL artifact is invalid.") from None
@@ -3831,6 +3880,16 @@ def _parse_finite_float(value: str) -> float:
     if not math.isfinite(parsed):
         raise ValueError("nonfinite value")
     return parsed
+
+
+def _parse_bounded_private_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > _MAX_PRIVATE_JSON_INTEGER_DIGITS:
+        raise ValueError("integer digit limit")
+    try:
+        return int(value)
+    except (OverflowError, ValueError):
+        raise ValueError("invalid integer") from None
 
 
 def _pretty_json_bytes(value: Mapping[str, Any]) -> bytes:

@@ -68,7 +68,7 @@ The initial taxonomy is deliberately narrow:
 | Class | Train evidence and selected-bank treatment |
 | --- | --- |
 | Contact | Valid structured-header addresses recur in at least two distinct train leakage groups before activation. The selected policy also activates one bounded, low-precedence unknown-email fallback. |
-| Person | Full names come from structured display names or a sender-local-part name that is also observed near the end of that sender's current body. Support is counted separately for each matcher-equivalent case/whitespace surface, so reordered or punctuated forms do not pool recurrence. Independently recurring matcher-distinct surfaces may share one address identity only when they normalize to the exact same full name; for example, `First Last` and `Last, First` can qualify separately. Nicknames, initials, and same-initial/same-last-name variants remain draft even when they recur. An active alias also needs one unambiguous recurring contact-address anchor retained as active or draft and local-part compatibility. The contact literal may remain draft only because of the compile-safe active cap. First-name-only aliases are prohibited. |
+| Person | Full names come from structured display names or a sender-local-part name that is also observed near the end of that sender's current body. Support is counted separately for each matcher-equivalent case/whitespace surface, so reordered or punctuated forms do not pool recurrence. Independently recurring matcher-distinct surfaces may share one address identity only when they normalize to the exact same full name; for example, `First Last` and `Last, First` can qualify separately. Nickname-like and same-initial/same-last-name variants remain separate identities rather than being merged. A first-initial identity remains draft, as do all otherwise eligible full identities when an initial-plus-surname address is compatible with more than one of them. An active alias also needs one unambiguous recurring contact-address anchor retained as active or draft and local-part compatibility. The contact literal may remain draft only because of the compile-safe active cap. First-name-only aliases are prohibited. |
 | Organization domain | Observed domains are retained as draft because the current literal boundary model cannot express the intended exact domain span without unsafe expansion. |
 | Phone number | The bounded US phone fallback is an experiment only. It remains draft in the selected bank because independent negative and over-redaction evidence is unavailable. |
 
@@ -272,19 +272,21 @@ cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.7
 over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
 hidden by the catalog guarantee.
 
-On an Apple M4 with 16 GiB RAM, the CMU-enabled build took 132.25 seconds and 1,157,824,512 bytes peak RSS. Deep replay
-took 118.84 seconds and 1,249,099,776 bytes peak RSS. These are one-time construction/audit costs, not steady-state scan
+On an Apple M4 with 16 GiB RAM, the CMU-enabled build took 130.98 seconds and 1,177,747,456 bytes peak RSS. Deep replay
+took 118.94 seconds and 1,247,543,296 bytes peak RSS. These are one-time construction/audit costs, not steady-state scan
 latency claims; #152 owns runtime benchmarks.
 
 Key commitments are:
 
-- selected bank: `sha256:58fc2453723e6ec6e5749ecc4da07a27eebc1923b8584adfc3728e226d8b591c`;
-- candidate ledger: `sha256:9bdbe4be768dac541597cdc621fd479f7f879e43478c2a88cd9617e7cfaa6914`;
-- builder implementation: `sha256:e06b71fbfede07ead65ca7308dcdaba5cb3e2978d958aeab4c6f6eb03c6a9b22`;
+- selected bank: `sha256:02753288b5073beb8605a35735012ff3fb9cc64fc14e7be882ef3196198b629f`;
+- bank artifact: `sha256:405405a0ae3938eed66b946706d96525f914b565edde0222c9d8201eb27d2b94`;
+- candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
+- builder implementation: `sha256:e882d414b21dca3ab8efbafe727807c584efe5dcf96fa4a64f6f063a7289ee05`;
+- privacy scanner implementation: `sha256:5a4539b01a6cb4a42622db935c1fe78f9eac226e2a1aea3ac535ca5ecd5fdd61`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
-- canonical CMU catalog binding: `sha256:87c2c2f843f03006498d1a7d3b6823e1250aa4e72f31a6451e44239d89107217`;
-- bank-card run: `sha256:57b32fb2a32a73470d89454bffd300ef092b6ba7b772e3c8a59ea0012b0e3ea3`;
-- committed bank-card file: `sha256:2dbbee2c255b02dadd37d9525469075d6f725d4a1aa48a9e98b32d7bde9ea073`; and
+- canonical CMU catalog binding: `sha256:de86057ba5e45df43f0da7abcbd71ebb823fd8caa4f84bda558c07c72b3cb43a`;
+- bank-card run: `sha256:b8ae85712406ff5f0a043b3abc14a9bde728c9f0c6d241ea957774c8a75704cb`;
+- committed bank-card file: `sha256:39ab2bbcd1a9e0cb07c426dfc59152747d2b6bfb817c4c6a90a1b238e22809d5`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
 The exact private commands were:
@@ -292,13 +294,13 @@ The exact private commands were:
 ```shell
 /usr/bin/time -l uv run nerb build-enron-bank \
   --development-run .nerb/issue149-development-50000-v6 \
-  --output-dir .nerb/issue151-real-50000-v4-final \
+  --output-dir .nerb/issue151-real-50000-v5-final \
   --annotation-run .nerb/issue150-cmu/annotations-run-final4 \
   --cmu-catalog-bindings .nerb/issue151-cmu-v4-proposal.jsonl \
   --benchmark-version enron-v2-issue149-scale-50000
 
 /usr/bin/time -l uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/issue151-real-50000-v4-final \
+  --run-dir .nerb/issue151-real-50000-v5-final \
   --annotation-run .nerb/issue150-cmu/annotations-run-final4
 ```
 
