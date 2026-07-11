@@ -168,3 +168,6 @@ Run `verify-enron-splits` before freezing the bank, evaluator, thresholds, claim
 frozen target has been bound and access is claimed, treat every result as final-test evidence rather than development
 feedback. See the [Enron v2 charter](enron-benchmark.md#sealed-train-validation-and-test-policy) for the quality and
 promotion rules that apply after splitting.
+
+Before any release freeze, a builder may pass only the development bundle to the
+[train-only bank construction workflow](enron-bank-building.md). That command has no sealed-test path or role selector.

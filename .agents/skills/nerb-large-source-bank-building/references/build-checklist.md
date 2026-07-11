@@ -58,27 +58,24 @@ uv run nerb benchmark-bank --bank path/to/bank.json --benchmark-iterations 3
 uv run nerb regress-bank --old-bank baseline.json --new-bank candidate.json --benchmark-iterations 3
 ```
 
-The following command is a **retired v1 fixture diagnostic**, retained only while the v2 pipeline is staged. It injects
-answer-bearing address inventory text, has no validation split, and must not support a current benchmark or promotion
-claim:
+For the implemented Enron v2 train-only workflow, build from a committed private development bundle and deep-verify the
+transactional output:
 
 ```shell
-uv run python scripts/enron_bank_build_benchmark.py \
-  --input-jsonl tests/data/enron_sample.jsonl \
-  --output-dir .nerb/enron-benchmark/fixture \
-  --sample-fraction 1.0 \
-  --test-fraction 0.35 \
-  --seed fixture-seed \
-  --created-at 2026-06-09T00:00:00Z \
-  --min-address-count 1 \
-  --min-domain-count 1 \
-  --benchmark-documents 5 \
-  --benchmark-iterations 1
+uv run nerb build-enron-bank \
+  --development-run .nerb/enron-splits/enron-v2-development \
+  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --benchmark-version enron-v2
+
+uv run nerb verify-enron-bank-build \
+  --run-dir .nerb/enron-bank-builds/enron-v2
 ```
 
-Do not run a real-corpus v1 command for current goal work. `docs/enron-benchmark.md` now defines a v2 contract whose
-executable preparation, split, and evaluator surfaces land in later implementation issues. Never tune a builder or
-autoresearch loop on final-test quality.
+The builder has no sealed-test option. It mines train only, uses validation for three frozen policy iterations, and emits
+private artifacts plus an aggregate non-promotable card. Structured-weak labeled-span recall is not open-world recall;
+precision, false-alarm, and over-redaction metrics remain unsupported without independent exhaustive annotations. Never
+tune a builder or autoresearch loop on final-test quality. The retired v1 script remains historical-only and must not
+support a current claim.
 
 ## Handoff Summary
 

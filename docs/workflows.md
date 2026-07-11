@@ -76,6 +76,6 @@ For large corpora, treat bank construction as an evidence pipeline:
 - keep handoff artifacts reproducible and privacy-safe.
 
 The [Enron Benchmark](enron-benchmark.md), [private preparation workflow](enron-preparation.md),
-[Autoresearch](autoresearch.md), and
+[train-only bank construction guide](enron-bank-building.md), [Autoresearch](autoresearch.md), and
 [large-source bank skill](https://github.com/johnnygreco/nerb/tree/main/.agents/skills/nerb-large-source-bank-building)
 document that deeper workflow.

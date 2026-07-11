@@ -5528,7 +5528,7 @@ def _contains_unsafe_path_text(value: str, *, depth: int = 0) -> bool:
 
 
 def _contains_unsafe_local_path(value: str) -> bool:
-    value = normalize_unicode("NFKC", value).translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
+    value = normalize_unicode("NFKC", value).translate(_DEFAULT_IGNORABLE_TRANSLATION)
     if _EMBEDDED_POSIX_PATH_PATTERN.search(value):
         return True
     if _ATTACHED_OPTION_PATH_PATTERN.search(value):
@@ -5557,8 +5557,13 @@ _STRUCTURED_PHONE_PATTERN = re.compile(
     r"\([0-9]{3}\)[ .+-]*[0-9]{3}[ .+-]*[0-9]{4}"
     r"|[0-9]{3}[ .+-]+[0-9]{3}[ .+-]+[0-9]{4})(?![0-9])"
 )
+_COMPACT_US_PHONE_PATTERN = re.compile(r"(?<![^\W_])(?:1[0-9]{10}|[0-9]{10})(?![^\W_])")
 _E164_PHONE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9]{8,15}(?![0-9])")
 _INTERNATIONAL_PHONE_CANDIDATE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9() .+-]+")
+_DOCUMENT_IDENTIFIER_PATTERN = re.compile(
+    r"(?<![^\W_])doc_[0-9a-f]{64}(?![^\W_])",
+    re.IGNORECASE,
+)
 _HTTP_URL_PATTERN = re.compile(
     r"(?i)https?://(?:\[[0-9a-f:.]+\]|[^/\s\"'<>,;\[\]{}]+)(?::[0-9]+)?"
     r"(?:(?:/|[?#])[^\s\"'<>,;\]}]*)?"
@@ -5585,7 +5590,28 @@ _STRUCTURED_IDENTIFIER_TRANSLATION = str.maketrans(
         "\u2212": "-",
     }
 )
-_ZERO_WIDTH_SEPARATORS = "\u200b\u200c\u200d\u2060\ufeff"
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_DEFAULT_IGNORABLE_TRANSLATION = dict.fromkeys(
+    codepoint for start, end in _DEFAULT_IGNORABLE_RANGES for codepoint in range(start, end + 1)
+)
 
 
 def _partition_http_url_text(value: str) -> tuple[str, list[str]]:
@@ -5610,8 +5636,8 @@ def _partition_http_url_text(value: str) -> tuple[str, list[str]]:
 
 def _public_text_transform(value: str) -> str:
     compatible = normalize_unicode("NFKC", value)
-    without_zero_width = compatible.translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
-    return unquote(unescape_html(without_zero_width))
+    without_ignorables = compatible.translate(_DEFAULT_IGNORABLE_TRANSLATION)
+    return unquote(unescape_html(without_ignorables))
 
 
 def _normalize_public_text(value: str) -> tuple[str, bool]:
@@ -5628,8 +5654,8 @@ def _normalize_public_text(value: str) -> tuple[str, bool]:
 
 def _normalized_structured_identifier_text(value: str) -> str:
     compatible = normalize_unicode("NFKC", value)
-    without_zero_width = compatible.translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
-    translated = without_zero_width.translate(_STRUCTURED_IDENTIFIER_TRANSLATION)
+    without_ignorables = compatible.translate(_DEFAULT_IGNORABLE_TRANSLATION)
+    translated = without_ignorables.translate(_STRUCTURED_IDENTIFIER_TRANSLATION)
     normalized: list[str] = []
     for character in translated:
         try:
@@ -5648,7 +5674,7 @@ def _contains_international_phone(value: str) -> bool:
 
 def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
-    for path, text in _iter_strings(value):
+    for path, text in _iter_public_serialization_strings(value):
         normalized_text, converged = _normalize_public_text(text)
         if not converged:
             diagnostics.append(
@@ -5663,12 +5689,12 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
             continue
         _, url_payloads = _partition_http_url_text(normalized_text)
         identifier_texts = [_normalized_structured_identifier_text(item) for item in (normalized_text, *url_payloads)]
-        if any("@" in item for item in identifier_texts):
+        if any("@" in item or _DOCUMENT_IDENTIFIER_PATTERN.search(item) for item in identifier_texts):
             diagnostics.append(
                 _error(
                     "contract.public_direct_identifier",
                     path,
-                    "Public contract serialization contains an at-sign-shaped direct identifier.",
+                    "Public contract serialization contains a direct identifier shape.",
                 )
             )
             if len(diagnostics) > MAX_DIAGNOSTICS:
@@ -5676,6 +5702,7 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
         if any(
             _STRUCTURED_SSN_PATTERN.search(item)
             or _STRUCTURED_PHONE_PATTERN.search(item)
+            or _COMPACT_US_PHONE_PATTERN.search(item)
             or _E164_PHONE_PATTERN.search(item)
             or _contains_international_phone(item)
             for item in identifier_texts
@@ -5701,6 +5728,36 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
             if len(diagnostics) > MAX_DIAGNOSTICS:
                 return diagnostics
     return diagnostics
+
+
+def _iter_public_serialization_strings(value: Any) -> Iterable[tuple[str, str]]:
+    """Yield values with their JSON pointers and mapping keys with privacy-safe synthetic pointers."""
+
+    yield from _iter_strings(value)
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    containers: set[int] = set()
+    key_index = 0
+    while stack:
+        item, depth = stack.pop()
+        if depth > MAX_CONTRACT_DEPTH:
+            raise RecursionError
+        if type(item) is dict:
+            if id(item) in containers:
+                raise RecursionError
+            containers.add(id(item))
+            children = []
+            for key in sorted(item):
+                if type(key) is not str:
+                    raise TypeError
+                yield f"/@mapping-key/{key_index}", key
+                key_index += 1
+                children.append((item[key], depth + 1))
+            stack.extend(reversed(children))
+        elif type(item) is list:
+            if id(item) in containers:
+                raise RecursionError
+            containers.add(id(item))
+            stack.extend((child, depth + 1) for child in reversed(item))
 
 
 def _placeholder_hash_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:

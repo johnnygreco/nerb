@@ -1,0 +1,48 @@
+{
+  "schema_version": "nerb.enron_candidate_funnel.v2",
+  "total_candidates": 5,
+  "by_decision": {
+    "active": 3,
+    "draft": 2,
+    "rejected": 0
+  },
+  "by_type": {
+    "contact": {
+      "total": 1,
+      "active": 1,
+      "draft": 0,
+      "rejected": 0
+    },
+    "contact_fallback": {
+      "total": 1,
+      "active": 1,
+      "draft": 0,
+      "rejected": 0
+    },
+    "organization_domain": {
+      "total": 1,
+      "active": 0,
+      "draft": 1,
+      "rejected": 0
+    },
+    "person_alias": {
+      "total": 1,
+      "active": 1,
+      "draft": 0,
+      "rejected": 0
+    },
+    "phone_fallback": {
+      "total": 1,
+      "active": 0,
+      "draft": 1,
+      "rejected": 0
+    }
+  },
+  "by_primary_reason": {
+    "bounded_structured_email_fallback": 1,
+    "exact_domain_boundary_not_expressible": 1,
+    "independent_phone_negative_evidence_unavailable": 1,
+    "recurring_unique_full_name_alias": 1,
+    "recurring_valid_contact": 1
+  }
+}

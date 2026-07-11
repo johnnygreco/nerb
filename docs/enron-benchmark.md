@@ -1,9 +1,11 @@
 # Enron Benchmark v2 Charter
 
-> **Status: contract, private preparation, immutable splitting, independent quality execution, and catalog conformance implemented.**
+> **Status: contract, private preparation, immutable splitting, train-only bank construction, independent quality
+> execution, and catalog conformance implemented.**
 > The v2 manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
 > [group-aware split and sealing workflow](enron-splits.md), and [privacy evaluation workflow](enron-evaluation.md) are
-> implemented. Bank construction and frozen real-corpus evidence will land in later work.
+> implemented alongside the [train-only bank workflow](enron-bank-building.md). Development bank cards remain
+> non-promotable until frozen real-corpus, one-shot sealed-test, privacy, performance, and lineage evidence is complete.
 > The existing `scripts/enron_bank_build_benchmark.py`, its `nerb.enron_benchmark.v1` output, the v1 autoresearch
 > harness, committed hero measurements, and previously published Enron numbers are historical. They do **not** satisfy
 > this charter and must not support a public quality, privacy, performance, or product claim.
@@ -26,8 +28,8 @@ The v2 demonstration models the following production workflow:
 2. Private preparation profiles and cleans the source and assigns stable document identities and grouping features; the
    immutable [split workflow](enron-splits.md) builds leakage components and freezes train, validation, and sealed-test
    bundles.
-3. An agent uses **train only** to mine candidates. A reviewer promotes well-supported aliases and generic structured-PII
-   patterns; ambiguous candidates stay draft or inactive.
+3. An agent uses **train only** to mine candidates. The implemented [bank workflow](enron-bank-building.md) promotes
+   well-supported aliases and a bounded email fallback; ambiguous candidates stay draft or rejected.
 4. Synthetic conformance cases validate every approved active pattern, including its case, normalization, boundary,
    overlap, and canonical-identity semantics.
 5. Validation evidence tunes construction rules and explicit privacy/utility thresholds. Validation text may inform the
@@ -447,5 +449,6 @@ stale runtime identities.
 | Public artifacts containing aggregate v1 numbers | Explicit historical label; no promotion until verified v2 evidence exists |
 
 Do not rerun the v1 command and relabel its output v2. Do not use its historical benchmark JSON, generated images, or
-autoresearch rows to claim current Enron quality or performance. Later v2 implementation must produce new artifacts under
-the contracts above.
+autoresearch rows to claim current Enron quality or performance. The v2 bank builder produces new private artifacts and
+an aggregate non-promotable card under the contracts above; only the later frozen release workflow may produce a public
+benchmark claim.

@@ -4670,6 +4670,91 @@ def test_http_url_exemption_does_not_hide_encoded_identifiers(manifest: JsonObje
 
 
 @pytest.mark.parametrize(
+    ("value", "code"),
+    [
+        ("doc_" + "a" * 64, "contract.public_direct_identifier"),
+        ("ｄｏｃ＿" + "ａ" * 64, "contract.public_direct_identifier"),
+        ("do\u200bc_" + "a" * 64, "contract.public_direct_identifier"),
+        ("doc%255F" + "a" * 64, "contract.public_direct_identifier"),
+        (
+            "https://example.test/archive/doc%255F" + "a" * 64,
+            "contract.public_direct_identifier",
+        ),
+        ("7135550199", "contract.public_structured_identifier"),
+        ("17135550199", "contract.public_structured_identifier"),
+        ("７１３５５５０１９９", "contract.public_structured_identifier"),
+        ("71355\u200b50199", "contract.public_structured_identifier"),
+        (
+            "https://example.test/run?callback=7135550199",
+            "contract.public_structured_identifier",
+        ),
+    ],
+)
+def test_canonical_public_scanner_rejects_obfuscated_document_ids_and_compact_phones(
+    value: str,
+    code: str,
+) -> None:
+    diagnostics = enron_contract._public_serialization_diagnostics({"safe": value})
+
+    assert code in {item["code"] for item in diagnostics}
+
+
+@pytest.mark.parametrize("location", ["key", "value"])
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        "do\u00adc_" + "a" * 64,
+        "do\U000e0001c_" + "b" * 64,
+        "71355\u180e50199",
+        "alice%4\u20620example.test",
+        "artifact(.\ufe0f./private.json)",
+    ],
+)
+def test_canonical_public_scanner_removes_default_ignorables_in_keys_and_values(
+    location: str,
+    unsafe: str,
+) -> None:
+    payload = {unsafe: "aggregate"} if location == "key" else {"safe": unsafe}
+
+    diagnostics = enron_contract._public_serialization_diagnostics(payload)
+
+    assert diagnostics
+    assert unsafe not in json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    "unsafe_key",
+    [
+        "doc_" + "b" * 64,
+        "do\u200bc_" + "b" * 64,
+        "7135550199",
+        "７１３５５５０１９９",
+    ],
+)
+def test_canonical_public_scanner_inspects_mapping_keys(unsafe_key: str) -> None:
+    diagnostics = enron_contract._public_serialization_diagnostics({unsafe_key: "aggregate"})
+
+    assert diagnostics
+    assert unsafe_key not in json.dumps(diagnostics, ensure_ascii=False, sort_keys=True)
+
+
+@pytest.mark.parametrize(
+    "safe",
+    [
+        "sha256:" + "1" * 64,
+        "1" * 64,
+        "a7135550199b",
+        "17135550199suffix",
+        "prefix7135550199",
+    ],
+)
+def test_compact_phone_scanner_uses_alphanumeric_boundaries_without_matching_hashes(safe: str) -> None:
+    diagnostics = enron_contract._public_serialization_diagnostics({"safe": safe})
+
+    assert "contract.public_structured_identifier" not in {item["code"] for item in diagnostics}
+
+
+@pytest.mark.parametrize(
     "safe_url",
     [
         "https://example.test/a(b)/c?view=public#summary",

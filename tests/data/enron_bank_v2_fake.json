@@ -1,0 +1,268 @@
+{
+  "schema_version": "nerb.bank.v1",
+  "id": "enron_intelligence_v2_fixture",
+  "name": "Synthetic Enron Intelligence Bank",
+  "description": "Structurally representative fictitious bank for the Enron v2 construction workflow.",
+  "version": "2026.07.10",
+  "status": "active",
+  "created_at": "2026-07-10T00:00:00Z",
+  "updated_at": "2026-07-10T00:00:00Z",
+  "unicode_normalization": "none",
+  "default_regex_flags": [],
+  "entities": {
+    "contact": {
+      "description": "Known contact addresses and a bounded unknown-email fallback.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "fixture_contact": {
+          "canonical": "fixture.persona@example.invalid",
+          "description": "Fictitious recurring contact.",
+          "status": "active",
+          "patterns": {
+            "exact_email": {
+              "kind": "literal",
+              "value": "fixture.persona@example.invalid",
+              "description": "Fictitious observed contact address.",
+              "status": "active",
+              "priority": 0,
+              "case_sensitive": false,
+              "normalize_whitespace": false,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "source_type": "structured_header",
+                "split": "train",
+                "observation_count": 4,
+                "distinct_document_count": 4,
+                "distinct_leakage_group_count": 2,
+                "first_seen": "2001-01-01T00:00:00Z",
+                "last_seen": "2001-01-04T00:00:00Z",
+                "unknown_date_documents": 0,
+                "confidence": "medium",
+                "review_status": "active",
+                "curation_reason_code": "recurring_valid_contact",
+                "privacy_class": "email_address",
+                "label_strength": "structured_weak",
+                "evidence_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+                "provenance_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+                "builder_policy_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+                "ambiguity": {"status": "clear", "reason_codes": []},
+                "contact_scope": "external"
+              }
+            }
+          },
+          "metadata": {
+            "source_type": "structured_header",
+            "split": "train",
+            "observation_count": 4,
+            "distinct_document_count": 4,
+            "distinct_leakage_group_count": 2,
+            "first_seen": "2001-01-01T00:00:00Z",
+            "last_seen": "2001-01-04T00:00:00Z",
+            "confidence": "medium",
+            "review_status": "active",
+            "curation_reason_code": "recurring_valid_contact",
+            "privacy_class": "email_address",
+            "provenance_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+            "ambiguity": {"status": "clear", "reason_codes": []}
+          }
+        },
+        "unknown_email_contact": {
+          "canonical": "Unknown email contact",
+          "description": "Fictitious generic structured-email fallback.",
+          "status": "active",
+          "patterns": {
+            "structured_email": {
+              "kind": "regex",
+              "value": "(?i)\\b[a-z0-9_][a-z0-9.!#$%&'*+/=?^_`{|}~-]*@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\\b",
+              "description": "Bounded unknown-email fallback.",
+              "status": "active",
+              "priority": 24999,
+              "regex_flags": [],
+              "metadata": {
+                "source_type": "generic_structured_fallback",
+                "split": "train",
+                "observation_count": 0,
+                "distinct_document_count": 0,
+                "distinct_leakage_group_count": 0,
+                "first_seen": null,
+                "last_seen": null,
+                "unknown_date_documents": 0,
+                "confidence": "medium",
+                "review_status": "active",
+                "curation_reason_code": "bounded_structured_email_fallback",
+                "privacy_class": "email_address",
+                "label_strength": "synthetic_conformance",
+                "evidence_scope": "synthetic_adversarial_and_structured_weak",
+                "ambiguity": {"status": "bounded_format", "reason_codes": []}
+              }
+            }
+          },
+          "metadata": {
+            "review_status": "active",
+            "privacy_class": "email_address",
+            "curation_reason_code": "bounded_structured_email_fallback"
+          }
+        }
+      },
+      "metadata": {
+        "charter_role": "structured_contact_discovery_and_canonical_address_identity",
+        "label_source": "train_structured_headers"
+      }
+    },
+    "person": {
+      "description": "Address-anchored people with recurring collision-free full-name aliases.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "fixture_person": {
+          "canonical": "Fixture Persona",
+          "description": "Fictitious address-anchored identity.",
+          "status": "active",
+          "patterns": {
+            "full_name": {
+              "kind": "literal",
+              "value": "Fixture Persona",
+              "description": "Fictitious recurring full-name alias.",
+              "status": "active",
+              "priority": 20000,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {
+                "source_type": "sender_body_local_link",
+                "split": "train",
+                "observation_count": 2,
+                "distinct_document_count": 2,
+                "distinct_leakage_group_count": 2,
+                "first_seen": "2001-01-01T00:00:00Z",
+                "last_seen": "2001-01-02T00:00:00Z",
+                "unknown_date_documents": 0,
+                "confidence": "medium",
+                "review_status": "active",
+                "curation_reason_code": "recurring_unique_full_name_alias",
+                "privacy_class": "person_name",
+                "label_strength": "structured_weak",
+                "identity_ref": "identity_fixture",
+                "contact_ref": "contact_fixture",
+                "evidence_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000004",
+                "provenance_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000005",
+                "builder_policy_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+                "ambiguity": {"status": "clear", "reason_codes": []}
+              }
+            }
+          },
+          "metadata": {
+            "source_type": "sender_body_local_link",
+            "split": "train",
+            "observation_count": 2,
+            "distinct_document_count": 2,
+            "distinct_leakage_group_count": 2,
+            "first_seen": "2001-01-01T00:00:00Z",
+            "last_seen": "2001-01-02T00:00:00Z",
+            "confidence": "medium",
+            "review_status": "active",
+            "curation_reason_code": "recurring_unique_identity",
+            "privacy_class": "person_name",
+            "identity_ref": "identity_fixture",
+            "contact_ref": "contact_fixture",
+            "provenance_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000005",
+            "ambiguity": {"status": "clear", "reason_codes": []}
+          }
+        }
+      },
+      "metadata": {
+        "charter_role": "canonical_person_identity_and_observed_full_name_aliases",
+        "first_name_aliases": "prohibited"
+      }
+    },
+    "organization_domain": {
+      "description": "Fictitious domain candidates awaiting exact-boundary support.",
+      "status": "draft",
+      "regex_flags": [],
+      "names": {
+        "fixture_domain": {
+          "canonical": "example.invalid",
+          "description": "Fictitious draft organization domain.",
+          "status": "draft",
+          "patterns": {
+            "at_domain": {
+              "kind": "literal",
+              "value": "@example.invalid",
+              "description": "Draft full-domain contact suffix.",
+              "status": "draft",
+              "priority": 25003,
+              "case_sensitive": false,
+              "normalize_whitespace": false,
+              "left_boundary": "none",
+              "right_boundary": "word",
+              "metadata": {
+                "source_type": "structured_header",
+                "split": "train",
+                "observation_count": 6,
+                "distinct_document_count": 4,
+                "distinct_leakage_group_count": 2,
+                "confidence": "medium",
+                "review_status": "draft",
+                "curation_reason_code": "exact_domain_boundary_not_expressible",
+                "privacy_class": "organization_domain",
+                "ambiguity": {"status": "review_required", "reason_codes": ["exact_domain_boundary_not_expressible"]}
+              }
+            }
+          },
+          "metadata": {
+            "review_status": "draft",
+            "privacy_class": "organization_domain",
+            "curation_reason_code": "exact_domain_boundary_not_expressible"
+          }
+        }
+      },
+      "metadata": {"charter_role": "organization_domain_candidate_pool"}
+    },
+    "phone_number": {
+      "description": "Fictitious unknown-phone fallback retained as draft.",
+      "status": "draft",
+      "regex_flags": [],
+      "names": {
+        "unknown_phone_number": {
+          "canonical": "Unknown phone number",
+          "description": "Draft structured-phone fallback.",
+          "status": "draft",
+          "patterns": {
+            "structured_us_phone": {
+              "kind": "regex",
+              "value": "\\b(?:1[ .-])?(?:[2-9][0-9]{2}[ .-][0-9]{3}[ .-][0-9]{4}|[2-9][0-9]{2}\\)[ .-]?[0-9]{3}[ .-][0-9]{4})(?:[ ]*(?:x|ext[.]?)[ ]*[0-9]{1,6})?\\b",
+              "description": "Draft US-like phone fallback.",
+              "status": "draft",
+              "priority": 24998,
+              "regex_flags": [],
+              "metadata": {
+                "source_type": "generic_structured_fallback",
+                "split": "train",
+                "confidence": "low",
+                "review_status": "draft",
+                "curation_reason_code": "independent_phone_negative_evidence_unavailable",
+                "privacy_class": "phone_number",
+                "ambiguity": {"status": "review_required", "reason_codes": ["independent_phone_negative_evidence_unavailable"]}
+              }
+            }
+          },
+          "metadata": {
+            "review_status": "draft",
+            "privacy_class": "phone_number",
+            "curation_reason_code": "independent_phone_negative_evidence_unavailable"
+          }
+        }
+      },
+      "metadata": {"charter_role": "unknown_structured_phone_candidate"}
+    }
+  },
+  "metadata": {
+    "benchmark_version": "enron-v2-synthetic-fixture",
+    "candidate_lifecycle": ["active", "draft", "rejected"],
+    "privacy": "fictitious_values_only",
+    "selected_iteration_id": "iteration_02_email_recall"
+  }
+}

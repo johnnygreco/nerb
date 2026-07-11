@@ -112,6 +112,8 @@ _RECEIPT_NAMES = frozenset({"PAIR_COMMITTED.json", "ACCESS_CLAIMED.json", "ACCES
 _RECEIPT_STAGE_RE = re.compile(
     r"^\.(?:PAIR_COMMITTED\.json|ACCESS_CLAIMED\.json|ACCESS_OUTCOME\.json)\.stage-[0-9a-f]{24}$"
 )
+_MAX_PRIVATE_JSON_DEPTH = 256
+_MAX_PRIVATE_JSON_INTEGER_DIGITS = 256
 
 _DEVELOPMENT_FILES = (
     "train.jsonl",
@@ -136,6 +138,10 @@ class EnronSplitError(ValueError):
     """Raised when a split cannot be constructed or verified safely."""
 
 
+class EnronDevelopmentAdmissionError(EnronSplitError):
+    """Raised before large development artifacts are hashed when declared limits fail."""
+
+
 @dataclass(frozen=True)
 class EnronSplitOptions:
     preparation_run: Path
@@ -150,6 +156,18 @@ class EnronSplitOptions:
     sample_per_role: int = 10_000
     fixture_mode: bool = False
     allow_unignored_output: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EnronDevelopmentAdmissionLimits:
+    """Builder-owned limits applied to frozen manifest metadata before artifact hashing."""
+
+    max_train_records: int
+    max_train_artifact_bytes: int
+    max_validation_records: int
+    max_validation_artifact_bytes: int
+    max_development_memberships_bytes: int
+    max_development_samples_bytes: int
 
 
 @dataclass(frozen=True)
@@ -514,10 +532,16 @@ def _ingest_prepared(
     *,
     start_node: int = 0,
     finalize: bool = True,
+    expected_snapshot: _PrivateFileSnapshot | None = None,
 ) -> int:
     records = 0
     previous_document_id: str | None = None
-    for _, raw, row in _iter_strict_jsonl(prepared_path, DEFAULT_MAX_PREPARED_LINE_BYTES):
+    record_stream = (
+        _iter_snapshot_jsonl(prepared_path, expected_snapshot)
+        if expected_snapshot is not None
+        else _iter_strict_jsonl(prepared_path, DEFAULT_MAX_PREPARED_LINE_BYTES)
+    )
+    for _, raw, row in record_stream:
         document_id = row.get("document_id")
         if not isinstance(document_id, str) or not _DOCUMENT_ID_RE.fullmatch(document_id):
             raise EnronSplitError("Prepared document identity is invalid.")
@@ -1810,22 +1834,92 @@ def _reject_duplicate_keys(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _read_json_object(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
+@dataclass(frozen=True, slots=True)
+class _PrivateFileSnapshot:
+    sha256: str
+    bytes: int
+    identity: tuple[int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _PrivateJSONObjectSnapshot:
+    value: dict[str, Any]
+    file: _PrivateFileSnapshot
+
+
+def _assert_private_snapshot_current(path: Path, snapshot: _PrivateFileSnapshot) -> None:
+    try:
+        with open_private_binary_input(path) as current:
+            current_identity = _private_regular_identity(os.fstat(current.fileno()))
+    except EnronSplitError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError, ValueError):
+        raise EnronSplitError(f"{path.name} changed while it was being verified.") from None
+    if current_identity != snapshot.identity:
+        raise EnronSplitError(f"{path.name} changed while it was being verified.")
+
+
+def _read_json_object_snapshot(
+    path: Path,
+    *,
+    max_bytes: int = 16 * 1024 * 1024,
+) -> _PrivateJSONObjectSnapshot:
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise EnronSplitError("Private JSON byte limit must be a positive integer.")
     try:
         with open_private_binary_input(path) as handle:
+            before_identity = _private_regular_identity(os.fstat(handle.fileno()))
+            if before_identity[4] > max_bytes:
+                raise EnronSplitError(f"{path.name} exceeds its byte limit.")
             raw = handle.read(max_bytes + 1)
-        if len(raw) > max_bytes:
-            raise EnronSplitError(f"{path.name} exceeds its byte limit.")
-        value = json.loads(
-            raw.decode("utf-8"),
-            parse_constant=lambda _value: (_ for _ in ()).throw(EnronSplitError("Non-finite JSON is invalid.")),
-            object_pairs_hook=_reject_duplicate_keys,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, EnronPrivateIOError) as exc:
-        raise EnronSplitError(f"{path.name} is not a valid private JSON object.") from exc
+            after_identity = _private_regular_identity(os.fstat(handle.fileno()))
+            if before_identity != after_identity or len(raw) != before_identity[4]:
+                raise EnronSplitError(f"{path.name} changed while it was being read.")
+            value = json.loads(
+                raw.decode("utf-8"),
+                parse_constant=lambda _value: (_ for _ in ()).throw(EnronSplitError("Non-finite JSON is invalid.")),
+                parse_float=_parse_finite_split_float,
+                parse_int=_parse_bounded_split_int,
+                object_pairs_hook=_reject_duplicate_keys,
+            )
+    except EnronSplitError:
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        OverflowError,
+        ValueError,
+        EnronPrivateIOError,
+        OSError,
+    ):
+        raise EnronSplitError(f"{path.name} is not a valid private JSON object.") from None
     if not isinstance(value, dict):
         raise EnronSplitError(f"{path.name} must contain a JSON object.")
-    return value
+    _validate_private_json_depth(value)
+    snapshot = _PrivateFileSnapshot(
+        sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+        bytes=len(raw),
+        identity=after_identity,
+    )
+    _assert_private_snapshot_current(path, snapshot)
+    return _PrivateJSONObjectSnapshot(value=value, file=snapshot)
+
+
+def _read_json_object(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
+    return _read_json_object_snapshot(path, max_bytes=max_bytes).value
+
+
+def _validate_private_json_depth(value: Any) -> None:
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        item, depth = stack.pop()
+        if depth > _MAX_PRIVATE_JSON_DEPTH:
+            raise EnronSplitError("Private JSON nesting depth exceeds the safety limit.")
+        if isinstance(item, Mapping):
+            stack.extend((nested, depth + 1) for nested in item.values())
+        elif isinstance(item, list):
+            stack.extend((nested, depth + 1) for nested in item)
 
 
 def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_access_files: bool = False) -> Path:
@@ -1872,7 +1966,43 @@ def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_ac
     return root
 
 
-def _verify_descriptor(root: Path, descriptor: Any, expected_name: str, expected_records: int | None = None) -> None:
+def _snapshot_private_artifact(path: Path, expected_bytes: int) -> _PrivateFileSnapshot:
+    digest = hashlib.sha256()
+    byte_count = 0
+    try:
+        with open_private_binary_input(path) as handle:
+            before_identity = _private_regular_identity(os.fstat(handle.fileno()))
+            if before_identity[4] != expected_bytes:
+                raise EnronSplitError("Split artifact size differs from its descriptor.")
+            while chunk := handle.read(1024 * 1024):
+                byte_count += len(chunk)
+                if byte_count > expected_bytes:
+                    raise EnronSplitError("Split artifact size differs from its descriptor.")
+                digest.update(chunk)
+            after_identity = _private_regular_identity(os.fstat(handle.fileno()))
+    except EnronSplitError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError, ValueError):
+        raise EnronSplitError("Split artifact could not be verified safely.") from None
+    if before_identity != after_identity or byte_count != expected_bytes:
+        raise EnronSplitError("Split artifact changed while it was being verified.")
+    snapshot = _PrivateFileSnapshot(
+        sha256="sha256:" + digest.hexdigest(),
+        bytes=byte_count,
+        identity=after_identity,
+    )
+    _assert_private_snapshot_current(path, snapshot)
+    return snapshot
+
+
+def _verify_descriptor(
+    root: Path,
+    descriptor: Any,
+    expected_name: str,
+    expected_records: int | None = None,
+    *,
+    observed: _PrivateFileSnapshot | None = None,
+) -> _PrivateFileSnapshot:
     if not isinstance(descriptor, Mapping) or set(descriptor) != {"id", "name", "sha256", "bytes", "records"}:
         raise EnronSplitError("Split artifact descriptor is invalid.")
     if (
@@ -1891,14 +2021,143 @@ def _verify_descriptor(root: Path, descriptor: Any, expected_name: str, expected
     if expected_records is not None and descriptor.get("records") != expected_records:
         raise EnronSplitError("Split artifact descriptor record count is invalid.")
     artifact = root / expected_name
-    if descriptor.get("sha256") != _hash_file(artifact) or descriptor.get("bytes") != artifact.stat().st_size:
+    snapshot = observed or _snapshot_private_artifact(artifact, int(descriptor["bytes"]))
+    if descriptor.get("sha256") != snapshot.sha256 or descriptor.get("bytes") != snapshot.bytes:
         raise EnronSplitError("Split artifact descriptor does not match its file.")
+    return snapshot
 
 
-def _iter_role_records(path: Path, expected_records: int) -> Iterator[dict[str, Any]]:
+def _frozen_artifact_contract(path: Path, descriptor: Mapping[str, Any]) -> tuple[str, int, int]:
+    if (
+        set(descriptor) != {"id", "name", "sha256", "bytes", "records"}
+        or descriptor.get("name") != path.name
+        or not isinstance(descriptor.get("sha256"), str)
+        or not _SHA256_RE.fullmatch(str(descriptor["sha256"]))
+        or type(descriptor.get("bytes")) is not int
+        or int(descriptor["bytes"]) < 0
+        or type(descriptor.get("records")) is not int
+        or int(descriptor["records"]) < 0
+    ):
+        raise EnronSplitError("Frozen development artifact descriptor is invalid.")
+    return str(descriptor["sha256"]), int(descriptor["bytes"]), int(descriptor["records"])
+
+
+def _private_regular_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    mode = stat.S_IMODE(info.st_mode)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or mode & 0o077:
+        raise EnronSplitError("Frozen development artifacts must remain private single-link regular files.")
+    return (
+        info.st_dev,
+        info.st_ino,
+        mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _parse_frozen_jsonl_object(path: Path, line_no: int, raw: bytes) -> dict[str, Any]:
+    try:
+        payload = raw.decode("utf-8")
+        value = json.loads(
+            payload,
+            parse_constant=lambda _value: (_ for _ in ()).throw(EnronSplitError("Non-finite JSON is invalid.")),
+            parse_float=_parse_finite_split_float,
+            parse_int=_parse_bounded_split_int,
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except EnronSplitError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, OverflowError, ValueError):
+        raise EnronSplitError(f"{path.name} line {line_no} is not valid strict JSON.") from None
+    if not isinstance(value, dict):
+        raise EnronSplitError(f"{path.name} line {line_no} must contain a JSON object.")
+    _validate_private_json_depth(value)
+    return value
+
+
+def _parse_finite_split_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise EnronSplitError("Non-finite JSON is invalid.")
+    return parsed
+
+
+def _parse_bounded_split_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > _MAX_PRIVATE_JSON_INTEGER_DIGITS:
+        raise EnronSplitError("JSON integer exceeds the digit limit.")
+    try:
+        return int(value)
+    except (OverflowError, ValueError):
+        raise EnronSplitError("JSON integer is invalid.") from None
+
+
+def _iter_snapshot_jsonl(
+    path: Path,
+    expected_snapshot: _PrivateFileSnapshot,
+) -> Iterator[tuple[int, bytes, dict[str, Any]]]:
+    digest = hashlib.sha256()
+    byte_count = 0
+    record_count = 0
+    before_identity: tuple[int, int, int, int, int, int, int] | None = None
+    after_identity: tuple[int, int, int, int, int, int, int] | None = None
+    try:
+        with open_private_binary_input(path) as handle:
+            before_identity = _private_regular_identity(os.fstat(handle.fileno()))
+            if before_identity != expected_snapshot.identity or before_identity[4] != expected_snapshot.bytes:
+                raise EnronSplitError("Split artifact identity differs from its frozen snapshot.")
+            while True:
+                raw = handle.readline(DEFAULT_MAX_PREPARED_LINE_BYTES + 1)
+                if not raw:
+                    break
+                record_count += 1
+                byte_count += len(raw)
+                digest.update(raw)
+                if len(raw) > DEFAULT_MAX_PREPARED_LINE_BYTES:
+                    raise EnronSplitError(f"{path.name} line {record_count} exceeds the byte limit.")
+                yield record_count, raw, _parse_frozen_jsonl_object(path, record_count, raw)
+            after_identity = _private_regular_identity(os.fstat(handle.fileno()))
+    except EnronSplitError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError, ValueError):
+        raise EnronSplitError("Frozen development artifact could not be consumed safely.") from None
+
+    if before_identity is None or after_identity is None or before_identity != after_identity:
+        raise EnronSplitError("Split artifact changed while it was consumed.")
+    if byte_count != expected_snapshot.bytes or "sha256:" + digest.hexdigest() != expected_snapshot.sha256:
+        raise EnronSplitError("Consumed split artifact differs from its frozen snapshot.")
+
+    _assert_private_snapshot_current(path, expected_snapshot)
+
+
+def _iter_frozen_development_jsonl(
+    path: Path,
+    descriptor: Mapping[str, Any],
+    expected_snapshot: _PrivateFileSnapshot,
+) -> Iterator[tuple[int, bytes, dict[str, Any]]]:
+    expected_sha256, expected_bytes, expected_records = _frozen_artifact_contract(path, descriptor)
+    if expected_snapshot.sha256 != expected_sha256 or expected_snapshot.bytes != expected_bytes:
+        raise EnronSplitError("Frozen development artifact snapshot does not match its descriptor.")
+
+    records = 0
+    for line_no, raw, row in _iter_snapshot_jsonl(path, expected_snapshot):
+        records += 1
+        yield line_no, raw, row
+    if records != expected_records:
+        raise EnronSplitError("Frozen development artifact record count differs from its descriptor.")
+
+
+def _iter_role_records(
+    path: Path,
+    descriptor: Mapping[str, Any],
+    expected_snapshot: _PrivateFileSnapshot,
+) -> Iterator[dict[str, Any]]:
+    _expected_sha256, _expected_bytes, expected_records = _frozen_artifact_contract(path, descriptor)
     records = 0
     previous: str | None = None
-    for _, raw, row in _iter_strict_jsonl(path, DEFAULT_MAX_PREPARED_LINE_BYTES):
+    for _, raw, row in _iter_frozen_development_jsonl(path, descriptor, expected_snapshot):
         document_id = row.get("document_id")
         if (
             not isinstance(document_id, str)
@@ -1917,28 +2176,156 @@ def _iter_role_records(path: Path, expected_records: int) -> Iterator[dict[str, 
 class EnronDevelopmentSplit:
     """Verified train/validation-only access to a redacted development run."""
 
-    __slots__ = ("_root", "manifest", "freeze_receipt")
+    __slots__ = (
+        "_artifact_snapshots",
+        "_expected_memberships_by_role",
+        "_freeze_receipt_snapshot",
+        "_manifest_snapshot",
+        "_memberships_descriptor",
+        "_root",
+        "_train_descriptor",
+        "_validation_descriptor",
+        "freeze_receipt",
+        "manifest",
+    )
 
-    def __init__(self, root: Path, manifest: Mapping[str, Any], freeze_receipt: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        root: Path,
+        manifest: Mapping[str, Any],
+        freeze_receipt: Mapping[str, Any],
+        *,
+        artifact_snapshots: Mapping[str, _PrivateFileSnapshot],
+        manifest_snapshot: _PrivateFileSnapshot,
+        freeze_receipt_snapshot: _PrivateFileSnapshot,
+    ) -> None:
         self._root = root
         self.manifest = dict(manifest)
         self.freeze_receipt = dict(freeze_receipt)
+        self._artifact_snapshots = dict(artifact_snapshots)
+        self._manifest_snapshot = manifest_snapshot
+        self._freeze_receipt_snapshot = freeze_receipt_snapshot
+        self._train_descriptor = dict(manifest["development_roles"]["train"]["artifact"])
+        self._validation_descriptor = dict(manifest["development_roles"]["validation"]["artifact"])
+        self._memberships_descriptor = dict(manifest["artifacts"]["memberships"])
+        self._expected_memberships_by_role = {
+            role: int(manifest["development_roles"][role]["records"]) for role in ("train", "validation")
+        }
+
+    def _assert_metadata_current(self) -> None:
+        _assert_private_snapshot_current(self._root / "manifest.json", self._manifest_snapshot)
+        _assert_private_snapshot_current(
+            self._root / "split-freeze-receipt.json",
+            self._freeze_receipt_snapshot,
+        )
+
+    def _guard_metadata(self, records: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+        self._assert_metadata_current()
+        yield from records
+        self._assert_metadata_current()
+
+    @property
+    def manifest_sha256(self) -> str:
+        """Return the exact loaded manifest hash while its frozen metadata remains current."""
+
+        self._assert_metadata_current()
+        return self._manifest_snapshot.sha256
 
     def iter_train_records(self) -> Iterator[dict[str, Any]]:
-        descriptor = self.manifest["development_roles"]["train"]["artifact"]
-        return _iter_role_records(self._root / "train.jsonl", int(descriptor["records"]))
+        return self._guard_metadata(
+            _iter_role_records(
+                self._root / "train.jsonl",
+                self._train_descriptor,
+                self._artifact_snapshots["train"],
+            )
+        )
 
     def iter_validation_records(self) -> Iterator[dict[str, Any]]:
-        descriptor = self.manifest["development_roles"]["validation"]["artifact"]
-        return _iter_role_records(self._root / "validation.jsonl", int(descriptor["records"]))
+        return self._guard_metadata(
+            _iter_role_records(
+                self._root / "validation.jsonl",
+                self._validation_descriptor,
+                self._artifact_snapshots["validation"],
+            )
+        )
+
+    def _iter_memberships(self) -> Iterator[dict[str, Any]]:
+        return self._guard_metadata(
+            _iter_development_memberships(
+                self._root / "memberships.jsonl",
+                descriptor=self._memberships_descriptor,
+                expected_by_role=self._expected_memberships_by_role,
+                expected_snapshot=self._artifact_snapshots["memberships"],
+            )
+        )
+
+    def iter_train_memberships(self) -> Iterator[dict[str, Any]]:
+        """Iterate verified train memberships in train-record order."""
+
+        return (row for row in self._iter_memberships() if row["role"] == "train")
+
+    def iter_validation_memberships(self) -> Iterator[dict[str, Any]]:
+        """Iterate verified validation memberships in validation-record order."""
+
+        return (row for row in self._iter_memberships() if row["role"] == "validation")
 
 
-def load_enron_development_split(path: Path) -> EnronDevelopmentSplit:
+def _validate_development_admission_limits(
+    contracts: Mapping[str, tuple[str, int, int]],
+    limits: EnronDevelopmentAdmissionLimits | None,
+) -> None:
+    if limits is None:
+        return
+    if type(limits) is not EnronDevelopmentAdmissionLimits:
+        raise EnronDevelopmentAdmissionError("Development admission limits are invalid.")
+    configured = (
+        limits.max_train_records,
+        limits.max_train_artifact_bytes,
+        limits.max_validation_records,
+        limits.max_validation_artifact_bytes,
+        limits.max_development_memberships_bytes,
+        limits.max_development_samples_bytes,
+    )
+    if any(type(value) is not int or value <= 0 for value in configured):
+        raise EnronDevelopmentAdmissionError("Development admission limits must be positive integers.")
+    checks = (
+        ("train records", contracts["train"][2], limits.max_train_records),
+        ("train artifact bytes", contracts["train"][1], limits.max_train_artifact_bytes),
+        ("validation records", contracts["validation"][2], limits.max_validation_records),
+        (
+            "validation artifact bytes",
+            contracts["validation"][1],
+            limits.max_validation_artifact_bytes,
+        ),
+        (
+            "development memberships artifact bytes",
+            contracts["memberships"][1],
+            limits.max_development_memberships_bytes,
+        ),
+        (
+            "development samples artifact bytes",
+            contracts["samples"][1],
+            limits.max_development_samples_bytes,
+        ),
+    )
+    for description, declared, maximum in checks:
+        if declared > maximum:
+            raise EnronDevelopmentAdmissionError(f"Declared {description} exceed the development admission limit.")
+
+
+def load_enron_development_split(
+    path: Path,
+    *,
+    admission_limits: EnronDevelopmentAdmissionLimits | None = None,
+) -> EnronDevelopmentSplit:
     """Load a redacted development run without exposing any test selector."""
 
     root = _assert_committed_run(path, _DEVELOPMENT_FILES)
-    manifest = _read_json_object(root / "manifest.json")
-    receipt = _read_json_object(root / "split-freeze-receipt.json")
+    manifest_snapshot = _read_json_object_snapshot(root / "manifest.json")
+    freeze_receipt_snapshot = _read_json_object_snapshot(root / "split-freeze-receipt.json")
+    manifest = manifest_snapshot.value
+    receipt = freeze_receipt_snapshot.value
+    artifact_snapshots: dict[str, _PrivateFileSnapshot] = {}
     _validate_aggregate_privacy(manifest)
     _validate_aggregate_privacy(receipt)
     expected_manifest_keys = {
@@ -1977,6 +2364,7 @@ def load_enron_development_split(path: Path) -> EnronDevelopmentSplit:
         "freeze_receipt",
     }:
         raise EnronSplitError("Development artifact inventory is invalid.")
+    role_records: dict[str, int] = {}
     for role in ("train", "validation"):
         role_value = manifest["development_roles"].get(role)
         if not isinstance(role_value, Mapping) or set(role_value) != {"records", "groups", "artifact"}:
@@ -1985,7 +2373,10 @@ def load_enron_development_split(path: Path) -> EnronDevelopmentSplit:
             raise EnronSplitError("Development role artifact binding is invalid.")
         if not isinstance(artifacts[role], Mapping) or artifacts[role].get("id") != role:
             raise EnronSplitError("Development role artifact identity is invalid.")
-        _verify_descriptor(root, artifacts[role], f"{role}.jsonl", int(role_value["records"]))
+        records = role_value.get("records")
+        if type(records) is not int or records < 0:
+            raise EnronSplitError("Development role record count is invalid.")
+        role_records[role] = records
     expected_artifact_ids = {
         "memberships": "development_memberships",
         "samples": "development_samples",
@@ -1996,9 +2387,36 @@ def load_enron_development_split(path: Path) -> EnronDevelopmentSplit:
         for key, value in expected_artifact_ids.items()
     ):
         raise EnronSplitError("Development supporting artifact identity is invalid.")
-    _verify_descriptor(root, artifacts["memberships"], "memberships.jsonl")
-    _verify_descriptor(root, artifacts["samples"], "samples.jsonl")
-    _verify_descriptor(root, artifacts["freeze_receipt"], "split-freeze-receipt.json", 1)
+    artifact_names = {
+        "train": "train.jsonl",
+        "validation": "validation.jsonl",
+        "memberships": "memberships.jsonl",
+        "samples": "samples.jsonl",
+        "freeze_receipt": "split-freeze-receipt.json",
+    }
+    contracts = {key: _frozen_artifact_contract(root / name, artifacts[key]) for key, name in artifact_names.items()}
+    if any(contracts[role][2] != role_records[role] for role in ("train", "validation")):
+        raise EnronSplitError("Development role artifact record count is invalid.")
+    if contracts["memberships"][2] != role_records["train"] + role_records["validation"]:
+        raise EnronSplitError("Development membership artifact record count is invalid.")
+    _validate_development_admission_limits(contracts, admission_limits)
+
+    for role in ("train", "validation"):
+        artifact_snapshots[role] = _verify_descriptor(
+            root,
+            artifacts[role],
+            artifact_names[role],
+            role_records[role],
+        )
+    artifact_snapshots["memberships"] = _verify_descriptor(root, artifacts["memberships"], "memberships.jsonl")
+    artifact_snapshots["samples"] = _verify_descriptor(root, artifacts["samples"], "samples.jsonl")
+    artifact_snapshots["freeze_receipt"] = _verify_descriptor(
+        root,
+        artifacts["freeze_receipt"],
+        "split-freeze-receipt.json",
+        1,
+        observed=freeze_receipt_snapshot.file,
+    )
     if (
         set(receipt)
         != {
@@ -2019,13 +2437,33 @@ def load_enron_development_split(path: Path) -> EnronDevelopmentSplit:
         or receipt.get("split_policy_sha256") != manifest.get("policy", {}).get("sha256")
     ):
         raise EnronSplitError("Development freeze receipt binding is invalid.")
-    return EnronDevelopmentSplit(root, manifest, receipt)
+    _assert_private_snapshot_current(root / "manifest.json", manifest_snapshot.file)
+    _assert_private_snapshot_current(root / "split-freeze-receipt.json", freeze_receipt_snapshot.file)
+    return EnronDevelopmentSplit(
+        root,
+        manifest,
+        receipt,
+        artifact_snapshots=artifact_snapshots,
+        manifest_snapshot=manifest_snapshot.file,
+        freeze_receipt_snapshot=freeze_receipt_snapshot.file,
+    )
 
 
-def _iter_canonical_objects(path: Path, expected_records: int, schema_version: str) -> Iterator[dict[str, Any]]:
+def _iter_canonical_objects(
+    path: Path,
+    expected_records: int,
+    schema_version: str,
+    *,
+    expected_snapshot: _PrivateFileSnapshot | None = None,
+) -> Iterator[dict[str, Any]]:
     count = 0
     previous_document_id: str | None = None
-    for _, raw, row in _iter_strict_jsonl(path, DEFAULT_MAX_PREPARED_LINE_BYTES):
+    source = (
+        _iter_snapshot_jsonl(path, expected_snapshot)
+        if expected_snapshot is not None
+        else _iter_strict_jsonl(path, DEFAULT_MAX_PREPARED_LINE_BYTES)
+    )
+    for _, raw, row in source:
         if raw != _canonical_line(row) or row.get("schema_version") != schema_version:
             raise EnronSplitError(f"{path.name} is not canonical {schema_version} JSONL.")
         document_id = row.get("document_id")
@@ -2039,11 +2477,47 @@ def _iter_canonical_objects(path: Path, expected_records: int, schema_version: s
         raise EnronSplitError(f"{path.name} record count is invalid.")
 
 
+def _iter_development_memberships(
+    path: Path,
+    *,
+    descriptor: Mapping[str, Any],
+    expected_by_role: Mapping[str, int],
+    expected_snapshot: _PrivateFileSnapshot,
+) -> Iterator[dict[str, Any]]:
+    _expected_sha256, _expected_bytes, expected_records = _frozen_artifact_contract(path, descriptor)
+    if set(expected_by_role) != {"train", "validation"} or expected_records != sum(expected_by_role.values()):
+        raise EnronSplitError("Development membership descriptor count is invalid.")
+
+    observed_by_role = {"train": 0, "validation": 0}
+    count = 0
+    previous_document_id: str | None = None
+    for _, raw, row in _iter_frozen_development_jsonl(path, descriptor, expected_snapshot):
+        if raw != _canonical_line(row) or row.get("schema_version") != SPLIT_MEMBERSHIP_SCHEMA_VERSION:
+            raise EnronSplitError(f"{path.name} is not canonical {SPLIT_MEMBERSHIP_SCHEMA_VERSION} JSONL.")
+        document_id = row.get("document_id")
+        role = row.get("role")
+        if (
+            not isinstance(document_id, str)
+            or not _DOCUMENT_ID_RE.fullmatch(document_id)
+            or (previous_document_id is not None and document_id <= previous_document_id)
+            or role not in observed_by_role
+        ):
+            raise EnronSplitError("Development membership schema or role is invalid.")
+        previous_document_id = document_id
+        count += 1
+        observed_by_role[role] += 1
+        yield dict(row)
+
+    if count != expected_records or observed_by_role != expected_by_role:
+        raise EnronSplitError("Development membership role counts are invalid.")
+
+
 def _verify_private_membership_artifacts(
     development_root: Path,
     sealed_root: Path,
     full_manifest: Mapping[str, Any],
     state: _BuildState,
+    artifact_snapshots: Mapping[Path, _PrivateFileSnapshot],
 ) -> None:
     expected = {row.document_id: row for row in state.memberships}
     observed: set[str] = set()
@@ -2056,7 +2530,12 @@ def _verify_private_membership_artifacts(
         (sealed_root / "memberships.jsonl", int(full_manifest["roles"]["test"]["records"]), {"test"}),
     )
     for path, count, allowed_roles in paths:
-        for row in _iter_canonical_objects(path, count, SPLIT_MEMBERSHIP_SCHEMA_VERSION):
+        for row in _iter_canonical_objects(
+            path,
+            count,
+            SPLIT_MEMBERSHIP_SCHEMA_VERSION,
+            expected_snapshot=artifact_snapshots[path],
+        ):
             document_id = row.get("document_id")
             if (
                 not isinstance(document_id, str)
@@ -2088,7 +2567,12 @@ def _verify_private_membership_artifacts(
         (sealed_root / "samples.jsonl", {"test"}),
     ):
         expected_count = sum(state.sample_counts[role] for role in roles)
-        for row in _iter_canonical_objects(path, expected_count, SPLIT_SAMPLE_SCHEMA_VERSION):
+        for row in _iter_canonical_objects(
+            path,
+            expected_count,
+            SPLIT_SAMPLE_SCHEMA_VERSION,
+            expected_snapshot=artifact_snapshots[path],
+        ):
             document_id = row.get("document_id")
             if (
                 not isinstance(document_id, str)
@@ -2102,7 +2586,11 @@ def _verify_private_membership_artifacts(
         raise EnronSplitError("Representative sample coverage is incomplete.")
 
 
-def _verify_group_artifact(sealed_root: Path, state: _BuildState) -> None:
+def _verify_group_artifact(
+    sealed_root: Path,
+    state: _BuildState,
+    expected_snapshot: _PrivateFileSnapshot,
+) -> None:
     expected: list[dict[str, Any]] = []
     for component in state.components:
         challenges = {challenge for node in component.nodes for challenge in state.memberships[node].challenges}
@@ -2124,7 +2612,12 @@ def _verify_group_artifact(sealed_root: Path, state: _BuildState) -> None:
             }
         )
     observed = list(
-        _iter_canonical_objects(sealed_root / "group-assignments.jsonl", len(expected), SPLIT_GROUP_SCHEMA_VERSION)
+        _iter_canonical_objects(
+            sealed_root / "group-assignments.jsonl",
+            len(expected),
+            SPLIT_GROUP_SCHEMA_VERSION,
+            expected_snapshot=expected_snapshot,
+        )
     )
     if observed != expected:
         raise EnronSplitError("Sealed group assignment artifact does not match reconstructed leakage groups.")
@@ -2135,11 +2628,12 @@ def _verify_prepared_conservation(
     sealed_root: Path,
     expected_sha256: str,
     expected_records: int,
+    role_snapshots: Mapping[str, _PrivateFileSnapshot],
 ) -> None:
     streams: list[Iterator[tuple[int, bytes, Mapping[str, Any]]]] = []
     for role in _ROLE_NAMES:
         root = sealed_root if role == "test" else development_root
-        streams.append(iter(_iter_strict_jsonl(root / f"{role}.jsonl", DEFAULT_MAX_PREPARED_LINE_BYTES)))
+        streams.append(iter(_iter_snapshot_jsonl(root / f"{role}.jsonl", role_snapshots[role])))
     heap: list[tuple[str, int, bytes, Mapping[str, Any]]] = []
     for index, stream in enumerate(streams):
         try:
@@ -2177,7 +2671,8 @@ def _verify_pair_receipt(
     sealed_manifest_sha256: str,
     benchmark_version: str,
     *,
-    development_root: Path | None = None,
+    development_manifest_sha256: str | None = None,
+    development_freeze_receipt_sha256: str | None = None,
 ) -> dict[str, Any]:
     receipt = _read_json_object(sealed_root / "PAIR_COMMITTED.json")
     if (
@@ -2201,9 +2696,11 @@ def _verify_pair_receipt(
         )
     ):
         raise EnronSplitError("Split pair receipt does not bind the sealed run.")
-    if development_root is not None and (
-        receipt["development_manifest_sha256"] != _hash_file(development_root / "manifest.json")
-        or receipt["freeze_receipt_sha256"] != _hash_file(development_root / "split-freeze-receipt.json")
+    if (development_manifest_sha256 is None) != (development_freeze_receipt_sha256 is None):
+        raise EnronSplitError("Split pair receipt development binding is incomplete.")
+    if development_manifest_sha256 is not None and (
+        receipt["development_manifest_sha256"] != development_manifest_sha256
+        or receipt["freeze_receipt_sha256"] != development_freeze_receipt_sha256
     ):
         raise EnronSplitError("Split pair receipt does not bind the committed development run.")
     return receipt
@@ -2298,7 +2795,8 @@ def _verify_enron_splits(
     development = load_enron_development_split(development_path)
     development_root = development._root
     sealed_root = _assert_committed_run(sealed_path, _SEALED_FILES, allow_access_files=True)
-    full_manifest = _read_json_object(sealed_root / "manifest.json")
+    full_manifest_snapshot = _read_json_object_snapshot(sealed_root / "manifest.json")
+    full_manifest = full_manifest_snapshot.value
     _validate_aggregate_privacy(full_manifest)
     expected_keys = {
         "schema_version",
@@ -2321,14 +2819,15 @@ def _verify_enron_splits(
     if set(full_manifest) != expected_keys or full_manifest.get("schema_version") != SPLIT_MANIFEST_SCHEMA_VERSION:
         raise EnronSplitError("Sealed split manifest schema is invalid.")
     _validate_preparation_binding(full_manifest.get("preparation"))
-    manifest_sha256 = _hash_file(sealed_root / "manifest.json")
+    manifest_sha256 = full_manifest_snapshot.file.sha256
     if manifest_sha256 != development.freeze_receipt.get("full_split_manifest_sha256"):
         raise EnronSplitError("Development receipt does not commit to the sealed split manifest.")
     _verify_pair_receipt(
         sealed_root,
         manifest_sha256,
         str(full_manifest.get("benchmark_version")),
-        development_root=development_root,
+        development_manifest_sha256=development._manifest_snapshot.sha256,
+        development_freeze_receipt_sha256=development._freeze_receipt_snapshot.sha256,
     )
     if (
         full_manifest.get("benchmark_version") != development.manifest.get("benchmark_version")
@@ -2347,6 +2846,8 @@ def _verify_enron_splits(
         or set(artifacts) != {"test", "memberships", "samples", "group_assignments", "leakage_audit"}
     ):
         raise EnronSplitError("Sealed role or artifact inventory is invalid.")
+    artifact_snapshots: dict[Path, _PrivateFileSnapshot] = {}
+    role_snapshots: dict[str, _PrivateFileSnapshot] = {}
     for role in _ROLE_NAMES:
         role_value = roles.get(role)
         if not isinstance(role_value, Mapping) or set(role_value) != {"records", "groups", "artifact"}:
@@ -2354,7 +2855,20 @@ def _verify_enron_splits(
         root = sealed_root if role == "test" else development_root
         if not isinstance(role_value["artifact"], Mapping) or role_value["artifact"].get("id") != role:
             raise EnronSplitError("Sealed role artifact identity is invalid.")
-        _verify_descriptor(root, role_value["artifact"], f"{role}.jsonl", int(role_value["records"]))
+        path = root / f"{role}.jsonl"
+        snapshot = _verify_descriptor(root, role_value["artifact"], path.name, int(role_value["records"]))
+        artifact_snapshots[path] = snapshot
+        role_snapshots[role] = snapshot
+    development_artifacts = development.manifest["artifacts"]
+    for artifact_id, filename in (("memberships", "memberships.jsonl"), ("samples", "samples.jsonl")):
+        path = development_root / filename
+        artifact_snapshots[path] = _verify_descriptor(
+            development_root,
+            development_artifacts[artifact_id],
+            filename,
+            observed=development._artifact_snapshots[artifact_id],
+        )
+    leakage_audit_snapshot = _read_json_object_snapshot(sealed_root / "leakage-audit.json")
     for artifact_id, expected_id, filename in (
         ("memberships", "test_memberships", "memberships.jsonl"),
         ("samples", "test_samples", "samples.jsonl"),
@@ -2363,7 +2877,13 @@ def _verify_enron_splits(
     ):
         if not isinstance(artifacts.get(artifact_id), Mapping) or artifacts[artifact_id].get("id") != expected_id:
             raise EnronSplitError("Sealed supporting artifact identity is invalid.")
-        _verify_descriptor(sealed_root, artifacts.get(artifact_id), filename)
+        path = sealed_root / filename
+        artifact_snapshots[path] = _verify_descriptor(
+            sealed_root,
+            artifacts.get(artifact_id),
+            filename,
+            observed=leakage_audit_snapshot.file if artifact_id == "leakage_audit" else None,
+        )
     if artifacts.get("test") != roles["test"]["artifact"]:
         raise EnronSplitError("Sealed test artifact binding is invalid.")
 
@@ -2399,6 +2919,7 @@ def _verify_enron_splits(
         sealed_root,
         str(preparation["prepared_sha256"]),
         int(preparation["prepared_records"]),
+        role_snapshots,
     )
     with tempfile.TemporaryDirectory(prefix="nerb-enron-split-verify-") as temporary:
         temporary_root = Path(temporary)
@@ -2415,6 +2936,7 @@ def _verify_enron_splits(
                     expected_source,
                     start_node=start_node,
                     finalize=index == len(_ROLE_NAMES) - 1,
+                    expected_snapshot=role_snapshots[role],
                 )
                 role_counts[role] = count
                 start_node += count
@@ -2472,8 +2994,18 @@ def _verify_enron_splits(
                     rebuild_options,
                 ),
             )
-            _verify_private_membership_artifacts(development_root, sealed_root, full_manifest, state)
-            _verify_group_artifact(sealed_root, state)
+            _verify_private_membership_artifacts(
+                development_root,
+                sealed_root,
+                full_manifest,
+                state,
+                artifact_snapshots,
+            )
+            _verify_group_artifact(
+                sealed_root,
+                state,
+                artifact_snapshots[sealed_root / "group-assignments.jsonl"],
+            )
             expected_allocation = {
                 **dict(state.allocation_audit),
                 "group_assignments_sha256": artifacts["group_assignments"]["sha256"],
@@ -2483,7 +3015,7 @@ def _verify_enron_splits(
                 or development.manifest.get("allocation") != state.allocation_audit
             ):
                 raise EnronSplitError("Allocation audit does not match reconstructed temporal boundaries.")
-            if _read_json_object(sealed_root / "leakage-audit.json") != _leakage_audit(state):
+            if leakage_audit_snapshot.value != _leakage_audit(state):
                 raise EnronSplitError("Leakage audit does not match the reconstructed leakage graph.")
             if full_manifest.get("cohorts", {}).get("roles") != {role: dict(cohorts[role]) for role in _ROLE_NAMES}:
                 raise EnronSplitError("Cohort aggregates do not match reconstructed memberships.")
@@ -2531,6 +3063,11 @@ def _verify_enron_splits(
             connection.close()
 
     access_state = _verify_access_state(sealed_root, full_manifest, manifest_sha256)
+    development._assert_metadata_current()
+    _assert_private_snapshot_current(sealed_root / "manifest.json", full_manifest_snapshot.file)
+    _assert_private_snapshot_current(sealed_root / "leakage-audit.json", leakage_audit_snapshot.file)
+    for artifact_path, snapshot in artifact_snapshots.items():
+        _assert_private_snapshot_current(artifact_path, snapshot)
     contract_splits = _contract_split_projection(full_manifest, manifest_sha256)
     return {
         "valid": True,
@@ -2833,7 +3370,8 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         self._root = root
         if (root / "ACCESS_CLAIMED.json").exists() or (root / "ACCESS_OUTCOME.json").exists():
             raise EnronSplitError("Final-test access has already been claimed; retries are forbidden.")
-        manifest = _read_json_object(root / "manifest.json")
+        manifest_snapshot = _read_json_object_snapshot(root / "manifest.json")
+        manifest = manifest_snapshot.value
         expected_manifest_keys = {
             "schema_version",
             "benchmark_version",
@@ -2860,7 +3398,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             or set(manifest.get("roles", {})) != set(_ROLE_NAMES)
         ):
             raise EnronSplitError("Sealed split is not structurally valid for final access.")
-        manifest_sha256 = _hash_file(root / "manifest.json")
+        manifest_sha256 = manifest_snapshot.file.sha256
         _verify_pair_receipt(root, manifest_sha256, str(manifest.get("benchmark_version")))
         role = manifest.get("roles", {}).get("test")
         if not isinstance(role, Mapping) or not isinstance(role.get("artifact"), Mapping):
@@ -2877,6 +3415,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         if manifest.get("artifacts", {}).get("test") != role["artifact"]:
             raise EnronSplitError("Sealed test artifact binding is invalid.")
         _verify_descriptor(root, role["artifact"], "test.jsonl", int(role["records"]))
+        _assert_private_snapshot_current(root / "manifest.json", manifest_snapshot.file)
         directory_fd = _open_pinned_private_root(root)
         handle: BinaryIO | None = None
         try:
@@ -2933,11 +3472,18 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
                 row = json.loads(
                     raw.decode("utf-8"),
                     parse_constant=lambda _value: (_ for _ in ()).throw(EnronSplitError("Non-finite JSON is invalid.")),
+                    parse_float=_parse_finite_split_float,
+                    parse_int=_parse_bounded_split_int,
                     object_pairs_hook=_reject_duplicate_keys,
                 )
-            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
-                raise EnronSplitError("Sealed test record is invalid JSON.") from exc
-            if not isinstance(row, dict) or raw != _canonical_line(row):
+            except EnronSplitError:
+                raise
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, OverflowError, ValueError):
+                raise EnronSplitError("Sealed test record is invalid JSON.") from None
+            if not isinstance(row, dict):
+                raise EnronSplitError("Sealed test record must contain a JSON object.")
+            _validate_private_json_depth(row)
+            if raw != _canonical_line(row):
                 raise EnronSplitError("Sealed test record is not canonical.")
             document_id = row.get("document_id")
             if (
@@ -3003,8 +3549,9 @@ def finalize_aborted_enron_final_test_access(sealed_path: Path) -> dict[str, Any
     """Record an aborted outcome for a valid crash-stranded claim without reopening test data."""
 
     root = _assert_committed_run(sealed_path, _SEALED_FILES, allow_access_files=True)
-    manifest = _read_json_object(root / "manifest.json")
-    manifest_sha256 = _hash_file(root / "manifest.json")
+    manifest_snapshot = _read_json_object_snapshot(root / "manifest.json")
+    manifest = manifest_snapshot.value
+    manifest_sha256 = manifest_snapshot.file.sha256
     _verify_pair_receipt(root, manifest_sha256, str(manifest.get("benchmark_version")))
     access_state = _verify_access_state(root, manifest, manifest_sha256)
     if access_state.get("status") != "claimed":
