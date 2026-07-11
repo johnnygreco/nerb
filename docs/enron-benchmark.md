@@ -1,9 +1,10 @@
 # Enron Benchmark v2 Charter
 
-> **Status: contract frozen; implementation staged.** The v2 preparation pipeline, evaluator, bank, and real-corpus
-> evidence will land in later work. The existing `scripts/enron_bank_build_benchmark.py`, its `nerb.enron_benchmark.v1`
-> output, the v1 autoresearch harness, committed hero measurements, and previously published Enron numbers are historical.
-> They do **not** satisfy this charter and must not support a public quality, privacy, performance, or product claim.
+> **Status: executable contract frozen; benchmark execution staged.** The v2 manifest/evidence schemas and semantic
+> verifier are implemented. The preparation pipeline, evaluator, bank, and real-corpus evidence will land in later work.
+> The existing `scripts/enron_bank_build_benchmark.py`, its `nerb.enron_benchmark.v1` output, the v1 autoresearch
+> harness, committed hero measurements, and previously published Enron numbers are historical. They do **not** satisfy
+> this charter and must not support a public quality, privacy, performance, or product claim.
 
 NERB's Enron benchmark demonstrates a privacy-first intelligence-cache workflow: a capable agent turns a large private
 organizational source into a reviewed entity bank once; an application compiles that bank once and reuses it for fast,
@@ -77,6 +78,12 @@ The guarantee does not cover an unknown name or free-form identifier merely beca
 depends on catalog coverage and any separately evaluated generic fallback patterns. Open-world recall must therefore be
 measured and reported; it must never be described as guaranteed 100% recall. A deterministic miss is still a miss.
 
+The public-verifier guarantee is narrower still. Content hashes, frozen descriptors, and privacy-safe inventories prove
+immutable commitments and let the verifier recompute arithmetic and claim support. They do not prove that an honest
+runner actually derived an inventory from the addressed private input or ran the declared bank against those bytes.
+Authorized harness execution, retained private audit material, and independent review provide that evidence. A clean
+clone can verify schema conformance, hashes, aggregate arithmetic, gates, lineage, and claims without private text.
+
 ## Taxonomy And Bank Policy
 
 Taxonomy follows the privacy workflow and corpus evidence rather than a universal NER label set. The initial v2 bank is
@@ -115,6 +122,12 @@ from different strengths, scopes, or completeness states stay separate.
 | `synthetic_conformance` | Positive, negative, boundary, normalization, overlap, and adversarial cases derived from the frozen active bank contract. | Catalog conformance and canonical-mapping guarantees. Not catalog coverage or open-world recall. |
 | `unlabeled` | Text with no exhaustive gold spans. Absence of a label is not evidence that a prediction is wrong. | Throughput, memory, robustness, and qualitative inspection only; no precision, recall, or F1. |
 
+The manifest binds exact document and span populations for each role covered by a label artifact. Every natural-text
+`independent` or `structured_weak` artifact covers one entity class so those populations cannot be hidden in a vague
+multi-class total. Annotation provenance records the protocol and producer, reviewer, review status, and adjudication
+artifact. `independent` and `synthetic_conformance` labels require a distinct reviewer and content-addressed
+adjudication evidence; declaring a label independently reviewed is not enough by itself.
+
 Only an `independent`, `exhaustive_within_scope` slice may support open-world PII recall, precision/F1, negative-document
 false-alarm rate, leaked-sensitive-character measures, or over-redaction measures. A `partial` independent slice may
 report raw labeled-span hits and misses as a partial diagnostic, but those values are not open-world recall and
@@ -152,6 +165,18 @@ including a failed or aborted run, enters an append-only public benchmark lineag
 benchmark version and newly sealed test, but the successor must link the failed version and disclose the changes and
 decisions informed by its outcome; it never replaces or hides that result. Repeatedly tuning against the same final test
 or selectively surfacing only successful benchmark versions invalidates promotion.
+
+Before access, the manifest designates exactly one prepared primary natural-content view and binds its artifact and
+content policy. A promoted quality run must attest that this view contains no answer-bearing fields. The manifest also
+freezes each quality slice's label artifact, role, class, cohort, text view, gate status, and exact document, span,
+cataloged-span, sensitive-positive, catalog-positive, negative-document, sensitive-character, and evaluated-character
+denominators. Evidence must preserve the plan's order and membership; each gate slice is the complete independently and
+exhaustively labeled final-test role, not a favorable subsample.
+
+The conformance plan separately freezes content-addressed positive and negative/adversarial case artifacts, their
+counts, the exhaustive synthetic label artifact, and the conformance policy hash. It requires positive support for every
+active pattern. The final-test frozen target and every lineage entry bind the manifest hash alongside the bank,
+evaluator, split, thresholds, performance plan, source commit, and freeze time.
 
 ## Quality Metrics
 
@@ -215,6 +240,10 @@ The evidence also reports total positive/negative documents, gold/predicted span
 numerators and denominators for every rate. Per-class, head/tail, seen/unseen identity, temporal/future, document-size,
 hit-density, and challenge slices are required when applicable. Micro averages never replace these slices.
 
+V2 does not assert a binomial confidence interval for quality. The sealed benchmark is a fixed finite evaluation, and
+the contract makes no independent-and-identically-distributed sampling claim that would justify one. This does not
+excuse small evidence: raw support counts and promotion support floors are mandatory and stay visible beside every rate.
+
 ## Performance And Scale Protocol
 
 The primary runtime measurement is the direct compiled-bank reuse path: construct one validated `Bank`, warm it under a
@@ -228,37 +257,62 @@ combined into a single latency number:
 - input decode/read and any redaction/serialization post-processing; and
 - end-to-end application time.
 
-Workloads use frozen bank and document hashes and include realistic 1k, 10k, 25k, and 100k active-alias shapes; negative,
-sparse-hit, normal-hit, and dense-hit documents; small through huge documents; and declared concurrency levels. Relevant
-format-regex and forced-recompile/uncached baselines may show the value of cached canonical intelligence, but their
-different capabilities must be stated.
+Every workload declares one timing unit. `operation` measures a bank setup operation and has no document-throughput
+denominator. `document` measures document-level latency. `whole_input` measures a complete bound input and supports
+documents/second, MiB/second, and records/second. Setup phases cannot borrow an input denominator; every scan-bearing
+phase binds the exact bank and input descriptor. Workload hashes freeze the phase, bank/input identities, unit, warmups,
+work per sample, concurrency, process model, and statistic methods without hashing observed timings into the plan.
 
-Each workload records isolated warmups, raw timing samples or a content-addressed reference to them, sample count,
-median/p95/p99 and dispersion, documents/second, MiB/second, match count, bank/source bytes, peak RSS when available, and
-machine/runtime identity. Cold compile requires independent process samples. Tail latency requires enough document-level
-samples to make its percentile meaningful. Public evidence may not rely on one sample, mix quality text with injected
-inventories, or compare different workload/evaluator fingerprints.
+Each real or generated input descriptor binds a content-addressed artifact and a bank-specific, content-addressed
+privacy-safe inventory containing only byte and detected-record counts per document. The verifier recomputes the
+document, byte, and record totals, length and hit distributions, and deterministic size and density cohorts from that
+inventory; promoted decision cells must provide it. This commits every throughput denominator without publishing
+message text.
+
+Bank descriptors freeze taxonomy composition as well as entity, name, alias, literal-pattern, regex-pattern, and byte
+counts. Promotion exercises distinct 1k, 10k, 25k, and 100k active-alias banks whose taxonomy and alias/regex
+proportions track the evaluated bank within the contract tolerance. Direct-scan inputs cover negative, sparse, normal,
+and dense hits; small, medium, large, and huge documents; and both serial and machine-bounded concurrent execution.
+
+Each lifecycle phase—source build, cold compile, helper cache miss, helper cache hit, direct bank scan, and end to
+end—has an evaluated-bank decision cell. Decision-grade cells use one work unit and at least 100 raw timing samples
+(inline or by verified content-addressed reference), plus one positive RSS sample per timing sample with peak RSS equal
+to their maximum. Fresh-process phases use zero warmups; reused-process phases use at least three. Median and median
+absolute deviation use the declared conventional methods; nearest-rank p95 requires 20 samples and p99 requires 100.
+
+Every decision cell has same-machine comparisons against an exact semantic baseline on identical phase, bank, input,
+sample unit, work, and concurrency. At minimum it compares p99, plus MiB/second for whole-input cells, and promotion
+rejects a regression beyond the frozen noise multiplier and tolerance. Comparison hashes commit only the candidate and
+baseline cell IDs, metric, direction, and noise policy, not observed values or outcomes. Capability differences must
+still be stated for non-equivalent exploratory baseline measurements, which are not exact regression comparisons.
 
 Absolute results are hardware-specific. Promotion uses thresholds frozen from validation and a same-machine repeated
-baseline, reports uncertainty/noise diagnostics, and fails closed when required samples or environment provenance are
-missing. CI smoke timing is robustness evidence, not a substitute for the decision-grade protocol.
+baseline, reports noise diagnostics, and fails closed when required samples, input inventories, RSS, or environment
+provenance are missing. Every decision cell gates median, p95, p99, and peak RSS; document cells also gate seconds per
+document, while whole-input cells gate documents/second and MiB/second. CI smoke timing is robustness evidence, not a
+substitute for the decision-grade protocol.
 
-The value demonstration also records a parameterized break-even model rather than inventing hosted-model prices. Let
-`B` be one-time private source profiling/build/curation cost, `C` cold validation/compile cost, `S(n)` repeated NERB scan
-cost for `n` documents, and `A(n)` the measured or user-supplied cost of an explicitly scoped alternative. Report the
-smallest `n` for which `B + C + S(n) <= A(n)`, with every price, latency, labor, hardware, and reuse-frequency assumption
-visible. This economic model supplements privacy/quality gates; it never discounts a miss.
+The value demonstration records an additive parameterized break-even model rather than inventing hosted-model prices.
+Candidate fixed costs separate declared source curation, measured bank build, and measured cold compile; marginal scan
+cost comes from a decision-grade document workload and is paired with a comparable exact-baseline scan. Other fixed or
+marginal assumptions remain explicit. Let `B` be private curation/build cost, `C` cold compile cost, `S(n)` repeated
+NERB scan cost for `n` documents, and `A(n)` the alternative's additive cost. Report the smallest `n` for which
+`B + C + S(n) <= A(n)`. The value-plan hash commits component roles and sources, units, range, and declared assumption
+values, but not later measured workload values or the derived result. Promotion requires a finite supported advantage or
+break-even. This model supplements privacy/quality gates; it never discounts a miss.
 
 ## V2 Artifact Contract
 
 V2 has two versioned JSON contracts:
 
-- `nerb.enron_manifest.v2` binds evaluator ID/digest; source ID, revision, and content hashes; cleaning/group/split policy
-  hashes; the split-manifest hash; train/validation/test artifact hashes and counts; bank hash; label artifact references
-  and strengths; package, native-engine, commit, and schema identities; exact commands; environment; and privacy-safe
-  validation status.
+- `nerb.enron_manifest.v2` binds evaluator ID/digest; source ID, revision, and content hashes;
+  cleaning/group/split policy hashes; the split-manifest hash; train/validation/test artifact hashes and counts; the
+  primary prepared text view; bank hash; exact per-role label populations and annotation provenance; quality-denominator
+  and positive/negative conformance plans; package, native-engine, commit, and schema identities; exact commands;
+  environment; and privacy-safe validation status.
 - `nerb.enron_evidence.v2` binds one manifest hash to evaluation status, aggregate quality slices, catalog-conformance
-  results, performance workloads and raw sample arrays/references, configured thresholds, promotion-gate results,
+  results, the final-test frozen target and lineage, performance banks and inputs, raw timing samples or references plus
+  raw RSS samples, exact baseline comparisons and additive value models, configured thresholds, promotion-gate results,
   verifier status, and supportable claims.
 
 Paths and commands are sanitized but remain exact enough to reproduce in an authorized environment. Private artifact
@@ -293,6 +347,18 @@ A result is promotable only when all applicable checks pass:
 7. privacy-safe serialization/scan passes and no raw text, aliases, addresses, per-document failures, or sensitive paths
    appear in public artifacts; and
 8. an independent reviewer verifies the evidence/claim mapping at the final commit.
+
+Every promotion-gate quality slice must contain at least 100 documents, 100 gold spans, 20 negative documents, and 500
+sensitive-gold characters. Validation may tighten, but cannot weaken, the v2 policy floors: open-world recall at least
+0.95, catalog coverage at least 0.80, cataloged recall exactly 1.0, and sensitive-character recall at least 0.98. The
+corresponding ceilings are document leak rate 0.05, sensitive-character leak rate 0.02, negative-document false-alarm
+rate 0.50, and over-redaction rate 0.05. Zero cataloged misses, wrong canonical mappings, and catalog-miss documents are
+separate exact gates.
+
+Structured public claims are not selected from convenient diagnostics. Promotion requires the full quality metric set
+for every gate-designated slice, a passing catalog-conformance claim, and performance claims tied to the exact promoted
+document-latency and whole-input-throughput workloads. Each claim repeats its exact slice or workload, scope, label
+strength/completeness, bank, evaluator, source revision, benchmark version, and environment provenance.
 
 A failed final gate is evidence, not permission to tune on the test. Claims must name the corpus revision, benchmark
 version, bank and evaluator hashes, label strength, class/cohort scope, and machine context for performance. “No known

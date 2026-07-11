@@ -6,7 +6,7 @@ import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -17,8 +17,14 @@ from nerb.enron_contract import (
     ENRON_EVIDENCE_SCHEMA_VERSION,
     ENRON_MANIFEST_SCHEMA,
     ENRON_MANIFEST_SCHEMA_VERSION,
+    hash_enron_breakeven_plan,
     hash_enron_environment,
     hash_enron_manifest,
+    hash_enron_performance_bank,
+    hash_enron_performance_baseline,
+    hash_enron_performance_comparison_plan,
+    hash_enron_performance_input,
+    hash_enron_performance_inventory,
     hash_enron_performance_manifest,
     hash_enron_samples,
     hash_enron_test_lineage_entry,
@@ -67,22 +73,124 @@ def _set(value: Any, path: JsonPath, replacement: Any) -> None:
     current[path[-1]] = replacement
 
 
+def _resolve_pointer(value: Any, pointer: str) -> Any:
+    current = value
+    for raw_part in pointer.removeprefix("/").split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        current = current[int(part)] if isinstance(current, list) else current[part]
+    return current
+
+
+def _refresh_check_actuals(evidence: JsonObject, *, target_prefix: str) -> None:
+    for check in evidence["promotion"]["checks"]:
+        if not check["target"].startswith(target_prefix):
+            continue
+        actual = _resolve_pointer(evidence, check["target"])
+        refreshed = _gate(
+            check["id"],
+            check["category"],
+            check["target"],
+            check["operator"],
+            check["threshold"],
+            actual,
+        )
+        check["actual"] = refreshed["actual"]
+        check["passed"] = refreshed["passed"]
+
+
 def _nearest_rank(values: Sequence[float], probability: float) -> float:
     return sorted(values)[max(0, math.ceil(probability * len(values)) - 1)]
 
 
-def _sample_stats(samples: Sequence[float], documents: int, byte_count: int) -> JsonObject:
+def _inventory_summary(inventory: Sequence[Mapping[str, int]]) -> JsonObject:
+    byte_counts = sorted(int(row["bytes"]) for row in inventory)
+    record_counts = sorted(int(row["records"]) for row in inventory)
+    documents = len(inventory)
+    byte_count = sum(byte_counts)
+    records = sum(record_counts)
+    records_per_document = records / documents
+    if records == 0:
+        hit_density = "negative"
+    elif records_per_document < 0.1:
+        hit_density = "sparse"
+    elif records_per_document <= 2:
+        hit_density = "normal"
+    else:
+        hit_density = "dense"
+    mean_bytes = byte_count / documents
+    if mean_bytes < 1024:
+        size_cohort = "small"
+    elif mean_bytes < 16 * 1024:
+        size_cohort = "medium"
+    elif mean_bytes < 256 * 1024:
+        size_cohort = "large"
+    else:
+        size_cohort = "huge"
+    return {
+        "documents": documents,
+        "bytes": byte_count,
+        "records": records,
+        "hit_density": hit_density,
+        "size_cohort": size_cohort,
+        "document_length_distribution": {
+            "minimum_bytes": byte_counts[0],
+            "p50_bytes": int(_nearest_rank(byte_counts, 0.50)),
+            "p95_bytes": int(_nearest_rank(byte_counts, 0.95)),
+            "p99_bytes": int(_nearest_rank(byte_counts, 0.99)),
+            "maximum_bytes": byte_counts[-1],
+            "mean_bytes": byte_count / documents,
+        },
+        "hit_distribution": {
+            "negative_documents": sum(value == 0 for value in record_counts),
+            "documents_with_records": sum(value > 0 for value in record_counts),
+            "minimum_records": record_counts[0],
+            "p50_records": int(_nearest_rank(record_counts, 0.50)),
+            "p95_records": int(_nearest_rank(record_counts, 0.95)),
+            "p99_records": int(_nearest_rank(record_counts, 0.99)),
+            "maximum_records": record_counts[-1],
+            "mean_records": records / documents,
+        },
+    }
+
+
+def _inventory_payload_bytes(inventory: Sequence[Mapping[str, int]]) -> int:
+    payload = json.dumps(inventory, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return len(payload.encode("utf-8"))
+
+
+def _sample_stats(
+    samples: Sequence[float], input_descriptor: Mapping[str, Any] | None, sample_unit: str, work_per_sample: int
+) -> JsonObject:
     ordered = sorted(float(value) for value in samples)
     median_seconds = float(median(ordered))
     deviations = [abs(value - median_seconds) for value in ordered]
+    if sample_unit == "operation":
+        documents_per_sample = None
+        documents_per_second = None
+        mib_per_second = None
+        records_per_second = None
+    elif sample_unit == "whole_input" and input_descriptor is not None:
+        documents_per_sample = input_descriptor["documents"] * work_per_sample
+        bytes_per_sample = input_descriptor["bytes"] * work_per_sample
+        records_per_sample = input_descriptor["records"] * work_per_sample
+        documents_per_second: float | None = documents_per_sample / median_seconds
+        mib_per_second: float | None = bytes_per_sample / (1024 * 1024) / median_seconds
+        records_per_second: float | None = records_per_sample / median_seconds
+    elif input_descriptor is not None:
+        documents_per_sample = work_per_sample
+        documents_per_second = None
+        mib_per_second = None
+        records_per_second = None
     return {
         "sample_count": len(ordered),
         "median_seconds": median_seconds,
         "p95_seconds": _nearest_rank(ordered, 0.95) if len(ordered) >= 20 else None,
         "p99_seconds": _nearest_rank(ordered, 0.99) if len(ordered) >= 100 else None,
         "mad_seconds": float(median(deviations)),
-        "documents_per_second": documents / median_seconds,
-        "mib_per_second": byte_count / (1024 * 1024) / median_seconds,
+        "documents_per_second": documents_per_second,
+        "mib_per_second": mib_per_second,
+        "records_per_second": records_per_second,
+        "seconds_per_document": None if documents_per_sample is None else median_seconds / documents_per_sample,
     }
 
 
@@ -97,9 +205,29 @@ def _sample_payload_bytes(samples: Sequence[float]) -> int:
     return len(payload.encode("utf-8"))
 
 
-def _refresh_workload(workload: JsonObject, samples: Sequence[float] | None = None) -> None:
+def _refresh_bank_descriptor(bank: JsonObject) -> None:
+    bank["descriptor_sha256"] = hash_enron_performance_bank(bank)
+
+
+def _refresh_input_descriptor(input_descriptor: JsonObject) -> None:
+    input_descriptor["descriptor_sha256"] = hash_enron_performance_input(input_descriptor)
+
+
+def _refresh_workload(evidence: JsonObject, workload: JsonObject, samples: Sequence[float] | None = None) -> None:
     resolved = list(workload["samples_seconds"] if samples is None else samples)
-    workload["stats"] = _sample_stats(resolved, workload["documents"], workload["bytes"])
+    input_descriptor = next(
+        (item for item in evidence["performance"]["inputs"] if item["id"] == workload["input_id"]),
+        None,
+    )
+    workload["input_sha256"] = None if input_descriptor is None else input_descriptor["descriptor_sha256"]
+    workload["stats"] = _sample_stats(
+        resolved,
+        input_descriptor,
+        workload["sample_unit"],
+        workload["work_per_sample"],
+    )
+    peak_rss_bytes = workload["peak_rss_bytes"]
+    workload["rss_samples_bytes"] = [] if peak_rss_bytes is None else [peak_rss_bytes] * len(resolved)
     workload["workload_sha256"] = hash_enron_workload(workload)
 
 
@@ -137,6 +265,7 @@ def _refresh_frozen_contract(evidence: JsonObject) -> None:
     frozen = access["frozen_target"]
     frozen.update(
         {
+            "manifest_sha256": evidence["manifest_sha256"],
             "bank_hash": evidence["bank"]["canonical_hash"],
             "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
             "split_manifest_sha256": evidence["splits"]["manifest_sha256"],
@@ -155,6 +284,7 @@ def _sync_bound_manifest(manifest: JsonObject, evidence: JsonObject) -> None:
     manifest["thresholds_sha256"] = evidence["thresholds_sha256"]
     manifest["performance_manifest_sha256"] = evidence["performance_manifest_sha256"]
     evidence["manifest_sha256"] = hash_enron_manifest(manifest)
+    _refresh_frozen_contract(evidence)
 
 
 def _gate(
@@ -184,6 +314,7 @@ def _gate(
 
 def _claim_provenance(evidence: Mapping[str, Any]) -> JsonObject:
     return {
+        "benchmark_version": evidence["test_access"]["benchmark_version"],
         "source_revision": evidence["source"]["revision"],
         "bank_hash": evidence["bank"]["canonical_hash"],
         "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
@@ -206,8 +337,8 @@ def _catalog_claim(evidence: Mapping[str, Any]) -> JsonObject:
     }
 
 
-def _quality_claim(evidence: Mapping[str, Any], metric: str) -> JsonObject:
-    item = evidence["quality"]["slices"][0]
+def _quality_claim(evidence: Mapping[str, Any], metric: str, *, slice_index: int = 0) -> JsonObject:
+    item = evidence["quality"]["slices"][slice_index]
     return {
         "id": metric,
         "kind": "open_world_quality",
@@ -227,8 +358,10 @@ def _quality_claim(evidence: Mapping[str, Any], metric: str) -> JsonObject:
     }
 
 
-def _performance_claim(evidence: Mapping[str, Any], metric: str, stat_field: str) -> JsonObject:
-    workload = evidence["performance"]["workloads"][0]
+def _performance_claim(
+    evidence: Mapping[str, Any], metric: str, stat_field: str, *, workload_index: int = 0
+) -> JsonObject:
+    workload = evidence["performance"]["workloads"][workload_index]
     return {
         "id": metric,
         "kind": "performance",
@@ -243,66 +376,439 @@ def _performance_claim(evidence: Mapping[str, Any], metric: str, stat_field: str
     }
 
 
-def _add_required_performance_matrix(evidence: JsonObject) -> None:
-    performance = evidence["performance"]
-    evaluated_hash = evidence["bank"]["canonical_hash"]
-    base = performance["workloads"][0]
-    phase_specs = (
-        ("source_build", "negative", 1, "reused_process"),
-        ("cold_compile", "sparse", 1, "fresh_process_per_sample"),
-        ("helper_cache_miss", "dense", 1, "reused_process"),
-        ("helper_cache_hit", "normal", 4, "reused_process"),
-        ("end_to_end", "normal", 1, "reused_process"),
+def _sha256_number(value: int) -> str:
+    return "sha256:" + f"{value:064x}"
+
+
+def _make_inventory(hit_density: str, *, documents: int = 100, bytes_per_document: int = 10240) -> list[JsonObject]:
+    record_counts = {
+        "negative": [0] * documents,
+        "sparse": [1] + [0] * (documents - 1),
+        "normal": [1] * documents,
+        "dense": [3] * documents,
+    }[hit_density]
+    return [{"bytes": bytes_per_document, "records": count} for count in record_counts]
+
+
+def _make_performance_input(
+    bank: Mapping[str, Any],
+    *,
+    identifier: str,
+    artifact_number: int,
+    kind: str,
+    hit_density: str,
+    bytes_per_document: int = 10240,
+) -> tuple[JsonObject, list[JsonObject]]:
+    inventory = _make_inventory(hit_density, bytes_per_document=bytes_per_document)
+    summary = _inventory_summary(inventory)
+    generator = None
+    if kind == "synthetic_input":
+        generator = {
+            "id": f"{identifier}_generator",
+            "version": "1.0.0",
+            "source_sha256": _sha256_number(artifact_number + 1),
+            "spec_sha256": _sha256_number(artifact_number + 2),
+            "seed": f"{identifier}-seed",
+        }
+    descriptor: JsonObject = {
+        "id": identifier,
+        "kind": kind,
+        "bank_id": bank["id"],
+        "bank_hash": bank["bank_hash"],
+        "artifact": {
+            "id": f"{identifier}_documents",
+            "sha256": _sha256_number(artifact_number),
+            "bytes": summary["bytes"],
+        },
+        "inventory_ref": {
+            "id": f"{identifier}_inventory",
+            "sha256": hash_enron_performance_inventory(inventory),
+            "bytes": _inventory_payload_bytes(inventory),
+        },
+        "generator": generator,
+        **summary,
+        "descriptor_sha256": _sha256_number(0),
+    }
+    _refresh_input_descriptor(descriptor)
+    return descriptor, inventory
+
+
+def _make_scale_bank(active_aliases: int, *, number: int) -> JsonObject:
+    active_entities = active_aliases * 3
+    active_names = active_aliases * 4
+    active_patterns = active_aliases * 5
+    regex_patterns = active_aliases
+    descriptor: JsonObject = {
+        "id": f"scale_{active_aliases}",
+        "kind": "synthetic_scale",
+        "bank_hash": _sha256_number(number),
+        "artifact": {
+            "id": f"scale_{active_aliases}_bank_artifact",
+            "sha256": _sha256_number(number + 1),
+            "bytes": active_patterns * 64,
+        },
+        "generator": {
+            "id": "fixture_scale_bank_generator",
+            "version": "1.0.0",
+            "source_sha256": _sha256_number(900),
+            "spec_sha256": _sha256_number(901),
+            "seed": f"scale-{active_aliases}-seed",
+        },
+        "composition": {
+            "taxonomy": [
+                {
+                    "entity_class": "synthetic_person",
+                    "entities": active_entities,
+                    "canonical_names": active_names - active_aliases,
+                    "aliases": active_aliases,
+                    "literal_patterns": active_patterns - regex_patterns,
+                    "regex_patterns": regex_patterns,
+                },
+            ]
+        },
+        "descriptor_sha256": _sha256_number(0),
+        "active_entities": active_entities,
+        "active_names": active_names,
+        "active_aliases": active_aliases,
+        "active_patterns": active_patterns,
+        "canonical_json_bytes": active_patterns * 64,
+        "native_source_bytes": active_patterns * 32,
+    }
+    _refresh_bank_descriptor(descriptor)
+    return descriptor
+
+
+def _make_decision_workload(
+    evidence: JsonObject,
+    template: JsonObject,
+    *,
+    identifier: str,
+    bank: Mapping[str, Any],
+    input_descriptor: Mapping[str, Any],
+    phase: str,
+    sample_unit: str,
+    promotion_gate: bool = False,
+    concurrency: int = 1,
+) -> JsonObject:
+    process_model = {
+        "source_build": "fresh_process_per_sample",
+        "cold_compile": "fresh_process_per_sample",
+        "helper_cache_miss": "fresh_process_per_sample",
+        "helper_cache_hit": "reused_process",
+        "direct_bank_scan": "reused_process",
+        "end_to_end": "fresh_process_per_sample",
+    }[phase]
+    setup_phase = phase in {"source_build", "cold_compile"}
+    if setup_phase:
+        sample_unit = "operation"
+    workload = copy.deepcopy(template)
+    workload.update(
+        {
+            "id": identifier,
+            "phase": phase,
+            "promotion_gate": promotion_gate,
+            "decision_grade": True,
+            "bank_id": bank["id"],
+            "bank_hash": bank["bank_hash"],
+            "input_id": None if setup_phase else input_descriptor["id"],
+            "input_sha256": None if setup_phase else input_descriptor["descriptor_sha256"],
+            "baseline_id": None,
+            "warmups": 3 if process_model == "reused_process" else 0,
+            "sample_unit": sample_unit,
+            "work_per_sample": 1,
+            "concurrency": concurrency,
+            "process_model": process_model,
+            "samples_seconds": [0.01 + index / 1_000_000 for index in range(100)],
+            "samples_ref": None,
+            "peak_rss_bytes": 1024 * 1024,
+        }
     )
-    for phase, hit_density, concurrency, process_model in phase_specs:
-        workload = copy.deepcopy(base)
-        workload.update(
+    _refresh_workload(evidence, workload)
+    return workload
+
+
+def _add_baseline_comparisons_and_breakeven(
+    evidence: JsonObject, candidate_workloads: Sequence[JsonObject]
+) -> list[JsonObject]:
+    performance = evidence["performance"]
+    baseline: JsonObject = {
+        "id": "exact_fixture_baseline",
+        "name": "fixture-exact-reference",
+        "version": "1.0.0",
+        "source_sha256": _sha256_number(960),
+        "capabilities": {
+            "literal_patterns": True,
+            "regex_patterns": True,
+            "aliases": True,
+            "canonical_mapping": True,
+            "unicode": True,
+        },
+        "semantic_equivalence": "exact",
+        "descriptor_sha256": _sha256_number(0),
+    }
+    baseline["descriptor_sha256"] = hash_enron_performance_baseline(baseline)
+    performance["baselines"] = [baseline]
+    baseline_workloads: list[JsonObject] = []
+    comparisons: list[JsonObject] = []
+    for candidate in candidate_workloads:
+        reference = copy.deepcopy(candidate)
+        reference.update(
             {
-                "id": f"{phase}_fixture",
-                "phase": phase,
+                "id": f"baseline_{candidate['id']}",
                 "promotion_gate": False,
-                "bank_hash": evaluated_hash,
-                "hit_density": hit_density,
-                "concurrency": concurrency,
-                "process_model": process_model,
-                "samples_seconds": [0.02 + index / 100_000 for index in range(5)],
-                "samples_ref": None,
+                "decision_grade": False,
+                "baseline_id": baseline["id"],
+                "samples_seconds": [0.015 + index / 1_000_000 for index in range(100)],
             }
         )
-        _refresh_workload(workload)
-        performance["workloads"].append(workload)
-
-    for index, active_patterns in enumerate((1_000, 10_000, 25_000, 100_000), start=1):
-        bank_hash = "sha256:" + f"{active_patterns:064x}"
-        performance["banks"].append(
-            {
-                "id": f"scale_{active_patterns}",
-                "kind": "synthetic_scale",
-                "bank_hash": bank_hash,
-                "active_entities": max(1, active_patterns // 10),
-                "active_names": active_patterns,
-                "active_patterns": active_patterns,
-                "canonical_json_bytes": active_patterns * 64,
-                "native_source_bytes": active_patterns * 32,
+        _refresh_workload(evidence, reference)
+        baseline_workloads.append(reference)
+        metrics = ["p99_seconds"]
+        if candidate["sample_unit"] == "whole_input":
+            metrics.append("mib_per_second")
+        for metric in metrics:
+            candidate_value = candidate["stats"][metric]
+            baseline_value = reference["stats"][metric]
+            direction = "lower_is_better" if metric == "p99_seconds" else "higher_is_better"
+            relative_degradation = (
+                (candidate_value - baseline_value) / baseline_value
+                if direction == "lower_is_better"
+                else (baseline_value - candidate_value) / baseline_value
+            )
+            noise_multiplier = 2.0
+            noise_floor = (
+                max(
+                    candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
+                    reference["stats"]["mad_seconds"] / reference["stats"]["median_seconds"],
+                )
+                * noise_multiplier
+            )
+            regression_tolerance = 0.05
+            boundary = noise_floor + regression_tolerance
+            result = (
+                "regressed"
+                if relative_degradation > boundary
+                else "improved"
+                if relative_degradation < -boundary
+                else "equivalent_within_noise"
+            )
+            comparison: JsonObject = {
+                "id": f"compare_{candidate['id']}_{metric}",
+                "candidate_workload_id": candidate["id"],
+                "baseline_workload_id": reference["id"],
+                "metric": metric,
+                "direction": direction,
+                "candidate_value": candidate_value,
+                "baseline_value": baseline_value,
+                "relative_degradation": relative_degradation,
+                "noise_multiplier": noise_multiplier,
+                "noise_floor": noise_floor,
+                "regression_tolerance": regression_tolerance,
+                "result": result,
+                "comparison_plan_sha256": _sha256_number(0),
             }
-        )
-        workload = copy.deepcopy(base)
-        workload.update(
-            {
-                "id": f"scale_{active_patterns}_scan",
-                "promotion_gate": False,
-                "bank_hash": bank_hash,
-                "concurrency": 1 if index < 4 else 4,
-                "hit_density": ("negative", "sparse", "normal", "dense")[index - 1],
-                "samples_seconds": [0.03 + sample / 100_000 for sample in range(5)],
-                "samples_ref": None,
-            }
-        )
-        _refresh_workload(workload)
-        performance["workloads"].append(workload)
+            comparison["comparison_plan_sha256"] = hash_enron_performance_comparison_plan(comparison)
+            comparisons.append(comparison)
+    performance["comparisons"] = sorted(comparisons, key=lambda item: item["id"])
+
+    candidate_setup = next(item for item in candidate_workloads if item["phase"] == "source_build")
+    candidate_compile = next(item for item in candidate_workloads if item["phase"] == "cold_compile")
+    candidate_marginal = next(item for item in candidate_workloads if item["id"] == "direct_bank_latency")
+    baseline_by_candidate = {item["id"].removeprefix("baseline_"): item for item in baseline_workloads}
+    baseline_setup = baseline_by_candidate[candidate_setup["id"]]
+    baseline_marginal = baseline_by_candidate[candidate_marginal["id"]]
+    components = [
+        {
+            "id": "baseline_fixed_build",
+            "side": "baseline",
+            "application": "fixed",
+            "category": "bank_build",
+            "source": "workload_median_seconds",
+            "description": "Exact baseline source-build time.",
+            "workload_id": baseline_setup["id"],
+            "assumption_sha256": None,
+            "value": baseline_setup["stats"]["median_seconds"],
+        },
+        {
+            "id": "baseline_per_document_scan",
+            "side": "baseline",
+            "application": "per_unit",
+            "category": "scan",
+            "source": "workload_seconds_per_document",
+            "description": "Exact baseline marginal scan time per document.",
+            "workload_id": baseline_marginal["id"],
+            "assumption_sha256": None,
+            "value": baseline_marginal["stats"]["seconds_per_document"],
+        },
+        {
+            "id": "candidate_fixed_build",
+            "side": "candidate",
+            "application": "fixed",
+            "category": "bank_build",
+            "source": "workload_median_seconds",
+            "description": "Candidate source-build time.",
+            "workload_id": candidate_setup["id"],
+            "assumption_sha256": None,
+            "value": candidate_setup["stats"]["median_seconds"],
+        },
+        {
+            "id": "candidate_fixed_cold_compile",
+            "side": "candidate",
+            "application": "fixed",
+            "category": "cold_compile",
+            "source": "workload_median_seconds",
+            "description": "Candidate cold native compilation time.",
+            "workload_id": candidate_compile["id"],
+            "assumption_sha256": None,
+            "value": candidate_compile["stats"]["median_seconds"],
+        },
+        {
+            "id": "candidate_fixed_source_curation",
+            "side": "candidate",
+            "application": "fixed",
+            "category": "source_curation",
+            "source": "declared_assumption",
+            "description": "Frozen source-curation effort assumption.",
+            "workload_id": None,
+            "assumption_sha256": _sha256_number(970),
+            "value": 0.001,
+        },
+        {
+            "id": "candidate_per_document_scan",
+            "side": "candidate",
+            "application": "per_unit",
+            "category": "scan",
+            "source": "workload_seconds_per_document",
+            "description": "Candidate marginal scan time per document.",
+            "workload_id": candidate_marginal["id"],
+            "assumption_sha256": None,
+            "value": candidate_marginal["stats"]["seconds_per_document"],
+        },
+    ]
+    candidate_fixed_value = (
+        candidate_setup["stats"]["median_seconds"] + candidate_compile["stats"]["median_seconds"] + 0.001
+    )
+    baseline_fixed_value = baseline_setup["stats"]["median_seconds"]
+    candidate_value_per_unit = candidate_marginal["stats"]["seconds_per_document"]
+    baseline_value_per_unit = baseline_marginal["stats"]["seconds_per_document"]
+    crossing = math.ceil(
+        (candidate_fixed_value - baseline_fixed_value) / (baseline_value_per_unit - candidate_value_per_unit)
+    )
+    model: JsonObject = {
+        "id": "fixture_build_scan_breakeven",
+        "parameter_name": "scanned_documents",
+        "parameter_unit": "document",
+        "value_unit": "seconds",
+        "minimum_units": 1,
+        "maximum_units": 1_000_000,
+        "components": components,
+        "candidate_fixed_value": candidate_fixed_value,
+        "baseline_fixed_value": baseline_fixed_value,
+        "candidate_value_per_unit": candidate_value_per_unit,
+        "baseline_value_per_unit": baseline_value_per_unit,
+        "result": "finite_breakeven",
+        "breakeven_units": crossing,
+        "model_plan_sha256": _sha256_number(0),
+    }
+    model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
+    performance["breakeven_models"] = [model]
+    return baseline_workloads
 
 
-def _promotable(manifest: JsonObject, evidence: JsonObject) -> tuple[JsonObject, JsonObject]:
+def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[JsonObject]]:
+    performance = evidence["performance"]
+    inventories: dict[str, list[JsonObject]] = {}
+    evaluated_bank = performance["banks"][0]
+    real_input, inventory = _make_performance_input(
+        evaluated_bank,
+        identifier="real_scan_input",
+        artifact_number=700,
+        kind="real_input",
+        hit_density="normal",
+    )
+    performance["inputs"] = [real_input]
+    inventories[real_input["inventory_ref"]["id"]] = inventory
+    template = performance["workloads"][0]
+    workloads = [
+        _make_decision_workload(
+            evidence,
+            template,
+            identifier="direct_bank_latency",
+            bank=evaluated_bank,
+            input_descriptor=real_input,
+            phase="direct_bank_scan",
+            sample_unit="document",
+            promotion_gate=True,
+        ),
+        _make_decision_workload(
+            evidence,
+            template,
+            identifier="direct_bank_throughput",
+            bank=evaluated_bank,
+            input_descriptor=real_input,
+            phase="direct_bank_scan",
+            sample_unit="whole_input",
+            promotion_gate=True,
+        ),
+    ]
+    for phase in ("source_build", "cold_compile", "helper_cache_miss", "helper_cache_hit", "end_to_end"):
+        workloads.append(
+            _make_decision_workload(
+                evidence,
+                template,
+                identifier=f"{phase}_fixture",
+                bank=evaluated_bank,
+                input_descriptor=real_input,
+                phase=phase,
+                sample_unit="whole_input",
+                concurrency=4 if phase == "helper_cache_hit" else 1,
+            )
+        )
+
+    for index, (active_aliases, hit_density, bytes_per_document) in enumerate(
+        zip(
+            (1_000, 10_000, 25_000, 100_000),
+            ("negative", "sparse", "normal", "dense"),
+            (512, 10_240, 65_536, 300_000),
+            strict=True,
+        ),
+        start=1,
+    ):
+        bank = _make_scale_bank(active_aliases, number=800 + index * 10)
+        input_descriptor, inventory = _make_performance_input(
+            bank,
+            identifier=f"scale_{active_aliases}_input",
+            artifact_number=850 + index * 10,
+            kind="synthetic_input",
+            hit_density=hit_density,
+            bytes_per_document=bytes_per_document,
+        )
+        performance["banks"].append(bank)
+        performance["inputs"].append(input_descriptor)
+        inventories[input_descriptor["inventory_ref"]["id"]] = inventory
+        workloads.append(
+            _make_decision_workload(
+                evidence,
+                template,
+                identifier=f"scale_{active_aliases}_scan",
+                bank=bank,
+                input_descriptor=input_descriptor,
+                phase="direct_bank_scan",
+                sample_unit="whole_input",
+                concurrency=4 if active_aliases == 100_000 else 1,
+            )
+        )
+    baseline_workloads = _add_baseline_comparisons_and_breakeven(evidence, workloads)
+    workloads.extend(baseline_workloads)
+    performance["banks"].sort(key=lambda item: item["id"])
+    performance["inputs"].sort(key=lambda item: item["id"])
+    performance["workloads"] = sorted(workloads, key=lambda item: item["id"])
+    return inventories
+
+
+def _promotable(
+    manifest: JsonObject, evidence: JsonObject
+) -> tuple[JsonObject, JsonObject, dict[str, list[JsonObject]]]:
     bound_manifest = copy.deepcopy(manifest)
     value = copy.deepcopy(evidence)
     bound_manifest["artifact_kind"] = "real_benchmark"
@@ -310,18 +816,75 @@ def _promotable(manifest: JsonObject, evidence: JsonObject) -> tuple[JsonObject,
     release_commit = "f" * 40
     bound_manifest["software"]["git_commit"] = release_commit
     value["software"]["git_commit"] = release_commit
+    bound_manifest["commands"] = copy.deepcopy(value["commands"])
 
+    bound_manifest["source"]["input_records"] = 145
+    bound_manifest["preparation"]["output_records"] = 145
+    bound_manifest["splits"]["roles"]["test"].update({"records": 120, "groups": 120})
+    natural_label = bound_manifest["labels"][0]
+    natural_label["role_populations"][0].update({"documents": 120, "spans": 200})
+    natural_label["span_count"] = 200
+    value["source"] = copy.deepcopy(bound_manifest["source"])
+    value["preparation"] = copy.deepcopy(bound_manifest["preparation"])
+    value["splits"] = copy.deepcopy(bound_manifest["splits"])
     quality = value["quality"]["slices"][0]
-    quality["promotion_gate"] = True
-    workload = value["performance"]["workloads"][0]
-    workload["promotion_gate"] = True
-    workload["samples_seconds"] = [0.01 + index / 1_000_000 for index in range(100)]
-    workload["samples_ref"] = None
-    _refresh_workload(workload)
-    _add_required_performance_matrix(value)
+    quality.update(
+        {
+            "promotion_gate": True,
+            "documents": 120,
+            "documents_with_sensitive_gold": 100,
+            "documents_with_any_miss": 5,
+            "documents_with_cataloged_gold": 80,
+            "documents_with_any_cataloged_miss": 0,
+            "documents_with_any_leaked_character": 5,
+            "gold_spans": 200,
+            "predicted_spans": 200,
+            "true_positive": 190,
+            "false_positive": 10,
+            "false_negative": 10,
+            "cataloged_gold_spans": 160,
+            "cataloged_true_positive": 160,
+            "cataloged_false_negative": 0,
+            "cataloged_wrong_canonical": 0,
+            "sensitive_gold_characters": 1000,
+            "covered_sensitive_characters": 980,
+            "leaked_sensitive_characters": 20,
+            "predicted_characters": 1110,
+            "over_redacted_characters": 130,
+            "evaluated_characters": 10_000,
+            "negative_documents": 20,
+            "negative_documents_with_predictions": 10,
+            "metrics": {
+                "precision": 0.95,
+                "open_world_recall": 0.95,
+                "f1": 0.95,
+                "catalog_coverage": 0.8,
+                "cataloged_recall": 1.0,
+                "document_leak_rate": 0.05,
+                "cataloged_document_leak_rate": 0.0,
+                "sensitive_character_recall": 0.98,
+                "sensitive_character_leak_rate": 0.02,
+                "negative_document_false_alarm_rate": 0.5,
+                "over_redaction_rate": 0.013,
+            },
+        }
+    )
+    bound_manifest["quality_plan"][0].update(
+        {
+            "promotion_gate": True,
+            "documents": quality["documents"],
+            "documents_with_sensitive_gold": quality["documents_with_sensitive_gold"],
+            "negative_documents": quality["negative_documents"],
+            "gold_spans": quality["gold_spans"],
+            "cataloged_gold_spans": quality["cataloged_gold_spans"],
+            "documents_with_cataloged_gold": quality["documents_with_cataloged_gold"],
+            "sensitive_gold_characters": quality["sensitive_gold_characters"],
+            "evaluated_characters": quality["evaluated_characters"],
+        }
+    )
+    inventories = _add_required_performance_matrix(value)
 
     quality_index = 0
-    workload_index = 0
     checks = [
         _gate(
             "catalog_conformance",
@@ -359,14 +922,14 @@ def _promotable(manifest: JsonObject, evidence: JsonObject) -> tuple[JsonObject,
         ),
     ]
     quality_thresholds = {
-        "open_world_recall": ("gte", 0.85),
-        "catalog_coverage": ("gte", 0.75),
+        "open_world_recall": ("gte", 0.95),
+        "catalog_coverage": ("gte", 0.8),
         "cataloged_recall": ("gte", 1.0),
-        "document_leak_rate": ("lte", 0.2),
-        "sensitive_character_recall": ("gte", 0.9),
-        "sensitive_character_leak_rate": ("lte", 0.1),
-        "negative_document_false_alarm_rate": ("lte", 0.6),
-        "over_redaction_rate": ("lte", 0.02),
+        "document_leak_rate": ("lte", 0.05),
+        "sensitive_character_recall": ("gte", 0.98),
+        "sensitive_character_leak_rate": ("lte", 0.02),
+        "negative_document_false_alarm_rate": ("lte", 0.5),
+        "over_redaction_rate": ("lte", 0.05),
     }
     for metric, (operator, threshold) in quality_thresholds.items():
         checks.append(
@@ -379,38 +942,110 @@ def _promotable(manifest: JsonObject, evidence: JsonObject) -> tuple[JsonObject,
                 quality["metrics"][metric],
             )
         )
-    performance_thresholds = {
-        "median_seconds": ("lte", 0.02),
-        "p95_seconds": ("lte", 0.02),
-        "p99_seconds": ("lte", 0.02),
-        "mib_per_second": ("gte", 50.0),
-        "peak_rss_bytes": ("lte", 2 * 1024 * 1024),
-    }
-    for field, (operator, threshold) in performance_thresholds.items():
-        target = f"/performance/workloads/{workload_index}/"
-        target += f"stats/{field}" if field != "peak_rss_bytes" else field
-        checks.append(
-            _gate(
-                f"performance_{field}",
-                "performance",
-                target,
-                operator,
-                threshold,
-                workload[field] if field == "peak_rss_bytes" else workload["stats"][field],
+    for workload_index, workload in enumerate(value["performance"]["workloads"]):
+        if not workload["decision_grade"]:
+            continue
+        fields = {
+            "median_seconds": ("lte", 1.0),
+            "p95_seconds": ("lte", 1.0),
+            "p99_seconds": ("lte", 1.0),
+            "peak_rss_bytes": ("lte", 2 * 1024 * 1024),
+        }
+        if workload["sample_unit"] == "document":
+            fields["seconds_per_document"] = ("lte", 1.0)
+        elif workload["sample_unit"] == "whole_input":
+            fields.update(
+                {
+                    "documents_per_second": ("gte", 1.0),
+                    "mib_per_second": ("gte", 0.001),
+                    "records_per_second": ("gte", 0.0),
+                }
             )
-        )
+        for field, (operator, threshold) in fields.items():
+            target = f"/performance/workloads/{workload_index}/"
+            target += f"stats/{field}" if field != "peak_rss_bytes" else field
+            actual = workload[field] if field == "peak_rss_bytes" else workload["stats"][field]
+            checks.append(
+                _gate(
+                    f"performance_{workload['id']}_{field}",
+                    "performance",
+                    target,
+                    operator,
+                    threshold,
+                    actual,
+                )
+            )
     value["promotion"]["checks"] = checks
+    latency_index = next(
+        index
+        for index, workload in enumerate(value["performance"]["workloads"])
+        if workload["id"] == "direct_bank_latency"
+    )
+    throughput_index = next(
+        index
+        for index, workload in enumerate(value["performance"]["workloads"])
+        if workload["id"] == "direct_bank_throughput"
+    )
+    quality_claim_metrics = (
+        "precision",
+        "open_world_recall",
+        "f1",
+        "catalog_coverage",
+        "cataloged_recall",
+        "document_leak_rate",
+        "cataloged_document_leak_rate",
+        "sensitive_character_recall",
+        "sensitive_character_leak_rate",
+        "negative_document_false_alarm_rate",
+        "over_redaction_rate",
+    )
     value["promotion"]["claims"] = [
         _catalog_claim(value),
-        _quality_claim(value, "open_world_recall"),
-        _performance_claim(value, "direct_bank_scan_p99_seconds", "p99_seconds"),
-        _performance_claim(value, "direct_bank_scan_mib_per_second", "mib_per_second"),
+        *(_quality_claim(value, metric) for metric in quality_claim_metrics),
+        _performance_claim(
+            value,
+            "direct_bank_scan_p99_seconds",
+            "p99_seconds",
+            workload_index=latency_index,
+        ),
+        _performance_claim(
+            value,
+            "direct_bank_scan_mib_per_second",
+            "mib_per_second",
+            workload_index=throughput_index,
+        ),
     ]
     value["promotion"]["passed"] = True
     value["verifier"]["passed"] = True
     _refresh_frozen_contract(value)
     _sync_bound_manifest(bound_manifest, value)
-    return bound_manifest, value
+    return bound_manifest, value, inventories
+
+
+def _validate_promoted(
+    evidence: JsonObject,
+    manifest: JsonObject,
+    inventories: Mapping[str, Sequence[Mapping[str, int]]],
+    *,
+    trusted_lineage_prefix: Sequence[Mapping[str, Any]] = (),
+    referenced_samples: Mapping[str, Sequence[float]] | None = None,
+) -> JsonObject:
+    return validate_enron_evidence(
+        evidence,
+        manifest=manifest,
+        trusted_lineage_prefix=trusted_lineage_prefix,
+        referenced_samples=referenced_samples,
+        referenced_input_inventories=inventories,
+    )
+
+
+def _real_nonpromoted(
+    manifest: JsonObject, evidence: JsonObject
+) -> tuple[JsonObject, JsonObject, dict[str, list[JsonObject]]]:
+    bound_manifest, value, inventories = _promotable(manifest, evidence)
+    value["promotion"]["passed"] = False
+    value["verifier"]["passed"] = False
+    return bound_manifest, value, inventories
 
 
 def _with_predecessor(evidence: JsonObject) -> list[JsonObject]:
@@ -452,10 +1087,19 @@ def _unevaluated(evidence: JsonObject) -> JsonObject:
         "unexpected_negative_matches": 0,
         "positive_cases_artifact": None,
         "negative_cases_artifact": None,
+        "policy_sha256": None,
         "recall": None,
         "passed": False,
     }
-    value["performance"] = {"evaluated": False, "banks": [], "workloads": []}
+    value["performance"] = {
+        "evaluated": False,
+        "banks": [],
+        "inputs": [],
+        "workloads": [],
+        "baselines": [],
+        "comparisons": [],
+        "breakeven_models": [],
+    }
     value["test_access"]["current_version_access_count"] = 0
     value["test_access"]["current_version_accessed_at"] = None
     value["test_access"]["lineage"] = []
@@ -499,25 +1143,22 @@ def test_schemas_close_root_and_nested_objects(manifest: JsonObject, evidence: J
 
 
 @pytest.mark.parametrize(
-    ("path", "replacement"),
+    ("path", "replacement", "code"),
     [
-        (("quality", "slices", 0, "gold_spans"), True),
-        (("quality", "slices", 0, "metrics", "open_world_recall"), float("nan")),
-        (("performance", "workloads", 0, "samples_seconds", 0), float("inf")),
-        (("performance", "workloads", 0, "samples_seconds", 0), 0.0),
-        (("source", "input_records"), 2**63),
-        (("commands", 0, "elapsed_seconds"), 1e301),
+        (("quality", "slices", 0, "gold_spans"), True, "contract.schema.type"),
+        (("quality", "slices", 0, "metrics", "open_world_recall"), float("nan"), "contract.resource_limits"),
+        (("performance", "workloads", 0, "samples_seconds", 0), float("inf"), "contract.resource_limits"),
+        (("performance", "workloads", 0, "samples_seconds", 0), 0.0, "contract.schema.minimum"),
+        (("source", "input_records"), 2**63, "contract.schema.maximum"),
+        (("commands", 0, "elapsed_seconds"), 1e301, "contract.resource_limits"),
     ],
 )
 def test_contract_rejects_non_json_or_out_of_range_numeric_values(
-    evidence: JsonObject, path: JsonPath, replacement: Any
+    evidence: JsonObject, path: JsonPath, replacement: Any, code: str
 ) -> None:
     _set(evidence, path, replacement)
 
-    result = validate_enron_evidence(evidence)
-
-    assert result["valid"] is False
-    assert any(code.startswith("contract.schema.") for code in _codes(result))
+    _assert_code(validate_enron_evidence(evidence), code)
 
 
 @pytest.mark.parametrize(
@@ -566,12 +1207,49 @@ def test_synthetic_fixture_cannot_self_promote_or_claim_verifier_success(
     _assert_code(result, "contract.synthetic_fixture_claim")
 
 
+def test_synthetic_fixture_cannot_publish_structured_claims(evidence: JsonObject) -> None:
+    evidence["promotion"]["claims"] = [_catalog_claim(evidence)]
+
+    _assert_code(validate_enron_evidence(evidence), "contract.synthetic_fixture_claim")
+
+
+def test_unverified_real_evidence_cannot_publish_structured_claims(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, value, inventories = _promotable(manifest, evidence)
+    value["promotion"]["passed"] = False
+    value["verifier"]["passed"] = False
+
+    _assert_code(
+        _validate_promoted(value, bound_manifest, inventories),
+        "contract.unverified_claims",
+    )
+
+
 def test_manifest_annotation_states_are_consistent(manifest: JsonObject) -> None:
     label = manifest["labels"][0]
     label["label_strength"] = "unlabeled"
     label["annotation_completeness"] = "partial"
 
     _assert_code(validate_enron_manifest(manifest), "contract.unlabeled_annotation_state")
+
+
+def test_natural_label_population_cannot_merge_multiple_entity_classes(manifest: JsonObject) -> None:
+    manifest["labels"][0]["annotation_scope"]["entity_classes"].append("email_address")
+
+    _assert_code(validate_enron_manifest(manifest), "contract.natural_label_entity_population")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("preparation", "prepared_artifact", "bytes"),
+        ("splits", "roles", "test", "artifact", "bytes"),
+        ("labels", 0, "artifact", "bytes"),
+    ],
+)
+def test_content_addressed_artifacts_must_be_nonempty(manifest: JsonObject, path: JsonPath) -> None:
+    _set(manifest, path, 0)
+
+    _assert_code(validate_enron_manifest(manifest), "contract.schema.minimum")
 
 
 @pytest.mark.parametrize(
@@ -599,6 +1277,14 @@ def test_manifest_split_and_preparation_invariants(manifest: JsonObject, mutatio
     _assert_code(validate_enron_manifest(manifest), code)
 
 
+def test_split_roles_cannot_reuse_identical_content_addressed_artifacts(manifest: JsonObject) -> None:
+    train_artifact = copy.deepcopy(manifest["splits"]["roles"]["train"]["artifact"])
+    manifest["splits"]["roles"]["validation"]["artifact"] = copy.deepcopy(train_artifact)
+    manifest["splits"]["roles"]["test"]["artifact"] = copy.deepcopy(train_artifact)
+
+    _assert_code(validate_enron_manifest(manifest), "contract.split_artifact_overlap")
+
+
 def test_manifest_timestamps_and_ids_are_deterministic(manifest: JsonObject) -> None:
     manifest["created_at"] = "not-a-time"
     manifest["commands"].append(copy.deepcopy(manifest["commands"][0]))
@@ -607,6 +1293,187 @@ def test_manifest_timestamps_and_ids_are_deterministic(manifest: JsonObject) -> 
     result = validate_enron_manifest(manifest)
 
     assert {"contract.invalid_timestamp", "contract.duplicate_id"} <= _codes(result)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("documents", "contract.label_population_bounds"),
+        ("span_total", "contract.label_population_spans"),
+        ("missing_role", "contract.label_population_roles"),
+        ("duplicate_role", "contract.duplicate_label_population_role"),
+        ("natural_conformance_role", "contract.natural_label_role"),
+        ("synthetic_test_role", "contract.conformance_label_role"),
+    ],
+)
+def test_manifest_label_populations_are_role_bound_and_bounded(manifest: JsonObject, mutation: str, code: str) -> None:
+    natural = manifest["labels"][0]
+    conformance = manifest["labels"][1]
+    if mutation == "documents":
+        natural["role_populations"][0]["documents"] = manifest["splits"]["roles"]["test"]["records"] + 1
+    elif mutation == "span_total":
+        natural["role_populations"][0]["spans"] += 1
+    elif mutation == "missing_role":
+        natural["roles"] = ["test", "validation"]
+    elif mutation == "duplicate_role":
+        natural["role_populations"].append(copy.deepcopy(natural["role_populations"][0]))
+    elif mutation == "natural_conformance_role":
+        natural["roles"] = ["conformance"]
+        natural["role_populations"][0]["role"] = "conformance"
+    else:
+        conformance["roles"] = ["test"]
+        conformance["role_populations"][0]["role"] = "test"
+
+    _assert_code(validate_enron_manifest(manifest), code)
+
+
+@pytest.mark.parametrize("mutation", ["same_producer", "missing_adjudication"])
+def test_independent_labels_require_distinct_review_and_adjudication_provenance(
+    manifest: JsonObject, mutation: str
+) -> None:
+    provenance = manifest["labels"][0]["annotation_provenance"]
+    if mutation == "same_producer":
+        provenance["reviewer_id"] = provenance["producer_id"]
+    else:
+        provenance["adjudication_artifact"] = None
+
+    result = validate_enron_manifest(manifest)
+
+    assert {"contract.annotation_review_provenance", "contract.annotation_independence"} <= _codes(result)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("unknown_label", "contract.unknown_quality_plan_label"),
+        ("unknown_view", "contract.unknown_quality_text_view"),
+        ("wrong_role", "contract.quality_plan_label_role"),
+        ("wrong_class", "contract.quality_plan_entity_class"),
+        ("duplicate_descriptor", "contract.duplicate_quality_plan_descriptor"),
+    ],
+)
+def test_manifest_quality_plan_is_closed_over_labels_views_and_unique_descriptors(
+    manifest: JsonObject, mutation: str, code: str
+) -> None:
+    plan = manifest["quality_plan"][0]
+    if mutation == "unknown_label":
+        plan["label_artifact_id"] = "missing_labels"
+    elif mutation == "unknown_view":
+        plan["text_view"] = "missing_view"
+    elif mutation == "wrong_role":
+        plan["split_role"] = "validation"
+    elif mutation == "wrong_class":
+        plan["entity_class"] = "email_address"
+    else:
+        duplicate = copy.deepcopy(plan)
+        duplicate["id"] = "duplicate_descriptor"
+        manifest["quality_plan"].append(duplicate)
+
+    _assert_code(validate_enron_manifest(manifest), code)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("documents", 99),
+        ("gold_spans", 99),
+        ("negative_documents", 19),
+        ("sensitive_gold_characters", 499),
+    ],
+)
+def test_decision_grade_quality_plan_rejects_tiny_privacy_support(
+    manifest: JsonObject, evidence: JsonObject, field: str, value: int
+) -> None:
+    bound_manifest, _, _ = _promotable(manifest, evidence)
+    plan = bound_manifest["quality_plan"][0]
+    plan[field] = value
+    label = bound_manifest["labels"][0]
+    if field == "documents":
+        bound_manifest["source"]["input_records"] = 124
+        bound_manifest["preparation"]["output_records"] = 124
+        bound_manifest["splits"]["roles"]["test"].update({"records": value, "groups": value})
+        label["role_populations"][0]["documents"] = value
+        plan["documents_with_sensitive_gold"] = 79
+        plan["negative_documents"] = 20
+    elif field == "gold_spans":
+        label["role_populations"][0]["spans"] = value
+        label["span_count"] = value
+        plan["cataloged_gold_spans"] = value
+    elif field == "negative_documents":
+        plan["documents_with_sensitive_gold"] = plan["documents"] - value
+
+    _assert_code(validate_enron_manifest(bound_manifest), "contract.quality_gate_minimum_support")
+
+
+def test_quality_gate_must_label_the_entire_frozen_final_test_population(manifest: JsonObject) -> None:
+    label = manifest["labels"][0]
+    label["role_populations"][0]["documents"] = 4
+    plan = manifest["quality_plan"][0]
+    plan.update(
+        {
+            "promotion_gate": True,
+            "documents": 4,
+            "documents_with_sensitive_gold": 4,
+            "negative_documents": 0,
+        }
+    )
+
+    _assert_code(validate_enron_manifest(manifest), "contract.quality_gate_test_population")
+
+
+def test_answer_bearing_nonprimary_view_cannot_replace_promoted_natural_view(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    injected_view = copy.deepcopy(bound_manifest["preparation"]["text_views"][0])
+    injected_view.update(
+        {
+            "id": "answer_inventory_view",
+            "artifact_sha256": _sha256_number(950),
+            "primary_for_quality": False,
+            "answer_bearing_fields_included": True,
+        }
+    )
+    bound_manifest["preparation"]["text_views"].append(injected_view)
+    promoted["preparation"] = copy.deepcopy(bound_manifest["preparation"])
+    promoted["quality"]["slices"][0]["text_view"] = injected_view["id"]
+    claim = next(item for item in promoted["promotion"]["claims"] if item["kind"] == "open_world_quality")
+    claim["scope"]["text_view"] = injected_view["id"]
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+
+    assert {"contract.quality_plan_binding", "contract.quality_gate_primary_view"} <= _codes(result)
+
+
+def test_answer_bearing_view_cannot_be_promoted_by_relabeling_it_primary(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    natural_view = bound_manifest["preparation"]["text_views"][0]
+    natural_view["primary_for_quality"] = False
+    injected_view = copy.deepcopy(natural_view)
+    injected_view.update(
+        {
+            "id": "answer_inventory_view",
+            "artifact_sha256": _sha256_number(951),
+            "primary_for_quality": True,
+            "answer_bearing_fields_included": True,
+        }
+    )
+    bound_manifest["preparation"]["text_views"].append(injected_view)
+    bound_manifest["quality_plan"][0]["text_view"] = injected_view["id"]
+    promoted["preparation"] = copy.deepcopy(bound_manifest["preparation"])
+    promoted["quality"]["slices"][0]["text_view"] = injected_view["id"]
+    for claim in promoted["promotion"]["claims"]:
+        if claim["kind"] == "open_world_quality":
+            claim["scope"]["text_view"] = injected_view["id"]
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.answer_bearing_quality_view",
+    )
 
 
 @pytest.mark.parametrize(
@@ -649,6 +1516,9 @@ def test_quality_semantics_lock_exact_spans_and_document_disjoint_positions(
 
 def test_partial_independent_slice_is_diagnostic_only(manifest: JsonObject, evidence: JsonObject) -> None:
     manifest["labels"][0]["annotation_completeness"] = "partial"
+    manifest["quality_plan"][0]["negative_documents"] = 0
+    manifest["quality_plan"][0]["sensitive_gold_characters"] = 0
+    manifest["quality_plan"][0]["evaluated_characters"] = 0
     item = evidence["quality"]["slices"][0]
     item["annotation_completeness"] = "partial"
     item["promotion_gate"] = False
@@ -685,22 +1555,17 @@ def test_partial_independent_slice_is_diagnostic_only(manifest: JsonObject, evid
         check for check in evidence["promotion"]["checks"] if check["category"] != "quality"
     ]
     _refresh_frozen_contract(evidence)
-    manifest["thresholds_sha256"] = evidence["thresholds_sha256"]
-    manifest["performance_manifest_sha256"] = evidence["performance_manifest_sha256"]
-    evidence["manifest_sha256"] = hash_enron_manifest(manifest)
+    _sync_bound_manifest(manifest, evidence)
 
     assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
     assert validate_enron_evidence(evidence, manifest=manifest) == {"valid": True, "diagnostics": []}
 
 
-def test_partial_independent_claim_is_rejected_even_when_nonpromoted(
-    manifest: JsonObject, evidence: JsonObject
-) -> None:
-    manifest["labels"][0]["annotation_completeness"] = "partial"
+def test_partial_independent_claim_is_rejected_even_when_nonpromoted(evidence: JsonObject) -> None:
+    evidence["promotion"]["claims"] = [_quality_claim(evidence, "open_world_recall")]
     evidence["quality"]["slices"][0]["annotation_completeness"] = "partial"
-    evidence["manifest_sha256"] = hash_enron_manifest(manifest)
 
-    _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.unsupported_claim")
+    _assert_code(validate_enron_evidence(evidence), "contract.unsupported_claim")
 
 
 @pytest.mark.parametrize(
@@ -824,6 +1689,65 @@ def test_public_quality_slices_have_a_privacy_minimum_size(evidence: JsonObject)
     _assert_code(validate_enron_evidence(evidence), "contract.privacy_small_slice")
 
 
+@pytest.mark.parametrize("field", ["documents", "gold_spans"])
+def test_quality_all_cohort_exactly_matches_bound_label_population(
+    manifest: JsonObject, evidence: JsonObject, field: str
+) -> None:
+    evidence["quality"]["slices"][0][field] -= 1
+
+    _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.quality_population_exactness")
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "documents",
+        "documents_with_sensitive_gold",
+        "negative_documents",
+        "gold_spans",
+        "cataloged_gold_spans",
+        "documents_with_cataloged_gold",
+        "sensitive_gold_characters",
+        "evaluated_characters",
+    ],
+)
+def test_quality_evidence_cannot_drift_from_frozen_plan_denominators(
+    manifest: JsonObject, evidence: JsonObject, field: str
+) -> None:
+    evidence["quality"]["slices"][0][field] += 1
+
+    _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.quality_plan_binding")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("empty_predictions_with_characters", "contract.empty_prediction_character_set"),
+        ("empty_gold_with_characters", "contract.empty_sensitive_character_set"),
+        ("catalog_partition", "contract.cataloged_true_positive_partition"),
+        ("perfect_span_recall_with_leaked_characters", "contract.exact_recall_character_consistency"),
+    ],
+)
+def test_quality_count_and_position_set_invariants(evidence: JsonObject, mutation: str, code: str) -> None:
+    item = evidence["quality"]["slices"][0]
+    if mutation == "empty_predictions_with_characters":
+        item["predicted_spans"] = 0
+    elif mutation == "empty_gold_with_characters":
+        item["sensitive_gold_characters"] = 0
+    elif mutation == "catalog_partition":
+        item["cataloged_true_positive"] = item["true_positive"]
+        item["cataloged_wrong_canonical"] = 1
+    else:
+        item["true_positive"] = item["gold_spans"]
+        item["false_negative"] = 0
+        item["documents_with_any_miss"] = 0
+        item["metrics"]["open_world_recall"] = 1.0
+        item["metrics"]["f1"] = 2 * item["true_positive"] / (2 * item["true_positive"] + item["false_positive"])
+        item["metrics"]["document_leak_rate"] = 0.0
+
+    _assert_code(validate_enron_evidence(evidence), code)
+
+
 @pytest.mark.parametrize(
     ("field", "replacement", "code"),
     [
@@ -855,12 +1779,58 @@ def test_conformance_binds_exhaustive_synthetic_label_artifact(manifest: JsonObj
     )
 
 
+@pytest.mark.parametrize("mutation", ["negative_artifact", "negative_count", "policy"])
+def test_conformance_evidence_cannot_drift_from_frozen_negative_cases_or_policy(
+    manifest: JsonObject, evidence: JsonObject, mutation: str
+) -> None:
+    conformance = evidence["catalog_conformance"]
+    if mutation == "negative_artifact":
+        conformance["negative_cases_artifact"]["sha256"] = _sha256_number(998)
+    elif mutation == "negative_count":
+        conformance["negative_cases"] += 1
+    else:
+        conformance["policy_sha256"] = _sha256_number(997)
+
+    _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.conformance_plan_binding")
+
+
+def test_manifest_conformance_plan_cannot_overlap_positive_and_negative_artifacts(manifest: JsonObject) -> None:
+    manifest["conformance_plan"]["negative_cases_artifact"] = copy.deepcopy(
+        manifest["conformance_plan"]["positive_cases_artifact"]
+    )
+
+    _assert_code(validate_enron_manifest(manifest), "contract.conformance_plan_artifact_overlap")
+
+
 def test_unevaluated_evidence_is_valid_but_cannot_be_promoted(evidence: JsonObject) -> None:
     value = _unevaluated(evidence)
     assert validate_enron_evidence(value) == {"valid": True, "diagnostics": []}
 
     value["promotion"]["passed"] = True
     _assert_code(validate_enron_evidence(value), "contract.promotion_prerequisite")
+
+
+def test_real_unevaluated_evidence_cannot_forge_promotion_and_verifier_success(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest = copy.deepcopy(manifest)
+    value = _unevaluated(evidence)
+    bound_manifest["artifact_kind"] = "real_benchmark"
+    value["artifact_kind"] = "real_benchmark"
+    bound_manifest["software"]["git_commit"] = "f" * 40
+    value["software"]["git_commit"] = "f" * 40
+    value["promotion"]["passed"] = True
+    value["verifier"]["passed"] = True
+    _refresh_frozen_contract(value)
+    _sync_bound_manifest(bound_manifest, value)
+
+    result = validate_enron_evidence(value, manifest=bound_manifest, trusted_lineage_prefix=[])
+
+    assert {
+        "contract.decision_grade_prerequisite",
+        "contract.forged_promotion",
+        "contract.forged_verifier",
+    } <= _codes(result)
 
 
 @pytest.mark.parametrize(
@@ -877,25 +1847,160 @@ def test_unevaluated_evidence_is_valid_but_cannot_be_promoted(evidence: JsonObje
     ],
 )
 def test_structured_quality_claims_are_verified_even_when_nonpromoted(
-    evidence: JsonObject, path: JsonPath, replacement: Any, code: str
+    manifest: JsonObject, evidence: JsonObject, path: JsonPath, replacement: Any, code: str
 ) -> None:
-    claim = evidence["promotion"]["claims"][1]
+    bound_manifest, value, inventories = _real_nonpromoted(manifest, evidence)
+    claim = next(item for item in value["promotion"]["claims"] if item["metric"] == "open_world_recall")
     _set(claim, path, replacement)
 
-    _assert_code(validate_enron_evidence(evidence), code)
+    _assert_code(_validate_promoted(value, bound_manifest, inventories), code)
 
 
-def test_structured_performance_claim_must_reference_exact_workload(evidence: JsonObject) -> None:
-    claim = next(item for item in evidence["promotion"]["claims"] if item["kind"] == "performance")
+def test_structured_performance_claim_must_reference_exact_workload(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, value, inventories = _real_nonpromoted(manifest, evidence)
+    claim = next(item for item in value["promotion"]["claims"] if item["kind"] == "performance")
     claim["performance_workload_id"] = "missing"
 
-    _assert_code(validate_enron_evidence(evidence), "contract.unsupported_claim")
+    _assert_code(
+        _validate_promoted(value, bound_manifest, inventories),
+        "contract.unsupported_claim",
+    )
 
 
-def test_duplicate_claim_ids_are_rejected(evidence: JsonObject) -> None:
-    evidence["promotion"]["claims"].append(copy.deepcopy(evidence["promotion"]["claims"][0]))
+def test_promoted_quality_claim_cannot_cherry_pick_a_non_gate_validation_slice(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    validation = copy.deepcopy(promoted["quality"]["slices"][0])
+    validation.update({"id": "validation_cherry_pick", "split_role": "validation", "promotion_gate": False})
+    promoted["quality"]["slices"].append(validation)
+    claim_index = next(
+        index for index, item in enumerate(promoted["promotion"]["claims"]) if item["metric"] == "open_world_recall"
+    )
+    promoted["promotion"]["claims"][claim_index] = _quality_claim(
+        promoted,
+        "open_world_recall",
+        slice_index=len(promoted["quality"]["slices"]) - 1,
+    )
 
-    _assert_code(validate_enron_evidence(evidence), "contract.duplicate_id")
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.unsupported_claim",
+    )
+
+
+def test_promoted_performance_claim_cannot_cherry_pick_a_synthetic_scale_workload(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    scale_index = next(
+        index for index, item in enumerate(promoted["performance"]["workloads"]) if item["id"].startswith("scale_")
+    )
+    claim_index = next(
+        index
+        for index, item in enumerate(promoted["promotion"]["claims"])
+        if item["metric"] == "direct_bank_scan_mib_per_second"
+    )
+    promoted["promotion"]["claims"][claim_index] = _performance_claim(
+        promoted,
+        "direct_bank_scan_mib_per_second",
+        "mib_per_second",
+        workload_index=scale_index,
+    )
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.unsupported_claim",
+    )
+
+
+def test_duplicate_claim_ids_are_rejected(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, value, inventories = _real_nonpromoted(manifest, evidence)
+    value["promotion"]["claims"].append(copy.deepcopy(value["promotion"]["claims"][0]))
+
+    _assert_code(_validate_promoted(value, bound_manifest, inventories), "contract.duplicate_id")
+
+
+@pytest.mark.parametrize(
+    "metric",
+    [
+        "catalog_conformance_recall",
+        "precision",
+        "open_world_recall",
+        "f1",
+        "catalog_coverage",
+        "cataloged_recall",
+        "document_leak_rate",
+        "cataloged_document_leak_rate",
+        "sensitive_character_recall",
+        "sensitive_character_leak_rate",
+        "negative_document_false_alarm_rate",
+        "over_redaction_rate",
+        "direct_bank_scan_p99_seconds",
+        "direct_bank_scan_mib_per_second",
+    ],
+)
+def test_promotion_requires_the_complete_privacy_utility_and_speed_claim_scorecard(
+    manifest: JsonObject, evidence: JsonObject, metric: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    promoted["promotion"]["claims"] = [item for item in promoted["promotion"]["claims"] if item["metric"] != metric]
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_required_claim",
+    )
+
+
+def test_complete_quality_claim_suite_is_required_for_each_promoted_gate(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    second_label = copy.deepcopy(bound_manifest["labels"][0])
+    second_label["id"] = "independent_person_labels_second"
+    second_label["artifact"] = {
+        "id": "independent_labels_second",
+        "sha256": _sha256_number(952),
+        "bytes": 1024,
+    }
+    second_label["annotation_provenance"]["adjudication_artifact"] = {
+        "id": "independent_adjudication_second",
+        "sha256": _sha256_number(953),
+        "bytes": 512,
+    }
+    bound_manifest["labels"].append(second_label)
+
+    second_plan = copy.deepcopy(bound_manifest["quality_plan"][0])
+    second_plan.update(
+        {
+            "id": "independent_all_test_second",
+            "label_artifact_id": second_label["id"],
+        }
+    )
+    bound_manifest["quality_plan"].append(second_plan)
+
+    second_slice = copy.deepcopy(promoted["quality"]["slices"][0])
+    second_slice.update(
+        {
+            "id": second_plan["id"],
+            "label_artifact_id": second_label["id"],
+        }
+    )
+    promoted["quality"]["slices"].append(second_slice)
+    first_quality_checks = [
+        item for item in promoted["promotion"]["checks"] if item["target"].startswith("/quality/slices/0/")
+    ]
+    for check in first_quality_checks:
+        duplicate = copy.deepcopy(check)
+        duplicate["id"] = f"second_{check['id']}"
+        duplicate["target"] = duplicate["target"].replace("/quality/slices/0/", "/quality/slices/1/")
+        promoted["promotion"]["checks"].append(duplicate)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_required_claim",
+    )
 
 
 @pytest.mark.parametrize(
@@ -927,6 +2032,79 @@ def test_threshold_hash_binds_typed_gate_configuration(evidence: JsonObject) -> 
     _assert_code(validate_enron_evidence(evidence), "contract.threshold_hash_mismatch")
 
 
+def test_threshold_hash_is_reorder_stable_but_prevents_cross_gate_threshold_swaps(evidence: JsonObject) -> None:
+    reordered = copy.deepcopy(evidence)
+    reordered["promotion"]["checks"].reverse()
+    assert validate_enron_evidence(reordered) == {"valid": True, "diagnostics": []}
+
+    recall = next(item for item in reordered["promotion"]["checks"] if item["id"] == "open_world_recall")
+    latency = next(item for item in reordered["promotion"]["checks"] if item["id"] == "direct_scan_median")
+    recall["threshold"], latency["threshold"] = latency["threshold"], recall["threshold"]
+
+    _assert_code(validate_enron_evidence(reordered), "contract.threshold_hash_mismatch")
+
+
+@pytest.mark.parametrize(
+    ("gate_kind", "threshold", "code"),
+    [
+        ("quality_gte", -1.0, "contract.vacuous_quality_threshold"),
+        ("quality_lte", 100.0, "contract.vacuous_quality_threshold"),
+        ("performance_gte", -1.0, "contract.vacuous_performance_threshold"),
+        ("performance_lte", 0.0, "contract.vacuous_performance_threshold"),
+    ],
+)
+def test_decision_grade_thresholds_reject_vacuous_minus_one_and_hundred_bypasses(
+    manifest: JsonObject, evidence: JsonObject, gate_kind: str, threshold: float, code: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    if gate_kind == "quality_gte":
+        check = next(item for item in promoted["promotion"]["checks"] if item["id"] == "quality_open_world_recall")
+    elif gate_kind == "quality_lte":
+        check = next(item for item in promoted["promotion"]["checks"] if item["id"] == "quality_document_leak_rate")
+    elif gate_kind == "performance_gte":
+        check = next(
+            item
+            for item in promoted["promotion"]["checks"]
+            if item["operator"] == "gte" and item["target"].endswith("/stats/mib_per_second")
+        )
+    else:
+        check = next(
+            item
+            for item in promoted["promotion"]["checks"]
+            if item["operator"] == "lte" and item["target"].endswith("/stats/median_seconds")
+        )
+    check["threshold"] = threshold
+    refreshed = _gate(
+        check["id"],
+        check["category"],
+        check["target"],
+        check["operator"],
+        threshold,
+        check["actual"],
+    )
+    check["passed"] = refreshed["passed"]
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(_validate_promoted(promoted, bound_manifest, inventories), code)
+
+
+def test_decision_grade_recall_threshold_cannot_weaken_privacy_policy_floor(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    check = next(item for item in promoted["promotion"]["checks"] if item["id"] == "quality_open_world_recall")
+    check["threshold"] = 0.94
+    check["passed"] = True
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.quality_threshold_policy",
+    )
+
+
 def test_gate_rejects_incompatible_typed_comparison(evidence: JsonObject) -> None:
     check = evidence["promotion"]["checks"][1]
     check["operator"] = "gte"
@@ -952,10 +2130,10 @@ def test_duplicate_gate_targets_are_rejected(evidence: JsonObject) -> None:
 def test_real_promotable_evidence_requires_and_accepts_manifest_and_trusted_lineage(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
 
     assert validate_enron_manifest(bound_manifest) == {"valid": True, "diagnostics": []}
-    assert validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]) == {
+    assert _validate_promoted(promoted, bound_manifest, inventories) == {
         "valid": True,
         "diagnostics": [],
     }
@@ -979,11 +2157,11 @@ def test_real_artifacts_reject_synthetic_placeholder_commit(manifest: JsonObject
 
 
 def test_zero_gold_cannot_be_a_promotion_quality_gate(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     promoted["quality"]["slices"][0]["gold_spans"] = 0
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
         "contract.natural_catalog_gate",
     )
 
@@ -991,20 +2169,20 @@ def test_zero_gold_cannot_be_a_promotion_quality_gate(manifest: JsonObject, evid
 def test_promotion_requires_every_predeclared_quality_and_performance_gate(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     promoted["promotion"]["checks"] = [
         item for item in promoted["promotion"]["checks"] if item["id"] != "quality_over_redaction_rate"
     ]
     _refresh_frozen_contract(promoted)
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
         "contract.missing_required_gate",
     )
 
 
 def test_promotion_requires_mandated_gate_operator_semantics(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     check = next(
         item
         for item in promoted["promotion"]["checks"]
@@ -1016,7 +2194,7 @@ def test_promotion_requires_mandated_gate_operator_semantics(manifest: JsonObjec
     _sync_bound_manifest(bound_manifest, promoted)
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
         "contract.required_gate_semantics",
     )
 
@@ -1027,6 +2205,7 @@ def test_promotion_requires_mandated_gate_operator_semantics(manifest: JsonObjec
         ("phase", "contract.missing_performance_phase"),
         ("scale", "contract.missing_scale_shape"),
         ("density", "contract.missing_hit_density"),
+        ("size", "contract.missing_document_size_cohort"),
         ("concurrency", "contract.missing_concurrency_shape"),
         ("unused_bank", "contract.unused_performance_bank"),
     ],
@@ -1034,32 +2213,252 @@ def test_promotion_requires_mandated_gate_operator_semantics(manifest: JsonObjec
 def test_promotion_requires_full_phase_scale_density_and_concurrency_matrix(
     manifest: JsonObject, evidence: JsonObject, mutation: str, code: str
 ) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     performance = promoted["performance"]
     if mutation == "phase":
         performance["workloads"] = [item for item in performance["workloads"] if item["phase"] != "end_to_end"]
     elif mutation == "scale":
-        removed_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_patterns"] == 1_000)
+        removed_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_aliases"] == 1_000)
         performance["banks"] = [item for item in performance["banks"] if item["bank_hash"] != removed_hash]
         performance["workloads"] = [item for item in performance["workloads"] if item["bank_hash"] != removed_hash]
-    elif mutation == "density":
+    elif mutation in {"density", "size"}:
+        for input_descriptor in performance["inputs"]:
+            field = "hit_density" if mutation == "density" else "size_cohort"
+            input_descriptor[field] = "normal" if mutation == "density" else "medium"
+            _refresh_input_descriptor(input_descriptor)
         for workload in performance["workloads"]:
-            workload["hit_density"] = "normal"
+            if workload["input_id"] is None:
+                continue
+            input_descriptor = next(item for item in performance["inputs"] if item["id"] == workload["input_id"])
+            workload["input_sha256"] = input_descriptor["descriptor_sha256"]
             workload["workload_sha256"] = hash_enron_workload(workload)
     elif mutation == "concurrency":
         for workload in performance["workloads"]:
             workload["concurrency"] = 1
             workload["workload_sha256"] = hash_enron_workload(workload)
     else:
-        unused_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_patterns"] == 100_000)
+        unused_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_aliases"] == 100_000)
         performance["workloads"] = [item for item in performance["workloads"] if item["bank_hash"] != unused_hash]
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
         code,
     )
+
+
+def test_required_scale_axis_is_exact_active_alias_count_not_pattern_count(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    bank = next(item for item in promoted["performance"]["banks"] if item["active_aliases"] == 1_000)
+    taxon = bank["composition"]["taxonomy"][0]
+    taxon.update(
+        {
+            "entities": 600,
+            "canonical_names": 600,
+            "aliases": 200,
+            "literal_patterns": 800,
+            "regex_patterns": 200,
+        }
+    )
+    bank.update(
+        {
+            "active_entities": 600,
+            "active_names": 800,
+            "active_aliases": 200,
+            "active_patterns": 1_000,
+        }
+    )
+    _refresh_bank_descriptor(bank)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_scale_shape",
+    )
+
+
+def test_promoted_performance_banks_require_unique_content_hashes(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    scale_banks = [item for item in promoted["performance"]["banks"] if item["kind"] == "synthetic_scale"]
+    scale_banks[1]["bank_hash"] = scale_banks[0]["bank_hash"]
+    _refresh_bank_descriptor(scale_banks[1])
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.duplicate_performance_bank_hash",
+    )
+
+
+@pytest.mark.parametrize("mutation", ["taxonomy", "aliases", "regex", "name_ratio"])
+def test_synthetic_scale_banks_require_realistic_mixed_composition(
+    manifest: JsonObject, evidence: JsonObject, mutation: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    bank = next(
+        item
+        for item in promoted["performance"]["banks"]
+        if item["kind"] == "synthetic_scale" and item["active_aliases"] == 1_000
+    )
+    taxonomy = bank["composition"]["taxonomy"]
+    if mutation == "taxonomy":
+        taxonomy[0]["entity_class"] = "unrelated_scale_taxonomy"
+    elif mutation == "aliases":
+        taxonomy[0]["canonical_names"] += bank["active_names"]
+        bank["active_names"] += bank["active_names"]
+    elif mutation == "regex":
+        taxonomy[0]["literal_patterns"] += taxonomy[0]["regex_patterns"]
+        taxonomy[0]["regex_patterns"] = 0
+    else:
+        taxonomy[0]["canonical_names"] += bank["active_patterns"] - bank["active_names"]
+        bank["active_names"] = bank["active_patterns"]
+    _refresh_bank_descriptor(bank)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.unrealistic_scale_bank",
+    )
+
+
+def test_scale_descriptor_without_a_decision_workload_cannot_promote(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    promoted["performance"]["workloads"] = [
+        item for item in promoted["performance"]["workloads"] if item["id"] != "scale_1000_scan"
+    ]
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_scale_decision_cell",
+    )
+
+
+def test_every_decision_cell_requires_full_exact_baseline_regression_coverage(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    promoted["performance"]["comparisons"] = [
+        item
+        for item in promoted["performance"]["comparisons"]
+        if not (item["candidate_workload_id"] == "scale_1000_scan" and item["metric"] == "p99_seconds")
+    ]
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_regression_coverage",
+    )
+
+
+def test_regressed_exact_baseline_comparison_cannot_promote(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    candidate = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_1000_scan")
+    candidate["samples_seconds"] = [0.02 + sample / 1_000_000 for sample in range(100)]
+    _refresh_workload(promoted, candidate)
+    index = promoted["performance"]["workloads"].index(candidate)
+    _refresh_check_actuals(promoted, target_prefix=f"/performance/workloads/{index}/")
+    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
+    for comparison in promoted["performance"]["comparisons"]:
+        if comparison["candidate_workload_id"] != candidate["id"]:
+            continue
+        baseline = workloads[comparison["baseline_workload_id"]]
+        metric = comparison["metric"]
+        candidate_value = candidate["stats"][metric]
+        baseline_value = baseline["stats"][metric]
+        relative_degradation = (
+            (candidate_value - baseline_value) / baseline_value
+            if comparison["direction"] == "lower_is_better"
+            else (baseline_value - candidate_value) / baseline_value
+        )
+        noise_floor = (
+            max(
+                candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
+                baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
+            )
+            * comparison["noise_multiplier"]
+        )
+        comparison.update(
+            {
+                "candidate_value": candidate_value,
+                "baseline_value": baseline_value,
+                "relative_degradation": relative_degradation,
+                "noise_floor": noise_floor,
+                "result": "regressed",
+            }
+        )
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_regression_coverage",
+    )
+
+
+def test_promotion_requires_a_finite_additive_breakeven_value_model(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    promoted["performance"]["breakeven_models"] = []
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_slow_decision_cell_fails_its_frozen_performance_thresholds(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    index = next(
+        index for index, item in enumerate(promoted["performance"]["workloads"]) if item["id"] == "scale_1000_scan"
+    )
+    workload = promoted["performance"]["workloads"][index]
+    workload["samples_seconds"] = [2.0 + sample / 1_000_000 for sample in range(100)]
+    _refresh_workload(promoted, workload)
+    _refresh_check_actuals(promoted, target_prefix=f"/performance/workloads/{index}/")
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.decision_grade_prerequisite",
+    )
+
+
+def test_scale_decision_cell_cannot_disguise_itself_as_the_wrong_phase(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_1000_scan")
+    workload["phase"] = "helper_cache_hit"
+    workload["workload_sha256"] = hash_enron_workload(workload)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_scale_decision_cell",
+    )
+
+
+def test_reused_decision_cell_requires_nonzero_warmups(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
+    workload["warmups"] = 0
+    workload["workload_sha256"] = hash_enron_workload(workload)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+
+    assert {"contract.performance_warmups", "contract.invalid_decision_grade_workload"} <= _codes(result)
 
 
 @pytest.mark.parametrize(
@@ -1095,6 +2494,14 @@ def test_bound_evidence_detects_manifest_and_verifier_identity_drift(
 
     evidence["manifest_sha256"] = hash_enron_manifest(manifest)
     evidence["verifier"]["source_sha256"] = "sha256:" + "0" * 64
+    _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.provenance_mismatch")
+
+
+def test_evidence_commands_must_equal_the_frozen_sanitized_manifest_plan(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    evidence["commands"][0]["elapsed_seconds"] += 0.5
+
     _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.provenance_mismatch")
 
 
@@ -1134,6 +2541,15 @@ def test_unrecorded_current_test_access_fails_closed(evidence: JsonObject) -> No
     evidence["test_access"]["lineage_head_sha256"] = None
 
     _assert_code(validate_enron_evidence(evidence), "contract.test_access_count")
+
+
+def test_test_quality_aggregate_cannot_hide_behind_zero_access_and_empty_lineage(evidence: JsonObject) -> None:
+    evidence["test_access"]["current_version_access_count"] = 0
+    evidence["test_access"]["current_version_accessed_at"] = None
+    evidence["test_access"]["lineage"] = []
+    evidence["test_access"]["lineage_head_sha256"] = None
+
+    _assert_code(validate_enron_evidence(evidence), "contract.test_aggregate_without_access")
 
 
 def test_lineage_entry_hash_and_head_are_verified(evidence: JsonObject) -> None:
@@ -1198,35 +2614,51 @@ def test_first_lineage_entry_cannot_claim_a_predecessor(evidence: JsonObject) ->
 
 
 def test_failed_or_aborted_current_outcome_cannot_promote(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     promoted["test_access"]["lineage"][-1]["outcome"] = "aborted"
     _rehash_lineage(promoted)
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
         "contract.failed_test_promotion",
     )
 
 
 def test_successor_lineage_accepts_exact_trusted_append(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     trusted_prefix = _with_predecessor(promoted)
 
-    assert validate_enron_evidence(
+    assert _validate_promoted(
         promoted,
-        manifest=bound_manifest,
+        bound_manifest,
+        inventories,
         trusted_lineage_prefix=trusted_prefix,
     ) == {"valid": True, "diagnostics": []}
 
 
 def test_successor_lineage_rejects_non_append_only_prefix(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     _with_predecessor(promoted)
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
         "contract.lineage_not_append_only",
     )
+
+
+def test_trusted_lineage_prefix_rejects_scalar_shape_without_type_error(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+
+    result = validate_enron_evidence(
+        promoted,
+        manifest=bound_manifest,
+        trusted_lineage_prefix=cast(Any, 42),
+        referenced_input_inventories=inventories,
+    )
+
+    _assert_code(result, "contract.trusted_lineage_shape")
 
 
 @pytest.mark.parametrize(
@@ -1241,7 +2673,7 @@ def test_successor_lineage_rejects_non_append_only_prefix(manifest: JsonObject, 
 def test_successor_lineage_links_and_discloses_prior_outcome(
     manifest: JsonObject, evidence: JsonObject, mutation: str, code: str
 ) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     trusted_prefix = _with_predecessor(promoted)
     current = promoted["test_access"]["lineage"][-1]
     if mutation == "hash":
@@ -1256,9 +2688,10 @@ def test_successor_lineage_links_and_discloses_prior_outcome(
     _rehash_lineage(promoted)
 
     _assert_code(
-        validate_enron_evidence(
+        _validate_promoted(
             promoted,
-            manifest=bound_manifest,
+            bound_manifest,
+            inventories,
             trusted_lineage_prefix=trusted_prefix,
         ),
         code,
@@ -1266,7 +2699,7 @@ def test_successor_lineage_links_and_discloses_prior_outcome(
 
 
 def test_repeated_benchmark_version_in_lineage_is_rejected(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     trusted_prefix = _with_predecessor(promoted)
     promoted["test_access"]["lineage"][0]["benchmark_version"] = promoted["test_access"]["benchmark_version"]
     promoted["test_access"]["lineage"][1]["predecessor_benchmark_version"] = promoted["test_access"][
@@ -1279,9 +2712,10 @@ def test_repeated_benchmark_version_in_lineage_is_rejected(manifest: JsonObject,
     trusted_prefix = copy.deepcopy(promoted["test_access"]["lineage"][:-1])
 
     _assert_code(
-        validate_enron_evidence(
+        _validate_promoted(
             promoted,
-            manifest=bound_manifest,
+            bound_manifest,
+            inventories,
             trusted_lineage_prefix=trusted_prefix,
         ),
         "contract.test_reused",
@@ -1289,13 +2723,369 @@ def test_repeated_benchmark_version_in_lineage_is_rejected(manifest: JsonObject,
 
 
 def test_workload_descriptor_and_performance_manifest_hashes_are_bound(evidence: JsonObject) -> None:
-    evidence["performance"]["workloads"][0]["documents"] += 1
+    evidence["performance"]["workloads"][0]["warmups"] += 1
     _assert_code(validate_enron_evidence(evidence), "contract.workload_hash_mismatch")
 
     evidence["performance"]["workloads"][0]["workload_sha256"] = hash_enron_workload(
         evidence["performance"]["workloads"][0]
     )
     _assert_code(validate_enron_evidence(evidence), "contract.performance_manifest_hash")
+
+
+@pytest.mark.parametrize(
+    ("collection", "field"),
+    [
+        ("banks", "composition"),
+        ("banks", "active_aliases"),
+        ("inputs", "inventory_ref"),
+        ("workloads", "sample_unit"),
+        ("workloads", "rss_samples_bytes"),
+    ],
+)
+def test_performance_descriptor_schema_requires_issue_152_identity_and_work_fields(
+    evidence: JsonObject, collection: str, field: str
+) -> None:
+    del evidence["performance"][collection][0][field]
+
+    _assert_code(validate_enron_evidence(evidence), "contract.schema.required")
+
+
+@pytest.mark.parametrize("collection", ["baselines", "comparisons", "breakeven_models"])
+def test_performance_result_schema_requires_complete_baseline_and_breakeven_shapes(
+    evidence: JsonObject, collection: str
+) -> None:
+    evidence["performance"][collection].append({})
+
+    _assert_code(validate_enron_evidence(evidence), "contract.schema.required")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("bank_hash", "contract.performance_bank_descriptor_hash"),
+        ("bank_composition", "contract.performance_bank_composition"),
+        ("input_hash", "contract.performance_input_descriptor_hash"),
+        ("input_distribution", "contract.performance_input_distribution"),
+        ("input_size", "contract.performance_size_cohort"),
+    ],
+)
+def test_performance_bank_and_input_descriptors_are_recomputed(evidence: JsonObject, mutation: str, code: str) -> None:
+    bank = evidence["performance"]["banks"][0]
+    input_descriptor = evidence["performance"]["inputs"][0]
+    if mutation == "bank_hash":
+        bank["active_patterns"] += 1
+    elif mutation == "bank_composition":
+        bank["composition"]["taxonomy"][0]["literal_patterns"] += 1
+        _refresh_bank_descriptor(bank)
+    elif mutation == "input_hash":
+        input_descriptor["records"] += 1
+    elif mutation == "input_distribution":
+        input_descriptor["hit_distribution"]["mean_records"] += 1
+        _refresh_input_descriptor(input_descriptor)
+    else:
+        input_descriptor["size_cohort"] = "small"
+        _refresh_input_descriptor(input_descriptor)
+
+    _assert_code(validate_enron_evidence(evidence), code)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("comparison_plan", "contract.performance_comparison_hash"),
+        ("comparison_output", "contract.performance_comparison_arithmetic"),
+        ("component_output", "contract.breakeven_component_arithmetic"),
+        ("model_output", "contract.performance_breakeven_arithmetic"),
+    ],
+)
+def test_baseline_comparison_and_breakeven_plans_are_frozen_but_outputs_are_recomputed(
+    manifest: JsonObject, evidence: JsonObject, mutation: str, code: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    comparison = promoted["performance"]["comparisons"][0]
+    model = promoted["performance"]["breakeven_models"][0]
+    if mutation == "comparison_plan":
+        comparison["noise_multiplier"] += 1
+    elif mutation == "comparison_output":
+        comparison["candidate_value"] += 1
+    elif mutation == "component_output":
+        model["components"][0]["value"] += 1
+    else:
+        model["candidate_fixed_value"] += 1
+
+    _assert_code(_validate_promoted(promoted, bound_manifest, inventories), code)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("noise_multiplier", 6.0), ("regression_tolerance", 0.11)],
+)
+def test_comparison_noise_policy_has_bounded_schema_parameters(
+    manifest: JsonObject, evidence: JsonObject, field: str, value: float
+) -> None:
+    _, promoted, _ = _promotable(manifest, evidence)
+    promoted["performance"]["comparisons"][0][field] = value
+
+    _assert_code(validate_enron_evidence(promoted), "contract.schema.maximum")
+
+
+def test_unstable_high_mad_samples_cannot_hide_performance_regressions(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    candidate = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_1000_scan")
+    candidate["samples_seconds"] = [value for _ in range(50) for value in (0.001, 0.1)]
+    _refresh_workload(promoted, candidate)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.unstable_performance_comparison",
+    )
+
+
+def test_breakeven_components_require_public_descriptions(manifest: JsonObject, evidence: JsonObject) -> None:
+    _, promoted, _ = _promotable(manifest, evidence)
+    del promoted["performance"]["breakeven_models"][0]["components"][0]["description"]
+
+    _assert_code(validate_enron_evidence(promoted), "contract.schema.required")
+
+
+def test_exact_baseline_identity_requires_full_nerb_capabilities(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    baseline = promoted["performance"]["baselines"][0]
+    baseline["capabilities"]["canonical_mapping"] = False
+    baseline["descriptor_sha256"] = hash_enron_performance_baseline(baseline)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_baseline_capability",
+    )
+
+
+def test_breakeven_component_category_must_match_its_workload_phase(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    component = next(item for item in model["components"] if item["id"] == "candidate_fixed_build")
+    component["category"] = "cold_compile"
+    model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.invalid_breakeven_component",
+    )
+
+
+def test_breakeven_scan_pair_must_use_the_exact_same_frozen_input(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    baseline_component = next(item for item in model["components"] if item["id"] == "baseline_per_document_scan")
+    baseline_workload = next(
+        item for item in promoted["performance"]["workloads"] if item["id"] == baseline_component["workload_id"]
+    )
+    other_input = next(item for item in promoted["performance"]["inputs"] if item["id"] == "scale_1000_input")
+    baseline_workload["input_id"] = other_input["id"]
+    baseline_workload["input_sha256"] = other_input["descriptor_sha256"]
+    baseline_workload["workload_sha256"] = hash_enron_workload(baseline_workload)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_zero_vacuous_breakeven_assumptions_cannot_satisfy_promotion(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    curation = next(item for item in model["components"] if item["id"] == "candidate_fixed_source_curation")
+    curation["value"] = 0.0
+    candidate_fixed = sum(
+        item["value"] for item in model["components"] if item["side"] == "candidate" and item["application"] == "fixed"
+    )
+    baseline_fixed = sum(
+        item["value"] for item in model["components"] if item["side"] == "baseline" and item["application"] == "fixed"
+    )
+    candidate_per_unit = next(
+        item["value"]
+        for item in model["components"]
+        if item["side"] == "candidate" and item["application"] == "per_unit"
+    )
+    baseline_per_unit = next(
+        item["value"]
+        for item in model["components"]
+        if item["side"] == "baseline" and item["application"] == "per_unit"
+    )
+    crossing = math.ceil((candidate_fixed - baseline_fixed) / (baseline_per_unit - candidate_per_unit))
+    model.update(
+        {
+            "candidate_fixed_value": candidate_fixed,
+            "baseline_fixed_value": baseline_fixed,
+            "candidate_value_per_unit": candidate_per_unit,
+            "baseline_value_per_unit": baseline_per_unit,
+            "result": "finite_breakeven",
+            "breakeven_units": crossing,
+        }
+    )
+    model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_breakeven_component_totals_reject_numeric_overflow(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    for index in range(2):
+        model["components"].append(
+            {
+                "id": f"candidate_fixed_overflow_{index}",
+                "side": "candidate",
+                "application": "fixed",
+                "category": "labor",
+                "source": "declared_assumption",
+                "description": "Overflow-boundary labor assumption.",
+                "workload_id": None,
+                "assumption_sha256": _sha256_number(985 + index),
+                "value": 1e300,
+            }
+        )
+    model["components"].sort(key=lambda item: item["id"])
+    model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.breakeven_numeric_bounds",
+    )
+
+
+def test_throughput_denominators_cannot_be_inflated_without_matching_inventory(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    input_descriptor = next(item for item in promoted["performance"]["inputs"] if item["id"] == "real_scan_input")
+    multiplier = 1_000_000
+    input_descriptor["bytes"] *= multiplier
+    input_descriptor["artifact"]["bytes"] *= multiplier
+    lengths = input_descriptor["document_length_distribution"]
+    for field in ("minimum_bytes", "p50_bytes", "p95_bytes", "p99_bytes", "maximum_bytes", "mean_bytes"):
+        lengths[field] *= multiplier
+    input_descriptor["size_cohort"] = "huge"
+    _refresh_input_descriptor(input_descriptor)
+    for workload in promoted["performance"]["workloads"]:
+        if workload["input_id"] != input_descriptor["id"]:
+            continue
+        _refresh_workload(promoted, workload)
+    for index, workload in enumerate(promoted["performance"]["workloads"]):
+        if workload["input_id"] == input_descriptor["id"] and workload["decision_grade"]:
+            _refresh_check_actuals(promoted, target_prefix=f"/performance/workloads/{index}/")
+    throughput_claim = next(
+        item for item in promoted["promotion"]["claims"] if item["metric"] == "direct_bank_scan_mib_per_second"
+    )
+    throughput_workload = next(
+        item
+        for item in promoted["performance"]["workloads"]
+        if item["id"] == throughput_claim["performance_workload_id"]
+    )
+    throughput_claim["value"] = throughput_workload["stats"]["mib_per_second"]
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_inventory_arithmetic",
+    )
+
+
+@pytest.mark.parametrize("commitment", ["artifact", "inventory"])
+def test_post_freeze_input_commitment_changes_break_manifest_and_frozen_binding(
+    manifest: JsonObject, evidence: JsonObject, commitment: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    input_descriptor = next(item for item in promoted["performance"]["inputs"] if item["id"] == "real_scan_input")
+    target = input_descriptor["artifact" if commitment == "artifact" else "inventory_ref"]
+    target["sha256"] = _sha256_number(993 if commitment == "artifact" else 992)
+    _refresh_input_descriptor(input_descriptor)
+    for workload in promoted["performance"]["workloads"]:
+        if workload["input_id"] == input_descriptor["id"]:
+            workload["input_sha256"] = input_descriptor["descriptor_sha256"]
+            workload["workload_sha256"] = hash_enron_workload(workload)
+    promoted["performance_manifest_sha256"] = hash_enron_performance_manifest(promoted["performance"])
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+
+    assert {"contract.freeze_mismatch", "contract.provenance_mismatch"} <= _codes(result)
+
+
+def test_referenced_input_inventory_hash_mismatch_is_rejected(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    changed = copy.deepcopy(inventories)
+    inventory_id = next(iter(changed))
+    changed[inventory_id][0]["records"] += 1
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, changed),
+        "contract.performance_inventory_hash",
+    )
+
+
+def test_document_sample_unit_cannot_report_aggregate_throughput(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
+    assert workload["stats"]["mib_per_second"] is None
+    workload["stats"]["mib_per_second"] = 1_000_000.0
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_arithmetic",
+    )
+
+
+def test_non_scan_phase_cannot_use_ambiguous_document_sample_units(evidence: JsonObject) -> None:
+    workload = evidence["performance"]["workloads"][0]
+    workload["phase"] = "source_build"
+    workload["sample_unit"] = "document"
+    workload["process_model"] = "fresh_process_per_sample"
+    _refresh_workload(evidence, workload)
+    _refresh_frozen_contract(evidence)
+
+    _assert_code(validate_enron_evidence(evidence), "contract.performance_phase_sample_unit")
+
+
+def test_setup_operation_cells_cannot_borrow_scan_denominators(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "source_build_fixture")
+    assert workload["sample_unit"] == "operation"
+    assert workload["input_id"] is workload["input_sha256"] is None
+    assert all(
+        workload["stats"][field] is None
+        for field in ("documents_per_second", "mib_per_second", "records_per_second", "seconds_per_document")
+    )
+    input_descriptor = next(item for item in promoted["performance"]["inputs"] if item["id"] == "real_scan_input")
+    workload["input_id"] = input_descriptor["id"]
+    workload["input_sha256"] = input_descriptor["descriptor_sha256"]
+    workload["workload_sha256"] = hash_enron_workload(workload)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.setup_phase_input",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1308,17 +3098,19 @@ def test_workload_descriptor_and_performance_manifest_hashes_are_bound(evidence:
         "mad_seconds",
         "documents_per_second",
         "mib_per_second",
+        "records_per_second",
+        "seconds_per_document",
     ],
 )
 def test_every_performance_statistic_is_recomputed_with_tail_samples(
     manifest: JsonObject, evidence: JsonObject, field: str
 ) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     stats = promoted["performance"]["workloads"][0]["stats"]
     stats[field] = stats[field] + 1 if stats[field] is not None else 1.0
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
         "contract.performance_arithmetic",
     )
 
@@ -1333,7 +3125,7 @@ def test_p95_and_p99_require_meaningful_sample_support(
     value = copy.deepcopy(evidence)
     workload = value["performance"]["workloads"][0]
     workload["samples_seconds"] = [0.01 + index / 1_000_000 for index in range(sample_count)]
-    _refresh_workload(workload)
+    _refresh_workload(value, workload)
     _drop_performance_assertions(value)
 
     assert (workload["stats"]["p95_seconds"] is not None) is has_p95
@@ -1342,13 +3134,14 @@ def test_p95_and_p99_require_meaningful_sample_support(
 
 
 def test_promoted_performance_requires_at_least_one_hundred_samples(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
-    workload = promoted["performance"]["workloads"][0]
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
     workload["samples_seconds"] = workload["samples_seconds"][:99]
+    _refresh_workload(promoted, workload)
 
     _assert_code(
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
-        "contract.invalid_performance_gate",
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.invalid_decision_grade_workload",
     )
 
 
@@ -1392,9 +3185,35 @@ def test_referenced_sample_byte_count_is_verified(evidence: JsonObject) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("resolver", "code"),
+    [
+        ("samples", "contract.performance_sample_resolver_shape"),
+        ("inventories", "contract.performance_inventory_resolver_shape"),
+    ],
+)
+def test_external_resolver_top_level_shape_is_validated(evidence: JsonObject, resolver: str, code: str) -> None:
+    kwargs: dict[str, Any] = (
+        {"referenced_samples": 42} if resolver == "samples" else {"referenced_input_inventories": [1, 2, 3]}
+    )
+
+    _assert_code(validate_enron_evidence(evidence, **kwargs), code)
+
+
+def test_scalar_referenced_sample_fails_closed_without_type_error(evidence: JsonObject) -> None:
+    workload = evidence["performance"]["workloads"][0]
+    workload["samples_seconds"] = []
+    workload["samples_ref"] = {"id": "scalar_samples", "sha256": _sha256_number(994), "bytes": 1}
+
+    _assert_code(
+        validate_enron_evidence(evidence, referenced_samples=cast(Any, {"scalar_samples": 0.01})),
+        "contract.performance_sample_support",
+    )
+
+
 def test_referenced_samples_can_support_promotion(manifest: JsonObject, evidence: JsonObject) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
-    workload = promoted["performance"]["workloads"][0]
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
     samples = list(workload["samples_seconds"])
     workload["samples_seconds"] = []
     workload["samples_ref"] = {
@@ -1403,10 +3222,10 @@ def test_referenced_samples_can_support_promotion(manifest: JsonObject, evidence
         "bytes": _sample_payload_bytes(samples),
     }
 
-    assert validate_enron_evidence(
+    assert _validate_promoted(
         promoted,
-        manifest=bound_manifest,
-        trusted_lineage_prefix=[],
+        bound_manifest,
+        inventories,
         referenced_samples={"decision_samples": samples},
     ) == {"valid": True, "diagnostics": []}
 
@@ -1414,8 +3233,8 @@ def test_referenced_samples_can_support_promotion(manifest: JsonObject, evidence
 @pytest.mark.parametrize(
     ("phase", "process_model", "code"),
     [
-        ("direct_bank_scan", "fresh_process_per_sample", "contract.direct_scan_process_model"),
-        ("cold_compile", "reused_process", "contract.cold_compile_process_model"),
+        ("direct_bank_scan", "fresh_process_per_sample", "contract.performance_phase_process_model"),
+        ("cold_compile", "reused_process", "contract.performance_phase_process_model"),
     ],
 )
 def test_performance_phase_requires_correct_process_model(
@@ -1446,12 +3265,85 @@ def test_performance_workload_must_reference_declared_bank(evidence: JsonObject)
     _assert_code(validate_enron_evidence(evidence), "contract.unknown_performance_bank")
 
 
+def test_unknown_decision_input_fails_with_diagnostic_instead_of_key_error(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_1000_scan")
+    workload["input_id"] = "missing_decision_input"
+    workload["input_sha256"] = _sha256_number(995)
+    workload["workload_sha256"] = hash_enron_workload(workload)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.unknown_performance_input",
+    )
+
+
+def test_peak_rss_measurements_must_be_strictly_positive(evidence: JsonObject) -> None:
+    evidence["performance"]["workloads"][0]["peak_rss_bytes"] = 0
+
+    _assert_code(validate_enron_evidence(evidence), "contract.schema.anyOf")
+
+
+@pytest.mark.parametrize("mutation", ["length", "maximum"])
+def test_peak_rss_is_bound_to_one_memory_sample_per_timing_sample(evidence: JsonObject, mutation: str) -> None:
+    workload = evidence["performance"]["workloads"][0]
+    if mutation == "length":
+        workload["rss_samples_bytes"].pop()
+    else:
+        workload["rss_samples_bytes"][0] = workload["peak_rss_bytes"] + 1
+
+    _assert_code(validate_enron_evidence(evidence), "contract.performance_rss_samples")
+
+
+def test_decision_grade_concurrency_cannot_exceed_recorded_machine_capacity(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_100000_scan")
+    workload["concurrency"] = promoted["environment"]["cpu_count"] + 1
+    workload["workload_sha256"] = hash_enron_workload(workload)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_concurrency_bounds",
+    )
+
+
+@pytest.mark.parametrize("target", ["manifest", "evidence"])
+def test_real_artifacts_reject_placeholder_all_zero_content_hashes(
+    manifest: JsonObject, evidence: JsonObject, target: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    if target == "manifest":
+        bound_manifest["source"]["content_sha256"] = "sha256:" + "0" * 64
+        result = validate_enron_manifest(bound_manifest)
+    else:
+        promoted["evaluator"]["source_sha256"] = "sha256:" + "0" * 64
+        result = _validate_promoted(promoted, bound_manifest, inventories)
+
+    _assert_code(result, "contract.placeholder_content_hash")
+
+
 @pytest.mark.parametrize(
     "unsafe",
     [
         "/private/source.jsonl",
         "--source=/private/source.jsonl",
         r"C:\Users\fixture\source.jsonl",
+        r"D:\corpus\source.jsonl",
+        r"E:relative\source.jsonl",
+        r"\rooted\source.jsonl",
+        r"\\server\share\source.jsonl",
+        "--source=Z:/corpus/source.jsonl",
+        "/tmp/source.jsonl",
+        "FOO=/tmp/source.jsonl",
+        "sh -c python /tmp/source.jsonl",
         "file:///private/source.jsonl",
         "~/source.jsonl",
         "../source.jsonl",
@@ -1467,7 +3359,10 @@ def test_commands_reject_private_or_traversing_paths(manifest: JsonObject, unsaf
     ("field", "value", "code"),
     [
         ("owner", "fixture@example.test", "contract.public_direct_identifier"),
+        ("owner", "person@internal", "contract.public_direct_identifier"),
         ("access", "/Users/fixture/private/source", "contract.public_private_path"),
+        ("access", "FOO=/tmp/source.jsonl", "contract.public_private_path"),
+        ("access", "python /tmp/source.jsonl --safe", "contract.public_private_path"),
     ],
 )
 def test_entire_public_serialization_is_scanned_for_identifiers_and_paths(
@@ -1478,12 +3373,101 @@ def test_entire_public_serialization_is_scanned_for_identifiers_and_paths(
     _assert_code(validate_enron_manifest(manifest), code)
 
 
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        r"D:\corpus\source.jsonl",
+        r"E:relative\source.jsonl",
+        r"\rooted\source.jsonl",
+        r"\\server\share\source.jsonl",
+    ],
+)
+def test_public_serialization_rejects_windows_local_path_variants(manifest: JsonObject, unsafe: str) -> None:
+    manifest["source"]["access"] = unsafe
+
+    _assert_code(validate_enron_manifest(manifest), "contract.public_private_path")
+
+
+def test_diagnostics_do_not_echo_direct_identifiers_or_offending_values(manifest: JsonObject) -> None:
+    secret = "sensitive.person@private.example"
+    manifest["source"]["owner"] = secret
+
+    result = validate_enron_manifest(manifest)
+
+    _assert_code(result, "contract.public_direct_identifier")
+    assert secret not in json.dumps(result, sort_keys=True)
+
+
+def test_schema_diagnostics_do_not_echo_invalid_secret_values(manifest: JsonObject) -> None:
+    secret = "sensitive.person@internal"
+    manifest["source"]["input_records"] = secret
+
+    result = validate_enron_manifest(manifest)
+
+    _assert_code(result, "contract.schema.type")
+    assert secret not in json.dumps(result, sort_keys=True)
+
+
 def test_privacy_pass_cannot_hide_raw_text_identifiers_or_violations(manifest: JsonObject) -> None:
     manifest["privacy"]["raw_text_included"] = True
     manifest["privacy"]["direct_identifiers_included"] = True
     manifest["privacy"]["violation_count"] = 2
 
     _assert_code(validate_enron_manifest(manifest), "contract.forged_privacy_pass")
+
+
+def test_diagnostics_are_deterministically_capped(manifest: JsonObject) -> None:
+    manifest["commands"] = [copy.deepcopy(manifest["commands"][0]) for _ in range(150)]
+
+    result = validate_enron_manifest(manifest)
+
+    assert len(result["diagnostics"]) == enron_contract.MAX_DIAGNOSTICS + 1
+    assert result["diagnostics"][-1]["code"] == "contract.diagnostics_truncated"
+
+
+@pytest.mark.parametrize("shape", ["depth", "cycle", "collection"])
+def test_validator_rejects_deep_cyclic_and_oversized_in_memory_structures(shape: str) -> None:
+    if shape == "depth":
+        value: Any = {}
+        current = value
+        for _ in range(enron_contract.MAX_CONTRACT_DEPTH + 2):
+            current["next"] = {}
+            current = current["next"]
+    elif shape == "cycle":
+        value = {}
+        value["self"] = value
+    else:
+        value = [None] * (enron_contract.MAX_COLLECTION_ITEMS + 1)
+
+    _assert_code(validate_enron_evidence(value), "contract.resource_limits")
+
+
+def test_embedded_and_referenced_sample_collection_limits_fail_closed(evidence: JsonObject) -> None:
+    embedded = copy.deepcopy(evidence)
+    embedded["performance"]["workloads"][0]["samples_seconds"] = [0.01] * (enron_contract.MAX_COLLECTION_ITEMS + 1)
+    _assert_code(validate_enron_evidence(embedded), "contract.resource_limits")
+
+    referenced = copy.deepcopy(evidence)
+    workload = referenced["performance"]["workloads"][0]
+    workload["samples_seconds"] = []
+    workload["samples_ref"] = {"id": "too_many_samples", "sha256": _sha256_number(990), "bytes": 1}
+    _assert_code(
+        validate_enron_evidence(
+            referenced,
+            referenced_samples={"too_many_samples": [0.01] * (enron_contract.MAX_COLLECTION_ITEMS + 1)},
+        ),
+        "contract.performance_sample_support",
+    )
+
+
+def test_referenced_input_inventory_collection_limit_fails_closed(evidence: JsonObject) -> None:
+    inventory_id = evidence["performance"]["inputs"][0]["inventory_ref"]["id"]
+    oversized = [{"bytes": 1, "records": 0}] * (enron_contract.MAX_COLLECTION_ITEMS + 1)
+
+    _assert_code(
+        validate_enron_evidence(evidence, referenced_input_inventories={inventory_id: oversized}),
+        "contract.performance_inventory_shape",
+    )
 
 
 def test_contract_loaders_accept_bound_sanitized_fixtures(test_data_path: Path) -> None:
@@ -1500,6 +3484,34 @@ def test_contract_loaders_reject_symlinks(tmp_path: Path, test_data_path: Path) 
 
     with pytest.raises(ValueError, match="regular non-symlink"):
         load_enron_manifest(link)
+
+
+def test_contract_loader_uses_nofollow_and_rejects_lstat_fstat_identity_change(
+    test_data_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_open = enron_contract.os.open
+    real_fstat = enron_contract.os.fstat
+    opened_flags: list[int] = []
+
+    def recording_open(path: Any, flags: int) -> int:
+        opened_flags.append(flags)
+        return real_open(path, flags)
+
+    def changed_fstat(descriptor: int) -> Any:
+        fields = list(real_fstat(descriptor))
+        fields[2] += 1
+        return enron_contract.os.stat_result(fields)
+
+    monkeypatch.setattr(enron_contract.os, "open", recording_open)
+    monkeypatch.setattr(enron_contract.os, "fstat", changed_fstat)
+
+    with pytest.raises(ValueError):
+        load_enron_manifest(test_data_path / "enron_manifest_v2.json")
+
+    assert opened_flags
+    nofollow = getattr(enron_contract.os, "O_NOFOLLOW", 0)
+    if nofollow:
+        assert opened_flags[0] & nofollow
 
 
 def test_contract_loaders_reject_directories(tmp_path: Path) -> None:
@@ -1551,7 +3563,7 @@ def test_contract_loaders_reject_structurally_invalid_contracts(tmp_path: Path) 
 def test_all_successful_results_and_contracts_serialize_without_non_finite_values(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
-    bound_manifest, promoted = _promotable(manifest, evidence)
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     successful_values = [
         ENRON_MANIFEST_SCHEMA,
         ENRON_EVIDENCE_SCHEMA,
@@ -1562,7 +3574,7 @@ def test_all_successful_results_and_contracts_serialize_without_non_finite_value
         validate_enron_manifest(manifest),
         validate_enron_evidence(evidence, manifest=manifest),
         validate_enron_manifest(bound_manifest),
-        validate_enron_evidence(promoted, manifest=bound_manifest, trusted_lineage_prefix=[]),
+        _validate_promoted(promoted, bound_manifest, inventories),
     ]
 
     for value in successful_values:

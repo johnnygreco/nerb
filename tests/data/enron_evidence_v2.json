@@ -3,7 +3,7 @@
   "charter_version": "2",
   "artifact_kind": "synthetic_fixture",
   "created_at": "2026-07-10T00:03:00Z",
-  "manifest_sha256": "sha256:7a24fcd5cc8a7a7b85a8f3014fd93829120b69e896903ee70b8a759ef7bc05ca",
+  "manifest_sha256": "sha256:bb07ed3eca0e8418b9b7fe1b92cc4847e862470873b083f097f66613571a9339",
   "evaluator": {
     "id": "synthetic_privacy_eval",
     "version": "2.0.0",
@@ -26,7 +26,17 @@
       "id": "prepared_records",
       "sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
       "bytes": 4096
-    }
+    },
+    "text_views": [
+      {
+        "id": "natural_body",
+        "artifact_sha256": "sha256:1818181818181818181818181818181818181818181818181818181818181818",
+        "content_policy_sha256": "sha256:1919191919191919191919191919191919191919191919191919191919191919",
+        "document_regions": ["natural_body"],
+        "primary_for_quality": true,
+        "answer_bearing_fields_included": false
+      }
+    ]
   },
   "splits": {
     "manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
@@ -71,6 +81,7 @@
     "artifact_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
     "active_entities": 3,
     "active_names": 4,
+    "active_aliases": 1,
     "active_patterns": 5,
     "canonical_json_bytes": 2048,
     "native_source_bytes": 1024
@@ -83,12 +94,12 @@
   },
   "commands": [
     {
-      "id": "fixture_evaluate",
-      "argv": ["nerb-fixture", "--evidence", "aggregate-only"],
+      "id": "fixture_build",
+      "argv": ["nerb-fixture", "--source", "synthetic/messages"],
       "cwd": ".",
       "timeout_seconds": 60.0,
       "exit_status": 0,
-      "elapsed_seconds": 2.0
+      "elapsed_seconds": 1.0
     }
   ],
   "environment": {
@@ -129,10 +140,10 @@
         "split_role": "test",
         "text_view": "natural_body",
         "promotion_gate": false,
-        "documents": 10,
-        "documents_with_sensitive_gold": 8,
+        "documents": 5,
+        "documents_with_sensitive_gold": 4,
         "documents_with_any_miss": 1,
-        "documents_with_cataloged_gold": 7,
+        "documents_with_cataloged_gold": 4,
         "documents_with_any_cataloged_miss": 0,
         "documents_with_any_leaked_character": 1,
         "gold_spans": 20,
@@ -150,7 +161,7 @@
         "predicted_characters": 105,
         "over_redacted_characters": 13,
         "evaluated_characters": 1000,
-        "negative_documents": 2,
+        "negative_documents": 1,
         "negative_documents_with_predictions": 1,
         "metrics": {
           "precision": 0.9,
@@ -158,11 +169,11 @@
           "f1": 0.9,
           "catalog_coverage": 0.8,
           "cataloged_recall": 1.0,
-          "document_leak_rate": 0.125,
+          "document_leak_rate": 0.25,
           "cataloged_document_leak_rate": 0.0,
           "sensitive_character_recall": 0.92,
           "sensitive_character_leak_rate": 0.08,
-          "negative_document_false_alarm_rate": 0.5,
+          "negative_document_false_alarm_rate": 1.0,
           "over_redaction_rate": 0.013
         }
       }
@@ -189,6 +200,7 @@
       "sha256": "sha256:1616161616161616161616161616161616161616161616161616161616161616",
       "bytes": 1024
     },
+    "policy_sha256": "sha256:2727272727272727272727272727272727272727272727272727272727272727",
     "recall": 1.0,
     "passed": true
   },
@@ -199,11 +211,12 @@
     "current_version_accessed_at": "2026-07-10T00:02:00Z",
     "frozen_target": {
       "frozen_at": "2026-07-10T00:01:00Z",
+      "manifest_sha256": "sha256:bb07ed3eca0e8418b9b7fe1b92cc4847e862470873b083f097f66613571a9339",
       "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
       "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
-      "performance_manifest_sha256": "sha256:624cffe03e72ce01728d2e169554a7b3d9113e2fc596d216b16f4f83bd5ff0d8",
+      "performance_manifest_sha256": "sha256:47755560fcafac7a50bdf7455b47bf2229a977a8a725ef656fcd87d32b3da68c",
       "git_commit": "0000000000000000000000000000000000000000"
     },
     "lineage": [
@@ -219,20 +232,21 @@
         },
         "frozen_target": {
           "frozen_at": "2026-07-10T00:01:00Z",
+          "manifest_sha256": "sha256:bb07ed3eca0e8418b9b7fe1b92cc4847e862470873b083f097f66613571a9339",
           "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
           "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
           "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
-          "performance_manifest_sha256": "sha256:624cffe03e72ce01728d2e169554a7b3d9113e2fc596d216b16f4f83bd5ff0d8",
+          "performance_manifest_sha256": "sha256:47755560fcafac7a50bdf7455b47bf2229a977a8a725ef656fcd87d32b3da68c",
           "git_commit": "0000000000000000000000000000000000000000"
         },
         "predecessor_benchmark_version": null,
         "changes_informed_by_predecessor": [],
         "previous_entry_sha256": null,
-        "entry_sha256": "sha256:0a3424572fe3e66fbb03e18fc60bea11217ed4b1af2ad7b34d9c083c3ed59601"
+        "entry_sha256": "sha256:93db230a618bad238f651888cb45fa75ff394770fadd7b707da30d367a754a54"
       }
     ],
-    "lineage_head_sha256": "sha256:0a3424572fe3e66fbb03e18fc60bea11217ed4b1af2ad7b34d9c083c3ed59601"
+    "lineage_head_sha256": "sha256:93db230a618bad238f651888cb45fa75ff394770fadd7b707da30d367a754a54"
   },
   "performance": {
     "evaluated": true,
@@ -241,11 +255,80 @@
         "id": "evaluated_fixture_bank",
         "kind": "evaluated_bank",
         "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact": {
+          "id": "synthetic_evaluated_bank_artifact",
+          "sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "bytes": 2048
+        },
+        "generator": null,
+        "composition": {
+          "taxonomy": [
+            {
+              "entity_class": "synthetic_person",
+              "entities": 3,
+              "canonical_names": 3,
+              "aliases": 1,
+              "literal_patterns": 4,
+              "regex_patterns": 1
+            }
+          ]
+        },
+        "descriptor_sha256": "sha256:776e4f9b416a5c2c07f66faf8cf0ea3383daf3192bd45cc659f3b20f63a8f789",
         "active_entities": 3,
         "active_names": 4,
+        "active_aliases": 1,
         "active_patterns": 5,
         "canonical_json_bytes": 2048,
         "native_source_bytes": 1024
+      }
+    ],
+    "inputs": [
+      {
+        "id": "synthetic_scan_input",
+        "kind": "synthetic_input",
+        "bank_id": "evaluated_fixture_bank",
+        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "artifact": {
+          "id": "synthetic_scan_documents",
+          "sha256": "sha256:2121212121212121212121212121212121212121212121212121212121212121",
+          "bytes": 1024000
+        },
+        "inventory_ref": {
+          "id": "synthetic_scan_inventory",
+          "sha256": "sha256:c77042b987cec82bbf55e97ae46efc5f9e5ec78e31871f677bd1fb8c59927f90",
+          "bytes": 2801
+        },
+        "generator": {
+          "id": "synthetic_input_generator",
+          "version": "1.0.0",
+          "source_sha256": "sha256:2525252525252525252525252525252525252525252525252525252525252525",
+          "spec_sha256": "sha256:2626262626262626262626262626262626262626262626262626262626262626",
+          "seed": "synthetic-fixture-input-seed"
+        },
+        "documents": 100,
+        "bytes": 1024000,
+        "records": 50,
+        "hit_density": "normal",
+        "size_cohort": "medium",
+        "document_length_distribution": {
+          "minimum_bytes": 10240,
+          "p50_bytes": 10240,
+          "p95_bytes": 10240,
+          "p99_bytes": 10240,
+          "maximum_bytes": 10240,
+          "mean_bytes": 10240.0
+        },
+        "hit_distribution": {
+          "negative_documents": 50,
+          "documents_with_records": 50,
+          "minimum_records": 0,
+          "p50_records": 0,
+          "p95_records": 1,
+          "p99_records": 1,
+          "maximum_records": 1,
+          "mean_records": 0.5
+        },
+        "descriptor_sha256": "sha256:b6f194f27de755bbf0450a44fb8ee273c04666edaa0a43572e575dfd15aff96a"
       }
     ],
     "workloads": [
@@ -253,14 +336,17 @@
         "id": "direct_bank_fixture",
         "phase": "direct_bank_scan",
         "promotion_gate": false,
-        "workload_sha256": "sha256:418de9d6c3680f1da2a4ec7b70b29afd3517dcc65fef3a529577a2eb05e0c088",
+        "decision_grade": false,
+        "workload_sha256": "sha256:6da8c0f481c8ebb47a16c539009692dac6c8e998e1eb2247695137c683a3ec27",
+        "bank_id": "evaluated_fixture_bank",
         "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "input_id": "synthetic_scan_input",
+        "input_sha256": "sha256:b6f194f27de755bbf0450a44fb8ee273c04666edaa0a43572e575dfd15aff96a",
+        "baseline_id": null,
         "warmups": 2,
-        "documents": 100,
-        "bytes": 1048576,
-        "matches": 50,
+        "sample_unit": "whole_input",
+        "work_per_sample": 1,
         "concurrency": 1,
-        "hit_density": "normal",
         "process_model": "reused_process",
         "median_method": "standard_even_average",
         "percentile_method": "nearest_rank",
@@ -273,13 +359,19 @@
           "p99_seconds": null,
           "mad_seconds": 0.001,
           "documents_per_second": 8333.333333333334,
-          "mib_per_second": 83.33333333333333
+          "mib_per_second": 81.38020833333333,
+          "records_per_second": 4166.666666666667,
+          "seconds_per_document": 0.00012
         },
+        "rss_samples_bytes": [1048576, 1048576, 1048576, 1048576, 1048576],
         "peak_rss_bytes": 1048576
       }
-    ]
+    ],
+    "baselines": [],
+    "comparisons": [],
+    "breakeven_models": []
   },
-  "performance_manifest_sha256": "sha256:624cffe03e72ce01728d2e169554a7b3d9113e2fc596d216b16f4f83bd5ff0d8",
+  "performance_manifest_sha256": "sha256:47755560fcafac7a50bdf7455b47bf2229a977a8a725ef656fcd87d32b3da68c",
   "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
   "promotion": {
     "passed": false,
@@ -330,68 +422,7 @@
         "passed": true
       }
     ],
-    "claims": [
-      {
-        "id": "catalog_conformance_recall",
-        "kind": "catalog_conformance",
-        "metric": "catalog_conformance_recall",
-        "value": 1.0,
-        "label_strength": "synthetic_conformance",
-        "annotation_completeness": "exhaustive_within_scope",
-        "quality_slice_id": null,
-        "performance_workload_id": null,
-        "scope": {
-          "entity_class": null,
-          "cohort": null,
-          "split_role": null,
-          "text_view": null
-        },
-        "source_revision": "fixture-v1",
-        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-        "environment_sha256": "sha256:1595cc289705b86895da4f5653f98d3f428fab6935cfcd4c07c8958360e6dd10"
-      },
-      {
-        "id": "open_world_recall",
-        "kind": "open_world_quality",
-        "metric": "open_world_recall",
-        "value": 0.9,
-        "label_strength": "independent",
-        "annotation_completeness": "exhaustive_within_scope",
-        "quality_slice_id": "independent_all_test",
-        "performance_workload_id": null,
-        "scope": {
-          "entity_class": "person",
-          "cohort": "all",
-          "split_role": "test",
-          "text_view": "natural_body"
-        },
-        "source_revision": "fixture-v1",
-        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-        "environment_sha256": "sha256:1595cc289705b86895da4f5653f98d3f428fab6935cfcd4c07c8958360e6dd10"
-      },
-      {
-        "id": "direct_scan_median",
-        "kind": "performance",
-        "metric": "direct_bank_scan_median_seconds",
-        "value": 0.012,
-        "label_strength": "unlabeled",
-        "annotation_completeness": "not_applicable",
-        "quality_slice_id": null,
-        "performance_workload_id": "direct_bank_fixture",
-        "scope": {
-          "entity_class": null,
-          "cohort": null,
-          "split_role": null,
-          "text_view": null
-        },
-        "source_revision": "fixture-v1",
-        "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-        "environment_sha256": "sha256:1595cc289705b86895da4f5653f98d3f428fab6935cfcd4c07c8958360e6dd10"
-      }
-    ]
+    "claims": []
   },
   "verifier": {
     "id": "nerb-enron-contract",

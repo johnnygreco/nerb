@@ -2,7 +2,7 @@
 
 The schemas close every object and the semantic verifier recomputes aggregate claims without reading private corpus
 text. A promoted or verifier-passed bundle must be checked with its exact manifest, the previously published final-test
-lineage prefix, and any content-addressed timing samples that are not embedded in the evidence JSON.
+lineage prefix, and any external content-addressed timing samples and privacy-safe input inventories.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from hashlib import sha256
+from heapq import nsmallest
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISREG
 from statistics import median
@@ -30,15 +31,40 @@ ENRON_EVIDENCE_SCHEMA_VERSION = "nerb.enron_evidence.v2"
 ENRON_CHARTER_VERSION = "2"
 ENRON_VERIFIER_ID = "nerb-enron-contract"
 ENRON_VERIFIER_VERSION = "2.0.0"
-MAX_CONTRACT_BYTES = 64 * 1024 * 1024
+MAX_CONTRACT_BYTES = 16 * 1024 * 1024
+MAX_CONTRACT_DEPTH = 100
+MAX_CONTRACT_NODES = 250_000
+MAX_COLLECTION_ITEMS = 10_000
+MAX_DIAGNOSTICS = 100
+MAX_ID_CHARS = 256
+MAX_STRING_CHARS = 4 * 1024
+MAX_TOTAL_STRING_CHARS = MAX_CONTRACT_BYTES
 MAX_SAFE_INTEGER = 2**63 - 1
 MAX_FINITE_CONTRACT_NUMBER = 1e300
 MIN_SAMPLE_SECONDS = 1e-9
 MAX_SAMPLE_SECONDS = 24 * 60 * 60
 MIN_PUBLIC_SLICE_DOCUMENTS = 5
+MIN_DECISION_GRADE_DOCUMENTS = 100
+MIN_DECISION_GRADE_GOLD_SPANS = 100
+MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS = 20
+MIN_DECISION_GRADE_SENSITIVE_CHARACTERS = 500
+MIN_QUALITY_THRESHOLDS = {
+    "open_world_recall": 0.95,
+    "catalog_coverage": 0.80,
+    "cataloged_recall": 1.0,
+    "sensitive_character_recall": 0.98,
+}
+MAX_QUALITY_THRESHOLDS = {
+    "document_leak_rate": 0.05,
+    "sensitive_character_leak_rate": 0.02,
+    "negative_document_false_alarm_rate": 0.50,
+    "over_redaction_rate": 0.05,
+}
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
+ZERO_SHA256 = "sha256:" + "0" * 64
 LABEL_STRENGTHS = ("independent", "structured_weak", "synthetic_conformance", "unlabeled")
+LABEL_ROLES = ("train", "validation", "test", "conformance")
 ANNOTATION_COMPLETENESS = ("exhaustive_within_scope", "partial", "not_applicable")
 CHARACTER_POSITION_SEMANTICS = "document_id_unicode_scalar_index"
 MATCHING_SEMANTICS = "one_to_one_exact_span_and_class"
@@ -50,6 +76,18 @@ PERFORMANCE_PHASES = (
     "direct_bank_scan",
     "end_to_end",
 )
+PERFORMANCE_PHASE_PROCESS_MODELS = {
+    "source_build": "fresh_process_per_sample",
+    "cold_compile": "fresh_process_per_sample",
+    "helper_cache_miss": "fresh_process_per_sample",
+    "helper_cache_hit": "reused_process",
+    "direct_bank_scan": "reused_process",
+    "end_to_end": "fresh_process_per_sample",
+}
+PERFORMANCE_SCALE_ALIASES = (1_000, 10_000, 25_000, 100_000)
+MIN_DECISION_GRADE_SAMPLES = 100
+MIN_DECISION_GRADE_WARMUPS = 3
+MAX_COMPARISON_NOISE_FLOOR = 0.25
 
 
 def _is_json_array(_checker: Any, value: Any) -> bool:
@@ -114,7 +152,7 @@ _STRING_ARRAY = {
 
 _ARTIFACT_REF = _closed_object(
     ("id", "sha256", "bytes"),
-    {"id": {"type": "string", "minLength": 1}, "sha256": _HASH, "bytes": _NONNEGATIVE_INTEGER},
+    {"id": {"type": "string", "minLength": 1}, "sha256": _HASH, "bytes": _POSITIVE_INTEGER},
 )
 _EVALUATOR = _closed_object(
     ("id", "version", "source_sha256", "label_schema_sha256"),
@@ -229,6 +267,7 @@ _BANK = _closed_object(
         "artifact_sha256",
         "active_entities",
         "active_names",
+        "active_aliases",
         "active_patterns",
         "canonical_json_bytes",
         "native_source_bytes",
@@ -239,6 +278,7 @@ _BANK = _closed_object(
         "artifact_sha256": _HASH,
         "active_entities": _POSITIVE_INTEGER,
         "active_names": _POSITIVE_INTEGER,
+        "active_aliases": _NONNEGATIVE_INTEGER,
         "active_patterns": _POSITIVE_INTEGER,
         "canonical_json_bytes": _POSITIVE_INTEGER,
         "native_source_bytes": _POSITIVE_INTEGER,
@@ -253,6 +293,30 @@ _ANNOTATION_SCOPE = _closed_object(
         "exclusions": _STRING_ARRAY,
     },
 )
+_LABEL_ROLE_POPULATION = _closed_object(
+    ("role", "documents", "spans"),
+    {
+        "role": {"type": "string", "enum": list(LABEL_ROLES)},
+        "documents": _POSITIVE_INTEGER,
+        "spans": _NONNEGATIVE_INTEGER,
+    },
+)
+_ANNOTATION_PROVENANCE = _closed_object(
+    (
+        "protocol_sha256",
+        "producer_id",
+        "reviewer_id",
+        "independently_reviewed",
+        "adjudication_artifact",
+    ),
+    {
+        "protocol_sha256": _HASH,
+        "producer_id": {"type": "string", "minLength": 1},
+        "reviewer_id": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+        "independently_reviewed": {"type": "boolean"},
+        "adjudication_artifact": {"anyOf": [_ARTIFACT_REF, {"type": "null"}]},
+    },
+)
 _LABEL_ARTIFACT = _closed_object(
     (
         "id",
@@ -260,6 +324,8 @@ _LABEL_ARTIFACT = _closed_object(
         "annotation_scope",
         "annotation_completeness",
         "roles",
+        "role_populations",
+        "annotation_provenance",
         "artifact",
         "span_count",
     ),
@@ -272,19 +338,94 @@ _LABEL_ARTIFACT = _closed_object(
             "type": "array",
             "minItems": 1,
             "uniqueItems": True,
-            "items": {"type": "string", "enum": ["train", "validation", "test"]},
+            "items": {"type": "string", "enum": list(LABEL_ROLES)},
         },
+        "role_populations": {"type": "array", "minItems": 1, "items": _LABEL_ROLE_POPULATION},
+        "annotation_provenance": _ANNOTATION_PROVENANCE,
         "artifact": _ARTIFACT_REF,
         "span_count": _NONNEGATIVE_INTEGER,
     },
 )
+_PREPARED_TEXT_VIEW = _closed_object(
+    (
+        "id",
+        "artifact_sha256",
+        "content_policy_sha256",
+        "document_regions",
+        "primary_for_quality",
+        "answer_bearing_fields_included",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "artifact_sha256": _HASH,
+        "content_policy_sha256": _HASH,
+        "document_regions": {**_STRING_ARRAY, "minItems": 1},
+        "primary_for_quality": {"type": "boolean"},
+        "answer_bearing_fields_included": {"type": "boolean"},
+    },
+)
 _PREPARATION = _closed_object(
-    ("cleaning_policy_sha256", "grouping_policy_sha256", "output_records", "prepared_artifact"),
+    ("cleaning_policy_sha256", "grouping_policy_sha256", "output_records", "prepared_artifact", "text_views"),
     {
         "cleaning_policy_sha256": _HASH,
         "grouping_policy_sha256": _HASH,
         "output_records": _POSITIVE_INTEGER,
         "prepared_artifact": _ARTIFACT_REF,
+        "text_views": {"type": "array", "minItems": 1, "items": _PREPARED_TEXT_VIEW},
+    },
+)
+_QUALITY_PLAN_SLICE = _closed_object(
+    (
+        "id",
+        "label_artifact_id",
+        "split_role",
+        "entity_class",
+        "cohort",
+        "text_view",
+        "promotion_gate",
+        "documents",
+        "documents_with_sensitive_gold",
+        "negative_documents",
+        "gold_spans",
+        "cataloged_gold_spans",
+        "documents_with_cataloged_gold",
+        "sensitive_gold_characters",
+        "evaluated_characters",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "label_artifact_id": {"type": "string", "minLength": 1},
+        "split_role": {"type": "string", "enum": ["train", "validation", "test"]},
+        "entity_class": {"type": "string", "minLength": 1},
+        "cohort": {"type": "string", "minLength": 1},
+        "text_view": {"type": "string", "minLength": 1},
+        "promotion_gate": {"type": "boolean"},
+        "documents": _POSITIVE_INTEGER,
+        "documents_with_sensitive_gold": _NONNEGATIVE_INTEGER,
+        "negative_documents": _NONNEGATIVE_INTEGER,
+        "gold_spans": _NONNEGATIVE_INTEGER,
+        "cataloged_gold_spans": _NONNEGATIVE_INTEGER,
+        "documents_with_cataloged_gold": _NONNEGATIVE_INTEGER,
+        "sensitive_gold_characters": _NONNEGATIVE_INTEGER,
+        "evaluated_characters": _NONNEGATIVE_INTEGER,
+    },
+)
+_CONFORMANCE_PLAN = _closed_object(
+    (
+        "label_artifact_id",
+        "positive_cases_artifact",
+        "positive_cases",
+        "negative_cases_artifact",
+        "negative_cases",
+        "policy_sha256",
+    ),
+    {
+        "label_artifact_id": {"type": "string", "minLength": 1},
+        "positive_cases_artifact": _ARTIFACT_REF,
+        "positive_cases": _POSITIVE_INTEGER,
+        "negative_cases_artifact": _ARTIFACT_REF,
+        "negative_cases": _POSITIVE_INTEGER,
+        "policy_sha256": _HASH,
     },
 )
 
@@ -308,6 +449,8 @@ ENRON_MANIFEST_SCHEMA: dict[str, Any] = {
             "thresholds_sha256",
             "performance_manifest_sha256",
             "labels",
+            "quality_plan",
+            "conformance_plan",
             "software",
             "commands",
             "environment",
@@ -328,6 +471,8 @@ ENRON_MANIFEST_SCHEMA: dict[str, Any] = {
             "thresholds_sha256": _HASH,
             "performance_manifest_sha256": _HASH,
             "labels": {"type": "array", "minItems": 1, "items": _LABEL_ARTIFACT},
+            "quality_plan": {"type": "array", "minItems": 1, "items": _QUALITY_PLAN_SLICE},
+            "conformance_plan": _CONFORMANCE_PLAN,
             "software": _SOFTWARE,
             "commands": {"type": "array", "minItems": 1, "items": _COMMAND},
             "environment": _ENVIRONMENT,
@@ -458,6 +603,7 @@ _CONFORMANCE = _closed_object(
         "unexpected_negative_matches",
         "positive_cases_artifact",
         "negative_cases_artifact",
+        "policy_sha256",
         "recall",
         "passed",
     ),
@@ -474,6 +620,7 @@ _CONFORMANCE = _closed_object(
         "unexpected_negative_matches": _NONNEGATIVE_INTEGER,
         "positive_cases_artifact": _OPTIONAL_ARTIFACT_REF,
         "negative_cases_artifact": _OPTIONAL_ARTIFACT_REF,
+        "policy_sha256": {"anyOf": [_HASH, {"type": "null"}]},
         "recall": _UNIT_METRIC,
         "passed": {"type": "boolean"},
     },
@@ -487,6 +634,8 @@ _PERFORMANCE_STATS = _closed_object(
         "mad_seconds",
         "documents_per_second",
         "mib_per_second",
+        "records_per_second",
+        "seconds_per_document",
     ),
     {
         "sample_count": {"type": "integer", "minimum": 5, "maximum": MAX_SAFE_INTEGER},
@@ -494,17 +643,50 @@ _PERFORMANCE_STATS = _closed_object(
         "p95_seconds": _NONNEGATIVE_METRIC,
         "p99_seconds": _NONNEGATIVE_METRIC,
         "mad_seconds": _NONNEGATIVE_NUMBER,
-        "documents_per_second": _POSITIVE_NUMBER,
-        "mib_per_second": _POSITIVE_NUMBER,
+        "documents_per_second": {"anyOf": [_POSITIVE_NUMBER, {"type": "null"}]},
+        "mib_per_second": {"anyOf": [_POSITIVE_NUMBER, {"type": "null"}]},
+        "records_per_second": _NONNEGATIVE_METRIC,
+        "seconds_per_document": {"anyOf": [_POSITIVE_NUMBER, {"type": "null"}]},
     },
+)
+_PERFORMANCE_GENERATOR = _closed_object(
+    ("id", "version", "source_sha256", "spec_sha256", "seed"),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "source_sha256": _HASH,
+        "spec_sha256": _HASH,
+        "seed": {"type": "string", "minLength": 1},
+    },
+)
+_OPTIONAL_PERFORMANCE_GENERATOR = {"anyOf": [_PERFORMANCE_GENERATOR, {"type": "null"}]}
+_PERFORMANCE_BANK_TAXON = _closed_object(
+    ("entity_class", "entities", "canonical_names", "aliases", "literal_patterns", "regex_patterns"),
+    {
+        "entity_class": {"type": "string", "minLength": 1},
+        "entities": _NONNEGATIVE_INTEGER,
+        "canonical_names": _NONNEGATIVE_INTEGER,
+        "aliases": _NONNEGATIVE_INTEGER,
+        "literal_patterns": _NONNEGATIVE_INTEGER,
+        "regex_patterns": _NONNEGATIVE_INTEGER,
+    },
+)
+_PERFORMANCE_BANK_COMPOSITION = _closed_object(
+    ("taxonomy",),
+    {"taxonomy": {"type": "array", "minItems": 1, "items": _PERFORMANCE_BANK_TAXON}},
 )
 _PERFORMANCE_BANK = _closed_object(
     (
         "id",
         "kind",
         "bank_hash",
+        "artifact",
+        "generator",
+        "composition",
+        "descriptor_sha256",
         "active_entities",
         "active_names",
+        "active_aliases",
         "active_patterns",
         "canonical_json_bytes",
         "native_source_bytes",
@@ -513,46 +695,134 @@ _PERFORMANCE_BANK = _closed_object(
         "id": {"type": "string", "minLength": 1},
         "kind": {"type": "string", "enum": ["evaluated_bank", "synthetic_scale"]},
         "bank_hash": _HASH,
+        "artifact": _ARTIFACT_REF,
+        "generator": _OPTIONAL_PERFORMANCE_GENERATOR,
+        "composition": _PERFORMANCE_BANK_COMPOSITION,
+        "descriptor_sha256": _HASH,
         "active_entities": _POSITIVE_INTEGER,
         "active_names": _POSITIVE_INTEGER,
+        "active_aliases": _NONNEGATIVE_INTEGER,
         "active_patterns": _POSITIVE_INTEGER,
         "canonical_json_bytes": _POSITIVE_INTEGER,
         "native_source_bytes": _POSITIVE_INTEGER,
     },
 )
+_PERFORMANCE_LENGTH_DISTRIBUTION = _closed_object(
+    ("minimum_bytes", "p50_bytes", "p95_bytes", "p99_bytes", "maximum_bytes", "mean_bytes"),
+    {
+        "minimum_bytes": _NONNEGATIVE_INTEGER,
+        "p50_bytes": _NONNEGATIVE_INTEGER,
+        "p95_bytes": _NONNEGATIVE_INTEGER,
+        "p99_bytes": _NONNEGATIVE_INTEGER,
+        "maximum_bytes": _NONNEGATIVE_INTEGER,
+        "mean_bytes": _NONNEGATIVE_NUMBER,
+    },
+)
+_PERFORMANCE_HIT_DISTRIBUTION = _closed_object(
+    (
+        "negative_documents",
+        "documents_with_records",
+        "minimum_records",
+        "p50_records",
+        "p95_records",
+        "p99_records",
+        "maximum_records",
+        "mean_records",
+    ),
+    {
+        "negative_documents": _NONNEGATIVE_INTEGER,
+        "documents_with_records": _NONNEGATIVE_INTEGER,
+        "minimum_records": _NONNEGATIVE_INTEGER,
+        "p50_records": _NONNEGATIVE_INTEGER,
+        "p95_records": _NONNEGATIVE_INTEGER,
+        "p99_records": _NONNEGATIVE_INTEGER,
+        "maximum_records": _NONNEGATIVE_INTEGER,
+        "mean_records": _NONNEGATIVE_NUMBER,
+    },
+)
+_PERFORMANCE_INPUT = _closed_object(
+    (
+        "id",
+        "kind",
+        "bank_id",
+        "bank_hash",
+        "artifact",
+        "inventory_ref",
+        "generator",
+        "documents",
+        "bytes",
+        "records",
+        "hit_density",
+        "size_cohort",
+        "document_length_distribution",
+        "hit_distribution",
+        "descriptor_sha256",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "enum": ["real_input", "synthetic_input"]},
+        "bank_id": {"type": "string", "minLength": 1},
+        "bank_hash": _HASH,
+        "artifact": _ARTIFACT_REF,
+        "inventory_ref": _ARTIFACT_REF,
+        "generator": _OPTIONAL_PERFORMANCE_GENERATOR,
+        "documents": _POSITIVE_INTEGER,
+        "bytes": _POSITIVE_INTEGER,
+        "records": _NONNEGATIVE_INTEGER,
+        "hit_density": {"type": "string", "enum": ["negative", "sparse", "normal", "dense"]},
+        "size_cohort": {"type": "string", "enum": ["small", "medium", "large", "huge"]},
+        "document_length_distribution": _PERFORMANCE_LENGTH_DISTRIBUTION,
+        "hit_distribution": _PERFORMANCE_HIT_DISTRIBUTION,
+        "descriptor_sha256": _HASH,
+    },
+)
+_OPTIONAL_BASELINE_ID = {
+    "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+}
+_OPTIONAL_PERFORMANCE_ID = {
+    "anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}],
+}
+_OPTIONAL_HASH = {"anyOf": [_HASH, {"type": "null"}]}
 _PERFORMANCE_WORKLOAD = _closed_object(
     (
         "id",
         "phase",
         "promotion_gate",
+        "decision_grade",
         "workload_sha256",
+        "bank_id",
         "bank_hash",
+        "input_id",
+        "input_sha256",
+        "baseline_id",
         "warmups",
-        "documents",
-        "bytes",
-        "matches",
+        "sample_unit",
+        "work_per_sample",
         "concurrency",
-        "hit_density",
         "process_model",
         "median_method",
         "percentile_method",
         "samples_seconds",
         "samples_ref",
         "stats",
+        "rss_samples_bytes",
         "peak_rss_bytes",
     ),
     {
         "id": {"type": "string", "minLength": 1},
         "phase": {"type": "string", "enum": list(PERFORMANCE_PHASES)},
         "promotion_gate": {"type": "boolean"},
+        "decision_grade": {"type": "boolean"},
         "workload_sha256": _HASH,
+        "bank_id": {"type": "string", "minLength": 1},
         "bank_hash": _HASH,
+        "input_id": _OPTIONAL_PERFORMANCE_ID,
+        "input_sha256": _OPTIONAL_HASH,
+        "baseline_id": _OPTIONAL_BASELINE_ID,
         "warmups": _NONNEGATIVE_INTEGER,
-        "documents": _POSITIVE_INTEGER,
-        "bytes": _POSITIVE_INTEGER,
-        "matches": _NONNEGATIVE_INTEGER,
-        "concurrency": _POSITIVE_INTEGER,
-        "hit_density": {"type": "string", "enum": ["negative", "sparse", "normal", "dense"]},
+        "sample_unit": {"type": "string", "enum": ["operation", "whole_input", "document"]},
+        "work_per_sample": _POSITIVE_INTEGER,
+        "concurrency": {"type": "integer", "minimum": 1, "maximum": 1024},
         "process_model": {"type": "string", "enum": ["fresh_process_per_sample", "reused_process"]},
         "median_method": {"const": "standard_even_average"},
         "percentile_method": {"const": "nearest_rank"},
@@ -566,7 +836,8 @@ _PERFORMANCE_WORKLOAD = _closed_object(
         },
         "samples_ref": _OPTIONAL_ARTIFACT_REF,
         "stats": _PERFORMANCE_STATS,
-        "peak_rss_bytes": {"anyOf": [_NONNEGATIVE_INTEGER, {"type": "null"}]},
+        "rss_samples_bytes": {"type": "array", "items": _POSITIVE_INTEGER},
+        "peak_rss_bytes": {"anyOf": [_POSITIVE_INTEGER, {"type": "null"}]},
     },
 )
 _PERFORMANCE_WORKLOAD["allOf"] = [
@@ -577,9 +848,158 @@ _PERFORMANCE_WORKLOAD["allOf"] = [
         ]
     }
 ]
+_PERFORMANCE_BASELINE_CAPABILITIES = _closed_object(
+    ("literal_patterns", "regex_patterns", "aliases", "canonical_mapping", "unicode"),
+    {
+        "literal_patterns": {"type": "boolean"},
+        "regex_patterns": {"type": "boolean"},
+        "aliases": {"type": "boolean"},
+        "canonical_mapping": {"type": "boolean"},
+        "unicode": {"type": "boolean"},
+    },
+)
+_PERFORMANCE_BASELINE = _closed_object(
+    ("id", "name", "version", "source_sha256", "capabilities", "semantic_equivalence", "descriptor_sha256"),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1},
+        "source_sha256": _HASH,
+        "capabilities": _PERFORMANCE_BASELINE_CAPABILITIES,
+        "semantic_equivalence": {"type": "string", "enum": ["exact", "subset", "not_equivalent"]},
+        "descriptor_sha256": _HASH,
+    },
+)
+_PERFORMANCE_COMPARISON = _closed_object(
+    (
+        "id",
+        "candidate_workload_id",
+        "baseline_workload_id",
+        "metric",
+        "direction",
+        "candidate_value",
+        "baseline_value",
+        "relative_degradation",
+        "noise_multiplier",
+        "noise_floor",
+        "regression_tolerance",
+        "result",
+        "comparison_plan_sha256",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "candidate_workload_id": {"type": "string", "minLength": 1},
+        "baseline_workload_id": {"type": "string", "minLength": 1},
+        "metric": {
+            "type": "string",
+            "enum": [
+                "median_seconds",
+                "p95_seconds",
+                "p99_seconds",
+                "documents_per_second",
+                "mib_per_second",
+                "records_per_second",
+                "seconds_per_document",
+            ],
+        },
+        "direction": {"type": "string", "enum": ["lower_is_better", "higher_is_better"]},
+        "candidate_value": _NONNEGATIVE_NUMBER,
+        "baseline_value": _POSITIVE_NUMBER,
+        "relative_degradation": _FINITE_NUMBER,
+        "noise_multiplier": {"type": "number", "minimum": 1, "maximum": 5},
+        "noise_floor": _NONNEGATIVE_NUMBER,
+        "regression_tolerance": {"type": "number", "minimum": 0, "maximum": 0.1},
+        "result": {"type": "string", "enum": ["improved", "equivalent_within_noise", "regressed"]},
+        "comparison_plan_sha256": _HASH,
+    },
+)
+_PERFORMANCE_VALUE_COMPONENT = _closed_object(
+    (
+        "id",
+        "side",
+        "application",
+        "category",
+        "source",
+        "description",
+        "workload_id",
+        "assumption_sha256",
+        "value",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "side": {"type": "string", "enum": ["candidate", "baseline"]},
+        "application": {"type": "string", "enum": ["fixed", "per_unit"]},
+        "category": {
+            "type": "string",
+            "enum": [
+                "source_curation",
+                "bank_build",
+                "cold_compile",
+                "scan",
+                "external_call",
+                "labor",
+                "hardware",
+                "other",
+            ],
+        },
+        "source": {
+            "type": "string",
+            "enum": [
+                "workload_median_seconds",
+                "workload_seconds_per_document",
+                "workload_seconds_per_scan",
+                "workload_seconds_per_mib",
+                "workload_seconds_per_record",
+                "declared_assumption",
+            ],
+        },
+        "description": {"type": "string", "minLength": 1},
+        "workload_id": _OPTIONAL_PERFORMANCE_ID,
+        "assumption_sha256": _OPTIONAL_HASH,
+        "value": _NONNEGATIVE_NUMBER,
+    },
+)
+_PERFORMANCE_BREAKEVEN = _closed_object(
+    (
+        "id",
+        "parameter_name",
+        "parameter_unit",
+        "value_unit",
+        "minimum_units",
+        "maximum_units",
+        "components",
+        "candidate_fixed_value",
+        "baseline_fixed_value",
+        "candidate_value_per_unit",
+        "baseline_value_per_unit",
+        "result",
+        "breakeven_units",
+        "model_plan_sha256",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "parameter_name": {"type": "string", "minLength": 1},
+        "parameter_unit": {"type": "string", "enum": ["document", "scan", "mib", "record"]},
+        "value_unit": {"type": "string", "enum": ["seconds", "usd"]},
+        "minimum_units": _NONNEGATIVE_INTEGER,
+        "maximum_units": _POSITIVE_INTEGER,
+        "components": {"type": "array", "minItems": 4, "items": _PERFORMANCE_VALUE_COMPONENT},
+        "candidate_fixed_value": _NONNEGATIVE_NUMBER,
+        "baseline_fixed_value": _NONNEGATIVE_NUMBER,
+        "candidate_value_per_unit": _NONNEGATIVE_NUMBER,
+        "baseline_value_per_unit": _NONNEGATIVE_NUMBER,
+        "result": {
+            "type": "string",
+            "enum": ["candidate_already_better", "finite_breakeven", "no_breakeven_within_range"],
+        },
+        "breakeven_units": {"anyOf": [_NONNEGATIVE_INTEGER, {"type": "null"}]},
+        "model_plan_sha256": _HASH,
+    },
+)
 _FROZEN_TARGET = _closed_object(
     (
         "frozen_at",
+        "manifest_sha256",
         "bank_hash",
         "evaluator_source_sha256",
         "split_manifest_sha256",
@@ -589,6 +1009,7 @@ _FROZEN_TARGET = _closed_object(
     ),
     {
         "frozen_at": _TIMESTAMP,
+        "manifest_sha256": _HASH,
         "bank_hash": _HASH,
         "evaluator_source_sha256": _HASH,
         "split_manifest_sha256": _HASH,
@@ -690,6 +1111,7 @@ _CLAIM = _closed_object(
         "quality_slice_id",
         "performance_workload_id",
         "scope",
+        "benchmark_version",
         "source_revision",
         "bank_hash",
         "evaluator_source_sha256",
@@ -705,7 +1127,10 @@ _CLAIM = _closed_object(
                 "precision",
                 "open_world_recall",
                 "f1",
+                "catalog_coverage",
+                "cataloged_recall",
                 "document_leak_rate",
+                "cataloged_document_leak_rate",
                 "sensitive_character_recall",
                 "sensitive_character_leak_rate",
                 "negative_document_false_alarm_rate",
@@ -714,6 +1139,8 @@ _CLAIM = _closed_object(
                 "direct_bank_scan_p95_seconds",
                 "direct_bank_scan_p99_seconds",
                 "direct_bank_scan_mib_per_second",
+                "direct_bank_scan_records_per_second",
+                "direct_bank_scan_seconds_per_document",
             ],
         },
         "value": _NONNEGATIVE_NUMBER,
@@ -722,6 +1149,7 @@ _CLAIM = _closed_object(
         "quality_slice_id": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
         "performance_workload_id": {"anyOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
         "scope": _CLAIM_SCOPE,
+        "benchmark_version": {"type": "string", "minLength": 1},
         "source_revision": {"type": "string", "minLength": 1},
         "bank_hash": _HASH,
         "evaluator_source_sha256": _HASH,
@@ -794,11 +1222,15 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "catalog_conformance": _CONFORMANCE,
             "test_access": _TEST_ACCESS,
             "performance": _closed_object(
-                ("evaluated", "banks", "workloads"),
+                ("evaluated", "banks", "inputs", "workloads", "baselines", "comparisons", "breakeven_models"),
                 {
                     "evaluated": {"type": "boolean"},
                     "banks": {"type": "array", "items": _PERFORMANCE_BANK},
+                    "inputs": {"type": "array", "items": _PERFORMANCE_INPUT},
                     "workloads": {"type": "array", "items": _PERFORMANCE_WORKLOAD},
+                    "baselines": {"type": "array", "items": _PERFORMANCE_BASELINE},
+                    "comparisons": {"type": "array", "items": _PERFORMANCE_COMPARISON},
+                    "breakeven_models": {"type": "array", "items": _PERFORMANCE_BREAKEVEN},
                 },
             ),
             "performance_manifest_sha256": _HASH,
@@ -819,6 +1251,36 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
         },
     ),
 }
+
+
+def _apply_schema_resource_limits(schema: Any, field_name: str | None = None) -> None:
+    """Add public size limits to every collection and string-bearing schema node."""
+    if isinstance(schema, list):
+        for item in schema:
+            _apply_schema_resource_limits(item, field_name)
+        return
+    if not isinstance(schema, dict):
+        return
+
+    schema_type = schema.get("type")
+    if schema_type == "array":
+        schema.setdefault("maxItems", MAX_COLLECTION_ITEMS)
+    elif schema_type == "object":
+        schema.setdefault("maxProperties", MAX_COLLECTION_ITEMS)
+    elif schema_type == "string":
+        maximum = MAX_ID_CHARS if field_name == "id" or (field_name or "").endswith("_id") else MAX_STRING_CHARS
+        schema["maxLength"] = min(int(schema.get("maxLength", maximum)), maximum)
+
+    for key, item in schema.items():
+        if key == "properties" and isinstance(item, dict):
+            for property_name, property_schema in item.items():
+                _apply_schema_resource_limits(property_schema, property_name)
+        else:
+            _apply_schema_resource_limits(item, field_name)
+
+
+_apply_schema_resource_limits(ENRON_MANIFEST_SCHEMA)
+_apply_schema_resource_limits(ENRON_EVIDENCE_SCHEMA)
 
 MANIFEST_VALIDATOR = EnronContractValidator(ENRON_MANIFEST_SCHEMA)
 EVIDENCE_VALIDATOR = EnronContractValidator(ENRON_EVIDENCE_SCHEMA)
@@ -851,18 +1313,81 @@ def hash_enron_samples(samples: Sequence[float]) -> str:
     return _canonical_hash(normalized)
 
 
+def hash_enron_performance_inventory(inventory: Sequence[Mapping[str, int]]) -> str:
+    normalized = _normalize_performance_inventory(inventory)
+    if normalized is None:
+        raise ValueError("Enron performance inventory rows require bounded nonnegative integer bytes and records.")
+    return _canonical_hash(normalized)
+
+
+def hash_enron_performance_bank(bank: Mapping[str, Any]) -> str:
+    return _canonical_hash({key: value for key, value in bank.items() if key != "descriptor_sha256"})
+
+
+def hash_enron_performance_input(input_descriptor: Mapping[str, Any]) -> str:
+    return _canonical_hash({key: value for key, value in input_descriptor.items() if key != "descriptor_sha256"})
+
+
+def hash_enron_performance_baseline(baseline: Mapping[str, Any]) -> str:
+    return _canonical_hash({key: value for key, value in baseline.items() if key != "descriptor_sha256"})
+
+
+def hash_enron_performance_comparison_plan(comparison: Mapping[str, Any]) -> str:
+    plan_fields = (
+        "id",
+        "candidate_workload_id",
+        "baseline_workload_id",
+        "metric",
+        "direction",
+        "noise_multiplier",
+        "regression_tolerance",
+    )
+    return _canonical_hash({field: comparison[field] for field in plan_fields})
+
+
+def hash_enron_breakeven_plan(model: Mapping[str, Any]) -> str:
+    plan_fields = (
+        "id",
+        "parameter_name",
+        "parameter_unit",
+        "value_unit",
+        "minimum_units",
+        "maximum_units",
+    )
+    component_fields = (
+        "id",
+        "side",
+        "application",
+        "category",
+        "source",
+        "description",
+        "workload_id",
+        "assumption_sha256",
+    )
+    components = []
+    for component in sorted(model["components"], key=lambda item: str(item["id"])):
+        plan = {field: component[field] for field in component_fields}
+        if component["source"] == "declared_assumption":
+            plan["value"] = component["value"]
+        components.append(plan)
+    return _canonical_hash({**{field: model[field] for field in plan_fields}, "components": components})
+
+
 def hash_enron_workload(workload: Mapping[str, Any]) -> str:
     fields = (
         "id",
         "phase",
         "promotion_gate",
+        "decision_grade",
+        "bank_id",
         "bank_hash",
+        "input_id",
+        "input_sha256",
+        "baseline_id",
         "warmups",
-        "documents",
-        "bytes",
-        "matches",
+        "sample_unit",
+        "work_per_sample",
         "concurrency",
-        "hit_density",
         "process_model",
         "median_method",
         "percentile_method",
@@ -871,12 +1396,40 @@ def hash_enron_workload(workload: Mapping[str, Any]) -> str:
 
 
 def hash_enron_performance_manifest(performance: Mapping[str, Any]) -> str:
-    banks = sorted(performance["banks"], key=lambda value: str(value["id"]))
+    banks = [
+        {"id": item["id"], "descriptor_sha256": hash_enron_performance_bank(item)}
+        for item in sorted(performance["banks"], key=lambda value: str(value["id"]))
+    ]
+    inputs = [
+        {"id": item["id"], "descriptor_sha256": hash_enron_performance_input(item)}
+        for item in sorted(performance["inputs"], key=lambda value: str(value["id"]))
+    ]
     workloads = [
         {"id": item["id"], "workload_sha256": hash_enron_workload(item)}
         for item in sorted(performance["workloads"], key=lambda value: str(value["id"]))
     ]
-    return _canonical_hash({"banks": banks, "workloads": workloads})
+    baselines = [
+        {"id": item["id"], "descriptor_sha256": hash_enron_performance_baseline(item)}
+        for item in sorted(performance["baselines"], key=lambda value: str(value["id"]))
+    ]
+    comparisons = [
+        {"id": item["id"], "comparison_plan_sha256": hash_enron_performance_comparison_plan(item)}
+        for item in sorted(performance["comparisons"], key=lambda value: str(value["id"]))
+    ]
+    breakeven_models = [
+        {"id": item["id"], "model_plan_sha256": hash_enron_breakeven_plan(item)}
+        for item in sorted(performance["breakeven_models"], key=lambda value: str(value["id"]))
+    ]
+    return _canonical_hash(
+        {
+            "banks": banks,
+            "inputs": inputs,
+            "workloads": workloads,
+            "baselines": baselines,
+            "comparisons": comparisons,
+            "breakeven_models": breakeven_models,
+        }
+    )
 
 
 def hash_enron_thresholds(checks: Sequence[Mapping[str, Any]]) -> str:
@@ -899,12 +1452,17 @@ def hash_enron_test_lineage_entry(entry: Mapping[str, Any]) -> str:
 
 def validate_enron_manifest(manifest: Any) -> dict[str, Any]:
     """Validate manifest structure, split integrity, provenance, and public serialization safety."""
+    diagnostics = _structure_diagnostics(manifest)
+    if diagnostics:
+        return _result(diagnostics)
     diagnostics = _schema_diagnostics(MANIFEST_VALIDATOR, manifest)
     if not diagnostics and isinstance(manifest, Mapping):
         diagnostics.extend(_manifest_diagnostics(manifest))
         diagnostics.extend(_privacy_diagnostics(manifest["privacy"], "/privacy"))
         diagnostics.extend(_command_diagnostics(manifest["commands"], "/commands"))
         diagnostics.extend(_public_serialization_diagnostics(manifest))
+        if manifest["artifact_kind"] == "real_benchmark":
+            diagnostics.extend(_placeholder_hash_diagnostics(manifest))
     return _result(diagnostics)
 
 
@@ -914,8 +1472,12 @@ def validate_enron_evidence(
     manifest: Mapping[str, Any] | None = None,
     trusted_lineage_prefix: Sequence[Mapping[str, Any]] | None = None,
     referenced_samples: Mapping[str, Sequence[float]] | None = None,
+    referenced_input_inventories: Mapping[str, Sequence[Mapping[str, int]]] | None = None,
 ) -> dict[str, Any]:
     """Validate evidence and recompute its privacy, claim, lineage, gate, and performance semantics."""
+    diagnostics = _structure_diagnostics(evidence)
+    if diagnostics:
+        return _result(diagnostics)
     diagnostics = _schema_diagnostics(EVIDENCE_VALIDATOR, evidence)
     if diagnostics or not isinstance(evidence, Mapping):
         return _result(diagnostics)
@@ -924,18 +1486,48 @@ def validate_enron_evidence(
     conformance = evidence["catalog_conformance"]
     performance = evidence["performance"]
     promotion = evidence["promotion"]
+    sample_resolver = referenced_samples if isinstance(referenced_samples, Mapping) else None
+    inventory_resolver = referenced_input_inventories if isinstance(referenced_input_inventories, Mapping) else None
+    if referenced_samples is not None and sample_resolver is None:
+        diagnostics.append(
+            _error(
+                "contract.performance_sample_resolver_shape",
+                "/performance/workloads",
+                "Referenced sample resolver must be a mapping of artifact ids to bounded sample sequences.",
+            )
+        )
+    if referenced_input_inventories is not None and inventory_resolver is None:
+        diagnostics.append(
+            _error(
+                "contract.performance_inventory_resolver_shape",
+                "/performance/inputs",
+                "Referenced inventory resolver must be a mapping of artifact ids to bounded inventory sequences.",
+            )
+        )
     diagnostics.extend(_privacy_diagnostics(evidence["privacy"], "/privacy"))
     diagnostics.extend(_command_diagnostics(evidence["commands"], "/commands"))
     diagnostics.extend(_public_serialization_diagnostics(evidence))
+    if evidence["artifact_kind"] == "real_benchmark":
+        diagnostics.extend(_placeholder_hash_diagnostics(evidence))
     diagnostics.extend(_evidence_provenance_diagnostics(evidence))
     diagnostics.extend(_quality_diagnostics(quality, manifest=manifest))
     diagnostics.extend(_conformance_diagnostics(conformance, evidence["bank"], manifest=manifest))
     diagnostics.extend(
         _test_access_diagnostics(evidence, manifest=manifest, trusted_lineage_prefix=trusted_lineage_prefix)
     )
-    diagnostics.extend(_performance_diagnostics(performance, evidence["bank"], referenced_samples))
+    diagnostics.extend(
+        _performance_diagnostics(
+            performance,
+            evidence["bank"],
+            sample_resolver,
+            inventory_resolver,
+            promotion_passed=promotion["passed"] or evidence["verifier"]["passed"],
+        )
+    )
     diagnostics.extend(_gate_diagnostics(evidence))
     diagnostics.extend(_promotion_diagnostics(evidence))
+    if promotion["passed"] or evidence["verifier"]["passed"]:
+        diagnostics.extend(_decision_grade_diagnostics(evidence, manifest))
     if manifest is not None:
         diagnostics.extend(_binding_diagnostics(evidence, manifest))
     elif promotion["passed"] or evidence["verifier"]["passed"]:
@@ -972,6 +1564,7 @@ def load_enron_evidence(
     manifest: Mapping[str, Any] | None = None,
     trusted_lineage_prefix: Sequence[Mapping[str, Any]] | None = None,
     referenced_samples: Mapping[str, Sequence[float]] | None = None,
+    referenced_input_inventories: Mapping[str, Sequence[Mapping[str, int]]] | None = None,
 ) -> dict[str, Any]:
     """Securely load and semantically validate one benchmark-v2 evidence JSON object."""
     value = _load_contract_json(path)
@@ -980,6 +1573,7 @@ def load_enron_evidence(
         manifest=manifest,
         trusted_lineage_prefix=trusted_lineage_prefix,
         referenced_samples=referenced_samples,
+        referenced_input_inventories=referenced_input_inventories,
     )
     if not result["valid"]:
         raise ValueError(f"Invalid Enron v2 evidence: {result['diagnostics'][0]['message']}")
@@ -991,6 +1585,18 @@ def _manifest_diagnostics(manifest: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics.extend(_split_diagnostics(manifest["source"], manifest["preparation"], manifest["splits"], "/splits"))
     diagnostics.extend(_duplicate_id_diagnostics(manifest["commands"], "/commands", "command"))
     diagnostics.extend(_duplicate_id_diagnostics(manifest["labels"], "/labels", "label artifact"))
+    text_views = manifest["preparation"]["text_views"]
+    diagnostics.extend(_duplicate_id_diagnostics(text_views, "/preparation/text_views", "prepared text view"))
+    primary_views = [item for item in text_views if item["primary_for_quality"]]
+    if len(primary_views) != 1:
+        diagnostics.append(
+            _error(
+                "contract.primary_quality_view",
+                "/preparation/text_views",
+                "Preparation must designate exactly one primary natural-content quality view.",
+            )
+        )
+    diagnostics.extend(_duplicate_id_diagnostics(manifest["quality_plan"], "/quality_plan", "quality-plan slice"))
     if manifest["artifact_kind"] == "real_benchmark" and manifest["software"]["git_commit"] == "0" * 40:
         diagnostics.append(
             _error(
@@ -1003,6 +1609,43 @@ def _manifest_diagnostics(manifest: Mapping[str, Any]) -> list[Diagnostic]:
         path = f"/labels/{index}"
         strength = label["label_strength"]
         completeness = label["annotation_completeness"]
+        annotation_provenance = label["annotation_provenance"]
+        populations = label["role_populations"]
+        population_roles = [str(item["role"]) for item in populations]
+        if len(population_roles) != len(set(population_roles)):
+            diagnostics.append(
+                _error(
+                    "contract.duplicate_label_population_role",
+                    f"{path}/role_populations",
+                    "A label artifact may declare at most one population per split role.",
+                )
+            )
+        if set(population_roles) != set(label["roles"]):
+            diagnostics.append(
+                _error(
+                    "contract.label_population_roles",
+                    f"{path}/role_populations",
+                    "Label population roles must exactly equal the artifact's declared roles.",
+                )
+            )
+        if sum(int(item["spans"]) for item in populations) != label["span_count"]:
+            diagnostics.append(
+                _error(
+                    "contract.label_population_spans",
+                    f"{path}/span_count",
+                    "Label span count must equal the sum of its per-role populations.",
+                )
+            )
+        for population_index, population in enumerate(populations):
+            role = str(population["role"])
+            if role != "conformance" and population["documents"] > manifest["splits"]["roles"][role]["records"]:
+                diagnostics.append(
+                    _error(
+                        "contract.label_population_bounds",
+                        f"{path}/role_populations/{population_index}/documents",
+                        "Label population documents cannot exceed the bound split artifact record count.",
+                    )
+                )
         if strength == "unlabeled":
             if completeness != "not_applicable" or label["span_count"] != 0:
                 diagnostics.append(
@@ -1028,6 +1671,278 @@ def _manifest_diagnostics(manifest: Mapping[str, Any]) -> list[Diagnostic]:
                     "Synthetic conformance labels must be exhaustive within their declared scope.",
                 )
             )
+        if strength == "synthetic_conformance" and label["roles"] != ["conformance"]:
+            diagnostics.append(
+                _error(
+                    "contract.conformance_label_role",
+                    f"{path}/roles",
+                    "Synthetic conformance labels must use the dedicated non-corpus conformance role.",
+                )
+            )
+        if strength != "synthetic_conformance" and "conformance" in label["roles"]:
+            diagnostics.append(
+                _error(
+                    "contract.natural_label_role",
+                    f"{path}/roles",
+                    "Natural-text labels cannot use the synthetic conformance role.",
+                )
+            )
+        if strength in {"independent", "structured_weak"} and len(label["annotation_scope"]["entity_classes"]) != 1:
+            diagnostics.append(
+                _error(
+                    "contract.natural_label_entity_population",
+                    f"{path}/annotation_scope/entity_classes",
+                    "Each natural-text label artifact must expose one entity class so its populations are exact.",
+                )
+            )
+        review_is_separate = (
+            annotation_provenance["reviewer_id"] is not None
+            and annotation_provenance["reviewer_id"] != annotation_provenance["producer_id"]
+            and annotation_provenance["adjudication_artifact"] is not None
+        )
+        if annotation_provenance["independently_reviewed"] != review_is_separate:
+            diagnostics.append(
+                _error(
+                    "contract.annotation_review_provenance",
+                    f"{path}/annotation_provenance",
+                    "Independent review requires distinct producer/reviewer ids and adjudication evidence.",
+                )
+            )
+        if strength in {"independent", "synthetic_conformance"} and not review_is_separate:
+            diagnostics.append(
+                _error(
+                    "contract.annotation_independence",
+                    f"{path}/annotation_provenance",
+                    "Independent and conformance labels require separately reviewed annotation provenance.",
+                )
+            )
+    diagnostics.extend(_manifest_quality_plan_diagnostics(manifest))
+    diagnostics.extend(_manifest_conformance_plan_diagnostics(manifest))
+    diagnostics.extend(_bank_provenance_diagnostics(manifest["bank"], "/bank"))
+    return diagnostics
+
+
+def _manifest_quality_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    labels = {str(item["id"]): item for item in manifest["labels"]}
+    text_views = {str(item["id"]): item for item in manifest["preparation"]["text_views"]}
+    descriptor_keys: set[tuple[str, str, str, str, str]] = set()
+    planned_label_ids: set[str] = set()
+    for index, item in enumerate(manifest["quality_plan"]):
+        path = f"/quality_plan/{index}"
+        label_id = str(item["label_artifact_id"])
+        label = labels.get(label_id)
+        text_view = text_views.get(str(item["text_view"]))
+        key = (
+            label_id,
+            str(item["split_role"]),
+            str(item["entity_class"]),
+            str(item["cohort"]),
+            str(item["text_view"]),
+        )
+        if key in descriptor_keys:
+            diagnostics.append(
+                _error(
+                    "contract.duplicate_quality_plan_descriptor",
+                    path,
+                    "Quality-plan descriptors must be unique beyond their public IDs.",
+                )
+            )
+        descriptor_keys.add(key)
+        if label is None:
+            diagnostics.append(
+                _error(
+                    "contract.unknown_quality_plan_label",
+                    f"{path}/label_artifact_id",
+                    "Quality plan references an undeclared label artifact.",
+                )
+            )
+        else:
+            planned_label_ids.add(label_id)
+            if item["split_role"] not in label["roles"]:
+                diagnostics.append(
+                    _error(
+                        "contract.quality_plan_label_role",
+                        f"{path}/split_role",
+                        "Quality-plan split role is outside the bound label population.",
+                    )
+                )
+            if item["entity_class"] not in label["annotation_scope"]["entity_classes"]:
+                diagnostics.append(
+                    _error(
+                        "contract.quality_plan_entity_class",
+                        f"{path}/entity_class",
+                        "Quality-plan entity class is outside the bound annotation scope.",
+                    )
+                )
+            populations = {str(population["role"]): population for population in label["role_populations"]}
+            population = populations.get(str(item["split_role"]))
+            if (
+                population is None
+                or item["documents"] > population["documents"]
+                or item["gold_spans"] > population["spans"]
+            ):
+                diagnostics.append(
+                    _error(
+                        "contract.quality_plan_population_bounds",
+                        path,
+                        "Frozen quality denominators must fit the bound role-specific label population.",
+                    )
+                )
+            elif item["cohort"] == "all" and (
+                item["documents"] != population["documents"] or item["gold_spans"] != population["spans"]
+            ):
+                diagnostics.append(
+                    _error(
+                        "contract.quality_plan_population_exactness",
+                        path,
+                        "An all-document quality plan must equal its complete bound label population.",
+                    )
+                )
+        open_world_eligible = (
+            label is not None
+            and label["label_strength"] == "independent"
+            and label["annotation_completeness"] == "exhaustive_within_scope"
+        )
+        invalid_denominators = (
+            item["documents_with_sensitive_gold"] > item["documents"]
+            or item["cataloged_gold_spans"] > item["gold_spans"]
+            or item["documents_with_cataloged_gold"] > item["documents_with_sensitive_gold"]
+            or (item["gold_spans"] == 0) != (item["documents_with_sensitive_gold"] == 0)
+            or (item["cataloged_gold_spans"] == 0) != (item["documents_with_cataloged_gold"] == 0)
+        )
+        if open_world_eligible:
+            invalid_denominators = invalid_denominators or (
+                item["documents_with_sensitive_gold"] + item["negative_documents"] != item["documents"]
+                or item["sensitive_gold_characters"] > item["evaluated_characters"]
+                or (item["gold_spans"] == 0) != (item["sensitive_gold_characters"] == 0)
+            )
+        else:
+            invalid_denominators = invalid_denominators or any(
+                item[field] != 0
+                for field in ("negative_documents", "sensitive_gold_characters", "evaluated_characters")
+            )
+        if invalid_denominators:
+            diagnostics.append(
+                _error(
+                    "contract.quality_plan_denominators",
+                    path,
+                    "Frozen quality document, span, and character denominators are internally inconsistent.",
+                )
+            )
+        if text_view is None:
+            diagnostics.append(
+                _error(
+                    "contract.unknown_quality_text_view",
+                    f"{path}/text_view",
+                    "Quality plan references an undeclared prepared text view.",
+                )
+            )
+        elif label is not None and not set(label["annotation_scope"]["document_regions"]) <= set(
+            text_view["document_regions"]
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.quality_view_regions",
+                    f"{path}/text_view",
+                    "Prepared text view does not contain every region in the bound annotation scope.",
+                )
+            )
+        if item["promotion_gate"] and (
+            label is None
+            or label["label_strength"] != "independent"
+            or label["annotation_completeness"] != "exhaustive_within_scope"
+            or item["split_role"] != "test"
+            or item["cohort"] != "all"
+            or text_view is None
+            or not text_view["primary_for_quality"]
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.invalid_quality_plan_gate",
+                    f"{path}/promotion_gate",
+                    "A quality-plan gate must cover the all-document independent exhaustive primary final-test view.",
+                )
+            )
+        if item["promotion_gate"] and label is not None:
+            populations = {str(population["role"]): population for population in label["role_populations"]}
+            population = populations.get("test")
+            if (
+                population is None
+                or population["documents"] != manifest["splits"]["roles"]["test"]["records"]
+                or item["documents"] != manifest["splits"]["roles"]["test"]["records"]
+            ):
+                diagnostics.append(
+                    _error(
+                        "contract.quality_gate_test_population",
+                        f"{path}/label_artifact_id",
+                        "A quality-plan gate must label every document in the bound final-test split artifact.",
+                    )
+                )
+            if (
+                item["documents"] < MIN_DECISION_GRADE_DOCUMENTS
+                or item["gold_spans"] < MIN_DECISION_GRADE_GOLD_SPANS
+                or item["negative_documents"] < MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS
+                or item["sensitive_gold_characters"] < MIN_DECISION_GRADE_SENSITIVE_CHARACTERS
+            ):
+                diagnostics.append(
+                    _error(
+                        "contract.quality_gate_minimum_support",
+                        path,
+                        "A quality-plan gate lacks the minimum frozen document, span, negative, or character support.",
+                    )
+                )
+    expected_planned_labels = {
+        str(item["id"]) for item in manifest["labels"] if item["label_strength"] in {"independent", "structured_weak"}
+    }
+    if planned_label_ids != expected_planned_labels:
+        diagnostics.append(
+            _error(
+                "contract.quality_plan_label_set",
+                "/quality_plan",
+                "Quality plan must cover every natural-text labeled artifact and no other label kind.",
+            )
+        )
+    return diagnostics
+
+
+def _manifest_conformance_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diagnostic]:
+    plan = manifest["conformance_plan"]
+    labels = {str(item["id"]): item for item in manifest["labels"]}
+    label = labels.get(str(plan["label_artifact_id"]))
+    diagnostics: list[Diagnostic] = []
+    if (
+        label is None
+        or label["label_strength"] != "synthetic_conformance"
+        or label["annotation_completeness"] != "exhaustive_within_scope"
+        or label["artifact"] != plan["positive_cases_artifact"]
+        or label["span_count"] != plan["positive_cases"]
+    ):
+        diagnostics.append(
+            _error(
+                "contract.conformance_plan_label_binding",
+                "/conformance_plan/label_artifact_id",
+                "Conformance plan must exactly bind its exhaustive synthetic positive-case label artifact.",
+            )
+        )
+    if plan["positive_cases"] < manifest["bank"]["active_patterns"]:
+        diagnostics.append(
+            _error(
+                "contract.conformance_plan_support",
+                "/conformance_plan/positive_cases",
+                "Conformance plan requires at least one approved positive case per active pattern.",
+            )
+        )
+    positive = plan["positive_cases_artifact"]
+    negative = plan["negative_cases_artifact"]
+    if positive["id"] == negative["id"] or positive["sha256"] == negative["sha256"]:
+        diagnostics.append(
+            _error(
+                "contract.conformance_plan_artifact_overlap",
+                "/conformance_plan",
+                "Positive and negative conformance cases must be distinct content-addressed artifacts.",
+            )
+        )
     return diagnostics
 
 
@@ -1044,13 +1959,13 @@ def _evidence_provenance_diagnostics(evidence: Mapping[str, Any]) -> list[Diagno
             )
         )
     if evidence["artifact_kind"] == "synthetic_fixture" and (
-        evidence["promotion"]["passed"] or evidence["verifier"]["passed"]
+        evidence["promotion"]["passed"] or evidence["verifier"]["passed"] or bool(evidence["promotion"]["claims"])
     ):
         diagnostics.append(
             _error(
                 "contract.synthetic_fixture_claim",
                 "/artifact_kind",
-                "Synthetic fixtures are non-claimable and cannot be verifier-passed or promoted.",
+                "Synthetic fixtures cannot carry claims, pass verification, or be promoted.",
             )
         )
     if evidence["artifact_kind"] == "real_benchmark" and evidence["software"]["git_commit"] == "0" * 40:
@@ -1061,7 +1976,20 @@ def _evidence_provenance_diagnostics(evidence: Mapping[str, Any]) -> list[Diagno
                 "Real benchmark evidence cannot use the synthetic all-zero commit identity.",
             )
         )
+    diagnostics.extend(_bank_provenance_diagnostics(evidence["bank"], "/bank"))
     return diagnostics
+
+
+def _bank_provenance_diagnostics(bank: Mapping[str, Any], path: str) -> list[Diagnostic]:
+    if bank["active_aliases"] > bank["active_names"]:
+        return [
+            _error(
+                "contract.bank_alias_bounds",
+                f"{path}/active_aliases",
+                "Active aliases cannot exceed all active canonical names plus aliases.",
+            )
+        ]
+    return []
 
 
 def _split_diagnostics(
@@ -1075,8 +2003,12 @@ def _split_diagnostics(
     if splits["test_sealed"] is not True:
         diagnostics.append(_error("contract.test_not_sealed", f"{path}/test_sealed", "Final test must be sealed."))
     role_records = 0
+    role_artifact_ids: list[str] = []
+    role_artifact_hashes: list[str] = []
     for role, value in splits["roles"].items():
         role_records += value["records"]
+        role_artifact_ids.append(str(value["artifact"]["id"]))
+        role_artifact_hashes.append(str(value["artifact"]["sha256"]))
         if value["groups"] > value["records"]:
             diagnostics.append(
                 _error(
@@ -1085,6 +2017,16 @@ def _split_diagnostics(
                     "Split groups cannot exceed split records.",
                 )
             )
+    if len(set(role_artifact_ids)) != len(role_artifact_ids) or len(set(role_artifact_hashes)) != len(
+        role_artifact_hashes
+    ):
+        diagnostics.append(
+            _error(
+                "contract.split_artifact_overlap",
+                f"{path}/roles",
+                "Train, validation, and sealed-test roles must bind distinct content-addressed artifacts.",
+            )
+        )
     if role_records != preparation["output_records"]:
         diagnostics.append(
             _error(
@@ -1123,8 +2065,18 @@ def _quality_diagnostics(quality: Mapping[str, Any], *, manifest: Mapping[str, A
         return [_error("contract.empty_quality", "/quality/slices", "Evaluated quality requires non-empty slices.")]
     diagnostics.extend(_duplicate_id_diagnostics(slices, "/quality/slices", "quality slice"))
     labels: dict[str, Mapping[str, Any]] = {}
+    quality_plan: dict[str, Mapping[str, Any]] = {}
     if manifest is not None and validate_enron_manifest(manifest)["valid"]:
         labels = {str(item["id"]): item for item in manifest["labels"]}
+        quality_plan = {str(item["id"]): item for item in manifest["quality_plan"]}
+        if [str(item["id"]) for item in slices] != [str(item["id"]) for item in manifest["quality_plan"]]:
+            diagnostics.append(
+                _error(
+                    "contract.quality_plan_order",
+                    "/quality/slices",
+                    "Quality evidence must preserve the exact frozen manifest plan order and membership.",
+                )
+            )
     for index, item in enumerate(slices):
         path = f"/quality/slices/{index}"
         if item["label_strength"] in {"unlabeled", "synthetic_conformance"}:
@@ -1144,6 +2096,40 @@ def _quality_diagnostics(quality: Mapping[str, Any], *, manifest: Mapping[str, A
                 )
             )
         label = labels.get(str(item["label_artifact_id"]))
+        planned = quality_plan.get(str(item["id"]))
+        if quality_plan and planned is None:
+            diagnostics.append(
+                _error(
+                    "contract.unknown_quality_plan_slice",
+                    f"{path}/id",
+                    "Quality evidence does not reference a frozen manifest quality-plan descriptor.",
+                )
+            )
+        elif planned is not None:
+            planned_fields = (
+                "label_artifact_id",
+                "split_role",
+                "entity_class",
+                "cohort",
+                "text_view",
+                "promotion_gate",
+                "documents",
+                "documents_with_sensitive_gold",
+                "negative_documents",
+                "gold_spans",
+                "cataloged_gold_spans",
+                "documents_with_cataloged_gold",
+                "sensitive_gold_characters",
+                "evaluated_characters",
+            )
+            if any(item[field] != planned[field] for field in planned_fields):
+                diagnostics.append(
+                    _error(
+                        "contract.quality_plan_binding",
+                        path,
+                        "Quality evidence differs from its frozen manifest slice descriptor.",
+                    )
+                )
         if labels and label is None:
             diagnostics.append(
                 _error(
@@ -1175,6 +2161,36 @@ def _quality_diagnostics(quality: Mapping[str, Any], *, manifest: Mapping[str, A
                         "Quality slice role is not covered by its bound label artifact.",
                     )
                 )
+            populations = {str(population["role"]): population for population in label["role_populations"]}
+            population = populations.get(str(item["split_role"]))
+            if population is None:
+                diagnostics.append(
+                    _error(
+                        "contract.missing_label_population",
+                        f"{path}/split_role",
+                        "Quality slice has no bound label population for its split role.",
+                    )
+                )
+            else:
+                if item["documents"] > population["documents"] or item["gold_spans"] > population["spans"]:
+                    diagnostics.append(
+                        _error(
+                            "contract.quality_population_bounds",
+                            path,
+                            "Quality counts exceed the bound role-specific label population.",
+                        )
+                    )
+                if item["cohort"] == "all" and (
+                    item["documents"] != population["documents"] or item["gold_spans"] != population["spans"]
+                ):
+                    diagnostics.append(
+                        _error(
+                            "contract.quality_population_exactness",
+                            path,
+                            "An all-document cohort must exactly equal its bound role-specific document and "
+                            "span population.",
+                        )
+                    )
         diagnostics.extend(_slice_diagnostics(item, path))
     return diagnostics
 
@@ -1205,7 +2221,7 @@ def _slice_diagnostics(item: Mapping[str, Any], path: str) -> list[Diagnostic]:
             _error(
                 "contract.privacy_small_slice",
                 f"{path}/documents",
-                f"Public aggregate slices require at least {MIN_PUBLIC_SLICE_DOCUMENTS} documents.",
+                "Public aggregate slices do not meet the minimum document count.",
             )
         )
     if not open_world_eligible:
@@ -1242,7 +2258,11 @@ def _slice_diagnostics(item: Mapping[str, Any], path: str) -> list[Diagnostic]:
     for field, expected in expected_counts.items():
         if item[field] != expected:
             diagnostics.append(
-                _error("contract.count_arithmetic", f"{path}/{field}", f"Expected {expected} from component counts.")
+                _error(
+                    "contract.count_arithmetic",
+                    f"{path}/{field}",
+                    "Count does not match its declared component counts.",
+                )
             )
     bounds = (
         ("documents_with_sensitive_gold", "documents"),
@@ -1265,8 +2285,51 @@ def _slice_diagnostics(item: Mapping[str, Any], path: str) -> list[Diagnostic]:
     for numerator, denominator in bounds:
         if item[numerator] > item[denominator]:
             diagnostics.append(
-                _error("contract.count_bounds", f"{path}/{numerator}", f"Must not exceed {denominator}.")
+                _error(
+                    "contract.count_bounds",
+                    f"{path}/{numerator}",
+                    "Count exceeds its declared containing total.",
+                )
             )
+    if item["cataloged_true_positive"] + item["cataloged_wrong_canonical"] > item["true_positive"]:
+        diagnostics.append(
+            _error(
+                "contract.cataloged_true_positive_partition",
+                f"{path}/cataloged_true_positive",
+                "Correctly and incorrectly canonicalized cataloged matches must fit the true-positive span set.",
+            )
+        )
+    if item["predicted_spans"] == 0 and any(
+        item[field] != 0
+        for field in ("predicted_characters", "covered_sensitive_characters", "over_redacted_characters")
+    ):
+        diagnostics.append(
+            _error(
+                "contract.empty_prediction_character_set",
+                f"{path}/predicted_characters",
+                "Zero predicted spans require an empty predicted-character position set.",
+            )
+        )
+    if item["sensitive_gold_characters"] == 0 and (
+        item["covered_sensitive_characters"] != 0 or item["leaked_sensitive_characters"] != 0
+    ):
+        diagnostics.append(
+            _error(
+                "contract.empty_sensitive_character_set",
+                f"{path}/sensitive_gold_characters",
+                "Zero sensitive-gold characters require empty covered and leaked character sets.",
+            )
+        )
+    if item["false_negative"] == 0 and (
+        item["leaked_sensitive_characters"] != 0 or item["documents_with_any_leaked_character"] != 0
+    ):
+        diagnostics.append(
+            _error(
+                "contract.exact_recall_character_consistency",
+                f"{path}/leaked_sensitive_characters",
+                "Perfect exact-span recall requires zero leaked sensitive-character positions.",
+            )
+        )
     if open_world_eligible and item["documents_with_sensitive_gold"] + item["negative_documents"] != item["documents"]:
         diagnostics.append(
             _error(
@@ -1362,7 +2425,7 @@ def _slice_diagnostics(item: Mapping[str, Any], path: str) -> list[Diagnostic]:
                 _error(
                     "contract.metric_arithmetic",
                     f"{path}/metrics/{field}",
-                    f"Expected {expected!r} from integer counts.",
+                    "Metric does not match the recomputed integer-count value.",
                 )
             )
     return diagnostics
@@ -1390,6 +2453,7 @@ def _conformance_diagnostics(
             or value["label_artifact_id"] is not None
             or value["positive_cases_artifact"] is not None
             or value["negative_cases_artifact"] is not None
+            or value["policy_sha256"] is not None
             or value["recall"] is not None
             or value["passed"]
         ):
@@ -1428,6 +2492,23 @@ def _conformance_diagnostics(
                     "Conformance cases differ from their exhaustive bound manifest label artifact.",
                 )
             )
+        plan = manifest["conformance_plan"]
+        expected_plan_fields = {
+            "label_artifact_id": plan["label_artifact_id"],
+            "positive_cases_artifact": plan["positive_cases_artifact"],
+            "approved_positive_cases": plan["positive_cases"],
+            "negative_cases_artifact": plan["negative_cases_artifact"],
+            "negative_cases": plan["negative_cases"],
+            "policy_sha256": plan["policy_sha256"],
+        }
+        if any(value[field] != expected for field, expected in expected_plan_fields.items()):
+            diagnostics.append(
+                _error(
+                    "contract.conformance_plan_binding",
+                    "/catalog_conformance",
+                    "Conformance evidence differs from its frozen manifest case artifacts, counts, or policy.",
+                )
+            )
     if value["active_patterns"] != bank["active_patterns"]:
         diagnostics.append(
             _error(
@@ -1460,12 +2541,16 @@ def _conformance_diagnostics(
                 "Conformance requires active patterns plus positive and negative/adversarial cases.",
             )
         )
-    if value["positive_cases_artifact"] is None or value["negative_cases_artifact"] is None:
+    if (
+        value["positive_cases_artifact"] is None
+        or value["negative_cases_artifact"] is None
+        or value["policy_sha256"] is None
+    ):
         diagnostics.append(
             _error(
                 "contract.missing_conformance_artifact",
                 "/catalog_conformance",
-                "Evaluated conformance requires content-addressed positive and negative case artifacts.",
+                "Evaluated conformance requires positive and negative case artifacts plus a frozen policy hash.",
             )
         )
     if support != value["correctly_mapped"] + value["missed"] + value["wrong_canonical"]:
@@ -1479,7 +2564,11 @@ def _conformance_diagnostics(
     expected = _ratio(value["correctly_mapped"], support)
     if not _same_metric(value["recall"], expected):
         diagnostics.append(
-            _error("contract.metric_arithmetic", "/catalog_conformance/recall", f"Expected {expected!r}.")
+            _error(
+                "contract.metric_arithmetic",
+                "/catalog_conformance/recall",
+                "Metric does not match the recomputed count value.",
+            )
         )
     if value["unexpected_negative_matches"] > value["negative_cases"]:
         diagnostics.append(
@@ -1497,6 +2586,7 @@ def _conformance_diagnostics(
         and support >= value["patterns_with_positive_cases"]
         and value["positive_cases_artifact"] is not None
         and value["negative_cases_artifact"] is not None
+        and value["policy_sha256"] is not None
         and value["missed"] == 0
         and value["wrong_canonical"] == 0
         and value["unexpected_negative_matches"] == 0
@@ -1522,6 +2612,7 @@ def _test_access_diagnostics(
 ) -> list[Diagnostic]:
     access = evidence["test_access"]
     diagnostics: list[Diagnostic] = []
+    has_test_aggregate = _has_test_role_aggregate(evidence, manifest)
     if "test" in access["optimization_roles"]:
         diagnostics.append(
             _error(
@@ -1541,6 +2632,7 @@ def _test_access_diagnostics(
         )
     frozen = access["frozen_target"]
     expected = {
+        "manifest_sha256": evidence["manifest_sha256"],
         "bank_hash": evidence["bank"]["canonical_hash"],
         "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
         "split_manifest_sha256": evidence["splits"]["manifest_sha256"],
@@ -1698,6 +2790,14 @@ def _test_access_diagnostics(
                 "Current-version access count must equal its lineage entry count.",
             )
         )
+    if has_test_aggregate and count != 1:
+        diagnostics.append(
+            _error(
+                "contract.test_aggregate_without_access",
+                "/test_access/current_version_access_count",
+                "Every current-version final-test aggregate requires exactly one recorded sealed-test access.",
+            )
+        )
     if count == 1 and len(current_entries) == 1:
         current = current_entries[0]
         if lineage[-1] is not current:
@@ -1742,6 +2842,14 @@ def _test_access_diagnostics(
                     "Failed or aborted final-test outcomes cannot be promoted.",
                 )
             )
+        if has_test_aggregate and current["outcome"] != "passed":
+            diagnostics.append(
+                _error(
+                    "contract.test_aggregate_failed_lineage",
+                    f"/test_access/lineage/{len(lineage) - 1}/outcome",
+                    "Published final-test aggregates require the matching current lineage outcome to be passed.",
+                )
+            )
 
     if trusted_lineage_prefix is None:
         if evidence["promotion"]["passed"] or evidence["verifier"]["passed"]:
@@ -1754,7 +2862,20 @@ def _test_access_diagnostics(
             )
     else:
         expected_prefix_length = len(lineage) - count
-        if len(trusted_lineage_prefix) != expected_prefix_length or list(trusted_lineage_prefix) != list(
+        prefix_valid = (
+            isinstance(trusted_lineage_prefix, (list, tuple))
+            and len(trusted_lineage_prefix) <= MAX_COLLECTION_ITEMS
+            and all(type(item) is dict for item in trusted_lineage_prefix)
+        )
+        if not prefix_valid:
+            diagnostics.append(
+                _error(
+                    "contract.trusted_lineage_shape",
+                    "/test_access/lineage",
+                    "Trusted lineage prefix must be a bounded sequence of JSON objects.",
+                )
+            )
+        elif len(trusted_lineage_prefix) != expected_prefix_length or list(trusted_lineage_prefix) != list(
             lineage[:expected_prefix_length]
         ):
             diagnostics.append(
@@ -1767,37 +2888,94 @@ def _test_access_diagnostics(
     return diagnostics
 
 
+def _has_test_role_aggregate(evidence: Mapping[str, Any], manifest: Mapping[str, Any] | None) -> bool:
+    if any(item["split_role"] == "test" for item in evidence["quality"]["slices"]):
+        return True
+    if any(item["scope"]["split_role"] == "test" for item in evidence["promotion"]["claims"]):
+        return True
+    return False
+
+
 def _performance_diagnostics(
     performance: Mapping[str, Any],
     bank: Mapping[str, Any],
     referenced_samples: Mapping[str, Sequence[float]] | None,
+    referenced_input_inventories: Mapping[str, Sequence[Mapping[str, int]]] | None,
+    *,
+    promotion_passed: bool,
 ) -> list[Diagnostic]:
     banks = performance["banks"]
+    inputs = performance["inputs"]
     workloads = performance["workloads"]
+    baselines = performance["baselines"]
+    comparisons = performance["comparisons"]
+    breakeven_models = performance["breakeven_models"]
+    collections = (banks, inputs, workloads, baselines, comparisons, breakeven_models)
     if not performance["evaluated"]:
         return (
             []
-            if not workloads and not banks
+            if not any(collections)
             else [
                 _error(
                     "contract.not_evaluated_has_workloads",
                     "/performance",
-                    "Unevaluated performance must not contain banks or workloads.",
+                    "Unevaluated performance must not contain descriptors, workloads, or derived results.",
                 )
             ]
         )
-    if not workloads or not banks:
+    if not workloads or not banks or not inputs:
         return [
             _error(
                 "contract.empty_performance",
                 "/performance",
-                "Evaluated performance requires declared banks and workloads.",
+                "Evaluated performance requires declared banks, inputs, and workloads.",
             )
         ]
     diagnostics: list[Diagnostic] = []
     diagnostics.extend(_duplicate_id_diagnostics(banks, "/performance/banks", "performance bank"))
+    diagnostics.extend(_duplicate_id_diagnostics(inputs, "/performance/inputs", "performance input"))
     diagnostics.extend(_duplicate_id_diagnostics(workloads, "/performance/workloads", "performance workload"))
-    bank_by_hash = {str(item["bank_hash"]): item for item in banks}
+    diagnostics.extend(_duplicate_id_diagnostics(baselines, "/performance/baselines", "performance baseline"))
+    diagnostics.extend(_duplicate_id_diagnostics(comparisons, "/performance/comparisons", "performance comparison"))
+    diagnostics.extend(_duplicate_id_diagnostics(breakeven_models, "/performance/breakeven_models", "breakeven model"))
+    for collection, path in (
+        (banks, "/performance/banks"),
+        (inputs, "/performance/inputs"),
+        (workloads, "/performance/workloads"),
+        (baselines, "/performance/baselines"),
+        (comparisons, "/performance/comparisons"),
+        (breakeven_models, "/performance/breakeven_models"),
+    ):
+        identifiers = [str(item["id"]) for item in collection]
+        if identifiers != sorted(identifiers):
+            diagnostics.append(
+                _error(
+                    "contract.performance_descriptor_order",
+                    path,
+                    "Performance descriptor collections must use canonical identifier order.",
+                )
+            )
+    bank_by_id = {str(item["id"]): item for item in banks}
+    bank_hashes = [str(item["bank_hash"]) for item in banks]
+    if len(bank_hashes) != len(set(bank_hashes)):
+        diagnostics.append(
+            _error(
+                "contract.duplicate_performance_bank_hash",
+                "/performance/banks",
+                "Every performance-bank descriptor must have a unique canonical bank hash.",
+            )
+        )
+    bank_artifact_hashes = [str(item["artifact"]["sha256"]) for item in banks]
+    if len(bank_artifact_hashes) != len(set(bank_artifact_hashes)):
+        diagnostics.append(
+            _error(
+                "contract.duplicate_performance_bank_artifact",
+                "/performance/banks",
+                "Every performance-bank descriptor must bind a distinct content-addressed bank artifact.",
+            )
+        )
+    for index, descriptor in enumerate(banks):
+        diagnostics.extend(_performance_bank_diagnostics(descriptor, f"/performance/banks/{index}"))
     evaluated_banks = [item for item in banks if item["kind"] == "evaluated_bank"]
     if len(evaluated_banks) != 1:
         diagnostics.append(
@@ -1813,11 +2991,20 @@ def _performance_diagnostics(
             "bank_hash": bank["canonical_hash"],
             "active_entities": bank["active_entities"],
             "active_names": bank["active_names"],
+            "active_aliases": bank["active_aliases"],
             "active_patterns": bank["active_patterns"],
             "canonical_json_bytes": bank["canonical_json_bytes"],
             "native_source_bytes": bank["native_source_bytes"],
+            "artifact": {
+                "sha256": bank["artifact_sha256"],
+                "bytes": bank["canonical_json_bytes"],
+            },
         }
-        if any(descriptor[field] != expected for field, expected in expected_descriptor.items()):
+        if any(
+            descriptor[field] != expected for field, expected in expected_descriptor.items() if field != "artifact"
+        ) or any(
+            descriptor["artifact"][field] != expected for field, expected in expected_descriptor["artifact"].items()
+        ):
             diagnostics.append(
                 _error(
                     "contract.performance_bank_mismatch",
@@ -1825,14 +3012,77 @@ def _performance_diagnostics(
                     "Evaluated performance-bank descriptor differs from evidence bank provenance.",
                 )
             )
+    input_by_id = {str(item["id"]): item for item in inputs}
+    for index, input_descriptor in enumerate(inputs):
+        path = f"/performance/inputs/{index}"
+        diagnostics.extend(_performance_input_diagnostics(input_descriptor, bank_by_id, path))
+        inventory = (
+            None
+            if referenced_input_inventories is None
+            else referenced_input_inventories.get(str(input_descriptor["inventory_ref"]["id"]))
+        )
+        if inventory is not None:
+            diagnostics.extend(_performance_inventory_diagnostics(input_descriptor, inventory, path))
+    baseline_by_id = {str(item["id"]): item for item in baselines}
+    for index, baseline in enumerate(baselines):
+        path = f"/performance/baselines/{index}"
+        if baseline["descriptor_sha256"] != hash_enron_performance_baseline(baseline):
+            diagnostics.append(
+                _error(
+                    "contract.performance_baseline_hash",
+                    f"{path}/descriptor_sha256",
+                    "Baseline identity and capability descriptor hash does not match its canonical content.",
+                )
+            )
+        if baseline["semantic_equivalence"] == "exact" and not all(baseline["capabilities"].values()):
+            diagnostics.append(
+                _error(
+                    "contract.performance_baseline_capability",
+                    f"{path}/capabilities",
+                    "Exact baselines must support every benchmark literal, regex, alias, mapping, and Unicode feature.",
+                )
+            )
     for index, workload in enumerate(workloads):
         path = f"/performance/workloads/{index}"
-        if workload["bank_hash"] not in bank_by_hash:
+        workload_bank = bank_by_id.get(str(workload["bank_id"]))
+        if workload_bank is None or workload_bank["bank_hash"] != workload["bank_hash"]:
             diagnostics.append(
                 _error(
                     "contract.unknown_performance_bank",
-                    f"{path}/bank_hash",
-                    "Performance workload references an undeclared bank descriptor.",
+                    f"{path}/bank_id",
+                    "Performance workload bank id and hash must reference the same declared descriptor.",
+                )
+            )
+        setup_phase = workload["phase"] in {"source_build", "cold_compile"}
+        input_descriptor = None if workload["input_id"] is None else input_by_id.get(str(workload["input_id"]))
+        if setup_phase and (workload["input_id"] is not None or workload["input_sha256"] is not None):
+            diagnostics.append(
+                _error(
+                    "contract.setup_phase_input",
+                    f"{path}/input_id",
+                    "Bank source-build and cold-compile workloads cannot borrow scan-input denominators.",
+                )
+            )
+        if not setup_phase and (
+            input_descriptor is None
+            or input_descriptor["descriptor_sha256"] != workload["input_sha256"]
+            or input_descriptor["bank_id"] != workload["bank_id"]
+            or input_descriptor["bank_hash"] != workload["bank_hash"]
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.unknown_performance_input",
+                    f"{path}/input_id",
+                    "Scan-bearing workloads must bind an input descriptor for the exact bank id and hash.",
+                )
+            )
+        baseline_id = workload["baseline_id"]
+        if baseline_id is not None and str(baseline_id) not in baseline_by_id:
+            diagnostics.append(
+                _error(
+                    "contract.unknown_performance_baseline",
+                    f"{path}/baseline_id",
+                    "Performance workload references an undeclared baseline identity.",
                 )
             )
         if workload["workload_sha256"] != hash_enron_workload(workload):
@@ -1843,20 +3093,45 @@ def _performance_diagnostics(
                     "Workload hash does not match its canonical descriptor.",
                 )
             )
-        if workload["phase"] == "cold_compile" and workload["process_model"] != "fresh_process_per_sample":
+        expected_process_model = PERFORMANCE_PHASE_PROCESS_MODELS[str(workload["phase"])]
+        if workload["process_model"] != expected_process_model:
             diagnostics.append(
                 _error(
-                    "contract.cold_compile_process_model",
+                    "contract.performance_phase_process_model",
                     f"{path}/process_model",
-                    "Cold compile requires a fresh process for every sample.",
+                    "Performance phase uses an invalid timing-isolation process model.",
                 )
             )
-        if workload["phase"] == "direct_bank_scan" and workload["process_model"] != "reused_process":
+        invalid_sample_unit = (
+            (setup_phase and workload["sample_unit"] != "operation")
+            or (
+                workload["phase"] in {"helper_cache_miss", "helper_cache_hit", "end_to_end"}
+                and workload["sample_unit"] != "whole_input"
+            )
+            or (workload["phase"] == "direct_bank_scan" and workload["sample_unit"] == "operation")
+        )
+        if invalid_sample_unit:
             diagnostics.append(
                 _error(
-                    "contract.direct_scan_process_model",
-                    f"{path}/process_model",
-                    "Direct Bank scans require a reused compiled process.",
+                    "contract.performance_phase_sample_unit",
+                    f"{path}/sample_unit",
+                    "Performance sample units must match bank setup, whole-input, or direct document work.",
+                )
+            )
+        if workload["phase"] == "direct_bank_scan" and workload["warmups"] < 1:
+            diagnostics.append(
+                _error(
+                    "contract.performance_warmups",
+                    f"{path}/warmups",
+                    "Reused direct Bank scans require at least one untimed warmup.",
+                )
+            )
+        if workload["baseline_id"] is not None and (workload["promotion_gate"] or workload["decision_grade"]):
+            diagnostics.append(
+                _error(
+                    "contract.baseline_decision_grade",
+                    f"{path}/baseline_id",
+                    "Baseline cells cannot be NERB promotion or decision-grade cells.",
                 )
             )
         samples = workload["samples_seconds"]
@@ -1876,7 +3151,7 @@ def _performance_diagnostics(
         if resolved_samples is None:
             continue
         normalized_samples = _normalize_samples(resolved_samples)
-        if len(resolved_samples) < 5 or normalized_samples is None:
+        if normalized_samples is None or len(normalized_samples) < 5:
             diagnostics.append(
                 _error(
                     "contract.performance_sample_support",
@@ -1896,31 +3171,77 @@ def _performance_diagnostics(
                     "Resolved samples do not match the non-empty content-addressed sample reference.",
                 )
             )
+        if workload["sample_unit"] != "operation" and input_descriptor is None:
+            continue
+        if workload["sample_unit"] == "document" and input_descriptor is not None:
+            measured_documents = len(normalized_samples) * workload["work_per_sample"]
+            if measured_documents < input_descriptor["documents"] or measured_documents % input_descriptor["documents"]:
+                diagnostics.append(
+                    _error(
+                        "contract.document_sample_coverage",
+                        f"{path}/sample_unit",
+                        "Document timing samples must cover one or more complete balanced passes over the input.",
+                    )
+                )
+        rss_samples = workload["rss_samples_bytes"]
+        if (workload["peak_rss_bytes"] is None) != (not rss_samples) or (
+            workload["peak_rss_bytes"] is not None
+            and (len(rss_samples) != len(normalized_samples) or max(rss_samples) != workload["peak_rss_bytes"])
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.performance_rss_samples",
+                    f"{path}/rss_samples_bytes",
+                    "Peak RSS must be the maximum of one positive memory sample per timing sample.",
+                )
+            )
         stats = workload["stats"]
-        expected = _sample_statistics(normalized_samples, workload["documents"], workload["bytes"])
+        expected = _sample_statistics(
+            normalized_samples,
+            input_descriptor,
+            workload["sample_unit"],
+            workload["work_per_sample"],
+        )
         for field, value in expected.items():
             if not _same_metric(stats[field], value):
                 diagnostics.append(
                     _error(
                         "contract.performance_arithmetic",
                         f"{path}/stats/{field}",
-                        f"Expected {value!r} from raw samples.",
+                        "Statistic does not match the recomputed raw-sample value.",
                     )
                 )
+        warm_path = workload["process_model"] == "reused_process"
+        if workload["decision_grade"] and (
+            workload["baseline_id"] is not None
+            or (warm_path and workload["warmups"] < MIN_DECISION_GRADE_WARMUPS)
+            or (not warm_path and workload["warmups"] != 0)
+            or len(normalized_samples) < MIN_DECISION_GRADE_SAMPLES
+            or workload["work_per_sample"] != 1
+            or workload["peak_rss_bytes"] is None
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.invalid_decision_grade_workload",
+                    f"{path}/decision_grade",
+                    "Decision-grade cells require one-unit work, phase-correct warmups, 100 samples, and peak RSS.",
+                )
+            )
         if workload["promotion_gate"] and (
-            workload["phase"] != "direct_bank_scan"
+            not workload["decision_grade"]
             or workload["bank_hash"] != bank["canonical_hash"]
-            or len(normalized_samples) < 100
+            or workload["phase"] != "direct_bank_scan"
+            or workload["work_per_sample"] != 1
         ):
             diagnostics.append(
                 _error(
                     "contract.invalid_performance_gate",
                     f"{path}/promotion_gate",
-                    "Promoted performance requires at least 100 direct reused-Bank samples on the evaluated bank.",
+                    "Headline gates must be decision-grade direct scans of the evaluated Bank.",
                 )
             )
-    unused_bank_hashes = set(bank_by_hash) - {str(item["bank_hash"]) for item in workloads}
-    if unused_bank_hashes:
+    used_bank_ids = {str(item["bank_id"]) for item in workloads}
+    if set(bank_by_id) - used_bank_ids:
         diagnostics.append(
             _error(
                 "contract.unused_performance_bank",
@@ -1928,7 +3249,890 @@ def _performance_diagnostics(
                 "Every declared performance bank must be exercised by at least one workload.",
             )
         )
+    used_input_ids = {str(item["input_id"]) for item in workloads}
+    if set(input_by_id) - used_input_ids:
+        diagnostics.append(
+            _error(
+                "contract.unused_performance_input",
+                "/performance/inputs",
+                "Every declared performance input must be exercised by at least one workload.",
+            )
+        )
+    used_baseline_ids = {str(item["baseline_id"]) for item in workloads if item["baseline_id"] is not None}
+    if set(baseline_by_id) - used_baseline_ids:
+        diagnostics.append(
+            _error(
+                "contract.unused_performance_baseline",
+                "/performance/baselines",
+                "Every declared baseline identity must be exercised by at least one workload.",
+            )
+        )
+    if promotion_passed:
+        decision_input_ids = {
+            str(item["input_id"])
+            for item in workloads
+            if item["decision_grade"] and str(item["input_id"]) in input_by_id
+        }
+        missing_inventories = sorted(
+            item_id
+            for item_id in decision_input_ids
+            if referenced_input_inventories is None
+            or str(input_by_id[item_id]["inventory_ref"]["id"]) not in referenced_input_inventories
+        )
+        if missing_inventories:
+            diagnostics.append(
+                _error(
+                    "contract.performance_inventory_unavailable",
+                    "/performance/inputs",
+                    "Promoted decision-grade denominators require all referenced input inventories.",
+                )
+            )
+    diagnostics.extend(_performance_comparison_diagnostics(comparisons, workloads, baseline_by_id))
+    diagnostics.extend(_performance_breakeven_diagnostics(breakeven_models, workloads))
     return diagnostics
+
+
+def _performance_bank_diagnostics(descriptor: Mapping[str, Any], path: str) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    if descriptor["descriptor_sha256"] != hash_enron_performance_bank(descriptor):
+        diagnostics.append(
+            _error(
+                "contract.performance_bank_descriptor_hash",
+                f"{path}/descriptor_sha256",
+                "Performance-bank descriptor hash does not match its canonical content.",
+            )
+        )
+    generator_required = descriptor["kind"] == "synthetic_scale"
+    if (descriptor["generator"] is not None) != generator_required:
+        diagnostics.append(
+            _error(
+                "contract.performance_bank_generator",
+                f"{path}/generator",
+                "Synthetic scale banks require a versioned generator; evaluated banks bind their real artifact.",
+            )
+        )
+    if descriptor["artifact"]["bytes"] != descriptor["canonical_json_bytes"]:
+        diagnostics.append(
+            _error(
+                "contract.performance_bank_artifact",
+                f"{path}/artifact/bytes",
+                "Bank artifact byte count must equal the canonical JSON bank size.",
+            )
+        )
+    taxonomy = descriptor["composition"]["taxonomy"]
+    taxon_ids = [str(item["entity_class"]) for item in taxonomy]
+    if len(taxon_ids) != len(set(taxon_ids)):
+        diagnostics.append(
+            _error(
+                "contract.duplicate_bank_taxon",
+                f"{path}/composition/taxonomy",
+                "Bank taxonomy ids must be unique.",
+            )
+        )
+    totals = {
+        "active_entities": sum(int(item["entities"]) for item in taxonomy),
+        "active_names": sum(int(item["canonical_names"]) + int(item["aliases"]) for item in taxonomy),
+        "active_aliases": sum(int(item["aliases"]) for item in taxonomy),
+        "active_patterns": sum(int(item["literal_patterns"]) + int(item["regex_patterns"]) for item in taxonomy),
+    }
+    if any(descriptor[field] != expected for field, expected in totals.items()):
+        diagnostics.append(
+            _error(
+                "contract.performance_bank_composition",
+                f"{path}/composition",
+                "Taxonomy, canonical-name/alias, and literal/regex totals must equal the bank descriptor totals.",
+            )
+        )
+    return diagnostics
+
+
+def _performance_input_diagnostics(
+    descriptor: Mapping[str, Any], bank_by_id: Mapping[str, Mapping[str, Any]], path: str
+) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    if descriptor["descriptor_sha256"] != hash_enron_performance_input(descriptor):
+        diagnostics.append(
+            _error(
+                "contract.performance_input_descriptor_hash",
+                f"{path}/descriptor_sha256",
+                "Performance-input descriptor hash does not match its canonical content.",
+            )
+        )
+    bound_bank = bank_by_id.get(str(descriptor["bank_id"]))
+    if bound_bank is None or bound_bank["bank_hash"] != descriptor["bank_hash"]:
+        diagnostics.append(
+            _error(
+                "contract.performance_input_bank",
+                f"{path}/bank_id",
+                "Performance input must bind an exact bank id and hash because record counts are bank-specific.",
+            )
+        )
+    generator_required = descriptor["kind"] == "synthetic_input"
+    if (descriptor["generator"] is not None) != generator_required:
+        diagnostics.append(
+            _error(
+                "contract.performance_input_generator",
+                f"{path}/generator",
+                "Synthetic inputs require a versioned generator; real inputs must be content-addressed without one.",
+            )
+        )
+    if descriptor["artifact"]["bytes"] != descriptor["bytes"]:
+        diagnostics.append(
+            _error(
+                "contract.performance_input_artifact",
+                f"{path}/artifact/bytes",
+                "Input byte denominator must equal the content-addressed input artifact size.",
+            )
+        )
+    lengths = descriptor["document_length_distribution"]
+    length_order = [
+        lengths[field] for field in ("minimum_bytes", "p50_bytes", "p95_bytes", "p99_bytes", "maximum_bytes")
+    ]
+    hits = descriptor["hit_distribution"]
+    hit_order = [
+        hits[field] for field in ("minimum_records", "p50_records", "p95_records", "p99_records", "maximum_records")
+    ]
+    if (
+        length_order != sorted(length_order)
+        or hit_order != sorted(hit_order)
+        or not _same_metric(lengths["mean_bytes"], descriptor["bytes"] / descriptor["documents"])
+        or not _same_metric(hits["mean_records"], descriptor["records"] / descriptor["documents"])
+        or not lengths["minimum_bytes"] <= lengths["mean_bytes"] <= lengths["maximum_bytes"]
+        or not hits["minimum_records"] <= hits["mean_records"] <= hits["maximum_records"]
+        or hits["negative_documents"] + hits["documents_with_records"] != descriptor["documents"]
+        or (descriptor["records"] == 0) != (hits["documents_with_records"] == 0)
+    ):
+        diagnostics.append(
+            _error(
+                "contract.performance_input_distribution",
+                path,
+                "Document-length and hit distributions must reconcile to document, byte, and record totals.",
+            )
+        )
+    expected_density = _classify_hit_density(descriptor["records"], descriptor["documents"])
+    if descriptor["hit_density"] != expected_density:
+        diagnostics.append(
+            _error(
+                "contract.performance_hit_density",
+                f"{path}/hit_density",
+                "Hit density does not match its deterministic records-per-document classification.",
+            )
+        )
+    expected_size = _classify_size_cohort(descriptor["bytes"], descriptor["documents"])
+    if descriptor["size_cohort"] != expected_size:
+        diagnostics.append(
+            _error(
+                "contract.performance_size_cohort",
+                f"{path}/size_cohort",
+                "Document size cohort does not match the deterministic mean-byte classification.",
+            )
+        )
+    return diagnostics
+
+
+def _performance_inventory_diagnostics(
+    descriptor: Mapping[str, Any], inventory: Sequence[Mapping[str, int]], path: str
+) -> list[Diagnostic]:
+    normalized = _normalize_performance_inventory(inventory)
+    if normalized is None:
+        return [
+            _error(
+                "contract.performance_inventory_shape",
+                f"{path}/inventory_ref",
+                "Referenced inventory must contain only bounded nonnegative integer bytes and records per document.",
+            )
+        ]
+    inventory_ref = descriptor["inventory_ref"]
+    if inventory_ref["sha256"] != _canonical_hash(normalized) or inventory_ref["bytes"] != len(
+        _canonical_payload(normalized)
+    ):
+        return [
+            _error(
+                "contract.performance_inventory_hash",
+                f"{path}/inventory_ref",
+                "Referenced input inventory does not match its content-addressed reference.",
+            )
+        ]
+    expected = _performance_inventory_summary(normalized)
+    fields = (
+        "documents",
+        "bytes",
+        "records",
+        "hit_density",
+        "size_cohort",
+        "document_length_distribution",
+        "hit_distribution",
+    )
+    if any(descriptor[field] != expected[field] for field in fields):
+        return [
+            _error(
+                "contract.performance_inventory_arithmetic",
+                path,
+                "Input denominators and distributions differ from the referenced per-document inventory.",
+            )
+        ]
+    return []
+
+
+def _performance_comparison_diagnostics(
+    comparisons: Sequence[Mapping[str, Any]],
+    workloads: Sequence[Mapping[str, Any]],
+    baseline_by_id: Mapping[str, Mapping[str, Any]],
+) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    workload_by_id = {str(item["id"]): item for item in workloads}
+    lower_is_better = {"median_seconds", "p95_seconds", "p99_seconds", "seconds_per_document"}
+    comparison_keys = [(str(item["candidate_workload_id"]), str(item["metric"])) for item in comparisons]
+    if len(comparison_keys) != len(set(comparison_keys)):
+        diagnostics.append(
+            _error(
+                "contract.duplicate_performance_comparison_metric",
+                "/performance/comparisons",
+                "A candidate workload may declare at most one comparison for each metric.",
+            )
+        )
+    for index, comparison in enumerate(comparisons):
+        path = f"/performance/comparisons/{index}"
+        if comparison["comparison_plan_sha256"] != hash_enron_performance_comparison_plan(comparison):
+            diagnostics.append(
+                _error(
+                    "contract.performance_comparison_hash",
+                    f"{path}/comparison_plan_sha256",
+                    "Comparison plan hash does not match its frozen candidate, baseline, metric, and noise policy.",
+                )
+            )
+        candidate = workload_by_id.get(str(comparison["candidate_workload_id"]))
+        baseline = workload_by_id.get(str(comparison["baseline_workload_id"]))
+        baseline_identity = None if baseline is None else baseline_by_id.get(str(baseline["baseline_id"]))
+        comparable_fields = (
+            "phase",
+            "bank_id",
+            "bank_hash",
+            "input_id",
+            "input_sha256",
+            "sample_unit",
+            "work_per_sample",
+            "concurrency",
+        )
+        if (
+            candidate is None
+            or baseline is None
+            or candidate["baseline_id"] is not None
+            or baseline["baseline_id"] is None
+            or baseline_identity is None
+            or baseline_identity["semantic_equivalence"] != "exact"
+            or any(candidate[field] != baseline[field] for field in comparable_fields)
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.incomparable_performance_baseline",
+                    path,
+                    "Baseline comparison requires exact implementations on identical bank, input, work, and phase.",
+                )
+            )
+            continue
+        metric = str(comparison["metric"])
+        candidate_value = candidate["stats"][metric]
+        baseline_value = baseline["stats"][metric]
+        direction = "lower_is_better" if metric in lower_is_better else "higher_is_better"
+        if candidate_value is None or baseline_value is None or not baseline_value:
+            diagnostics.append(
+                _error(
+                    "contract.unsupported_performance_comparison",
+                    path,
+                    "Comparison metric lacks supported nonzero raw-sample statistics.",
+                )
+            )
+            continue
+        relative_degradation = (
+            (candidate_value - baseline_value) / baseline_value
+            if direction == "lower_is_better"
+            else (baseline_value - candidate_value) / baseline_value
+        )
+        noise_floor = (
+            max(
+                candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
+                baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
+            )
+            * comparison["noise_multiplier"]
+        )
+        if noise_floor > MAX_COMPARISON_NOISE_FLOOR:
+            diagnostics.append(
+                _error(
+                    "contract.unstable_performance_comparison",
+                    path,
+                    "Decision-grade comparison noise exceeds the benchmark-v2 stability ceiling.",
+                )
+            )
+        boundary = noise_floor + comparison["regression_tolerance"]
+        if relative_degradation > boundary:
+            result = "regressed"
+        elif relative_degradation < -boundary:
+            result = "improved"
+        else:
+            result = "equivalent_within_noise"
+        expected = {
+            "direction": direction,
+            "candidate_value": candidate_value,
+            "baseline_value": baseline_value,
+            "relative_degradation": relative_degradation,
+            "noise_floor": noise_floor,
+            "result": result,
+        }
+        if any(not _same_scalar(comparison[field], value) for field, value in expected.items()):
+            diagnostics.append(
+                _error(
+                    "contract.performance_comparison_arithmetic",
+                    path,
+                    "Noise-aware comparison differs from the bound raw-sample statistics.",
+                )
+            )
+    return diagnostics
+
+
+def _performance_breakeven_diagnostics(
+    models: Sequence[Mapping[str, Any]], workloads: Sequence[Mapping[str, Any]]
+) -> list[Diagnostic]:
+    diagnostics: list[Diagnostic] = []
+    workload_by_id = {str(item["id"]): item for item in workloads}
+    for index, model in enumerate(models):
+        path = f"/performance/breakeven_models/{index}"
+        if model["model_plan_sha256"] != hash_enron_breakeven_plan(model):
+            diagnostics.append(
+                _error(
+                    "contract.performance_breakeven_hash",
+                    f"{path}/model_plan_sha256",
+                    "Breakeven plan hash does not match its frozen components and parameter policy.",
+                )
+            )
+        components = model["components"]
+        component_ids = [str(item["id"]) for item in components]
+        if len(component_ids) != len(set(component_ids)) or component_ids != sorted(component_ids):
+            diagnostics.append(
+                _error(
+                    "contract.breakeven_component_ids",
+                    f"{path}/components",
+                    "Breakeven components require unique ids in canonical order.",
+                )
+            )
+        resolved_components: list[tuple[Mapping[str, Any], float]] = []
+        referenced_bank_hashes: set[str] = set()
+        for component_index, component in enumerate(components):
+            component_path = f"{path}/components/{component_index}"
+            expected_value = _breakeven_component_value(component, model, workload_by_id)
+            if expected_value is None:
+                diagnostics.append(
+                    _error(
+                        "contract.invalid_breakeven_component",
+                        component_path,
+                        "Breakeven component source, unit, side, and workload binding are inconsistent.",
+                    )
+                )
+                continue
+            if not _same_metric(component["value"], expected_value):
+                diagnostics.append(
+                    _error(
+                        "contract.breakeven_component_arithmetic",
+                        f"{component_path}/value",
+                        "Breakeven component value differs from its frozen assumption or workload statistic.",
+                    )
+                )
+            resolved_components.append((component, expected_value))
+            workload_id = component["workload_id"]
+            if workload_id is not None:
+                referenced_bank_hashes.add(str(workload_by_id[str(workload_id)]["bank_hash"]))
+        coverage = {(str(item["side"]), str(item["application"])) for item, _ in resolved_components}
+        if (
+            coverage
+            != {
+                ("candidate", "fixed"),
+                ("candidate", "per_unit"),
+                ("baseline", "fixed"),
+                ("baseline", "per_unit"),
+            }
+            or len(referenced_bank_hashes) > 1
+            or model["minimum_units"] > model["maximum_units"]
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.invalid_breakeven_model",
+                    path,
+                    "Breakeven models require both sides' fixed/marginal components on one bank and a valid range.",
+                )
+            )
+        totals = {
+            (side, application): sum(
+                value
+                for component, value in resolved_components
+                if component["side"] == side and component["application"] == application
+            )
+            for side in ("candidate", "baseline")
+            for application in ("fixed", "per_unit")
+        }
+        if any(not math.isfinite(value) or value > MAX_FINITE_CONTRACT_NUMBER for value in totals.values()):
+            diagnostics.append(
+                _error(
+                    "contract.breakeven_numeric_bounds",
+                    path,
+                    "Breakeven component totals must remain finite and bounded.",
+                )
+            )
+            continue
+        breakeven = _breakeven_result(
+            totals[("candidate", "fixed")],
+            totals[("baseline", "fixed")],
+            totals[("candidate", "per_unit")],
+            totals[("baseline", "per_unit")],
+            model["minimum_units"],
+            model["maximum_units"],
+        )
+        if breakeven is None:
+            diagnostics.append(
+                _error(
+                    "contract.breakeven_numeric_bounds",
+                    path,
+                    "Breakeven projection arithmetic must remain finite and bounded.",
+                )
+            )
+            continue
+        result, units = breakeven
+        expected = {
+            "candidate_fixed_value": totals[("candidate", "fixed")],
+            "baseline_fixed_value": totals[("baseline", "fixed")],
+            "candidate_value_per_unit": totals[("candidate", "per_unit")],
+            "baseline_value_per_unit": totals[("baseline", "per_unit")],
+            "result": result,
+            "breakeven_units": units,
+        }
+        if any(not _same_scalar(model[field], value) for field, value in expected.items()):
+            diagnostics.append(
+                _error(
+                    "contract.performance_breakeven_arithmetic",
+                    path,
+                    "Parameterized breakeven result differs from its additive frozen components.",
+                )
+            )
+    return diagnostics
+
+
+def _breakeven_component_value(
+    component: Mapping[str, Any],
+    model: Mapping[str, Any],
+    workload_by_id: Mapping[str, Mapping[str, Any]],
+) -> float | None:
+    source = str(component["source"])
+    category = str(component["category"])
+    workload_id = component["workload_id"]
+    assumption_sha256 = component["assumption_sha256"]
+    if source == "declared_assumption":
+        if workload_id is not None or assumption_sha256 is None or category in {"bank_build", "cold_compile", "scan"}:
+            return None
+        return float(component["value"])
+    if model["value_unit"] != "seconds" or workload_id is None or assumption_sha256 is not None:
+        return None
+    workload = workload_by_id.get(str(workload_id))
+    if workload is None:
+        return None
+    candidate_side = component["side"] == "candidate"
+    if candidate_side != (workload["baseline_id"] is None):
+        return None
+    if source == "workload_median_seconds":
+        expected_phase = {"bank_build": "source_build", "cold_compile": "cold_compile"}.get(category)
+        if component["application"] != "fixed" or expected_phase is None or workload["phase"] != expected_phase:
+            return None
+        return float(workload["stats"]["median_seconds"])
+    if component["application"] != "per_unit" or category != "scan" or workload["phase"] != "direct_bank_scan":
+        return None
+    metric_by_source = {
+        "workload_seconds_per_document": ("document", "seconds_per_document"),
+        "workload_seconds_per_scan": ("scan", "median_seconds"),
+        "workload_seconds_per_mib": ("mib", "mib_per_second"),
+        "workload_seconds_per_record": ("record", "records_per_second"),
+    }
+    expected_unit, metric = metric_by_source[source]
+    if model["parameter_unit"] != expected_unit:
+        return None
+    metric_value = workload["stats"][metric]
+    if metric_value is None or metric_value <= 0:
+        return None
+    if source in {"workload_seconds_per_mib", "workload_seconds_per_record"}:
+        return 1.0 / float(metric_value)
+    if source == "workload_seconds_per_scan":
+        return float(metric_value) / int(workload["work_per_sample"])
+    return float(metric_value)
+
+
+def _scale_composition_matches_evaluated(
+    scale_bank: Mapping[str, Any], evaluated_bank: Mapping[str, Any], *, tolerance: float = 0.10
+) -> bool:
+    scale_taxonomy = {str(item["entity_class"]): item for item in scale_bank["composition"]["taxonomy"]}
+    evaluated_taxonomy = {str(item["entity_class"]): item for item in evaluated_bank["composition"]["taxonomy"]}
+    if set(scale_taxonomy) != set(evaluated_taxonomy):
+        return False
+
+    def share(item: Mapping[str, Any], field: str, total: int) -> float:
+        return float(item[field]) / total if total else 0.0
+
+    scale_aliases = sum(int(item["aliases"]) for item in scale_taxonomy.values())
+    evaluated_aliases = sum(int(item["aliases"]) for item in evaluated_taxonomy.values())
+    scale_regex = sum(int(item["regex_patterns"]) for item in scale_taxonomy.values())
+    evaluated_regex = sum(int(item["regex_patterns"]) for item in evaluated_taxonomy.values())
+    global_pairs = (
+        (scale_aliases / scale_bank["active_names"], evaluated_aliases / evaluated_bank["active_names"]),
+        (scale_regex / scale_bank["active_patterns"], evaluated_regex / evaluated_bank["active_patterns"]),
+        (
+            scale_bank["active_names"] / scale_bank["active_patterns"],
+            evaluated_bank["active_names"] / evaluated_bank["active_patterns"],
+        ),
+        (
+            scale_bank["active_entities"] / scale_bank["active_patterns"],
+            evaluated_bank["active_entities"] / evaluated_bank["active_patterns"],
+        ),
+    )
+    if any(abs(scale_value - evaluated_value) > tolerance for scale_value, evaluated_value in global_pairs):
+        return False
+    for entity_class, scale_item in scale_taxonomy.items():
+        evaluated_item = evaluated_taxonomy[entity_class]
+        proportions = (
+            (
+                share(scale_item, "entities", int(scale_bank["active_entities"])),
+                share(evaluated_item, "entities", int(evaluated_bank["active_entities"])),
+            ),
+            (
+                share(scale_item, "canonical_names", int(scale_bank["active_names"])),
+                share(evaluated_item, "canonical_names", int(evaluated_bank["active_names"])),
+            ),
+            (
+                share(scale_item, "aliases", int(scale_bank["active_names"])),
+                share(evaluated_item, "aliases", int(evaluated_bank["active_names"])),
+            ),
+            (
+                share(scale_item, "literal_patterns", int(scale_bank["active_patterns"])),
+                share(evaluated_item, "literal_patterns", int(evaluated_bank["active_patterns"])),
+            ),
+            (
+                share(scale_item, "regex_patterns", int(scale_bank["active_patterns"])),
+                share(evaluated_item, "regex_patterns", int(evaluated_bank["active_patterns"])),
+            ),
+        )
+        if any(abs(scale_value - evaluated_value) > tolerance for scale_value, evaluated_value in proportions):
+            return False
+    return True
+
+
+def _performance_promotion_diagnostics(
+    evidence: Mapping[str, Any],
+) -> tuple[list[Diagnostic], dict[str, tuple[str, Any | None]]]:
+    diagnostics: list[Diagnostic] = []
+    performance = evidence["performance"]
+    banks = performance["banks"]
+    inputs = {str(item["id"]): item for item in performance["inputs"]}
+    workloads = performance["workloads"]
+    evaluated_bank = next((item for item in banks if item["kind"] == "evaluated_bank"), None)
+    promotion_indices = [index for index, item in enumerate(workloads) if item["promotion_gate"]]
+    latency_indices = [index for index in promotion_indices if workloads[index]["sample_unit"] == "document"]
+    throughput_indices = [index for index in promotion_indices if workloads[index]["sample_unit"] == "whole_input"]
+    if len(latency_indices) != 1:
+        diagnostics.append(
+            _error(
+                "contract.performance_latency_headline_gate",
+                "/performance/workloads",
+                "Promotion requires exactly one per-document latency headline on the evaluated bank.",
+            )
+        )
+    if len(throughput_indices) != 1:
+        diagnostics.append(
+            _error(
+                "contract.performance_throughput_headline_gate",
+                "/performance/workloads",
+                "Promotion requires exactly one whole-input throughput headline on the evaluated bank.",
+            )
+        )
+    headline_indices = latency_indices + throughput_indices
+    for index in headline_indices:
+        item = workloads[index]
+        if (
+            evaluated_bank is None
+            or item["bank_id"] != evaluated_bank["id"]
+            or item["bank_hash"] != evaluated_bank["bank_hash"]
+            or item["phase"] != "direct_bank_scan"
+            or item["process_model"] != "reused_process"
+            or item["work_per_sample"] != 1
+            or inputs.get(str(item["input_id"]), {}).get("kind") != "real_input"
+            or item["baseline_id"] is not None
+            or not item["decision_grade"]
+            or item["warmups"] < MIN_DECISION_GRADE_WARMUPS
+            or item["stats"]["sample_count"] < MIN_DECISION_GRADE_SAMPLES
+            or item["peak_rss_bytes"] is None
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.invalid_performance_headline",
+                    f"/performance/workloads/{index}",
+                    "Headline performance must be a decision-grade direct scan of one real evaluated-bank input.",
+                )
+            )
+    if (
+        len(headline_indices) == 2
+        and workloads[headline_indices[0]]["input_id"] != workloads[headline_indices[1]]["input_id"]
+    ):
+        diagnostics.append(
+            _error(
+                "contract.performance_headline_input_mismatch",
+                "/performance/workloads",
+                "Latency and throughput headlines must measure the exact same content-addressed real input.",
+            )
+        )
+
+    decision_indices = [index for index, item in enumerate(workloads) if item["decision_grade"]]
+    required_gate_specs: dict[str, tuple[str, Any | None]] = {}
+    for index in decision_indices:
+        item = workloads[index]
+        path = f"/performance/workloads/{index}"
+        required_gate_specs.update(
+            {
+                f"{path}/stats/median_seconds": ("lte", None),
+                f"{path}/stats/p95_seconds": ("lte", None),
+                f"{path}/stats/p99_seconds": ("lte", None),
+                f"{path}/peak_rss_bytes": ("lte", None),
+            }
+        )
+        if item["sample_unit"] == "document":
+            required_gate_specs[f"{path}/stats/seconds_per_document"] = ("lte", None)
+        elif item["sample_unit"] == "whole_input":
+            required_gate_specs.update(
+                {
+                    f"{path}/stats/documents_per_second": ("gte", None),
+                    f"{path}/stats/mib_per_second": ("gte", None),
+                }
+            )
+
+    missing_phases = []
+    for phase in PERFORMANCE_PHASES:
+        phase_cells = [
+            item
+            for item in workloads
+            if item["decision_grade"]
+            and item["baseline_id"] is None
+            and evaluated_bank is not None
+            and item["bank_id"] == evaluated_bank["id"]
+            and item["bank_hash"] == evaluated_bank["bank_hash"]
+            and item["phase"] == phase
+        ]
+        if not phase_cells:
+            missing_phases.append(phase)
+    if missing_phases:
+        diagnostics.append(
+            _error(
+                "contract.missing_performance_phase",
+                "/performance/workloads",
+                "Promoted evaluated-bank evidence is missing a decision-grade lifecycle phase.",
+            )
+        )
+    scale_banks: dict[int, list[Mapping[str, Any]]] = {}
+    for item in banks:
+        if item["kind"] == "synthetic_scale":
+            scale_banks.setdefault(int(item["active_aliases"]), []).append(item)
+    for alias_count in PERFORMANCE_SCALE_ALIASES:
+        descriptors = scale_banks.get(alias_count, [])
+        if len(descriptors) != 1:
+            diagnostics.append(
+                _error(
+                    "contract.missing_scale_shape",
+                    "/performance/banks",
+                    "Promotion requires exactly one content-addressed bank for every required scale.",
+                )
+            )
+            continue
+        descriptor = descriptors[0]
+        if evaluated_bank is not None and not _scale_composition_matches_evaluated(descriptor, evaluated_bank):
+            diagnostics.append(
+                _error(
+                    "contract.unrealistic_scale_bank",
+                    "/performance/banks",
+                    "Synthetic scale composition must preserve the evaluated taxonomy and alias/regex proportions.",
+                )
+            )
+        cells = [
+            item
+            for item in workloads
+            if item["bank_id"] == descriptor["id"]
+            and item["bank_hash"] == descriptor["bank_hash"]
+            and item["phase"] == "direct_bank_scan"
+            and item["decision_grade"]
+            and item["baseline_id"] is None
+            and item["sample_unit"] == "whole_input"
+            and inputs.get(str(item["input_id"]), {}).get("kind") == "synthetic_input"
+        ]
+        if not cells:
+            diagnostics.append(
+                _error(
+                    "contract.missing_scale_decision_cell",
+                    "/performance/workloads",
+                    "Every required scale bank needs a direct decision-grade workload cell.",
+                )
+            )
+    candidate_inputs = {
+        str(item["input_id"])
+        for item in workloads
+        if item["decision_grade"]
+        and item["baseline_id"] is None
+        and item["phase"] == "direct_bank_scan"
+        and str(item["input_id"]) in inputs
+    }
+    hit_densities = {str(inputs[item_id]["hit_density"]) for item_id in candidate_inputs}
+    if not {"negative", "sparse", "normal", "dense"} <= hit_densities:
+        diagnostics.append(
+            _error(
+                "contract.missing_hit_density",
+                "/performance/inputs",
+                "Promoted workloads require negative, sparse, normal, and dense content-addressed inputs.",
+            )
+        )
+    size_cohorts = {str(inputs[item_id]["size_cohort"]) for item_id in candidate_inputs}
+    if not {"small", "medium", "large", "huge"} <= size_cohorts:
+        diagnostics.append(
+            _error(
+                "contract.missing_document_size_cohort",
+                "/performance/inputs",
+                "Promoted direct scans require small, medium, large, and huge document-size cohorts.",
+            )
+        )
+    concurrencies = {
+        int(item["concurrency"])
+        for item in workloads
+        if item["decision_grade"] and item["baseline_id"] is None and item["phase"] == "direct_bank_scan"
+    }
+    if 1 not in concurrencies or not any(value > 1 for value in concurrencies):
+        diagnostics.append(
+            _error(
+                "contract.missing_concurrency_shape",
+                "/performance/workloads",
+                "Promoted evidence requires both serial and concurrent NERB workloads.",
+            )
+        )
+    if any(value > evidence["environment"]["cpu_count"] for value in concurrencies):
+        diagnostics.append(
+            _error(
+                "contract.performance_concurrency_bounds",
+                "/performance/workloads",
+                "Decision-grade concurrency cannot exceed the recorded machine CPU count.",
+            )
+        )
+    workload_by_id = {str(item["id"]): item for item in workloads}
+    baseline_by_id = {str(item["id"]): item for item in performance["baselines"]}
+    comparisons = performance["comparisons"]
+    for index in decision_indices:
+        candidate = workloads[index]
+        required_metrics = {"p99_seconds"}
+        if candidate["sample_unit"] == "whole_input":
+            required_metrics.add("mib_per_second")
+        candidate_comparisons = [item for item in comparisons if item["candidate_workload_id"] == candidate["id"]]
+        observed_metrics = {str(item["metric"]) for item in candidate_comparisons}
+        baseline_cells = [workload_by_id.get(str(item["baseline_workload_id"])) for item in candidate_comparisons]
+        if (
+            not required_metrics <= observed_metrics
+            or any(item["result"] == "regressed" for item in candidate_comparisons)
+            or any(
+                cell is None
+                or cell["stats"]["sample_count"] < MIN_DECISION_GRADE_SAMPLES
+                or cell["baseline_id"] not in baseline_by_id
+                or baseline_by_id[str(cell["baseline_id"])]["semantic_equivalence"] != "exact"
+                for cell in baseline_cells
+            )
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.performance_regression_coverage",
+                    f"/performance/workloads/{index}",
+                    "Every decision cell requires supported non-regressed same-machine exact-baseline comparisons.",
+                )
+            )
+
+    value_models = performance["breakeven_models"]
+    required_component_roles = {
+        ("candidate", "fixed", "source_curation"),
+        ("candidate", "fixed", "bank_build"),
+        ("candidate", "fixed", "cold_compile"),
+        ("candidate", "per_unit", "scan"),
+        ("baseline", "per_unit", "scan"),
+    }
+    acceptable_value_model = False
+    decision_workload_ids = {str(workloads[index]["id"]) for index in decision_indices}
+    for model in value_models:
+        components_by_role: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+        for component in model["components"]:
+            role = (str(component["side"]), str(component["application"]), str(component["category"]))
+            components_by_role.setdefault(role, []).append(component)
+        required_components = {role: components_by_role.get(role, []) for role in required_component_roles}
+        if any(len(items) != 1 for items in required_components.values()):
+            continue
+        curation = required_components[("candidate", "fixed", "source_curation")][0]
+        bank_build = required_components[("candidate", "fixed", "bank_build")][0]
+        cold_compile = required_components[("candidate", "fixed", "cold_compile")][0]
+        candidate_scan = required_components[("candidate", "per_unit", "scan")][0]
+        baseline_scan = required_components[("baseline", "per_unit", "scan")][0]
+        bank_build_workload = workload_by_id.get(str(bank_build["workload_id"]))
+        cold_compile_workload = workload_by_id.get(str(cold_compile["workload_id"]))
+        candidate_scan_workload = workload_by_id.get(str(candidate_scan["workload_id"]))
+        baseline_scan_workload = workload_by_id.get(str(baseline_scan["workload_id"]))
+        scan_pair_fields = (
+            "bank_id",
+            "bank_hash",
+            "input_id",
+            "input_sha256",
+            "sample_unit",
+            "work_per_sample",
+            "concurrency",
+        )
+        has_scan_pair_comparison = (
+            candidate_scan_workload is not None
+            and baseline_scan_workload is not None
+            and any(
+                item["candidate_workload_id"] == candidate_scan_workload["id"]
+                and item["baseline_workload_id"] == baseline_scan_workload["id"]
+                and item["metric"] == "p99_seconds"
+                and item["result"] != "regressed"
+                for item in comparisons
+            )
+        )
+        if (
+            model["parameter_unit"] == "document"
+            and model["value_unit"] == "seconds"
+            and curation["source"] == "declared_assumption"
+            and curation["value"] > 0
+            and bank_build_workload is not None
+            and str(bank_build_workload["id"]) in decision_workload_ids
+            and bank_build_workload["phase"] == "source_build"
+            and cold_compile_workload is not None
+            and str(cold_compile_workload["id"]) in decision_workload_ids
+            and cold_compile_workload["phase"] == "cold_compile"
+            and candidate_scan_workload is not None
+            and str(candidate_scan_workload["id"]) in decision_workload_ids
+            and candidate_scan_workload["phase"] == "direct_bank_scan"
+            and candidate_scan_workload["sample_unit"] == "document"
+            and candidate_scan["source"] == "workload_seconds_per_document"
+            and baseline_scan_workload is not None
+            and baseline_scan_workload["phase"] == "direct_bank_scan"
+            and all(candidate_scan_workload[field] == baseline_scan_workload[field] for field in scan_pair_fields)
+            and baseline_scan_workload["baseline_id"] in baseline_by_id
+            and baseline_by_id[str(baseline_scan_workload["baseline_id"])]["semantic_equivalence"] == "exact"
+            and baseline_scan["source"] == "workload_seconds_per_document"
+            and has_scan_pair_comparison
+            and model["result"] in {"candidate_already_better", "finite_breakeven"}
+        ):
+            acceptable_value_model = True
+            break
+    if not acceptable_value_model:
+        diagnostics.append(
+            _error(
+                "contract.missing_breakeven_value_model",
+                "/performance/breakeven_models",
+                "Promotion requires a finite additive document-value model separating curation, build, compile, "
+                "and scan.",
+            )
+        )
+    return diagnostics, required_gate_specs
 
 
 def _gate_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
@@ -2007,151 +4211,55 @@ def _gate_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
     return diagnostics
 
 
-def _promotion_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
+def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any] | None) -> list[Diagnostic]:
     promotion = evidence["promotion"]
-    diagnostics = _claim_diagnostics(evidence)
-    if not promotion["passed"]:
-        return diagnostics
+    diagnostics: list[Diagnostic] = []
+    current_version = evidence["test_access"]["benchmark_version"]
+    lineage = evidence["test_access"]["lineage"]
+    current_lineage_passed = (
+        evidence["test_access"]["current_version_access_count"] == 1
+        and bool(lineage)
+        and lineage[-1]["benchmark_version"] == current_version
+        and lineage[-1]["outcome"] == "passed"
+    )
+    manifest_bound = (
+        manifest is not None
+        and validate_enron_manifest(manifest)["valid"]
+        and evidence["manifest_sha256"] == hash_enron_manifest(manifest)
+    )
     requirements = {
         "quality evaluated": evidence["quality"]["evaluated"],
+        "catalog conformance evaluated": evidence["catalog_conformance"]["evaluated"],
         "catalog conformance passed": evidence["catalog_conformance"]["passed"],
         "performance evaluated": evidence["performance"]["evaluated"],
         "privacy passed": evidence["privacy"]["status"] == "passed",
-        "verifier passed": evidence["verifier"]["passed"],
         "all declared checks passed": all(item["passed"] for item in promotion["checks"]),
         "clean git state": evidence["software"]["git_dirty"] is False,
         "one-shot final test": evidence["test_access"]["current_version_access_count"] == 1,
+        "matching passed current lineage": current_lineage_passed,
         "real benchmark artifact": evidence["artifact_kind"] == "real_benchmark",
-        "structured claims": bool(promotion["claims"]),
+        "exact valid manifest binding": manifest_bound,
     }
-    for name, passed in requirements.items():
+    for passed in requirements.values():
         if not passed:
             diagnostics.append(
-                _error("contract.promotion_prerequisite", "/promotion/passed", f"Promotion requires {name}.")
+                _error(
+                    "contract.decision_grade_prerequisite",
+                    "/verifier/passed" if evidence["verifier"]["passed"] else "/promotion/passed",
+                    "A required decision-grade verification prerequisite is missing or false.",
+                )
             )
-    quality_gate_indices = [index for index, item in enumerate(evidence["quality"]["slices"]) if item["promotion_gate"]]
-    if not quality_gate_indices:
-        diagnostics.append(
-            _error(
-                "contract.missing_quality_gate",
-                "/quality/slices",
-                "Promotion requires an independent exhaustive final-test quality gate slice.",
-            )
-        )
     required_gate_specs: dict[str, tuple[str, Any | None]] = {
         "/catalog_conformance/passed": ("eq", True),
         "/privacy/status": ("eq", "passed"),
         "/software/git_dirty": ("eq", False),
     }
-    quality_metric_fields = (
-        "open_world_recall",
-        "catalog_coverage",
-        "cataloged_recall",
-        "document_leak_rate",
-        "sensitive_character_recall",
-        "sensitive_character_leak_rate",
-        "negative_document_false_alarm_rate",
-        "over_redaction_rate",
-    )
-    for index in quality_gate_indices:
-        item = evidence["quality"]["slices"][index]
-        if (
-            item["gold_spans"] <= 0
-            or item["cataloged_gold_spans"] <= 0
-            or item["cataloged_false_negative"] != 0
-            or item["cataloged_wrong_canonical"] != 0
-            or item["documents_with_any_cataloged_miss"] != 0
-        ):
-            diagnostics.append(
-                _error(
-                    "contract.natural_catalog_gate",
-                    f"/quality/slices/{index}",
-                    "Promoted slices require nonzero gold plus zero cataloged misses and wrong mappings.",
-                )
-            )
-        for field in (
-            "cataloged_false_negative",
-            "cataloged_wrong_canonical",
-            "documents_with_any_cataloged_miss",
-        ):
-            required_gate_specs[f"/quality/slices/{index}/{field}"] = ("eq", 0)
-        for field in quality_metric_fields:
-            operator = (
-                "gte"
-                if field in {"open_world_recall", "catalog_coverage", "cataloged_recall", "sensitive_character_recall"}
-                else "lte"
-            )
-            required_gate_specs[f"/quality/slices/{index}/metrics/{field}"] = (operator, None)
-    performance_gate_indices = [
-        index for index, item in enumerate(evidence["performance"]["workloads"]) if item["promotion_gate"]
-    ]
-    workload_phases = {str(item["phase"]) for item in evidence["performance"]["workloads"]}
-    missing_phases = sorted(set(PERFORMANCE_PHASES) - workload_phases)
-    if missing_phases:
-        diagnostics.append(
-            _error(
-                "contract.missing_performance_phase",
-                "/performance/workloads",
-                "Promoted evidence is missing performance phases: " + ", ".join(missing_phases),
-            )
-        )
-    scale_shapes = {
-        int(item["active_patterns"]) for item in evidence["performance"]["banks"] if item["kind"] == "synthetic_scale"
-    }
-    required_scale_shapes = {1_000, 10_000, 25_000, 100_000}
-    if not required_scale_shapes <= scale_shapes:
-        diagnostics.append(
-            _error(
-                "contract.missing_scale_shape",
-                "/performance/banks",
-                "Promoted evidence requires 1k, 10k, 25k, and 100k synthetic scale-bank descriptors.",
-            )
-        )
-    hit_densities = {str(item["hit_density"]) for item in evidence["performance"]["workloads"]}
-    if not {"negative", "sparse", "normal", "dense"} <= hit_densities:
-        diagnostics.append(
-            _error(
-                "contract.missing_hit_density",
-                "/performance/workloads",
-                "Promoted evidence requires negative, sparse, normal, and dense hit-density workloads.",
-            )
-        )
-    concurrencies = {int(item["concurrency"]) for item in evidence["performance"]["workloads"]}
-    if 1 not in concurrencies or not any(value > 1 for value in concurrencies):
-        diagnostics.append(
-            _error(
-                "contract.missing_concurrency_shape",
-                "/performance/workloads",
-                "Promoted evidence requires both serial and concurrent workloads.",
-            )
-        )
-    if not performance_gate_indices:
-        diagnostics.append(
-            _error(
-                "contract.missing_performance_gate",
-                "/performance/workloads",
-                "Promotion requires a decision-grade direct reused-Bank performance workload.",
-            )
-        )
-    for index in performance_gate_indices:
-        item = evidence["performance"]["workloads"][index]
-        if item["peak_rss_bytes"] is None:
-            diagnostics.append(
-                _error(
-                    "contract.missing_peak_rss",
-                    f"/performance/workloads/{index}/peak_rss_bytes",
-                    "Promoted performance workloads require peak RSS evidence.",
-                )
-            )
-        required_gate_specs.update(
-            {
-                f"/performance/workloads/{index}/stats/median_seconds": ("lte", None),
-                f"/performance/workloads/{index}/stats/p95_seconds": ("lte", None),
-                f"/performance/workloads/{index}/stats/p99_seconds": ("lte", None),
-                f"/performance/workloads/{index}/stats/mib_per_second": ("gte", None),
-                f"/performance/workloads/{index}/peak_rss_bytes": ("lte", None),
-            }
-        )
+    quality_diagnostics, quality_gate_specs = _quality_decision_grade_diagnostics(evidence, manifest)
+    diagnostics.extend(quality_diagnostics)
+    required_gate_specs.update(quality_gate_specs)
+    performance_diagnostics, performance_gate_specs = _performance_promotion_diagnostics(evidence)
+    diagnostics.extend(performance_diagnostics)
+    required_gate_specs.update(performance_gate_specs)
     checks_by_target = {str(item["target"]): item for item in promotion["checks"]}
     missing_targets = sorted(set(required_gate_specs) - set(checks_by_target))
     if missing_targets:
@@ -2159,7 +4267,7 @@ def _promotion_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
             _error(
                 "contract.missing_required_gate",
                 "/promotion/checks",
-                "Missing required promotion gate targets: " + ", ".join(missing_targets),
+                "Required promotion gate targets are missing.",
             )
         )
     for target, (operator, exact_threshold) in required_gate_specs.items():
@@ -2173,17 +4281,117 @@ def _promotion_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 _error(
                     "contract.required_gate_semantics",
                     "/promotion/checks",
-                    f"Required gate {target} must use {operator} with its mandated threshold semantics.",
+                    "Required gate does not use its mandated operator and threshold semantics.",
                 )
             )
-    claim_metrics = {str(item["metric"]) for item in promotion["claims"]}
-    required_claim_metrics = {
-        "catalog_conformance_recall",
+        threshold = check["threshold"]
+        if "/quality/slices/" in target and "/metrics/" in target:
+            valid_unit_threshold = (
+                isinstance(threshold, (int, float))
+                and not isinstance(threshold, bool)
+                and (
+                    (operator == "gte" and 0 < float(threshold) <= 1)
+                    or (operator == "lte" and 0 <= float(threshold) < 1)
+                )
+            )
+            if not valid_unit_threshold:
+                diagnostics.append(
+                    _error(
+                        "contract.vacuous_quality_threshold",
+                        "/promotion/checks",
+                        "Decision-grade quality thresholds must be non-vacuous values inside the unit interval.",
+                    )
+                )
+            elif isinstance(threshold, (int, float)) and not isinstance(threshold, bool):
+                metric = target.rsplit("/", 1)[-1]
+                policy_floor = MIN_QUALITY_THRESHOLDS.get(metric)
+                policy_ceiling = MAX_QUALITY_THRESHOLDS.get(metric)
+                if (policy_floor is not None and float(threshold) < policy_floor) or (
+                    policy_ceiling is not None and float(threshold) > policy_ceiling
+                ):
+                    diagnostics.append(
+                        _error(
+                            "contract.quality_threshold_policy",
+                            "/promotion/checks",
+                            "Privacy thresholds may tighten but cannot weaken the benchmark-v2 policy bounds.",
+                        )
+                    )
+        elif target.startswith("/performance/workloads/") and exact_threshold is None:
+            if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or float(threshold) <= 0:
+                diagnostics.append(
+                    _error(
+                        "contract.vacuous_performance_threshold",
+                        "/promotion/checks",
+                        "Decision-grade performance thresholds must be strictly positive.",
+                    )
+                )
+    return diagnostics
+
+
+def _promotion_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
+    promotion = evidence["promotion"]
+    diagnostics = _claim_diagnostics(evidence)
+    if promotion["claims"] and not evidence["verifier"]["passed"]:
+        diagnostics.append(
+            _error(
+                "contract.unverified_claims",
+                "/promotion/claims",
+                "Public structured claims require a passed decision-grade verifier result.",
+            )
+        )
+    if not promotion["passed"]:
+        return diagnostics
+    if not evidence["verifier"]["passed"]:
+        diagnostics.append(
+            _error(
+                "contract.promotion_prerequisite",
+                "/promotion/passed",
+                "Promotion requires an independently passed verifier result.",
+            )
+        )
+    if not promotion["claims"]:
+        diagnostics.append(
+            _error(
+                "contract.promotion_prerequisite",
+                "/promotion/claims",
+                "Promotion requires structured claims bound to exact decision-grade support.",
+            )
+        )
+    claims = promotion["claims"]
+    quality_claim_metrics = {
+        "precision",
         "open_world_recall",
-        "direct_bank_scan_p99_seconds",
-        "direct_bank_scan_mib_per_second",
+        "f1",
+        "catalog_coverage",
+        "cataloged_recall",
+        "document_leak_rate",
+        "cataloged_document_leak_rate",
+        "sensitive_character_recall",
+        "sensitive_character_leak_rate",
+        "negative_document_false_alarm_rate",
+        "over_redaction_rate",
     }
-    if not required_claim_metrics <= claim_metrics:
+    missing_quality_support = any(
+        not quality_claim_metrics
+        <= {str(claim["metric"]) for claim in claims if claim["quality_slice_id"] == item["id"]}
+        for item in evidence["quality"]["slices"]
+        if item["promotion_gate"]
+    )
+    workload_by_id = {str(item["id"]): item for item in evidence["performance"]["workloads"]}
+    has_document_tail = any(
+        claim["metric"] == "direct_bank_scan_p99_seconds"
+        and claim["performance_workload_id"] in workload_by_id
+        and workload_by_id[str(claim["performance_workload_id"])]["sample_unit"] == "document"
+        for claim in claims
+    )
+    has_whole_input_throughput = any(
+        claim["metric"] == "direct_bank_scan_mib_per_second"
+        and claim["performance_workload_id"] in workload_by_id
+        and workload_by_id[str(claim["performance_workload_id"])]["sample_unit"] == "whole_input"
+        for claim in claims
+    )
+    has_catalog_claim = any(claim["metric"] == "catalog_conformance_recall" for claim in claims)
+    if missing_quality_support or not has_document_tail or not has_whole_input_throughput or not has_catalog_claim:
         diagnostics.append(
             _error(
                 "contract.missing_required_claim",
@@ -2194,13 +4402,134 @@ def _promotion_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
     return diagnostics
 
 
+def _quality_decision_grade_diagnostics(
+    evidence: Mapping[str, Any], manifest: Mapping[str, Any] | None
+) -> tuple[list[Diagnostic], dict[str, tuple[str, Any | None]]]:
+    diagnostics: list[Diagnostic] = []
+    required_gate_specs: dict[str, tuple[str, Any | None]] = {}
+    slices = evidence["quality"]["slices"]
+    gate_indices = [index for index, item in enumerate(slices) if item["promotion_gate"]]
+    if not gate_indices:
+        diagnostics.append(
+            _error(
+                "contract.missing_quality_gate",
+                "/quality/slices",
+                "Decision-grade evidence requires an independent exhaustive final-test quality gate slice.",
+            )
+        )
+    manifest_valid = manifest is not None and validate_enron_manifest(manifest)["valid"]
+    primary_view: Mapping[str, Any] | None = None
+    if manifest_valid and manifest is not None:
+        bound_primary_view: Mapping[str, Any] = next(
+            item for item in manifest["preparation"]["text_views"] if item["primary_for_quality"]
+        )
+        primary_view = bound_primary_view
+        planned_gate_ids = {str(item["id"]) for item in manifest["quality_plan"] if item["promotion_gate"]}
+        observed_gate_ids = {str(slices[index]["id"]) for index in gate_indices}
+        if observed_gate_ids != planned_gate_ids:
+            diagnostics.append(
+                _error(
+                    "contract.quality_gate_plan_set",
+                    "/quality/slices",
+                    "Decision-grade evidence must evaluate every and only frozen quality-plan gate descriptor.",
+                )
+            )
+        if bound_primary_view["answer_bearing_fields_included"]:
+            diagnostics.append(
+                _error(
+                    "contract.answer_bearing_quality_view",
+                    "/preparation/text_views",
+                    "The primary promoted quality view must attest that answer-bearing fields were excluded.",
+                )
+            )
+    quality_metric_fields = (
+        "open_world_recall",
+        "catalog_coverage",
+        "cataloged_recall",
+        "document_leak_rate",
+        "sensitive_character_recall",
+        "sensitive_character_leak_rate",
+        "negative_document_false_alarm_rate",
+        "over_redaction_rate",
+    )
+    for index in gate_indices:
+        item = slices[index]
+        path = f"/quality/slices/{index}"
+        if (
+            item["label_strength"] != "independent"
+            or item["annotation_completeness"] != "exhaustive_within_scope"
+            or item["split_role"] != "test"
+            or item["cohort"] != "all"
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.invalid_quality_gate",
+                    f"{path}/promotion_gate",
+                    "Decision-grade quality must use the all-document independent exhaustive final-test cohort.",
+                )
+            )
+        if primary_view is not None and item["text_view"] != primary_view["id"]:
+            diagnostics.append(
+                _error(
+                    "contract.quality_gate_primary_view",
+                    f"{path}/text_view",
+                    "Decision-grade quality must use the manifest's exact primary prepared natural-content view.",
+                )
+            )
+        if (
+            manifest_valid
+            and manifest is not None
+            and item["documents"] != manifest["splits"]["roles"]["test"]["records"]
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.quality_gate_split_population",
+                    f"{path}/documents",
+                    "Decision-grade quality must aggregate the entire bound final-test split artifact.",
+                )
+            )
+        if (
+            item["gold_spans"] <= 0
+            or item["cataloged_gold_spans"] <= 0
+            or item["negative_documents"] <= 0
+            or item["evaluated_characters"] <= 0
+            or item["cataloged_false_negative"] != 0
+            or item["cataloged_wrong_canonical"] != 0
+            or item["documents_with_any_cataloged_miss"] != 0
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.natural_catalog_gate",
+                    path,
+                    "Decision-grade slices require positive gold/negative support plus zero cataloged misses and "
+                    "wrong mappings.",
+                )
+            )
+        for field in (
+            "cataloged_false_negative",
+            "cataloged_wrong_canonical",
+            "documents_with_any_cataloged_miss",
+        ):
+            required_gate_specs[f"{path}/{field}"] = ("eq", 0)
+        for field in quality_metric_fields:
+            operator = (
+                "gte"
+                if field in {"open_world_recall", "catalog_coverage", "cataloged_recall", "sensitive_character_recall"}
+                else "lte"
+            )
+            required_gate_specs[f"{path}/metrics/{field}"] = (operator, None)
+    return diagnostics, required_gate_specs
+
+
 def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
     claims = evidence["promotion"]["claims"]
     diagnostics = _duplicate_id_diagnostics(claims, "/promotion/claims", "claim")
+    decision_grade = evidence["promotion"]["passed"] or evidence["verifier"]["passed"]
     slices = {str(item["id"]): item for item in evidence["quality"]["slices"]}
     workloads = {str(item["id"]): item for item in evidence["performance"]["workloads"]}
     expected_environment_hash = hash_enron_environment(evidence["environment"])
     common_expected = {
+        "benchmark_version": evidence["test_access"]["benchmark_version"],
         "source_revision": evidence["source"]["revision"],
         "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
         "environment_sha256": expected_environment_hash,
@@ -2209,7 +4538,10 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
         "precision",
         "open_world_recall",
         "f1",
+        "catalog_coverage",
+        "cataloged_recall",
         "document_leak_rate",
+        "cataloged_document_leak_rate",
         "sensitive_character_recall",
         "sensitive_character_leak_rate",
         "negative_document_false_alarm_rate",
@@ -2220,6 +4552,18 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
         "direct_bank_scan_p95_seconds": "p95_seconds",
         "direct_bank_scan_p99_seconds": "p99_seconds",
         "direct_bank_scan_mib_per_second": "mib_per_second",
+        "direct_bank_scan_records_per_second": "records_per_second",
+        "direct_bank_scan_seconds_per_document": "seconds_per_document",
+    }
+    document_metrics = {
+        "direct_bank_scan_median_seconds",
+        "direct_bank_scan_p95_seconds",
+        "direct_bank_scan_p99_seconds",
+        "direct_bank_scan_seconds_per_document",
+    }
+    throughput_metrics = {
+        "direct_bank_scan_mib_per_second",
+        "direct_bank_scan_records_per_second",
     }
     null_scope = {"entity_class": None, "cohort": None, "split_role": None, "text_view": None}
     for index, claim in enumerate(claims):
@@ -2243,6 +4587,7 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 and claim["annotation_completeness"] == "exhaustive_within_scope"
                 and claim["bank_hash"] == evidence["bank"]["canonical_hash"]
                 and _same_metric(claim["value"], evidence["catalog_conformance"]["recall"])
+                and (not decision_grade or evidence["catalog_conformance"]["passed"])
             )
         elif claim["kind"] == "open_world_quality":
             item = slices.get(str(claim["quality_slice_id"]))
@@ -2269,6 +4614,7 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 and claim["bank_hash"] == evidence["bank"]["canonical_hash"]
                 and expected_value is not None
                 and _same_metric(claim["value"], expected_value)
+                and (not decision_grade or item["promotion_gate"])
             )
         else:
             workload = workloads.get(str(claim["performance_workload_id"]))
@@ -2285,6 +4631,18 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 and claim["bank_hash"] == workload["bank_hash"]
                 and expected_value is not None
                 and _same_metric(claim["value"], expected_value)
+                and (
+                    (claim["metric"] in document_metrics and workload["sample_unit"] == "document")
+                    or (claim["metric"] in throughput_metrics and workload["sample_unit"] == "whole_input")
+                )
+                and (
+                    not decision_grade
+                    or (
+                        workload["promotion_gate"]
+                        and workload["decision_grade"]
+                        and workload["bank_hash"] == evidence["bank"]["canonical_hash"]
+                    )
+                )
             )
         if not valid:
             diagnostics.append(
@@ -2314,7 +4672,7 @@ def _binding_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any
                 _error(
                     "contract.provenance_mismatch",
                     f"/{field}",
-                    f"Evidence {field} differs from the supplied manifest.",
+                    "Evidence field differs from the supplied manifest.",
                 )
             )
     for field in (
@@ -2325,13 +4683,16 @@ def _binding_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any
         "splits",
         "bank",
         "software",
+        "commands",
         "environment",
         "privacy",
     ):
         if evidence[field] != manifest[field]:
             diagnostics.append(
                 _error(
-                    "contract.provenance_mismatch", f"/{field}", f"Evidence {field} differs from the supplied manifest."
+                    "contract.provenance_mismatch",
+                    f"/{field}",
+                    "Evidence field differs from the supplied manifest.",
                 )
             )
     evidence_verifier = {field: evidence["verifier"][field] for field in ("id", "version", "source_sha256")}
@@ -2388,24 +4749,34 @@ def _command_diagnostics(commands: Sequence[Mapping[str, Any]], path: str) -> li
 
 
 def _contains_unsafe_command_path(value: str) -> bool:
-    candidates = [value]
-    if "=" in value:
-        candidates.append(value.split("=", 1)[1])
+    candidates = [value, *re.split(r"[\s=]+", value)]
     for candidate in candidates:
+        candidate = candidate.strip().strip("\"'")
         lowered = candidate.lower()
         if lowered.startswith(("file://", "~/", "~\\")):
             return True
-        if PurePosixPath(candidate).is_absolute() or PureWindowsPath(candidate).is_absolute():
+        if _WINDOWS_LOCAL_PATH_PATTERN.search(candidate):
             return True
-        if ".." in PurePosixPath(candidate).parts or ".." in PureWindowsPath(candidate).parts:
+        windows_path = PureWindowsPath(candidate)
+        if PurePosixPath(candidate).is_absolute() or windows_path.drive or windows_path.root:
+            return True
+        if ".." in PurePosixPath(candidate).parts or ".." in windows_path.parts:
             return True
     return False
 
 
-_EMAIL_PATTERN = re.compile(r"(?i)(?<![\w.+-])[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}(?![\w.-])")
+_EMAIL_PATTERN = re.compile(
+    r"(?i)(?<![\w.+-])[a-z0-9](?:[a-z0-9._%+-]{0,62}[a-z0-9])?@"
+    r"[a-z0-9](?:[a-z0-9.-]{0,252}[a-z0-9])?(?![\w.-])"
+)
 _PRIVATE_PATH_PATTERN = re.compile(
     r"(?i)(?:file://|/(?:users|home|private|var/folders)/[^\s\"']+|[a-z]:\\users\\[^\s\"']+|\\\\[^\s\"']+)"
 )
+_WINDOWS_LOCAL_PATH_PATTERN = re.compile(
+    r"(?i)(?:(?<![a-z0-9_])[a-z]:(?:[\\/][^\s\"']*|[^\s\"']*)|\\\\[^\s\"']+|"
+    r"(?<![\\a-z0-9_])\\[a-z0-9_.-][^\s\"']*)"
+)
+_EMBEDDED_POSIX_PATH_PATTERN = re.compile(r"(?:^|[\s=])/(?!/)[^\s\"']+")
 
 
 def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:
@@ -2419,7 +4790,15 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
                     "Public contract serialization contains an email-address-shaped direct identifier.",
                 )
             )
-        if _PRIVATE_PATH_PATTERN.search(text):
+        is_gate_pointer = bool(re.fullmatch(r"/promotion/checks/\d+/target", path))
+        is_posix_absolute = PurePosixPath(text).is_absolute() and not is_gate_pointer
+        has_embedded_posix_path = bool(_EMBEDDED_POSIX_PATH_PATTERN.search(text)) and not is_gate_pointer
+        if (
+            is_posix_absolute
+            or has_embedded_posix_path
+            or _PRIVATE_PATH_PATTERN.search(text)
+            or _WINDOWS_LOCAL_PATH_PATTERN.search(text)
+        ):
             diagnostics.append(
                 _error(
                     "contract.public_private_path",
@@ -2430,19 +4809,51 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
     return diagnostics
 
 
+def _placeholder_hash_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:
+    return [
+        _error(
+            "contract.placeholder_content_hash",
+            path,
+            "Real benchmark artifacts cannot use an all-zero content hash.",
+        )
+        for path, text in _iter_strings(value)
+        if text == ZERO_SHA256
+    ]
+
+
 def _iter_strings(value: Any, path: str = "") -> Iterable[tuple[str, str]]:
-    if isinstance(value, str):
-        yield path, value
-    elif isinstance(value, Mapping):
-        for key, item in value.items():
-            escaped = str(key).replace("~", "~0").replace("/", "~1")
-            yield from _iter_strings(item, f"{path}/{escaped}")
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            yield from _iter_strings(item, f"{path}/{index}")
+    stack: list[tuple[Any, str, int]] = [(value, path, 0)]
+    containers: set[int] = set()
+    while stack:
+        item, item_path, depth = stack.pop()
+        if depth > MAX_CONTRACT_DEPTH:
+            raise RecursionError
+        if isinstance(item, str):
+            yield item_path, item
+        elif type(item) is dict:
+            if id(item) in containers:
+                raise RecursionError
+            containers.add(id(item))
+            children = []
+            for key, child in item.items():
+                escaped = key.replace("~", "~0").replace("/", "~1")
+                children.append((child, f"{item_path}/{escaped}", depth + 1))
+            stack.extend(reversed(children))
+        elif type(item) is list:
+            if id(item) in containers:
+                raise RecursionError
+            containers.add(id(item))
+            stack.extend((child, f"{item_path}/{index}", depth + 1) for index, child in reversed(list(enumerate(item))))
 
 
 def _normalize_samples(samples: Sequence[Any]) -> list[float] | None:
+    if not isinstance(samples, (list, tuple)):
+        return None
+    try:
+        if len(samples) > MAX_COLLECTION_ITEMS:
+            return None
+    except (OverflowError, TypeError):
+        return None
     normalized: list[float] = []
     for value in samples:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -2457,19 +4868,174 @@ def _normalize_samples(samples: Sequence[Any]) -> list[float] | None:
     return normalized
 
 
-def _sample_statistics(samples: Sequence[float], documents: int, byte_count: int) -> dict[str, float | int | None]:
+def _normalize_performance_inventory(
+    inventory: Sequence[Mapping[str, Any]],
+) -> list[dict[str, int]] | None:
+    if not isinstance(inventory, (list, tuple)):
+        return None
+    try:
+        if len(inventory) > MAX_COLLECTION_ITEMS:
+            return None
+    except (OverflowError, TypeError):
+        return None
+    normalized: list[dict[str, int]] = []
+    for row in inventory:
+        if not isinstance(row, Mapping) or set(row) != {"bytes", "records"}:
+            return None
+        byte_count = row["bytes"]
+        record_count = row["records"]
+        if (
+            isinstance(byte_count, bool)
+            or not isinstance(byte_count, int)
+            or isinstance(record_count, bool)
+            or not isinstance(record_count, int)
+            or not 0 <= byte_count <= MAX_SAFE_INTEGER
+            or not 0 <= record_count <= MAX_SAFE_INTEGER
+        ):
+            return None
+        normalized.append({"bytes": byte_count, "records": record_count})
+    return normalized or None
+
+
+def _performance_inventory_summary(inventory: Sequence[Mapping[str, int]]) -> dict[str, Any]:
+    byte_counts = sorted(int(row["bytes"]) for row in inventory)
+    record_counts = sorted(int(row["records"]) for row in inventory)
+    documents = len(inventory)
+    byte_count = sum(byte_counts)
+    records = sum(record_counts)
+    return {
+        "documents": documents,
+        "bytes": byte_count,
+        "records": records,
+        "hit_density": _classify_hit_density(records, documents),
+        "size_cohort": _classify_size_cohort(byte_count, documents),
+        "document_length_distribution": {
+            "minimum_bytes": byte_counts[0],
+            "p50_bytes": _integer_nearest_rank(byte_counts, 0.50),
+            "p95_bytes": _integer_nearest_rank(byte_counts, 0.95),
+            "p99_bytes": _integer_nearest_rank(byte_counts, 0.99),
+            "maximum_bytes": byte_counts[-1],
+            "mean_bytes": byte_count / documents,
+        },
+        "hit_distribution": {
+            "negative_documents": sum(value == 0 for value in record_counts),
+            "documents_with_records": sum(value > 0 for value in record_counts),
+            "minimum_records": record_counts[0],
+            "p50_records": _integer_nearest_rank(record_counts, 0.50),
+            "p95_records": _integer_nearest_rank(record_counts, 0.95),
+            "p99_records": _integer_nearest_rank(record_counts, 0.99),
+            "maximum_records": record_counts[-1],
+            "mean_records": records / documents,
+        },
+    }
+
+
+def _classify_hit_density(records: int, documents: int) -> str:
+    records_per_document = records / documents
+    if records == 0:
+        return "negative"
+    if records_per_document < 0.1:
+        return "sparse"
+    if records_per_document <= 2:
+        return "normal"
+    return "dense"
+
+
+def _classify_size_cohort(byte_count: int, documents: int) -> str:
+    mean_bytes = byte_count / documents
+    if mean_bytes < 1_024:
+        return "small"
+    if mean_bytes < 16 * 1_024:
+        return "medium"
+    if mean_bytes < 256 * 1_024:
+        return "large"
+    return "huge"
+
+
+def _integer_nearest_rank(values: Sequence[int], probability: float) -> int:
+    index = max(0, math.ceil(probability * len(values)) - 1)
+    return values[index]
+
+
+def _sample_statistics(
+    samples: Sequence[float],
+    input_descriptor: Mapping[str, Any] | None,
+    sample_unit: str,
+    work_per_sample: int,
+) -> dict[str, float | int | None]:
     ordered = sorted(float(item) for item in samples)
     median_seconds = float(median(ordered))
     deviations = [abs(item - median_seconds) for item in ordered]
+    documents_per_sample: float | int | None
+    documents_per_second: float | None
+    mib_per_second: float | None
+    records_per_second: float | None
+    if sample_unit == "operation":
+        documents_per_sample = None
+        documents_per_second = None
+        mib_per_second = None
+        records_per_second = None
+    elif sample_unit == "whole_input" and input_descriptor is not None:
+        whole_input_documents = int(input_descriptor["documents"]) * work_per_sample
+        documents_per_sample = whole_input_documents
+        bytes_per_sample = input_descriptor["bytes"] * work_per_sample
+        records_per_sample = input_descriptor["records"] * work_per_sample
+        documents_per_second = whole_input_documents / median_seconds
+        mib_per_second = bytes_per_sample / (1024 * 1024) / median_seconds
+        records_per_second = records_per_sample / median_seconds
+    elif input_descriptor is not None:
+        documents_per_sample = work_per_sample
+        documents_per_second = None
+        mib_per_second = None
+        records_per_second = None
+    else:
+        raise ValueError("Scan performance statistics require a bound input descriptor.")
     return {
         "sample_count": len(ordered),
         "median_seconds": median_seconds,
         "p95_seconds": _nearest_rank(ordered, 0.95) if len(ordered) >= 20 else None,
         "p99_seconds": _nearest_rank(ordered, 0.99) if len(ordered) >= 100 else None,
         "mad_seconds": float(median(deviations)),
-        "documents_per_second": documents / median_seconds,
-        "mib_per_second": byte_count / (1024 * 1024) / median_seconds,
+        "documents_per_second": documents_per_second,
+        "mib_per_second": mib_per_second,
+        "records_per_second": records_per_second,
+        "seconds_per_document": (None if documents_per_sample is None else median_seconds / documents_per_sample),
     }
+
+
+def _breakeven_result(
+    candidate_fixed_value: float,
+    baseline_fixed_value: float,
+    candidate_value_per_unit: float,
+    baseline_value_per_unit: float,
+    minimum_units: int,
+    maximum_units: int,
+) -> tuple[str, int | None] | None:
+    values = (
+        candidate_fixed_value,
+        baseline_fixed_value,
+        candidate_value_per_unit,
+        baseline_value_per_unit,
+    )
+    if any(not math.isfinite(value) or value < 0 or value > MAX_FINITE_CONTRACT_NUMBER for value in values):
+        return None
+    candidate_at_minimum = candidate_fixed_value + minimum_units * candidate_value_per_unit
+    baseline_at_minimum = baseline_fixed_value + minimum_units * baseline_value_per_unit
+    if not math.isfinite(candidate_at_minimum) or not math.isfinite(baseline_at_minimum):
+        return None
+    if candidate_at_minimum <= baseline_at_minimum:
+        return "candidate_already_better", minimum_units
+    marginal_advantage = baseline_value_per_unit - candidate_value_per_unit
+    if marginal_advantage <= 0:
+        return "no_breakeven_within_range", None
+    crossing_value = (candidate_fixed_value - baseline_fixed_value) / marginal_advantage
+    if not math.isfinite(crossing_value):
+        return None
+    crossing = math.ceil(crossing_value)
+    crossing = max(minimum_units, crossing)
+    if crossing <= maximum_units:
+        return "finite_breakeven", crossing
+    return "no_breakeven_within_range", None
 
 
 def _nearest_rank(values: Sequence[float], probability: float) -> float:
@@ -2551,7 +5117,7 @@ def _timestamp_diagnostics(value: str, path: str) -> list[Diagnostic]:
     return []
 
 
-def _duplicate_id_diagnostics(values: Sequence[Mapping[str, Any]], path: str, description: str) -> list[Diagnostic]:
+def _duplicate_id_diagnostics(values: Sequence[Mapping[str, Any]], path: str, _description: str) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     seen: set[str] = set()
     for index, value in enumerate(values):
@@ -2561,35 +5127,102 @@ def _duplicate_id_diagnostics(values: Sequence[Mapping[str, Any]], path: str, de
                 _error(
                     "contract.duplicate_id",
                     f"{path}/{index}/id",
-                    f"Duplicate {description} ID {identifier!r}.",
+                    "Duplicate IDs are not allowed.",
                 )
             )
         seen.add(identifier)
     return diagnostics
 
 
-def _zero_nonzero_diagnostics(total: int, documents: int, path: str, description: str) -> list[Diagnostic]:
+def _zero_nonzero_diagnostics(total: int, documents: int, path: str, _description: str) -> list[Diagnostic]:
     if (total == 0) != (documents == 0):
         return [
             _error(
                 "contract.document_event_consistency",
                 path,
-                f"Document count must be zero exactly when {description} are zero.",
+                "Document count and event count must be zero together.",
             )
         ]
     return []
 
 
+def _structure_diagnostics(value: Any) -> list[Diagnostic]:
+    """Reject non-JSON, cyclic, or oversized structures before recursive schema validation."""
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    containers: set[int] = set()
+    node_count = 0
+    string_chars = 0
+
+    while stack:
+        item, depth = stack.pop()
+        node_count += 1
+        if depth > MAX_CONTRACT_DEPTH or node_count > MAX_CONTRACT_NODES:
+            return [_resource_limit_error()]
+        if isinstance(item, str):
+            string_chars += len(item)
+            if len(item) > MAX_STRING_CHARS or string_chars > MAX_TOTAL_STRING_CHARS:
+                return [_resource_limit_error()]
+            continue
+        if item is None or isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            if abs(item) > MAX_FINITE_CONTRACT_NUMBER:
+                return [_resource_limit_error()]
+            continue
+        if isinstance(item, float):
+            if not math.isfinite(item) or abs(item) > MAX_FINITE_CONTRACT_NUMBER:
+                return [_resource_limit_error()]
+            continue
+        if type(item) is list:
+            if id(item) in containers or len(item) > MAX_COLLECTION_ITEMS:
+                return [_resource_limit_error()]
+            containers.add(id(item))
+            stack.extend((child, depth + 1) for child in reversed(item))
+            continue
+        if type(item) is dict:
+            if id(item) in containers or len(item) > MAX_COLLECTION_ITEMS:
+                return [_resource_limit_error()]
+            containers.add(id(item))
+            children: list[Any] = []
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    return [_resource_limit_error()]
+                string_chars += len(key)
+                if len(key) > MAX_STRING_CHARS or string_chars > MAX_TOTAL_STRING_CHARS:
+                    return [_resource_limit_error()]
+                children.append(child)
+            stack.extend((child, depth + 1) for child in reversed(children))
+            continue
+        return [_resource_limit_error()]
+    return []
+
+
+def _resource_limit_error() -> Diagnostic:
+    return _error(
+        "contract.resource_limits",
+        "",
+        "Contract JSON exceeds structural safety limits.",
+    )
+
+
 def _schema_diagnostics(validator: Any, value: Any) -> list[Diagnostic]:
-    return [_schema_error(item) for item in sorted(validator.iter_errors(value), key=_schema_sort_key)]
+    try:
+        errors = nsmallest(MAX_DIAGNOSTICS + 1, validator.iter_errors(value), key=_schema_sort_key)
+    except RecursionError:
+        return [_resource_limit_error()]
+    return [_schema_error(item) for item in errors]
 
 
 def _schema_error(error: ValidationError) -> Diagnostic:
-    return _error(f"contract.schema.{error.validator}", _pointer(error.absolute_path), error.message)
+    return _error(
+        f"contract.schema.{error.validator}",
+        _pointer(error.absolute_path),
+        "Contract value violates the declared schema constraint.",
+    )
 
 
 def _schema_sort_key(error: ValidationError) -> tuple[str, str]:
-    return (_pointer(error.absolute_path), error.message)
+    return (_pointer(error.absolute_path), str(error.validator))
 
 
 def _pointer(parts: Iterable[Any]) -> str:
@@ -2603,31 +5236,45 @@ def _error(code: str, path: str, message: str) -> Diagnostic:
 
 def _result(diagnostics: list[Diagnostic]) -> dict[str, Any]:
     ordered = sorted(diagnostics, key=lambda item: (str(item["path"]), str(item["code"]), str(item["message"])))
+    if len(ordered) > MAX_DIAGNOSTICS:
+        ordered = ordered[:MAX_DIAGNOSTICS]
+        ordered.append(
+            _error(
+                "contract.diagnostics_truncated",
+                "",
+                "Additional contract diagnostics were omitted after the deterministic limit.",
+            )
+        )
     return {"valid": not has_errors(ordered), "diagnostics": ordered}
 
 
 def _load_contract_json(path: str | Path) -> dict[str, Any]:
-    source = Path(path).expanduser()
+    try:
+        source = Path(path).expanduser()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise ValueError("Contract path is invalid.") from None
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
         before = source.lstat()
-    except OSError as exc:
-        raise ValueError("Contract path could not be inspected.") from exc
+    except (OSError, ValueError):
+        raise ValueError("Contract path could not be inspected.") from None
     if not S_ISREG(before.st_mode):
         raise ValueError("Contract path must be a regular non-symlink file.")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | nofollow
+    flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | nofollow
+    )
     try:
         descriptor = os.open(source, flags)
-    except OSError as exc:
-        raise ValueError("Contract path could not be opened as a regular non-symlink file.") from exc
+    except (OSError, ValueError):
+        raise ValueError("Contract path could not be opened as a regular non-symlink file.") from None
     try:
         info = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError("Contract path changed while it was being opened.")
         if not S_ISREG(info.st_mode):
             raise ValueError("Contract path must be a regular non-symlink file.")
-        if nofollow == 0 and (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino):
-            raise ValueError("Contract path changed while it was being opened.")
         if info.st_size > MAX_CONTRACT_BYTES:
-            raise ValueError(f"Contract file exceeds the {MAX_CONTRACT_BYTES}-byte limit.")
+            raise ValueError("Contract file exceeds the size limit.")
         chunks: list[bytes] = []
         total = 0
         while True:
@@ -2637,25 +5284,44 @@ def _load_contract_json(path: str | Path) -> dict[str, Any]:
             chunks.append(chunk)
             total += len(chunk)
             if total > MAX_CONTRACT_BYTES:
-                raise ValueError(f"Contract file exceeds the {MAX_CONTRACT_BYTES}-byte limit.")
-        payload = b"".join(chunks).decode("utf-8")
+                raise ValueError("Contract file exceeds the size limit.")
+        encoded_payload = b"".join(chunks)
+    except OSError:
+        raise ValueError("Contract file could not be read safely.") from None
     finally:
         os.close(descriptor)
-    value = json.loads(payload, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicate_keys)
+    try:
+        payload = encoded_payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Contract file must contain valid UTF-8 JSON.") from None
+    try:
+        value = json.loads(payload, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicate_keys)
+    except _ContractJSONValueError:
+        raise
+    except (RecursionError, ValueError):
+        raise ValueError("Contract file must contain valid bounded JSON.") from None
     if not isinstance(value, dict):
         raise ValueError("Contract file must contain a JSON object.")
+    if _structure_diagnostics(value):
+        raise ValueError("Contract JSON exceeds structural safety limits.")
     return value
 
 
+class _ContractJSONValueError(ValueError):
+    pass
+
+
 def _reject_constant(value: str) -> None:
-    raise ValueError(f"Contract JSON contains non-finite value {value}.")
+    raise _ContractJSONValueError("Contract JSON contains a non-finite number.")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    if len(pairs) > MAX_COLLECTION_ITEMS:
+        raise _ContractJSONValueError("Contract JSON object exceeds the collection-size limit.")
     value: dict[str, Any] = {}
     for key, item in pairs:
         if key in value:
-            raise ValueError(f"Contract JSON contains duplicate key {key!r}.")
+            raise _ContractJSONValueError("Contract JSON contains a duplicate key.")
         value[key] = item
     return value
 
@@ -2672,7 +5338,13 @@ __all__ = [
     "ENRON_VERIFIER_VERSION",
     "MATCHING_SEMANTICS",
     "hash_enron_environment",
+    "hash_enron_breakeven_plan",
     "hash_enron_manifest",
+    "hash_enron_performance_bank",
+    "hash_enron_performance_baseline",
+    "hash_enron_performance_comparison_plan",
+    "hash_enron_performance_input",
+    "hash_enron_performance_inventory",
     "hash_enron_performance_manifest",
     "hash_enron_samples",
     "hash_enron_test_lineage_entry",
