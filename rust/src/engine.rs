@@ -1,12 +1,12 @@
 use crate::bank::{CanonicalBank, CanonicalPattern, MatchMode};
 use crate::error::{validation, Result};
 use crate::match_buffer::{NativeMatchBuffer, RawMatch};
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind as AhoMatchKind};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, Input as AhoInput, MatchKind as AhoMatchKind};
 use regex_automata::hybrid::dfa::{Cache as HybridCache, OverlappingState, DFA as HybridDfa};
 use regex_automata::meta::Regex;
 use regex_automata::nfa::thompson::{self, WhichCaptures};
-use regex_automata::{Anchored, Input, MatchKind as RegexMatchKind, PatternID};
-use regex_syntax::hir::Hir;
+use regex_automata::{Anchored, Input, MatchKind as RegexMatchKind};
+use regex_syntax::hir::{Hir, HirKind};
 use regex_syntax::ParserBuilder;
 use std::sync::{Arc, Mutex};
 
@@ -39,6 +39,7 @@ pub struct DetectorMetadata {
 enum MatcherShard {
     Regex(RegexMatcherShard),
     Literal(LiteralMatcherShard),
+    Layered(LayeredMatcherShard),
 }
 
 #[derive(Debug)]
@@ -56,6 +57,39 @@ struct LiteralMatcherShard {
     local_to_detector: Vec<u32>,
     fallback_patterns: Option<Vec<Hir>>,
     fallback_regex: Mutex<Option<Arc<Regex>>>,
+}
+
+#[derive(Debug)]
+struct LayeredMatcherShard {
+    entity: String,
+    case_sensitive_literals: Option<LiteralMatcherLayer>,
+    ascii_case_insensitive_literals: Option<LiteralMatcherLayer>,
+    residual_regex: Option<RegexMatcherLayer>,
+    fallback_patterns: Option<Vec<Hir>>,
+    fallback_local_to_detector: Option<Vec<u32>>,
+    fallback_regex: Mutex<Option<Arc<Regex>>>,
+}
+
+#[derive(Debug)]
+struct LiteralMatcherLayer {
+    matcher: AhoCorasick,
+    local_to_detector: Vec<u32>,
+    local_to_pattern_order: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct RegexMatcherLayer {
+    regex: Regex,
+    local_to_detector: Vec<u32>,
+    local_to_pattern_order: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LayerCandidate {
+    detector_index: u32,
+    pattern_order: usize,
+    start: usize,
+    end: usize,
 }
 
 #[derive(Debug)]
@@ -217,6 +251,7 @@ fn scan_entity_independent(
         match shard {
             MatcherShard::Regex(shard) => scan_regex_shard(shard, haystack, buffer)?,
             MatcherShard::Literal(shard) => scan_literal_shard(shard, haystack, buffer)?,
+            MatcherShard::Layered(shard) => scan_layered_shard(shard, haystack, buffer)?,
         }
     }
     buffer.sort();
@@ -295,6 +330,220 @@ fn scan_literal_shard(
         )?;
     }
     Ok(())
+}
+
+fn scan_layered_shard(
+    shard: &LayeredMatcherShard,
+    haystack: &[u8],
+    buffer: &mut NativeMatchBuffer,
+) -> Result<()> {
+    // Aho-Corasick's case-insensitive mode is deliberately ASCII-only. A
+    // non-ASCII haystack can participate in Unicode folds (for example, `k`
+    // and the Kelvin sign), so use the full entity regex in that case.
+    if shard.ascii_case_insensitive_literals.is_some() && !haystack.is_ascii() {
+        let regex = lazy_fallback_regex(
+            &shard.entity,
+            shard.fallback_patterns.as_deref(),
+            &shard.fallback_regex,
+        )?;
+        let local_to_detector = shard
+            .fallback_local_to_detector
+            .as_ref()
+            .expect("fallback detector map is present when a fallback regex is required");
+        return scan_regex_matches(&shard.entity, &regex, local_to_detector, haystack, buffer);
+    }
+
+    let mut cursor = 0;
+    let mut case_sensitive = next_literal_candidate(
+        &shard.entity,
+        shard.case_sensitive_literals.as_ref(),
+        haystack,
+        cursor,
+    )?;
+    let mut case_insensitive = next_literal_candidate(
+        &shard.entity,
+        shard.ascii_case_insensitive_literals.as_ref(),
+        haystack,
+        cursor,
+    )?;
+    let mut residual = next_regex_candidate(
+        &shard.entity,
+        shard.residual_regex.as_ref(),
+        haystack,
+        cursor,
+    )?;
+
+    loop {
+        // Each layer applies its own leftmost-first semantics. Merging the
+        // layers by start and then original pattern order reconstructs the
+        // same winner as one leftmost-first regex over every entity pattern.
+        let Some(winner) = [case_sensitive, case_insensitive, residual]
+            .into_iter()
+            .flatten()
+            .min_by_key(|candidate| (candidate.start, candidate.pattern_order))
+        else {
+            break;
+        };
+        debug_assert!(winner.end > winner.start);
+        push_utf8_match(
+            buffer,
+            haystack,
+            winner.detector_index,
+            winner.start as u64,
+            winner.end as u64,
+        )?;
+        cursor = winner.end;
+
+        // Keep a losing candidate when it starts beyond the consumed span.
+        // It remains the first candidate in its layer, avoiding rescans of a
+        // distant residual regex after every dense literal match.
+        if candidate_precedes_cursor(case_sensitive, cursor) {
+            case_sensitive = next_literal_candidate(
+                &shard.entity,
+                shard.case_sensitive_literals.as_ref(),
+                haystack,
+                cursor,
+            )?;
+        }
+        if candidate_precedes_cursor(case_insensitive, cursor) {
+            case_insensitive = next_literal_candidate(
+                &shard.entity,
+                shard.ascii_case_insensitive_literals.as_ref(),
+                haystack,
+                cursor,
+            )?;
+        }
+        if candidate_precedes_cursor(residual, cursor) {
+            residual = next_regex_candidate(
+                &shard.entity,
+                shard.residual_regex.as_ref(),
+                haystack,
+                cursor,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn lazy_fallback_regex(
+    entity: &str,
+    fallback_patterns: Option<&[Hir]>,
+    fallback_regex: &Mutex<Option<Arc<Regex>>>,
+) -> Result<Arc<Regex>> {
+    let mut fallback = fallback_regex.lock().map_err(|_| {
+        validation(
+            format!("/engine/shards/{entity}/fallback_regex"),
+            "layered matcher fallback lock was poisoned",
+        )
+    })?;
+    if fallback.is_none() {
+        let patterns = fallback_patterns.ok_or_else(|| {
+            validation(
+                format!("/engine/shards/{entity}/fallback_patterns"),
+                "layered matcher is missing fallback regex patterns",
+            )
+        })?;
+        *fallback = Some(Arc::new(compile_entity_regex(entity, patterns)?));
+    }
+    Ok(fallback
+        .as_ref()
+        .expect("fallback regex is initialized above")
+        .clone())
+}
+
+fn candidate_precedes_cursor(candidate: Option<LayerCandidate>, cursor: usize) -> bool {
+    candidate
+        .map(|candidate| candidate.start < cursor)
+        .unwrap_or(false)
+}
+
+fn next_literal_candidate(
+    entity: &str,
+    layer: Option<&LiteralMatcherLayer>,
+    haystack: &[u8],
+    cursor: usize,
+) -> Result<Option<LayerCandidate>> {
+    let Some(layer) = layer else {
+        return Ok(None);
+    };
+    let Some(raw_match) = layer
+        .matcher
+        .find(AhoInput::new(haystack).span(cursor..haystack.len()))
+    else {
+        return Ok(None);
+    };
+    layer_candidate(
+        entity,
+        "literal",
+        &layer.local_to_detector,
+        &layer.local_to_pattern_order,
+        raw_match.pattern().as_usize(),
+        raw_match.start(),
+        raw_match.end(),
+    )
+    .map(Some)
+}
+
+fn next_regex_candidate(
+    entity: &str,
+    layer: Option<&RegexMatcherLayer>,
+    haystack: &[u8],
+    cursor: usize,
+) -> Result<Option<LayerCandidate>> {
+    let Some(layer) = layer else {
+        return Ok(None);
+    };
+    let Some(raw_match) = layer
+        .regex
+        .find(Input::new(haystack).span(cursor..haystack.len()))
+    else {
+        return Ok(None);
+    };
+    layer_candidate(
+        entity,
+        "regex",
+        &layer.local_to_detector,
+        &layer.local_to_pattern_order,
+        raw_match.pattern().as_usize(),
+        raw_match.start(),
+        raw_match.end(),
+    )
+    .map(Some)
+}
+
+fn layer_candidate(
+    entity: &str,
+    layer_kind: &str,
+    local_to_detector: &[u32],
+    local_to_pattern_order: &[usize],
+    local_index: usize,
+    start: usize,
+    end: usize,
+) -> Result<LayerCandidate> {
+    let Some(&detector_index) = local_to_detector.get(local_index) else {
+        return Err(validation(
+            format!("/engine/shards/{entity}/{layer_kind}/local_to_detector"),
+            format!("{layer_kind} engine returned local pattern index {local_index} outside detector map"),
+        ));
+    };
+    let Some(&pattern_order) = local_to_pattern_order.get(local_index) else {
+        return Err(validation(
+            format!("/engine/shards/{entity}/{layer_kind}/local_to_pattern_order"),
+            format!("{layer_kind} engine returned local pattern index {local_index} outside pattern-order map"),
+        ));
+    };
+    if end <= start {
+        return Err(validation(
+            format!("/engine/shards/{entity}/{layer_kind}"),
+            "layered matcher unexpectedly produced an empty match",
+        ));
+    }
+    Ok(LayerCandidate {
+        detector_index,
+        pattern_order,
+        start,
+        end,
+    })
 }
 
 fn scan_regex_matches(
@@ -640,31 +889,16 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
     for entity in &canonical.entities {
         let mut patterns = Vec::with_capacity(entity.patterns.len());
         let mut literal_patterns = Vec::with_capacity(entity.patterns.len());
-        let mut literal_case_insensitive = None;
-        let mut literal_only = true;
         let mut local_to_detector = Vec::with_capacity(entity.patterns.len());
         for (pattern_index, pattern) in entity.patterns.iter().enumerate() {
-            patterns.push(parse_pattern_with_flags(
+            let hir = parse_pattern_with_flags(
                 &entity.name,
                 pattern_index,
                 &pattern.regex,
                 &pattern.flags,
-            )?);
-            match simple_literal_pattern(pattern) {
-                Some(literal_pattern)
-                    if literal_case_insensitive
-                        .map(|case_insensitive| {
-                            case_insensitive == literal_pattern.case_insensitive
-                        })
-                        .unwrap_or(true) =>
-                {
-                    literal_case_insensitive = Some(literal_pattern.case_insensitive);
-                    literal_patterns.push(literal_pattern.value);
-                }
-                _ => {
-                    literal_only = false;
-                }
-            }
+            )?;
+            literal_patterns.push(layer_literal_pattern(pattern, &hir));
+            patterns.push(hir);
             local_to_detector.push(next_detector_index);
             next_detector_index = next_detector_index.checked_add(1).ok_or_else(|| {
                 validation(
@@ -674,20 +908,63 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
             })?;
         }
 
-        let shard = if literal_only && literal_patterns.len() == patterns.len() {
-            MatcherShard::Literal(compile_literal_shard(
-                &entity.name,
-                literal_patterns,
-                literal_case_insensitive.unwrap_or(false),
-                local_to_detector,
-                patterns,
-            )?)
-        } else {
+        // Shared-cursor merging relies on every winner advancing the cursor.
+        // If a pattern can match empty (or matches nothing, for which the HIR
+        // has no minimum), retain the single-regex entity implementation.
+        let all_patterns_non_empty = patterns
+            .iter()
+            .all(|hir| matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0));
+        let literal_count = literal_patterns
+            .iter()
+            .filter(|literal| literal.is_some())
+            .count();
+        let first_literal_case = literal_patterns
+            .iter()
+            .flatten()
+            .next()
+            .map(|literal| literal.case_insensitive);
+
+        let shard = if !all_patterns_non_empty || literal_count == 0 {
             MatcherShard::Regex(RegexMatcherShard {
                 entity: entity.name.clone(),
                 regex: compile_entity_regex(&entity.name, &patterns)?,
                 local_to_detector,
             })
+        } else if literal_count == patterns.len()
+            && literal_patterns
+                .iter()
+                .flatten()
+                .map(|literal| literal.case_insensitive)
+                .all(|case_insensitive| {
+                    case_insensitive
+                        == literal_patterns[0]
+                            .as_ref()
+                            .expect("every pattern is classified as a literal")
+                            .case_insensitive
+                })
+        {
+            let case_insensitive = first_literal_case.expect("the entity has literal patterns");
+            MatcherShard::Literal(compile_literal_shard(
+                &entity.name,
+                literal_patterns
+                    .into_iter()
+                    .map(|literal| {
+                        literal
+                            .expect("every pattern is classified as a literal")
+                            .value
+                    })
+                    .collect(),
+                case_insensitive,
+                local_to_detector,
+                patterns,
+            )?)
+        } else {
+            MatcherShard::Layered(compile_layered_shard(
+                &entity.name,
+                patterns,
+                literal_patterns,
+                local_to_detector,
+            )?)
         };
 
         shards.push(shard);
@@ -695,7 +972,113 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
     Ok(shards)
 }
 
+fn compile_layered_shard(
+    entity_name: &str,
+    patterns: Vec<Hir>,
+    literal_patterns: Vec<Option<SimpleLiteralPattern>>,
+    local_to_detector: Vec<u32>,
+) -> Result<LayeredMatcherShard> {
+    let mut case_sensitive_values = Vec::new();
+    let mut case_sensitive_detectors = Vec::new();
+    let mut case_sensitive_orders = Vec::new();
+    let mut case_insensitive_values = Vec::new();
+    let mut case_insensitive_detectors = Vec::new();
+    let mut case_insensitive_orders = Vec::new();
+    let mut residual_patterns = Vec::new();
+    let mut residual_detectors = Vec::new();
+    let mut residual_orders = Vec::new();
+    let has_case_insensitive_literals = literal_patterns
+        .iter()
+        .flatten()
+        .any(|literal| literal.case_insensitive);
+    let fallback_patterns = has_case_insensitive_literals.then(|| patterns.clone());
+
+    for (pattern_order, ((hir, literal), detector_index)) in patterns
+        .into_iter()
+        .zip(literal_patterns)
+        .zip(local_to_detector.iter().copied())
+        .enumerate()
+    {
+        match literal {
+            Some(literal) if literal.case_insensitive => {
+                case_insensitive_values.push(literal.value);
+                case_insensitive_detectors.push(detector_index);
+                case_insensitive_orders.push(pattern_order);
+            }
+            Some(literal) => {
+                case_sensitive_values.push(literal.value);
+                case_sensitive_detectors.push(detector_index);
+                case_sensitive_orders.push(pattern_order);
+            }
+            None => {
+                residual_patterns.push(hir);
+                residual_detectors.push(detector_index);
+                residual_orders.push(pattern_order);
+            }
+        }
+    }
+
+    Ok(LayeredMatcherShard {
+        entity: entity_name.to_string(),
+        case_sensitive_literals: compile_literal_layer(
+            entity_name,
+            case_sensitive_values,
+            false,
+            case_sensitive_detectors,
+            case_sensitive_orders,
+        )?,
+        ascii_case_insensitive_literals: compile_literal_layer(
+            entity_name,
+            case_insensitive_values,
+            true,
+            case_insensitive_detectors,
+            case_insensitive_orders,
+        )?,
+        residual_regex: if residual_patterns.is_empty() {
+            None
+        } else {
+            Some(RegexMatcherLayer {
+                regex: compile_entity_regex_with_pattern_orders(
+                    entity_name,
+                    &residual_patterns,
+                    Some(&residual_orders),
+                )?,
+                local_to_detector: residual_detectors,
+                local_to_pattern_order: residual_orders,
+            })
+        },
+        fallback_patterns,
+        fallback_local_to_detector: has_case_insensitive_literals.then_some(local_to_detector),
+        fallback_regex: Mutex::new(None),
+    })
+}
+
+fn compile_literal_layer(
+    entity_name: &str,
+    literal_patterns: Vec<String>,
+    case_insensitive: bool,
+    local_to_detector: Vec<u32>,
+    local_to_pattern_order: Vec<usize>,
+) -> Result<Option<LiteralMatcherLayer>> {
+    if literal_patterns.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(LiteralMatcherLayer {
+        matcher: compile_literal_matcher(entity_name, &literal_patterns, case_insensitive)?,
+        local_to_detector,
+        local_to_pattern_order,
+    }))
+}
+
 fn compile_entity_regex(entity_name: &str, patterns: &[Hir]) -> Result<Regex> {
+    compile_entity_regex_with_pattern_orders(entity_name, patterns, None)
+}
+
+fn compile_entity_regex_with_pattern_orders(
+    entity_name: &str,
+    patterns: &[Hir],
+    pattern_orders: Option<&[usize]>,
+) -> Result<Regex> {
     Regex::builder()
         .configure(
             Regex::config()
@@ -709,7 +1092,14 @@ fn compile_entity_regex(entity_name: &str, patterns: &[Hir]) -> Result<Regex> {
         .build_many_from_hir(patterns)
         .map_err(|error| {
             let path = match error.pattern() {
-                Some(pattern_id) => pattern_path(entity_name, pattern_id),
+                Some(pattern_id) => {
+                    let local_index = pattern_id.as_usize();
+                    let pattern_index = pattern_orders
+                        .and_then(|orders| orders.get(local_index))
+                        .copied()
+                        .unwrap_or(local_index);
+                    pattern_path_by_index(entity_name, pattern_index)
+                }
                 None => format!("/entities/{entity_name}/patterns"),
             };
             validation(
@@ -728,18 +1118,7 @@ fn compile_literal_shard(
     local_to_detector: Vec<u32>,
     fallback_patterns: Vec<Hir>,
 ) -> Result<LiteralMatcherShard> {
-    let matcher = AhoCorasickBuilder::new()
-        .match_kind(AhoMatchKind::LeftmostFirst)
-        .ascii_case_insensitive(case_insensitive)
-        .build(&literal_patterns)
-        .map_err(|error| {
-            validation(
-                format!("/entities/{entity_name}/patterns"),
-                format!(
-                    "could not compile entity-independent literal matcher for entity {entity_name:?}: {error}"
-                ),
-            )
-        })?;
+    let matcher = compile_literal_matcher(entity_name, &literal_patterns, case_insensitive)?;
 
     Ok(LiteralMatcherShard {
         entity: entity_name.to_string(),
@@ -753,6 +1132,58 @@ fn compile_literal_shard(
         },
         fallback_regex: Mutex::new(None),
     })
+}
+
+fn compile_literal_matcher(
+    entity_name: &str,
+    literal_patterns: &[String],
+    case_insensitive: bool,
+) -> Result<AhoCorasick> {
+    let matcher = AhoCorasickBuilder::new()
+        .match_kind(AhoMatchKind::LeftmostFirst)
+        .ascii_case_insensitive(case_insensitive)
+        .build(literal_patterns)
+        .map_err(|error| {
+            validation(
+                format!("/entities/{entity_name}/patterns"),
+                format!(
+                    "could not compile entity-independent literal matcher for entity {entity_name:?}: {error}"
+                ),
+            )
+        })?;
+
+    Ok(matcher)
+}
+
+fn layer_literal_pattern(pattern: &CanonicalPattern, hir: &Hir) -> Option<SimpleLiteralPattern> {
+    simple_literal_pattern(pattern).or_else(|| exact_hir_literal_pattern(hir))
+}
+
+fn exact_hir_literal_pattern(hir: &Hir) -> Option<SimpleLiteralPattern> {
+    let mut bytes = Vec::new();
+    append_exact_hir_literal(hir, &mut bytes)?;
+    let value = std::str::from_utf8(&bytes).ok()?.to_string();
+    if value.is_empty() {
+        return None;
+    }
+    Some(SimpleLiteralPattern {
+        value,
+        case_insensitive: false,
+    })
+}
+
+fn append_exact_hir_literal(hir: &Hir, bytes: &mut Vec<u8>) -> Option<()> {
+    match hir.kind() {
+        HirKind::Literal(literal) => bytes.extend_from_slice(&literal.0),
+        HirKind::Capture(capture) => append_exact_hir_literal(&capture.sub, bytes)?,
+        HirKind::Concat(parts) => {
+            for part in parts {
+                append_exact_hir_literal(part, bytes)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(())
 }
 
 fn simple_literal_pattern(pattern: &CanonicalPattern) -> Option<SimpleLiteralPattern> {
@@ -803,10 +1234,6 @@ fn is_regex_meta_character(char: char) -> bool {
 
 fn is_simple_literal_escape(char: char) -> bool {
     !char.is_alphanumeric()
-}
-
-fn pattern_path(entity_name: &str, pattern_id: PatternID) -> String {
-    format!("/entities/{entity_name}/patterns/{}", pattern_id.as_usize())
 }
 
 fn parse_pattern_with_flags(
@@ -968,6 +1395,44 @@ mod tests {
             .collect()
     }
 
+    fn monolithic_raw_matches(patterns: &[CanonicalPattern], text: &str) -> Vec<(u32, u64, u64)> {
+        let hirs = patterns
+            .iter()
+            .enumerate()
+            .map(|(pattern_index, pattern)| {
+                parse_pattern_with_flags("entity", pattern_index, &pattern.regex, &pattern.flags)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let regex = compile_entity_regex("entity", &hirs).unwrap();
+        let local_to_detector = (0..patterns.len())
+            .map(|index| u32::try_from(index).unwrap())
+            .collect::<Vec<_>>();
+        let mut buffer = NativeMatchBuffer::new();
+        scan_regex_matches(
+            "entity",
+            &regex,
+            &local_to_detector,
+            text.as_bytes(),
+            &mut buffer,
+        )
+        .unwrap();
+        buffer.sort();
+        (0..buffer.len())
+            .map(|index| buffer.get(index).unwrap().as_tuple())
+            .collect()
+    }
+
+    fn assert_layered_matches_monolithic(patterns: Vec<CanonicalPattern>, text: &str) {
+        let expected = monolithic_raw_matches(&patterns, text);
+        let engine = engine_for_patterns(patterns);
+        assert!(matches!(
+            engine.shards.as_slice(),
+            [MatcherShard::Layered(_)]
+        ));
+        assert_eq!(engine_raw_matches(&engine, text), expected);
+    }
+
     #[test]
     fn literal_only_entity_uses_literal_shard_for_ascii_case_insensitive_patterns() {
         let engine = engine_for_patterns(vec![
@@ -1002,6 +1467,283 @@ mod tests {
 
         assert!(matches!(engine.shards.as_slice(), [MatcherShard::Regex(_)]));
         assert_eq!(engine_raw_matches(&engine, "123"), [(0, 0, 3)]);
+    }
+
+    #[test]
+    fn mixed_entity_uses_layered_matcher_and_preserves_same_start_priority() {
+        let regex_first = vec![
+            canonical_pattern(r"a(?:b)?", &[]),
+            canonical_pattern("a", &[]),
+        ];
+        let literal_first = vec![
+            canonical_pattern("a", &[]),
+            canonical_pattern(r"a(?:b)?", &[]),
+        ];
+
+        assert_layered_matches_monolithic(regex_first.clone(), "ab ab");
+        assert_layered_matches_monolithic(literal_first.clone(), "ab ab");
+        assert_eq!(monolithic_raw_matches(&regex_first, "ab"), [(0, 0, 2)]);
+        assert_eq!(monolithic_raw_matches(&literal_first, "ab"), [(0, 0, 1)]);
+    }
+
+    #[test]
+    fn layered_matcher_preserves_long_short_overlap_and_ordered_alternatives() {
+        let patterns = vec![
+            canonical_pattern(r"(Samba|Sam)", &[]),
+            canonical_pattern("Sam", &[]),
+            canonical_pattern("SambaX", &[]),
+        ];
+
+        assert_layered_matches_monolithic(patterns.clone(), "SambaX Sam");
+        assert_eq!(
+            monolithic_raw_matches(&patterns, "SambaX Sam"),
+            [(0, 0, 5), (0, 7, 10)]
+        );
+    }
+
+    #[test]
+    fn layered_matcher_preserves_case_sensitive_and_insensitive_priority() {
+        let patterns = vec![
+            canonical_pattern("FOO", &[]),
+            canonical_pattern("foo", &["IGNORECASE"]),
+            canonical_pattern(r"\d+", &[]),
+        ];
+
+        assert_layered_matches_monolithic(patterns.clone(), "foo FOO 12");
+        assert_eq!(
+            monolithic_raw_matches(&patterns, "foo FOO 12"),
+            [(1, 0, 3), (0, 4, 7), (2, 8, 10)]
+        );
+    }
+
+    #[test]
+    fn layered_matcher_falls_back_for_unicode_case_folding() {
+        let patterns = vec![
+            canonical_pattern("k", &["IGNORECASE"]),
+            canonical_pattern(r"\p{Letter}+", &[]),
+            canonical_pattern("done", &[]),
+        ];
+        let expected = monolithic_raw_matches(&patterns, "K done");
+        let engine = engine_for_patterns(patterns);
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("mixed case-folding entity should use a layered matcher");
+        };
+
+        assert!(shard.fallback_regex.lock().unwrap().is_none());
+        assert_eq!(engine_raw_matches(&engine, "K done"), expected);
+        assert!(shard.fallback_regex.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn layered_matcher_handles_non_ascii_literals_without_case_folding() {
+        let patterns = vec![
+            canonical_pattern("café", &[]),
+            canonical_pattern(r"\d+", &[]),
+        ];
+
+        assert_layered_matches_monolithic(patterns.clone(), "café 42 café");
+        assert_eq!(
+            monolithic_raw_matches(&patterns, "café 42 café"),
+            [(0, 0, 5), (1, 6, 8), (0, 9, 14)]
+        );
+    }
+
+    #[test]
+    fn layered_matcher_preserves_boundary_context_and_adjacent_matches() {
+        let patterns = vec![
+            canonical_pattern("X", &[]),
+            canonical_pattern(r"\bfoo\b", &[]),
+            canonical_pattern(r"\d+", &[]),
+        ];
+
+        assert_layered_matches_monolithic(patterns.clone(), "Xfoo foo12 X 34");
+        assert_eq!(
+            monolithic_raw_matches(&patterns, "Xfoo foo12 X 34"),
+            [(0, 0, 1), (2, 8, 10), (0, 11, 12), (2, 13, 15)]
+        );
+    }
+
+    #[test]
+    fn layered_matcher_preserves_anchor_context_after_cursor_advances() {
+        let patterns = vec![
+            canonical_pattern("X", &[]),
+            canonical_pattern(r"^foo", &["MULTILINE"]),
+            canonical_pattern(r"\Abar", &[]),
+        ];
+
+        assert_layered_matches_monolithic(patterns.clone(), "Xfoo\nfoo bar");
+        assert_eq!(
+            monolithic_raw_matches(&patterns, "Xfoo\nfoo bar"),
+            [(0, 0, 1), (1, 5, 8)]
+        );
+    }
+
+    #[test]
+    fn layered_entity_keeps_cross_entity_overlap() {
+        let bank = NativeBank::from_source_bytes(
+            br#"{"PERSON":{"Sam":"Sam","S-name":"Sa.+"},"PROJECT":{"Samba":"Samba"}}"#,
+            Some("json"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(raw_matches(bank, "Samba"), [(0, 0, 3), (2, 0, 5)]);
+    }
+
+    #[test]
+    fn exact_grouped_hir_literal_is_eligible_for_literal_layer() {
+        let patterns = vec![
+            canonical_pattern(r"(alpha)", &[]),
+            canonical_pattern(r"\d+", &[]),
+        ];
+        let engine = engine_for_patterns(patterns.clone());
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("grouped exact literal should use the layered matcher");
+        };
+
+        assert_eq!(
+            shard
+                .case_sensitive_literals
+                .as_ref()
+                .unwrap()
+                .local_to_pattern_order,
+            [0]
+        );
+        assert_eq!(
+            engine_raw_matches(&engine, "alpha 7"),
+            monolithic_raw_matches(&patterns, "alpha 7")
+        );
+    }
+
+    #[test]
+    fn possibly_empty_pattern_conservatively_uses_monolithic_matcher() {
+        let engine = engine_for_patterns(vec![
+            canonical_pattern("a", &[]),
+            canonical_pattern(r"b*", &[]),
+        ]);
+
+        assert!(matches!(engine.shards.as_slice(), [MatcherShard::Regex(_)]));
+    }
+
+    #[test]
+    fn layered_matcher_preserves_bounded_match_failure_and_clears_output() {
+        let engine = engine_for_patterns(vec![
+            canonical_pattern("a", &[]),
+            canonical_pattern(r"\d+", &[]),
+        ]);
+        let mut buffer = NativeMatchBuffer::with_match_limit(2).unwrap();
+
+        let error = engine
+            .scan_bytes_into(b"a1a2", &mut buffer)
+            .expect_err("the third match must exceed the configured limit");
+
+        assert!(error.to_string().contains("configured match limit 2"));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn layered_matcher_rejects_invalid_utf8_before_search() {
+        let engine = engine_for_patterns(vec![
+            canonical_pattern("a", &[]),
+            canonical_pattern(r"\d+", &[]),
+        ]);
+        let mut buffer = NativeMatchBuffer::new();
+
+        let error = engine.scan_bytes_into(&[0xff], &mut buffer).unwrap_err();
+
+        assert!(error.to_string().contains("valid UTF-8"));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn layered_matcher_matches_monolithic_reference_across_generated_cases() {
+        let mut state = 0x5eed_cafe_f00d_u64;
+        for case_index in 0..192 {
+            let mut patterns = vec![canonical_pattern("a", &[]), canonical_pattern(r"a+", &[])];
+            let extra_patterns = 1 + next_generated(&mut state) % 6;
+            for _ in 0..extra_patterns {
+                patterns.push(generated_pattern(next_generated(&mut state)));
+            }
+            rotate_generated(&mut patterns, next_generated(&mut state));
+
+            let text_len = next_generated(&mut state) % 96;
+            let mut text = String::new();
+            for _ in 0..text_len {
+                const PIECES: [&str; 12] =
+                    ["a", "b", "A", "B", "f", "o", "0", "1", " ", "-", "é", "K"];
+                text.push_str(PIECES[next_generated(&mut state) % PIECES.len()]);
+            }
+
+            let expected = monolithic_raw_matches(&patterns, &text);
+            let engine = engine_for_patterns(patterns.clone());
+            assert!(matches!(
+                engine.shards.as_slice(),
+                [MatcherShard::Layered(_)]
+            ));
+            assert_eq!(
+                engine_raw_matches(&engine, &text),
+                expected,
+                "generated differential case {case_index} failed for patterns {patterns:?} and text {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn layered_matcher_matches_monolithic_reference_for_dense_large_entity() {
+        let mut patterns = (0..500)
+            .map(|index| canonical_pattern(&format!("contact{index:03}@example\\.com"), &[]))
+            .collect::<Vec<_>>();
+        patterns.insert(173, canonical_pattern(r"ticket-[0-9]+", &[]));
+        let text = (0..120)
+            .map(|index| {
+                format!(
+                    "contact{:03}@example.com ticket-{}",
+                    index % 500,
+                    10_000 + index
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected = monolithic_raw_matches(&patterns, &text);
+        let engine = engine_for_patterns(patterns);
+
+        assert!(matches!(
+            engine.shards.as_slice(),
+            [MatcherShard::Layered(_)]
+        ));
+        assert_eq!(engine_raw_matches(&engine, &text), expected);
+    }
+
+    fn next_generated(state: &mut u64) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state as usize
+    }
+
+    fn generated_pattern(selector: usize) -> CanonicalPattern {
+        match selector % 14 {
+            0 => canonical_pattern("a", &[]),
+            1 => canonical_pattern("ab", &[]),
+            2 => canonical_pattern("foo", &[]),
+            3 => canonical_pattern("FOO", &[]),
+            4 => canonical_pattern("foo", &["IGNORECASE"]),
+            5 => canonical_pattern("k", &["IGNORECASE"]),
+            6 => canonical_pattern("é", &[]),
+            7 => canonical_pattern(r"a+", &[]),
+            8 => canonical_pattern(r"a(?:b)?", &[]),
+            9 => canonical_pattern(r"(ab|a)", &[]),
+            10 => canonical_pattern(r"\bfoo\b", &[]),
+            11 => canonical_pattern(r"[A-B]+", &[]),
+            12 => canonical_pattern(r"\d+", &[]),
+            _ => canonical_pattern(r"é+", &[]),
+        }
+    }
+
+    fn rotate_generated(patterns: &mut [CanonicalPattern], selector: usize) {
+        if !patterns.is_empty() {
+            patterns.rotate_left(selector % patterns.len());
+        }
     }
 
     #[test]
