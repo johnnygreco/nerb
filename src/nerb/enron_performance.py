@@ -2228,8 +2228,10 @@ def _source_build_request(
 
 def _run_source_build_once(request: Mapping[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
     try:
-        with tempfile.TemporaryDirectory(prefix="nerb-performance-build-") as temporary:
-            child_request = {**request, "output_dir": os.fspath(Path(temporary) / "build")}
+        system_temporary_root = Path(tempfile.gettempdir()).resolve()
+        with tempfile.TemporaryDirectory(dir=system_temporary_root, prefix="nerb-performance-build-") as temporary:
+            temporary_root = Path(temporary)
+            child_request = {**request, "output_dir": os.fspath(temporary_root / "build")}
             payload, child_pid = _run_bounded_fresh_process(
                 [sys.executable, "-m", "nerb.enron_performance", "--source-build-worker"],
                 child_request,

@@ -622,6 +622,47 @@ def test_source_build_parent_removes_private_temp_tree_after_forced_child_failur
     assert not temporary_roots[0].exists()
 
 
+def test_source_build_parent_resolves_symlinked_system_temp_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_temporary_root = tmp_path / "real-temporary-root"
+    real_temporary_root.mkdir()
+    alternate_temporary_root = tmp_path / "alternate-temporary-root"
+    alternate_temporary_root.mkdir()
+    symlinked_temporary_root = tmp_path / "symlinked-temporary-root"
+    try:
+        symlinked_temporary_root.symlink_to(real_temporary_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable")
+    monkeypatch.setattr(performance_module.tempfile, "tempdir", str(symlinked_temporary_root))
+    observed_output_dirs: list[Path] = []
+
+    def capture_resolved_output(
+        _command: Sequence[str],
+        request: Mapping[str, Any],
+        **_kwargs: Any,
+    ) -> tuple[bytes, int]:
+        output_dir = Path(str(request["output_dir"]))
+        output_dir.mkdir()
+        (output_dir / "private-artifact.json").write_text("private fixture", encoding="utf-8")
+        observed_output_dirs.append(output_dir)
+        symlinked_temporary_root.unlink()
+        symlinked_temporary_root.symlink_to(alternate_temporary_root, target_is_directory=True)
+        raise EnronPerformanceError("Source-build performance worker exited unsuccessfully.")
+
+    monkeypatch.setattr(performance_module, "_run_bounded_fresh_process", capture_resolved_output)
+    with pytest.raises(EnronPerformanceError, match="exited unsuccessfully"):
+        performance_module._run_source_build_once(
+            {"nonce": "safe-nonce", "workload_sha256": _HASH_1},
+            timeout_seconds=0.1,
+        )
+
+    assert len(observed_output_dirs) == 1
+    assert observed_output_dirs[0].parent.parent == real_temporary_root.resolve()
+    assert not observed_output_dirs[0].parent.exists()
+    assert not any(alternate_temporary_root.iterdir())
+
+
 def test_evaluated_descriptor_keeps_real_catalog_aliases_truthful(test_data_path: Path) -> None:
     bank = json.loads((test_data_path / "enron_bank_v2_fake.json").read_text(encoding="utf-8"))
     payload = _canonical(bank)
