@@ -2872,6 +2872,35 @@ def test_unrelated_generator_family_cannot_masquerade_as_controlled_density_swee
 
 
 @pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("id", "unrelated_scale_bank_generator"),
+        ("version", "9.0.0"),
+        ("source_sha256", _sha256_number(1111)),
+        ("spec_sha256", _sha256_number(1112)),
+    ],
+)
+def test_required_scale_banks_share_one_generator_family(
+    manifest: JsonObject, evidence: JsonObject, field: str, replacement: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    scale_bank = next(
+        item
+        for item in promoted["performance"]["banks"]
+        if item["kind"] == "synthetic_scale" and item["active_aliases"] == 100_000
+    )
+    scale_bank["generator"][field] = replacement
+    _refresh_bank_descriptor(scale_bank)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.uncontrolled_scale_generator_family",
+    )
+
+
+@pytest.mark.parametrize(
     ("axis", "input_ids", "code"),
     [
         (
@@ -4200,6 +4229,76 @@ def test_referenced_samples_can_support_promotion(manifest: JsonObject, evidence
     ) == {"valid": True, "diagnostics": []}
 
 
+def test_shared_referenced_performance_artifacts_are_prepared_once(
+    evidence: JsonObject, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workload = evidence["performance"]["workloads"][0]
+    samples = list(workload["samples_seconds"])
+    workload["samples_seconds"] = []
+    workload["samples_ref"] = {
+        "id": "shared_samples",
+        "sha256": hash_enron_samples(samples),
+        "bytes": _sample_payload_bytes(samples),
+    }
+    duplicate_workload = copy.deepcopy(workload)
+    duplicate_workload["id"] = "shared_samples_second_workload"
+    duplicate_workload["workload_sha256"] = hash_enron_workload(duplicate_workload)
+    evidence["performance"]["workloads"].append(duplicate_workload)
+
+    input_descriptor = evidence["performance"]["inputs"][0]
+    duplicate_input = copy.deepcopy(input_descriptor)
+    duplicate_input["id"] = "shared_inventory_second_input"
+    _refresh_input_descriptor(duplicate_input)
+    evidence["performance"]["inputs"].append(duplicate_input)
+    inventory_id = input_descriptor["inventory_ref"]["id"]
+    inventory = [{"bytes": 1, "records": 0}]
+
+    sample_calls = 0
+    inventory_calls = 0
+    prepare_samples = enron_contract._prepare_performance_samples
+    prepare_inventory = enron_contract._prepare_performance_inventory
+
+    def counted_samples(values: Sequence[Any]) -> Any:
+        nonlocal sample_calls
+        sample_calls += 1
+        return prepare_samples(values)
+
+    def counted_inventory(values: Sequence[Mapping[str, int]]) -> Any:
+        nonlocal inventory_calls
+        inventory_calls += 1
+        return prepare_inventory(values)
+
+    monkeypatch.setattr(enron_contract, "_prepare_performance_samples", counted_samples)
+    monkeypatch.setattr(enron_contract, "_prepare_performance_inventory", counted_inventory)
+
+    validate_enron_evidence(
+        evidence,
+        referenced_samples={"shared_samples": samples},
+        referenced_input_inventories={inventory_id: inventory},
+    )
+
+    assert sample_calls == inventory_calls == 1
+
+
+def test_referenced_performance_artifacts_share_an_aggregate_item_budget(
+    evidence: JsonObject, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workload = evidence["performance"]["workloads"][0]
+    samples = list(workload["samples_seconds"])
+    workload["samples_seconds"] = []
+    workload["samples_ref"] = {
+        "id": "budget_samples",
+        "sha256": hash_enron_samples(samples),
+        "bytes": _sample_payload_bytes(samples),
+    }
+    monkeypatch.setattr(enron_contract, "MAX_REFERENCED_ITEMS", len(samples) - 1)
+
+    _assert_code(
+        validate_enron_evidence(evidence, referenced_samples={"budget_samples": samples}),
+        "contract.performance_reference_budget",
+    )
+
+
 @pytest.mark.parametrize(
     ("phase", "process_model", "code"),
     [
@@ -4286,6 +4385,84 @@ def test_decision_grade_concurrency_cannot_exceed_recorded_machine_capacity(
     )
 
 
+def test_lifecycle_concurrency_cannot_exceed_recorded_machine_capacity(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    for workload_id in ("helper_cache_hit_fixture", "baseline_helper_cache_hit_fixture"):
+        workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == workload_id)
+        workload["concurrency"] = promoted["environment"]["cpu_count"] + 1
+        workload["workload_sha256"] = hash_enron_workload(workload)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_concurrency_bounds",
+    )
+
+
+def test_decision_grade_rss_cannot_exceed_recorded_machine_memory(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    bound_manifest["environment"]["memory_bytes"] = 1
+    promoted["environment"]["memory_bytes"] = 1
+    environment_sha256 = hash_enron_environment(promoted["environment"])
+    for claim in promoted["promotion"]["claims"]:
+        claim["environment_sha256"] = environment_sha256
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_memory_bounds",
+    )
+
+
+def test_failed_decision_grade_harness_command_cannot_support_promotion(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    bound_manifest["commands"][0]["exit_status"] = 1
+    promoted["commands"][0]["exit_status"] = 1
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_command_failure",
+    )
+
+
+def test_failed_exact_baseline_harness_command_cannot_support_promotion(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    failed_command = copy.deepcopy(promoted["commands"][0])
+    failed_command.update({"id": "failed_baseline_command", "exit_status": 1})
+    promoted["commands"].append(copy.deepcopy(failed_command))
+    bound_manifest["commands"].append(copy.deepcopy(failed_command))
+
+    baseline = next(
+        item for item in promoted["performance"]["workloads"] if item["id"] == "baseline_direct_bank_latency"
+    )
+    original_harness = next(
+        item for item in promoted["performance"]["harnesses"] if item["id"] == baseline["harness_id"]
+    )
+    failed_harness = copy.deepcopy(original_harness)
+    failed_harness.update({"id": "failed_baseline_harness", "command_id": failed_command["id"]})
+    failed_harness["descriptor_sha256"] = hash_enron_performance_harness(failed_harness)
+    promoted["performance"]["harnesses"].append(failed_harness)
+    promoted["performance"]["harnesses"].sort(key=lambda item: item["id"])
+    baseline["harness_id"] = failed_harness["id"]
+    baseline["harness_sha256"] = failed_harness["descriptor_sha256"]
+    baseline["workload_sha256"] = hash_enron_workload(baseline)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.performance_command_failure",
+    )
+
+
 @pytest.mark.parametrize("target", ["manifest", "evidence"])
 def test_real_artifacts_reject_placeholder_all_zero_content_hashes(
     manifest: JsonObject, evidence: JsonObject, target: str
@@ -4345,6 +4522,15 @@ def test_commands_reject_private_or_traversing_paths(manifest: JsonObject, unsaf
         ("owner", '"δοκιμή@παράδειγμα.test"', "contract.public_direct_identifier"),
         ("owner", "alice＠example.test", "contract.public_direct_identifier"),
         ("owner", "alice%2540example.test", "contract.public_direct_identifier"),
+        ("owner", "alice&#64;example.test", "contract.public_direct_identifier"),
+        ("owner", "alice&commat;example.test", "contract.public_direct_identifier"),
+        ("owner", "alice&amp;#64;example.test", "contract.public_direct_identifier"),
+        ("owner", "alice%25252540example.test", "contract.public_direct_identifier"),
+        (
+            "owner",
+            "https://example.test/run?contact=alice%25252525252540example.test",
+            "contract.public_direct_identifier",
+        ),
         ("owner", "123-45-6789", "contract.public_structured_identifier"),
         ("owner", "123‐45‐6789", "contract.public_structured_identifier"),
         ("owner", "１２３-４５-６７８９", "contract.public_structured_identifier"),
@@ -4355,10 +4541,16 @@ def test_commands_reject_private_or_traversing_paths(manifest: JsonObject, unsaf
         ("owner", "+17135550199", "contract.public_structured_identifier"),
         ("owner", "+447911123456", "contract.public_structured_identifier"),
         ("owner", "+44 7911 123456", "contract.public_structured_identifier"),
+        ("owner", "713+555+0199", "contract.public_structured_identifier"),
         ("owner", "+33 1 42 68 53 00", "contract.public_structured_identifier"),
         ("owner", "+91 98765 43210", "contract.public_structured_identifier"),
         ("owner", "+١٧١٣٥٥٥٠١٩٩", "contract.public_structured_identifier"),
         ("owner", "١٢٣-٤٥-٦٧٨٩", "contract.public_structured_identifier"),
+        (
+            "owner",
+            "%2525252B1%25252520%25252528713%25252529%25252520555-0199",
+            "contract.public_structured_identifier",
+        ),
         ("access", "/Users/fixture/private/source", "contract.public_private_path"),
         ("access", "FOO=/tmp/source.jsonl", "contract.public_private_path"),
         ("access", "python /tmp/source.jsonl --safe", "contract.public_private_path"),
@@ -4369,6 +4561,13 @@ def test_commands_reject_private_or_traversing_paths(manifest: JsonObject, unsaf
         ("access", "／Users／alice／secret.json", "contract.public_private_path"),
         ("access", "file：／／／Users／alice／secret.json", "contract.public_private_path"),
         ("access", "..／secret.json", "contract.public_private_path"),
+        ("access", "&#47;Users&#47;alice&#47;private.json", "contract.public_private_path"),
+        ("access", "%2525252FUsers%2525252Falice%2525252Fprivate.json", "contract.public_private_path"),
+        (
+            "access",
+            "file%2525253A%2525252F%2525252F%2525252FUsers%2525252Falice%2525252Fprivate.json",
+            "contract.public_private_path",
+        ),
     ],
 )
 def test_entire_public_serialization_is_scanned_for_identifiers_and_paths(
@@ -4415,6 +4614,8 @@ def test_http_url_exemption_does_not_hide_private_query_or_fragment_values(manif
         ("https://example.test/run?contact=alice%40example.test", "contract.public_direct_identifier"),
         ("https://example.test/alice%2540example.test", "contract.public_direct_identifier"),
         ("https://example.test/run?phone=%2B1%28713%29555-0199", "contract.public_structured_identifier"),
+        ("https://example.test/run?phone=%2B1+713+555+0199", "contract.public_structured_identifier"),
+        ("https://example.test/run?phone=%2B44+7911+123456", "contract.public_structured_identifier"),
         ("https://example.test/run#ssn=123%2D45%2D6789", "contract.public_structured_identifier"),
     ],
 )
@@ -4441,6 +4642,36 @@ def test_http_urls_and_gate_json_pointers_are_public_path_exemptions(
     assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
     assert validate_enron_evidence(evidence) == {"valid": True, "diagnostics": []}
     assert all(item["target"].startswith("/") for item in evidence["promotion"]["checks"])
+
+
+def test_safe_html_entity_text_remains_public(manifest: JsonObject) -> None:
+    manifest["source"]["owner"] = "Research &amp; Development"
+
+    assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
+
+
+def test_public_normalization_budget_fails_closed_with_bounded_work(
+    manifest: JsonObject, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    encoded = "%40"
+    for _ in range(enron_contract.MAX_PUBLIC_DECODE_ROUNDS + 1):
+        encoded = encoded.replace("%", "%25")
+    calls = 0
+    transform = enron_contract._public_text_transform
+
+    def counted(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return transform(value)
+
+    monkeypatch.setattr(enron_contract, "_public_text_transform", counted)
+    _, converged = enron_contract._normalize_public_text(f"alice{encoded}example.test")
+    assert converged is False
+    assert calls <= enron_contract.MAX_PUBLIC_DECODE_ROUNDS + 1
+    monkeypatch.setattr(enron_contract, "_public_text_transform", transform)
+    manifest["source"]["owner"] = f"alice{encoded}example.test"
+
+    _assert_code(validate_enron_manifest(manifest), "contract.public_ambiguous_encoding")
 
 
 def test_diagnostics_do_not_echo_direct_identifiers_or_offending_values(manifest: JsonObject) -> None:
@@ -4612,6 +4843,38 @@ def test_contract_loaders_reject_oversized_files(tmp_path: Path, monkeypatch: py
 
     with pytest.raises(ValueError, match="exceeds"):
         load_enron_manifest(oversized)
+
+
+@pytest.mark.parametrize(
+    ("limit", "payload", "message"),
+    [
+        ("nodes", '{"items":[' + ",".join("{}" for _ in range(20)) + "]}", "node-count"),
+        ("collection", '{"items":[0,1,2,3,4]}', "collection-size"),
+        ("depth", '{"a":{"b":{"c":0}}}', "depth"),
+    ],
+)
+def test_contract_loader_enforces_structural_limits_before_json_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: str, payload: str, message: str
+) -> None:
+    source = tmp_path / f"{limit}-amplification.json"
+    source.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(
+        enron_contract,
+        {
+            "nodes": "MAX_CONTRACT_NODES",
+            "collection": "MAX_COLLECTION_ITEMS",
+            "depth": "MAX_CONTRACT_DEPTH",
+        }[limit],
+        {"nodes": 8, "collection": 4, "depth": 2}[limit],
+    )
+
+    def unexpected_parse(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("json.loads must not run after preflight exhaustion")
+
+    monkeypatch.setattr(enron_contract.json, "loads", unexpected_parse)
+
+    with pytest.raises(ValueError, match=message):
+        enron_contract._load_contract_json(source)
 
 
 @pytest.mark.parametrize("payload", ["[]", "null", '"text"', "1"])

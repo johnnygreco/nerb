@@ -16,10 +16,11 @@ from datetime import datetime
 from fractions import Fraction
 from hashlib import sha256
 from heapq import nsmallest
+from html import unescape as unescape_html
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISREG
 from statistics import median
-from typing import Any
+from typing import Any, NoReturn
 from unicodedata import decimal as unicode_decimal
 from unicodedata import normalize as normalize_unicode
 from urllib.parse import unquote, urlsplit
@@ -39,10 +40,12 @@ MAX_CONTRACT_BYTES = 16 * 1024 * 1024
 MAX_CONTRACT_DEPTH = 100
 MAX_CONTRACT_NODES = 250_000
 MAX_COLLECTION_ITEMS = 10_000
+MAX_REFERENCED_ITEMS = 250_000
 MAX_DIAGNOSTICS = 100
 MAX_ID_CHARS = 256
 MAX_STRING_CHARS = 4 * 1024
 MAX_TOTAL_STRING_CHARS = MAX_CONTRACT_BYTES
+MAX_PUBLIC_DECODE_ROUNDS = 8
 MAX_SAFE_INTEGER = 2**63 - 1
 MAX_FINITE_CONTRACT_NUMBER = 1e300
 MIN_SAMPLE_SECONDS = 1e-9
@@ -3107,14 +3110,34 @@ def _performance_diagnostics(
             )
     input_by_id = {str(item["id"]): item for item in inputs}
     resolved_inventory_ids: set[str] = set()
+    referenced_item_count = 0
+    inventory_cache: dict[str, tuple[str, int, dict[str, Any]] | None] = {}
+    inventory_budget_exceeded: set[str] = set()
     for index, input_descriptor in enumerate(inputs):
         path = f"/performance/inputs/{index}"
         diagnostics.extend(_performance_input_diagnostics(input_descriptor, bank_by_id, path))
         inventory_id = str(input_descriptor["inventory_ref"]["id"])
         if referenced_input_inventories is not None and inventory_id in referenced_input_inventories:
+            if inventory_id not in inventory_cache and inventory_id not in inventory_budget_exceeded:
+                resolved_inventory = referenced_input_inventories[inventory_id]
+                inventory_items = len(resolved_inventory) if type(resolved_inventory) in (list, tuple) else 0
+                if referenced_item_count + inventory_items > MAX_REFERENCED_ITEMS:
+                    inventory_budget_exceeded.add(inventory_id)
+                else:
+                    referenced_item_count += inventory_items
+                    inventory_cache[inventory_id] = _prepare_performance_inventory(resolved_inventory)
+            if inventory_id in inventory_budget_exceeded:
+                diagnostics.append(
+                    _error(
+                        "contract.performance_reference_budget",
+                        f"{path}/inventory_ref",
+                        "Referenced performance artifacts exceed the aggregate item budget.",
+                    )
+                )
+                continue
             inventory_diagnostics = _performance_inventory_diagnostics(
                 input_descriptor,
-                referenced_input_inventories[inventory_id],
+                inventory_cache[inventory_id],
                 path,
             )
             diagnostics.extend(inventory_diagnostics)
@@ -3187,6 +3210,8 @@ def _performance_diagnostics(
                     "Source building must bind the exact frozen train-split artifact.",
                 )
             )
+    sample_cache: dict[str, tuple[list[float], int, str] | None] = {}
+    sample_budget_exceeded: set[str] = set()
     for index, workload in enumerate(workloads):
         path = f"/performance/workloads/{index}"
         harness = harness_by_id.get(str(workload["harness_id"]))
@@ -3294,10 +3319,13 @@ def _performance_diagnostics(
             )
         samples = workload["samples_seconds"]
         resolved_samples: Sequence[float] | None = samples
+        normalized_samples: list[float] | None = None
+        resolved_sample_bytes: int | None = None
+        resolved_sample_sha256: str | None = None
         if not samples:
             sample_ref = workload["samples_ref"]
-            resolved_samples = None if referenced_samples is None else referenced_samples.get(sample_ref["id"])
-            if resolved_samples is None:
+            sample_id = str(sample_ref["id"])
+            if referenced_samples is None or sample_id not in referenced_samples:
                 diagnostics.append(
                     _error(
                         "contract.performance_samples_unavailable",
@@ -3306,9 +3334,39 @@ def _performance_diagnostics(
                     )
                 )
                 continue
+            if sample_id not in sample_cache and sample_id not in sample_budget_exceeded:
+                resolved_reference = referenced_samples[sample_id]
+                sample_items = len(resolved_reference) if type(resolved_reference) in (list, tuple) else 0
+                if referenced_item_count + sample_items > MAX_REFERENCED_ITEMS:
+                    sample_budget_exceeded.add(sample_id)
+                else:
+                    referenced_item_count += sample_items
+                    sample_cache[sample_id] = _prepare_performance_samples(resolved_reference)
+            if sample_id in sample_budget_exceeded:
+                diagnostics.append(
+                    _error(
+                        "contract.performance_reference_budget",
+                        f"{path}/samples_ref",
+                        "Referenced performance artifacts exceed the aggregate item budget.",
+                    )
+                )
+                continue
+            prepared_samples = sample_cache[sample_id]
+            if prepared_samples is None:
+                diagnostics.append(
+                    _error(
+                        "contract.performance_sample_support",
+                        f"{path}/samples_seconds",
+                        "Performance requires at least five finite, strictly positive, bounded samples.",
+                    )
+                )
+                continue
+            resolved_samples, resolved_sample_bytes, resolved_sample_sha256 = prepared_samples
+            normalized_samples = resolved_samples
         if resolved_samples is None:
             continue
-        normalized_samples = _normalize_samples(resolved_samples)
+        if normalized_samples is None:
+            normalized_samples = _normalize_samples(resolved_samples)
         if normalized_samples is None or len(normalized_samples) < 5:
             diagnostics.append(
                 _error(
@@ -3319,8 +3377,8 @@ def _performance_diagnostics(
             )
             continue
         if not samples and (
-            workload["samples_ref"]["bytes"] != len(_canonical_payload(normalized_samples))
-            or hash_enron_samples(normalized_samples) != workload["samples_ref"]["sha256"]
+            workload["samples_ref"]["bytes"] != resolved_sample_bytes
+            or resolved_sample_sha256 != workload["samples_ref"]["sha256"]
         ):
             diagnostics.append(
                 _error(
@@ -3605,11 +3663,20 @@ def _performance_input_diagnostics(
     return diagnostics
 
 
-def _performance_inventory_diagnostics(
-    descriptor: Mapping[str, Any], inventory: Sequence[Mapping[str, int]], path: str
-) -> list[Diagnostic]:
+def _prepare_performance_inventory(
+    inventory: Sequence[Mapping[str, int]],
+) -> tuple[str, int, dict[str, Any]] | None:
     normalized = _normalize_performance_inventory(inventory)
     if normalized is None:
+        return None
+    payload = _canonical_payload(normalized)
+    return "sha256:" + sha256(payload).hexdigest(), len(payload), _performance_inventory_summary(normalized)
+
+
+def _performance_inventory_diagnostics(
+    descriptor: Mapping[str, Any], prepared: tuple[str, int, Mapping[str, Any]] | None, path: str
+) -> list[Diagnostic]:
+    if prepared is None:
         return [
             _error(
                 "contract.performance_inventory_shape",
@@ -3617,10 +3684,9 @@ def _performance_inventory_diagnostics(
                 "Referenced inventory must contain only bounded nonnegative integer bytes and records per document.",
             )
         ]
+    inventory_sha256, inventory_bytes, expected = prepared
     inventory_ref = descriptor["inventory_ref"]
-    if inventory_ref["sha256"] != _canonical_hash(normalized) or inventory_ref["bytes"] != len(
-        _canonical_payload(normalized)
-    ):
+    if inventory_ref["sha256"] != inventory_sha256 or inventory_ref["bytes"] != inventory_bytes:
         return [
             _error(
                 "contract.performance_inventory_hash",
@@ -3628,7 +3694,6 @@ def _performance_inventory_diagnostics(
                 "Referenced input inventory does not match its content-addressed reference.",
             )
         ]
-    expected = _performance_inventory_summary(normalized)
     fields = (
         "documents",
         "bytes",
@@ -4139,6 +4204,7 @@ def _performance_promotion_diagnostics(
             )
         )
     scale_banks: dict[int, list[Mapping[str, Any]]] = {}
+    required_scale_descriptors: list[Mapping[str, Any]] = []
     for item in banks:
         if item["kind"] == "synthetic_scale":
             scale_banks.setdefault(int(item["active_aliases"]), []).append(item)
@@ -4154,6 +4220,7 @@ def _performance_promotion_diagnostics(
             )
             continue
         descriptor = descriptors[0]
+        required_scale_descriptors.append(descriptor)
         if evaluated_bank is not None and not _scale_composition_matches_evaluated(descriptor, evaluated_bank):
             diagnostics.append(
                 _error(
@@ -4179,6 +4246,26 @@ def _performance_promotion_diagnostics(
                     "contract.missing_scale_decision_cell",
                     "/performance/workloads",
                     "Every required scale bank needs a direct decision-grade workload cell.",
+                )
+            )
+    if len(required_scale_descriptors) == len(PERFORMANCE_SCALE_ALIASES) and all(
+        descriptor["generator"] is not None for descriptor in required_scale_descriptors
+    ):
+        generator_families = {
+            (
+                descriptor["generator"]["id"],
+                descriptor["generator"]["version"],
+                descriptor["generator"]["source_sha256"],
+                descriptor["generator"]["spec_sha256"],
+            )
+            for descriptor in required_scale_descriptors
+        }
+        if len(generator_families) != 1:
+            diagnostics.append(
+                _error(
+                    "contract.uncontrolled_scale_generator_family",
+                    "/performance/banks",
+                    "Required scale banks must share one versioned generator implementation and specification.",
                 )
             )
     direct_cells = [
@@ -4308,13 +4395,51 @@ def _performance_promotion_diagnostics(
                 "and work.",
             )
         )
-    concurrencies = {int(item["concurrency"]) for item, _ in direct_cells}
+    concurrencies = {int(workloads[index]["concurrency"]) for index in decision_indices}
     if any(value > evidence["environment"]["cpu_count"] for value in concurrencies):
         diagnostics.append(
             _error(
                 "contract.performance_concurrency_bounds",
                 "/performance/workloads",
                 "Decision-grade concurrency cannot exceed the recorded machine CPU count.",
+            )
+        )
+    if any(
+        workloads[index]["peak_rss_bytes"] is not None
+        and workloads[index]["peak_rss_bytes"] > evidence["environment"]["memory_bytes"]
+        for index in decision_indices
+    ):
+        diagnostics.append(
+            _error(
+                "contract.performance_memory_bounds",
+                "/performance/workloads",
+                "Decision-grade peak RSS cannot exceed the recorded machine memory capacity.",
+            )
+        )
+    command_by_id = {str(item["id"]): item for item in evidence["commands"]}
+    harness_by_id = {str(item["id"]): item for item in performance["harnesses"]}
+    required_command_workload_ids = {str(workloads[index]["id"]) for index in decision_indices}
+    required_command_workload_ids.update(
+        str(comparison["baseline_workload_id"])
+        for comparison in performance["comparisons"]
+        if str(comparison["candidate_workload_id"]) in required_command_workload_ids
+    )
+    required_command_workloads = [
+        workload for workload in workloads if str(workload["id"]) in required_command_workload_ids
+    ]
+    decision_commands = [
+        command_by_id.get(str(harness_by_id[str(workload["harness_id"])]["command_id"]))
+        for workload in required_command_workloads
+        if str(workload["harness_id"]) in harness_by_id
+    ]
+    if len(decision_commands) != len(required_command_workloads) or any(
+        command is None or command["exit_status"] != 0 for command in decision_commands
+    ):
+        diagnostics.append(
+            _error(
+                "contract.performance_command_failure",
+                "/commands",
+                "Decision-grade performance and its exact baselines require successful declared harness commands.",
             )
         )
     workload_by_id = {str(item["id"]): item for item in workloads}
@@ -5328,7 +5453,9 @@ def _contains_unsafe_command_path(value: str) -> bool:
 
 
 def _contains_unsafe_path_text(value: str, *, depth: int = 0) -> bool:
-    decoded = _decode_url_component(value)
+    decoded, converged = _normalize_public_text(value)
+    if not converged:
+        return True
     local_path_text, url_payloads = _partition_http_url_text(decoded)
     if _contains_unsafe_local_path(local_path_text):
         return True
@@ -5364,12 +5491,12 @@ def _contains_unsafe_local_path(value: str) -> bool:
 
 _STRUCTURED_SSN_PATTERN = re.compile(r"(?<![0-9])[0-9]{3}[- ][0-9]{2}[- ][0-9]{4}(?![0-9])")
 _STRUCTURED_PHONE_PATTERN = re.compile(
-    r"(?<![0-9])(?:\+?1[ .-]*)?(?:"
-    r"\([0-9]{3}\)[ .-]*[0-9]{3}[ .-]*[0-9]{4}"
-    r"|[0-9]{3}[ .-]+[0-9]{3}[ .-]+[0-9]{4})(?![0-9])"
+    r"(?<![0-9])(?:\+?1[ .+-]*)?(?:"
+    r"\([0-9]{3}\)[ .+-]*[0-9]{3}[ .+-]*[0-9]{4}"
+    r"|[0-9]{3}[ .+-]+[0-9]{3}[ .+-]+[0-9]{4})(?![0-9])"
 )
 _E164_PHONE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9]{8,15}(?![0-9])")
-_INTERNATIONAL_PHONE_CANDIDATE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9() .-]+")
+_INTERNATIONAL_PHONE_CANDIDATE_PATTERN = re.compile(r"(?<![0-9+])\+[0-9() .+-]+")
 _HTTP_URL_PATTERN = re.compile(
     r"(?i)https?://(?:\[[0-9a-f:.]+\]|[^/\s\"'<>,;\[\]{}]+)(?::[0-9]+)?"
     r"(?:(?:/|[?#])[^\s\"'<>,;\]}]*)?"
@@ -5400,7 +5527,7 @@ _ZERO_WIDTH_SEPARATORS = "\u200b\u200c\u200d\u2060\ufeff"
 
 
 def _partition_http_url_text(value: str) -> tuple[str, list[str]]:
-    """Remove remote paths but retain decoded URL query and fragment text for local-path checks."""
+    """Remove remote paths but retain URL query and fragment text for local-path checks."""
     pieces: list[str] = []
     payloads: list[str] = []
     offset = 0
@@ -5414,18 +5541,27 @@ def _partition_http_url_text(value: str) -> tuple[str, list[str]]:
             continue
         pieces.extend((value[offset : match.start()], " "))
         offset = match.end()
-        payloads.extend((_decode_url_component(parsed.query), _decode_url_component(parsed.fragment)))
+        payloads.extend((parsed.query, parsed.fragment))
     pieces.append(value[offset:])
     return "".join(pieces), payloads
 
 
-def _decode_url_component(value: str) -> str:
-    for _ in range(3):
-        decoded = unquote(value)
+def _public_text_transform(value: str) -> str:
+    compatible = normalize_unicode("NFKC", value)
+    without_zero_width = compatible.translate({ord(char): None for char in _ZERO_WIDTH_SEPARATORS})
+    return unquote(unescape_html(without_zero_width))
+
+
+def _normalize_public_text(value: str) -> tuple[str, bool]:
+    for _ in range(MAX_PUBLIC_DECODE_ROUNDS):
+        decoded = _public_text_transform(value)
+        if len(decoded) > MAX_STRING_CHARS:
+            return value, False
         if decoded == value:
-            break
+            return value, True
         value = decoded
-    return value
+    probe = _public_text_transform(value)
+    return value, len(probe) <= MAX_STRING_CHARS and probe == value
 
 
 def _normalized_structured_identifier_text(value: str) -> str:
@@ -5451,10 +5587,20 @@ def _contains_international_phone(value: str) -> bool:
 def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     for path, text in _iter_strings(value):
-        _, url_payloads = _partition_http_url_text(text)
-        identifier_texts = [
-            _normalized_structured_identifier_text(_decode_url_component(item)) for item in (text, *url_payloads)
-        ]
+        normalized_text, converged = _normalize_public_text(text)
+        if not converged:
+            diagnostics.append(
+                _error(
+                    "contract.public_ambiguous_encoding",
+                    path,
+                    "Public contract serialization exceeds the bounded reversible-encoding normalization policy.",
+                )
+            )
+            if len(diagnostics) > MAX_DIAGNOSTICS:
+                return diagnostics
+            continue
+        _, url_payloads = _partition_http_url_text(normalized_text)
+        identifier_texts = [_normalized_structured_identifier_text(item) for item in (normalized_text, *url_payloads)]
         if any("@" in item for item in identifier_texts):
             diagnostics.append(
                 _error(
@@ -5482,7 +5628,7 @@ def _public_serialization_diagnostics(value: Mapping[str, Any]) -> list[Diagnost
             if len(diagnostics) > MAX_DIAGNOSTICS:
                 return diagnostics
         is_gate_pointer = bool(re.fullmatch(r"/promotion/checks/\d+/target", path))
-        if not is_gate_pointer and _contains_unsafe_path_text(text):
+        if not is_gate_pointer and _contains_unsafe_path_text(normalized_text):
             diagnostics.append(
                 _error(
                     "contract.public_private_path",
@@ -5557,6 +5703,14 @@ def _normalize_samples(samples: Sequence[Any]) -> list[float] | None:
             return None
         normalized.append(parsed)
     return normalized
+
+
+def _prepare_performance_samples(samples: Sequence[Any]) -> tuple[list[float], int, str] | None:
+    normalized = _normalize_samples(samples)
+    if normalized is None:
+        return None
+    payload = _canonical_payload(normalized)
+    return normalized, len(payload), "sha256:" + sha256(payload).hexdigest()
 
 
 def _normalize_performance_inventory(
@@ -5955,6 +6109,151 @@ def _result(diagnostics: list[Diagnostic]) -> dict[str, Any]:
     return {"valid": not has_errors(ordered), "diagnostics": ordered}
 
 
+_JSON_NUMBER_TOKEN = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+
+
+def _preflight_json_structure(payload: str) -> None:
+    index = 0
+    node_count = 0
+    root_state = "value"
+    stack: list[dict[str, Any]] = []
+
+    def fail() -> NoReturn:
+        raise _ContractJSONValueError("Contract file must contain valid bounded JSON.")
+
+    def skip_whitespace(position: int) -> int:
+        while position < len(payload) and payload[position] in " \t\r\n":
+            position += 1
+        return position
+
+    def scan_string(position: int) -> int:
+        position += 1
+        while position < len(payload):
+            character = payload[position]
+            if character == '"':
+                return position + 1
+            if character == "\\":
+                position += 1
+                if position >= len(payload):
+                    fail()
+                escape = payload[position]
+                if escape == "u":
+                    digits = payload[position + 1 : position + 5]
+                    if len(digits) != 4 or any(character not in "0123456789abcdefABCDEF" for character in digits):
+                        fail()
+                    position += 5
+                    continue
+                if escape not in '"\\/bfnrt':
+                    fail()
+            elif ord(character) < 0x20:
+                fail()
+            position += 1
+        fail()
+        return position
+
+    def consume_value() -> None:
+        nonlocal root_state
+        if not stack:
+            if root_state != "value":
+                fail()
+            root_state = "done"
+            return
+        frame = stack[-1]
+        if frame["kind"] == "array":
+            if frame["state"] != "value_or_end":
+                fail()
+        elif frame["state"] != "value":
+            fail()
+        frame["items"] += 1
+        if frame["items"] > MAX_COLLECTION_ITEMS:
+            raise _ContractJSONValueError("Contract JSON collection exceeds the collection-size limit.")
+        frame["state"] = "comma_or_end"
+
+    def scan_value(position: int) -> int:
+        nonlocal node_count
+        if position >= len(payload):
+            fail()
+        if len(stack) > MAX_CONTRACT_DEPTH:
+            raise _ContractJSONValueError("Contract JSON exceeds the depth limit.")
+        character = payload[position]
+        node_count += 1
+        if node_count > MAX_CONTRACT_NODES:
+            raise _ContractJSONValueError("Contract JSON exceeds the node-count limit.")
+        consume_value()
+        if character in "[{":
+            stack.append(
+                {
+                    "kind": "array" if character == "[" else "object",
+                    "state": "value_or_end" if character == "[" else "key_or_end",
+                    "items": 0,
+                }
+            )
+            return position + 1
+        if character == '"':
+            return scan_string(position)
+        for literal in ("true", "false", "null"):
+            if payload.startswith(literal, position):
+                return position + len(literal)
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            if payload.startswith(constant, position):
+                return position + len(constant)
+        number = _JSON_NUMBER_TOKEN.match(payload, position)
+        if number is None:
+            fail()
+        return number.end()
+
+    while True:
+        index = skip_whitespace(index)
+        if not stack:
+            if root_state == "done":
+                if index != len(payload):
+                    fail()
+                return
+            index = scan_value(index)
+            continue
+        frame = stack[-1]
+        state = frame["state"]
+        if frame["kind"] == "object":
+            if state == "key_or_end":
+                if index < len(payload) and payload[index] == "}":
+                    stack.pop()
+                    index += 1
+                elif index < len(payload) and payload[index] == '"':
+                    index = scan_string(index)
+                    frame["state"] = "colon"
+                else:
+                    fail()
+            elif state == "colon":
+                if index >= len(payload) or payload[index] != ":":
+                    fail()
+                frame["state"] = "value"
+                index += 1
+            elif state == "value":
+                index = scan_value(index)
+            elif index < len(payload) and payload[index] == ",":
+                frame["state"] = "key_or_end"
+                index += 1
+            elif index < len(payload) and payload[index] == "}":
+                stack.pop()
+                index += 1
+            else:
+                fail()
+        elif state == "value_or_end":
+            if index < len(payload) and payload[index] == "]":
+                stack.pop()
+                index += 1
+            else:
+                index = scan_value(index)
+        elif index < len(payload) and payload[index] == ",":
+            frame["state"] = "value_or_end"
+            index += 1
+        elif index < len(payload) and payload[index] == "]":
+            stack.pop()
+            index += 1
+        else:
+            fail()
+
+
 def _load_contract_json(path: str | Path) -> dict[str, Any]:
     try:
         source = Path(path).expanduser()
@@ -6002,6 +6301,7 @@ def _load_contract_json(path: str | Path) -> dict[str, Any]:
     except UnicodeDecodeError:
         raise ValueError("Contract file must contain valid UTF-8 JSON.") from None
     try:
+        _preflight_json_structure(payload)
         value = json.loads(payload, parse_constant=_reject_constant, object_pairs_hook=_reject_duplicate_keys)
     except _ContractJSONValueError:
         raise

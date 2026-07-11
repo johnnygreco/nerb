@@ -275,7 +275,9 @@ message text.
 
 Bank descriptors freeze taxonomy composition as well as entity, name, alias, literal-pattern, regex-pattern, and byte
 counts. Promotion exercises distinct 1k, 10k, 25k, and 100k active-alias banks whose taxonomy and alias/regex
-proportions track the evaluated bank within the contract tolerance. These are controlled measurements, not four
+proportions track the evaluated bank within the contract tolerance. All four banks share one content-addressed,
+versioned generator implementation and specification while allowing scale-specific seeds. These are controlled
+measurements, not four
 unrelated cells: every scale uses the same canonical negative, medium, serial whole-input shape; density varies on a
 fixed bank, size, and synthetic generator family; size varies on a fixed bank, density, and synthetic generator family;
 and serial/concurrent cells use the exact same bank, input, sample unit, and work. Unrelated real inputs cannot stand in
@@ -287,7 +289,8 @@ and end to end—has an evaluated-bank decision cell. Decision-grade cells use o
 samples (inline or by verified content-addressed reference), plus one positive RSS sample per timing sample with peak RSS
 equal to their maximum. Fresh-process phases use zero warmups; reused-process phases use at least three. Median and
 median absolute deviation use the declared conventional methods; nearest-rank p95 requires 20 samples and p99 requires
-100.
+100. Every decision-grade harness command must succeed, concurrency cannot exceed the recorded CPU count in any phase,
+and measured peak RSS cannot exceed the recorded machine memory.
 
 Every decision cell has same-machine comparisons against an exact semantic baseline on an identical operation
 specification, source artifact, phase, bank, input, warmup policy, sample count, sample unit, work, and concurrency. At
@@ -409,8 +412,12 @@ values. This includes compatibility-normalized/fullwidth identifier forms, canon
 separators and decimal digits, formatted international numbers, compatibility-normalized path punctuation, UNC shares,
 and local paths attached to command options. HTTP(S) remote paths, nested remote links, and promotion-gate JSON pointers
 remain permitted, but recursively partitioned and repeatedly decoded URL payloads cannot smuggle an identifier, local
-path, or file URI. External sample and inventory resolvers and trusted-lineage prefixes must use bounded exact JSON-like
-built-in containers and scalar types. Charts are regenerated solely from the verified aggregate evidence bundle.
+path, or file URI. Percent escapes, HTML entities, compatibility forms, and zero-width separators are normalized to a
+bounded fixed point; strings that exceed that normalization budget fail closed. External sample and inventory resolvers
+and trusted-lineage prefixes must use bounded exact JSON-like built-in containers and scalar types. Shared referenced
+performance artifacts are normalized once per content ID and share an aggregate item budget. File loaders enforce
+node, collection, and depth limits before materializing JSON as well as after parsing. Charts are regenerated solely
+from the verified aggregate evidence bundle.
 
 ## Historical V1 Quarantine
 
