@@ -472,6 +472,7 @@ _PUBLIC_CARD_SCHEMA = _closed_card_object(
     }
 )
 _PUBLIC_CARD_VALIDATOR = EnronContractValidator(_PUBLIC_CARD_SCHEMA)
+_AUXILIARY_CARD_VALIDATOR = EnronContractValidator(_CARD_AUXILIARY)
 _EXPECTED_CARD_CHARTER: dict[str, Any] = {
     "id": "privacy_first_enron_intelligence_v2",
     "primary_user_value": "prevent_sensitive_contact_and_person_name_leakage",
@@ -1670,43 +1671,61 @@ def _independent_auxiliary_summary(cmu_quality: Mapping[str, Any] | None) -> dic
             "evaluated": False,
             "reason_code": "annotation_run_not_supplied",
         }
-    cmu_slice = _slice_by_id(cmu_quality, "cmu_person_all_train")
+    quality = cmu_quality.get("quality")
+    slices = quality.get("slices") if isinstance(quality, Mapping) else None
+    if (
+        not isinstance(slices, Sequence)
+        or isinstance(slices, (str, bytes, bytearray))
+        or any(not isinstance(item, Mapping) for item in slices)
+    ):
+        raise EnronBankBuildError("Auxiliary CMU quality evidence is invalid.")
+    matches = [cast(Mapping[str, Any], item) for item in slices if item.get("id") == "cmu_person_all_train"]
+    if len(matches) != 1:
+        raise EnronBankBuildError("Auxiliary CMU quality evidence is invalid.")
+    cmu_slice = matches[0]
     metrics = cmu_slice.get("metrics")
     if not isinstance(metrics, Mapping):
-        raise EnronBankBuildError("Auxiliary CMU quality metrics are invalid.")
-    return {
+        raise EnronBankBuildError("Auxiliary CMU quality evidence is invalid.")
+    summary = {
         "evaluated": True,
         "scope": "cmu_meetings_person_train_auxiliary_nonpromotable",
-        "label_strength": cmu_slice["label_strength"],
-        "annotation_completeness": cmu_slice["annotation_completeness"],
-        "documents": cmu_slice["documents"],
-        "documents_with_sensitive_gold": cmu_slice["documents_with_sensitive_gold"],
-        "documents_with_any_miss": cmu_slice["documents_with_any_miss"],
-        "documents_with_cataloged_gold": cmu_slice["documents_with_cataloged_gold"],
-        "documents_with_any_cataloged_miss": cmu_slice["documents_with_any_cataloged_miss"],
-        "documents_with_any_leaked_character": cmu_slice["documents_with_any_leaked_character"],
-        "gold_spans": cmu_slice["gold_spans"],
-        "predicted_spans": cmu_slice["predicted_spans"],
-        "true_positive": cmu_slice["true_positive"],
-        "false_negative": cmu_slice["false_negative"],
-        "false_positive": cmu_slice["false_positive"],
-        "cataloged_gold_spans": cmu_slice["cataloged_gold_spans"],
-        "cataloged_true_positive": cmu_slice["cataloged_true_positive"],
-        "cataloged_false_negative": cmu_slice["cataloged_false_negative"],
-        "cataloged_wrong_canonical": cmu_slice["cataloged_wrong_canonical"],
-        "sensitive_gold_characters": cmu_slice["sensitive_gold_characters"],
-        "covered_sensitive_characters": cmu_slice["covered_sensitive_characters"],
-        "leaked_sensitive_characters": cmu_slice["leaked_sensitive_characters"],
-        "predicted_characters": cmu_slice["predicted_characters"],
-        "over_redacted_characters": cmu_slice["over_redacted_characters"],
-        "evaluated_characters": cmu_slice["evaluated_characters"],
-        "negative_documents": cmu_slice["negative_documents"],
-        "negative_documents_with_predictions": cmu_slice["negative_documents_with_predictions"],
+        "label_strength": cmu_slice.get("label_strength"),
+        "annotation_completeness": cmu_slice.get("annotation_completeness"),
+        "documents": cmu_slice.get("documents"),
+        "documents_with_sensitive_gold": cmu_slice.get("documents_with_sensitive_gold"),
+        "documents_with_any_miss": cmu_slice.get("documents_with_any_miss"),
+        "documents_with_cataloged_gold": cmu_slice.get("documents_with_cataloged_gold"),
+        "documents_with_any_cataloged_miss": cmu_slice.get("documents_with_any_cataloged_miss"),
+        "documents_with_any_leaked_character": cmu_slice.get("documents_with_any_leaked_character"),
+        "gold_spans": cmu_slice.get("gold_spans"),
+        "predicted_spans": cmu_slice.get("predicted_spans"),
+        "true_positive": cmu_slice.get("true_positive"),
+        "false_negative": cmu_slice.get("false_negative"),
+        "false_positive": cmu_slice.get("false_positive"),
+        "cataloged_gold_spans": cmu_slice.get("cataloged_gold_spans"),
+        "cataloged_true_positive": cmu_slice.get("cataloged_true_positive"),
+        "cataloged_false_negative": cmu_slice.get("cataloged_false_negative"),
+        "cataloged_wrong_canonical": cmu_slice.get("cataloged_wrong_canonical"),
+        "sensitive_gold_characters": cmu_slice.get("sensitive_gold_characters"),
+        "covered_sensitive_characters": cmu_slice.get("covered_sensitive_characters"),
+        "leaked_sensitive_characters": cmu_slice.get("leaked_sensitive_characters"),
+        "predicted_characters": cmu_slice.get("predicted_characters"),
+        "over_redacted_characters": cmu_slice.get("over_redacted_characters"),
+        "evaluated_characters": cmu_slice.get("evaluated_characters"),
+        "negative_documents": cmu_slice.get("negative_documents"),
+        "negative_documents_with_predictions": cmu_slice.get("negative_documents_with_predictions"),
         "metrics": dict(metrics),
-        "protocol_sha256": cmu_quality["protocol_sha256"],
-        "run_sha256": cmu_quality["run_sha256"],
+        "protocol_sha256": cmu_quality.get("protocol_sha256"),
+        "run_sha256": cmu_quality.get("run_sha256"),
         "nonpromotable": True,
     }
+    try:
+        schema_error = next(_AUXILIARY_CARD_VALIDATOR.iter_errors(summary), None)
+    except (RecursionError, TypeError, ValueError):
+        schema_error = True
+    if schema_error is not None:
+        raise EnronBankBuildError("Auxiliary CMU quality evidence is invalid.")
+    return summary
 
 
 def _safe_slice_summary(item: Mapping[str, Any]) -> dict[str, Any]:

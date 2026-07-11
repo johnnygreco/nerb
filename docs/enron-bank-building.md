@@ -272,21 +272,21 @@ cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.7
 over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
 hidden by the catalog guarantee.
 
-On an Apple M4 with 16 GiB RAM, the CMU-enabled build took 130.98 seconds and 1,177,747,456 bytes peak RSS. Deep replay
-took 118.94 seconds and 1,247,543,296 bytes peak RSS. These are one-time construction/audit costs, not steady-state scan
+On an Apple M4 with 16 GiB RAM, the CMU-enabled build took 129.43 seconds and 1,181,171,712 bytes peak RSS. Deep replay
+took 119.04 seconds and 1,249,689,600 bytes peak RSS. These are one-time construction/audit costs, not steady-state scan
 latency claims; #152 owns runtime benchmarks.
 
 Key commitments are:
 
-- selected bank: `sha256:02753288b5073beb8605a35735012ff3fb9cc64fc14e7be882ef3196198b629f`;
-- bank artifact: `sha256:405405a0ae3938eed66b946706d96525f914b565edde0222c9d8201eb27d2b94`;
+- selected bank: `sha256:f8a08d0a1c4cfcd36aabe956f3024d749b9fed2f7b1ce59dd7baa8be53e79232`;
+- bank artifact: `sha256:19b32bce6bff90423f524305661b3f07e12756ec295e68ff676f5af81f245082`;
 - candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
-- builder implementation: `sha256:e882d414b21dca3ab8efbafe727807c584efe5dcf96fa4a64f6f063a7289ee05`;
-- privacy scanner implementation: `sha256:5a4539b01a6cb4a42622db935c1fe78f9eac226e2a1aea3ac535ca5ecd5fdd61`;
+- builder implementation: `sha256:f4dee1922eef085e2c73d83c3f97e46dea5426dbda981f7ff53d4fef1657b061`;
+- privacy scanner implementation: `sha256:2c41533f19b8619fc22214f9e0abbb194a486802f17a1ad9cbaefcdc80fa8457`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
-- canonical CMU catalog binding: `sha256:de86057ba5e45df43f0da7abcbd71ebb823fd8caa4f84bda558c07c72b3cb43a`;
-- bank-card run: `sha256:b8ae85712406ff5f0a043b3abc14a9bde728c9f0c6d241ea957774c8a75704cb`;
-- committed bank-card file: `sha256:39ab2bbcd1a9e0cb07c426dfc59152747d2b6bfb817c4c6a90a1b238e22809d5`; and
+- canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
+- bank-card run: `sha256:75c11e49db05c72ea6e14a4b5227f32b5297f93fa364aa6ea4461d2a29a50c9a`;
+- committed bank-card file: `sha256:28a36f27136826fe33f5ce9c853bd90961fe73aee4ccbd47f68f1216642a233f`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
 The exact private commands were:
@@ -294,13 +294,13 @@ The exact private commands were:
 ```shell
 /usr/bin/time -l uv run nerb build-enron-bank \
   --development-run .nerb/issue149-development-50000-v6 \
-  --output-dir .nerb/issue151-real-50000-v5-final \
+  --output-dir .nerb/issue151-real-50000-v6-final \
   --annotation-run .nerb/issue150-cmu/annotations-run-final4 \
   --cmu-catalog-bindings .nerb/issue151-cmu-v4-proposal.jsonl \
   --benchmark-version enron-v2-issue149-scale-50000
 
 /usr/bin/time -l uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/issue151-real-50000-v5-final \
+  --run-dir .nerb/issue151-real-50000-v6-final \
   --annotation-run .nerb/issue150-cmu/annotations-run-final4
 ```
 

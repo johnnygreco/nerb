@@ -837,6 +837,18 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
     assert failed.exit_code == 1
     assert "private build failed" in failed.output
 
+    monkeypatch.setattr(
+        cli_module,
+        "verify_enron_bank_build",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            cli_module.EnronBankBuildError("Auxiliary CMU quality evidence is invalid")
+        ),
+    )
+    failed_verify = runner.invoke(app, ["verify-enron-bank-build", "--run-dir", str(output)])
+    assert failed_verify.exit_code == 1
+    assert "Auxiliary CMU quality evidence is invalid" in failed_verify.output
+    assert "Traceback" not in failed_verify.output
+
 
 def test_enron_bank_build_cli_has_no_sealed_or_role_selector() -> None:
     help_result = runner.invoke(app, ["build-enron-bank", "--help"])

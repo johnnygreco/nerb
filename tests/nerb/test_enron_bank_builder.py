@@ -207,6 +207,40 @@ def _synthetic_cmu_quality() -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize(
+    "malformation",
+    [
+        "missing_quality",
+        "slices_not_sequence",
+        "slice_not_mapping",
+        "duplicate_target_slice",
+        "metrics_not_mapping",
+        "missing_projected_field",
+        "missing_run_hash",
+    ],
+)
+def test_independent_auxiliary_summary_normalizes_malformed_private_quality(malformation: str) -> None:
+    quality = json.loads(json.dumps(_synthetic_cmu_quality()))
+    target = quality["quality"]["slices"][0]
+    if malformation == "missing_quality":
+        del quality["quality"]
+    elif malformation == "slices_not_sequence":
+        quality["quality"]["slices"] = 1
+    elif malformation == "slice_not_mapping":
+        quality["quality"]["slices"] = [1]
+    elif malformation == "duplicate_target_slice":
+        quality["quality"]["slices"].append(dict(target))
+    elif malformation == "metrics_not_mapping":
+        target["metrics"] = []
+    elif malformation == "missing_projected_field":
+        del target["label_strength"]
+    else:
+        del quality["run_sha256"]
+
+    with pytest.raises(EnronBankBuildError, match="Auxiliary CMU quality evidence is invalid"):
+        bank_workflow._independent_auxiliary_summary(quality)
+
+
 def test_private_builder_runs_three_iterations_and_verifies_without_sealed_access(tmp_path: Path) -> None:
     development, sealed = _development_bundle(tmp_path)
     output = tmp_path / "build"
@@ -336,6 +370,38 @@ def test_verifier_rejects_coherently_tampered_public_cmu_aggregate(
     manifest_path.chmod(0o600)
 
     with pytest.raises(EnronBankBuildError, match="Public auxiliary summary differs"):
+        verify_enron_bank_build(output)
+
+
+def test_verifier_normalizes_malformed_private_cmu_evidence(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    development, _sealed = _development_bundle(tmp_path)
+    reviewed = tmp_path / "reviewed-bindings.jsonl"
+    reviewed.write_text(
+        json.dumps({"document_id": "reviewed_document", "start": 0, "end": 1, "catalog_identity": None}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        bank_workflow,
+        "evaluate_cmu_enron_training_quality_files",
+        lambda *_args, **_kwargs: _synthetic_cmu_quality(),
+    )
+    output = tmp_path / "build"
+    build_enron_intelligence_bank(
+        EnronBankBuildOptions(
+            development_run=development,
+            output_dir=output,
+            annotation_run=tmp_path / "annotations",
+            cmu_catalog_bindings_path=reviewed,
+        )
+    )
+    _rewrite_private_artifact(
+        output,
+        artifact_id="cmu_quality",
+        relative_path="auxiliary/cmu-train-quality.json",
+        value={"quality": {"slices": 1}},
+    )
+
+    with pytest.raises(EnronBankBuildError, match="Auxiliary CMU quality evidence is invalid"):
         verify_enron_bank_build(output)
 
 
