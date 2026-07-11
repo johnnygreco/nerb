@@ -2,7 +2,8 @@
 
 The v2 preparation command turns the pinned parsed Enron email source into deterministic private records and a
 privacy-safe aggregate profile. It deliberately does **not** create train, validation, or test roles, build a bank, or
-compute quality scores. Leakage grouping and immutable split assignment happen in the next stage.
+compute quality scores. Leakage grouping and immutable role assignment happen in the implemented
+[split and sealing stage](enron-splits.md).
 
 The pinned large-corpus source is `corbt/enron-emails`, split `train`, revision
 `cfc06c758093d90993abce1a43668fb7357258a6`. Pin the loader package too:
@@ -132,3 +133,5 @@ environment even when the source revision is unchanged.
 
 Raw source, prepared records, and any later banks remain sensitive even when they are pseudonymous or hashed. Keep the
 run under the authorized retention and access policy; do not commit, publish, or use it to contact or profile people.
+After this run verifies, use the [immutable split workflow](enron-splits.md) to create the development and separately
+controlled steward bundles; do not manually divide or copy prepared rows into roles.

@@ -573,6 +573,79 @@ def test_prepare_enron_command_writes_private_v2_run_and_returns_aggregate_json(
     assert "@" not in verify_result.output
 
 
+def test_split_enron_commands_create_and_verify_redacted_and_sealed_bundles(tmp_path, test_data_path):
+    preparation_dir = tmp_path / "prepared-run"
+    development_dir = tmp_path / "development-run"
+    sealed_dir = tmp_path / "sealed-run"
+    prepare_result = runner.invoke(
+        app,
+        [
+            "prepare-enron",
+            "--input-jsonl",
+            str(test_data_path / "enron_preparation_v2.jsonl"),
+            "--dataset",
+            "synthetic/enron-preparation",
+            "--dataset-revision",
+            "fixture-v2",
+            "--output-dir",
+            str(preparation_dir),
+        ],
+    )
+    assert prepare_result.exit_code == 0, prepare_result.output
+
+    split_result = runner.invoke(
+        app,
+        [
+            "split-enron",
+            "--preparation-run",
+            str(preparation_dir),
+            "--development-output-dir",
+            str(development_dir),
+            "--sealed-output-dir",
+            str(sealed_dir),
+            "--benchmark-version",
+            "enron-v2-cli-fixture",
+            "--seed",
+            "cli-split-seed",
+            "--sample-per-role",
+            "2",
+            "--fixture-mode",
+        ],
+    )
+    assert split_result.exit_code == 0, split_result.output
+    split_payload = json.loads(split_result.output)
+    assert split_payload["committed"] is True
+    assert split_payload["fixture_mode"] is True
+    assert split_payload["promotable"] is False
+    assert all(split_payload["roles"][role]["records"] > 0 for role in ("train", "validation", "test"))
+    assert str(tmp_path) not in split_result.output
+    assert "@" not in split_result.output
+    assert (development_dir / "train.jsonl").is_file()
+    assert (development_dir / "validation.jsonl").is_file()
+    assert not (development_dir / "test.jsonl").exists()
+    assert (sealed_dir / "test.jsonl").is_file()
+
+    verify_result = runner.invoke(
+        app,
+        [
+            "verify-enron-splits",
+            "--development-dir",
+            str(development_dir),
+            "--sealed-dir",
+            str(sealed_dir),
+            "--seed",
+            "cli-split-seed",
+        ],
+    )
+    assert verify_result.exit_code == 0, verify_result.output
+    verified = json.loads(verify_result.output)
+    assert verified["valid"] is True
+    assert verified["leakage_groups_crossing"] == 0
+    assert verified["test_sealed"] is True
+    assert str(tmp_path) not in verify_result.output
+    assert "@" not in verify_result.output
+
+
 def test_extract_json_matches_api_for_fixture_config_and_document(test_data_path, prog_rock_wiki):
     config_path = test_data_path / "music_entities.yaml"
     document_path = test_data_path / "prog_rock_wiki.txt"

@@ -22,6 +22,7 @@ nav = [
     { "Performance" = "performance.md" },
     { "Enron v2 Charter" = "enron-benchmark.md" },
     { "Enron v2 Preparation" = "enron-preparation.md" },
+    { "Enron v2 Splits" = "enron-splits.md" },
     { "Enron v2 Autoresearch Policy" = "autoresearch.md" },
   ] },
   { "Reference" = [

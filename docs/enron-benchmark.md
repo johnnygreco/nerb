@@ -1,8 +1,9 @@
 # Enron Benchmark v2 Charter
 
-> **Status: executable contract and private preparation implemented; benchmark execution staged.** The v2
-> manifest/evidence schemas, semantic verifier, and deterministic private [preparation pipeline](enron-preparation.md)
-> are implemented. Group-aware splitting, the evaluator, bank, and real-corpus evidence will land in later work.
+> **Status: executable contract, private preparation, and immutable splitting implemented; benchmark execution staged.**
+> The v2 manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
+> and [group-aware split and sealing workflow](enron-splits.md) are implemented. The evaluator, bank, and real-corpus
+> evidence will land in later work.
 > The existing `scripts/enron_bank_build_benchmark.py`, its `nerb.enron_benchmark.v1` output, the v1 autoresearch
 > harness, committed hero measurements, and previously published Enron numbers are historical. They do **not** satisfy
 > this charter and must not support a public quality, privacy, performance, or product claim.
@@ -22,8 +23,9 @@ important constraints, but an aggregate F1 score or a fast scan cannot compensat
 The v2 demonstration models the following production workflow:
 
 1. A user authorizes a specific source, revision, purpose, taxonomy, and retention policy.
-2. Private preparation profiles and cleans the source, assigns stable document identities, builds duplicate/thread leakage
-   groups, and freezes train, validation, and sealed-test manifests.
+2. Private preparation profiles and cleans the source and assigns stable document identities and grouping features; the
+   immutable [split workflow](enron-splits.md) builds leakage components and freezes train, validation, and sealed-test
+   bundles.
 3. An agent uses **train only** to mine candidates. A reviewer promotes well-supported aliases and generic structured-PII
    patterns; ambiguous candidates stay draft or inactive.
 4. Synthetic conformance cases validate every approved active pattern, including its case, normalization, boundary,
@@ -145,6 +147,10 @@ alone is not sufficient: downloaded content hashes are mandatory.
 
 ## Sealed Train, Validation, And Test Policy
 
+The implemented commands, private-bundle boundary, exact/reference/thread/near-duplicate component policy, temporal
+assignment, diagnostic sampling, support floors, and one-shot access behavior are documented in the
+[immutable split guide](enron-splits.md).
+
 V2 uses three immutable roles, created before candidate tuning:
 
 - **Train:** available for profiling, candidate mining, bank construction, and curation.
@@ -178,7 +184,8 @@ view, and its annotation scope cannot exclude any part of that view.
 The conformance plan separately freezes content-addressed positive and negative/adversarial case artifacts, their
 counts, the exhaustive synthetic label artifact, and the conformance policy hash. It requires positive support for every
 active pattern. The final-test frozen target and every lineage entry bind the manifest hash alongside the bank,
-evaluator, split, thresholds, performance plan, source commit, and freeze time.
+evaluator, split, exact final-test artifact, thresholds, performance plan, source commit, and freeze time. Reusing that
+test artifact under another benchmark version invalidates the lineage.
 
 ## Quality Metrics
 
@@ -351,7 +358,8 @@ target only those recomputed workload statistics or raw peak RSS, not downstream
 lets a clean clone verify arithmetic and claim consistency without access to private email text.
 
 The schema and synthetic fixtures are part of the v2 contract, but a schema-valid fixture is not real-corpus evidence.
-No v2 command or real artifact is claimed on this page until later implementation issues deliver and verify it.
+Preparation and immutable split commands now implement the private data stages; the evaluator and verified real-corpus
+evidence remain staged. Neither a prepared corpus nor a split manifest is a quality, performance, or promotion result.
 
 ## Promotion Gates
 
