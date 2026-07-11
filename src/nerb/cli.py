@@ -55,6 +55,19 @@ from .diagnostics import JSON_PARSE
 from .diff import diff_banks as _diff_banks
 from .engine import Bank
 from .engines import DEFAULT_MAX_TEXT_BYTES
+from .enron_preparation import (
+    DEFAULT_DATASET_ID as DEFAULT_ENRON_DATASET_ID,
+)
+from .enron_preparation import (
+    DEFAULT_DATASET_REVISION as DEFAULT_ENRON_DATASET_REVISION,
+)
+from .enron_preparation import (
+    DEFAULT_DATASET_SPLIT as DEFAULT_ENRON_DATASET_SPLIT,
+)
+from .enron_preparation import (
+    DEFAULT_OUTPUT_DIR as DEFAULT_ENRON_OUTPUT_DIR,
+)
+from .enron_preparation import EnronPreparationOptions, load_enron_preparation_run, prepare_enron_source
 from .evals import eval_bank as _eval_bank
 from .extraction import ExtractionError
 from .extraction import (
@@ -2335,6 +2348,93 @@ def benchmark_json_bank(
     if stress_multiplier is not None:
         options["stress_multiplier"] = stress_multiplier
     _echo_json(_run_json_helper(lambda: _benchmark_bank(bank, options=options or None)))
+
+
+@app.command("prepare-enron")
+def prepare_enron(
+    output_dir: Path = typer.Option(
+        Path(DEFAULT_ENRON_OUTPUT_DIR),
+        "--output-dir",
+        help="New private run directory; inside a repository it must be ignored.",
+    ),
+    input_jsonl: Path | None = typer.Option(
+        None,
+        "--input-jsonl",
+        help="Local Enron-shaped JSONL source; otherwise stream the pinned Hugging Face source.",
+    ),
+    dataset_id: str = typer.Option(DEFAULT_ENRON_DATASET_ID, "--dataset", help="Source dataset identifier."),
+    dataset_revision: str = typer.Option(
+        DEFAULT_ENRON_DATASET_REVISION,
+        "--dataset-revision",
+        help="Required immutable source revision.",
+    ),
+    dataset_split: str = typer.Option(DEFAULT_ENRON_DATASET_SPLIT, "--dataset-split", help="Source dataset split."),
+    max_rows: int | None = typer.Option(None, "--max-rows", min=1, help="Optional bounded fixture row limit."),
+    max_jsonl_line_bytes: int = typer.Option(
+        16 * 1024 * 1024,
+        "--max-jsonl-line-bytes",
+        min=1,
+        help="Maximum bytes inspected for one local JSONL row.",
+    ),
+    max_body_chars: int = typer.Option(
+        2_500_000,
+        "--max-body-chars",
+        min=1,
+        help="Maximum cleaned body Unicode characters; truncation is counted.",
+    ),
+    max_body_bytes: int = typer.Option(
+        16 * 1024 * 1024,
+        "--max-body-bytes",
+        min=1,
+        help="Maximum cleaned body UTF-8 bytes; truncation is counted.",
+    ),
+    max_subject_chars: int = typer.Option(4_096, "--max-subject-chars", min=1),
+    max_subject_bytes: int = typer.Option(16 * 1024, "--max-subject-bytes", min=1),
+    max_recipients_per_field: int = typer.Option(
+        2_048,
+        "--max-recipients-per-field",
+        min=1,
+        help="Maximum structured recipients retained per header field; truncation is counted.",
+    ),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit a private run outside ignored repository paths; symlink checks remain enforced.",
+    ),
+) -> None:
+    """Prepare deterministic private Enron records and aggregate diagnostics without assigning splits."""
+    options = EnronPreparationOptions(
+        output_dir=output_dir,
+        input_jsonl=input_jsonl,
+        dataset_id=dataset_id,
+        dataset_revision=dataset_revision,
+        dataset_split=dataset_split,
+        max_rows=max_rows,
+        max_jsonl_line_bytes=max_jsonl_line_bytes,
+        max_body_chars=max_body_chars,
+        max_body_bytes=max_body_bytes,
+        max_subject_chars=max_subject_chars,
+        max_subject_bytes=max_subject_bytes,
+        max_recipients_per_field=max_recipients_per_field,
+        allow_unignored_output=allow_unignored_output,
+    )
+    try:
+        payload = _run_json_helper(lambda: prepare_enron_source(options))
+    except OSError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("verify-enron-preparation")
+def verify_enron_preparation(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Committed private Enron preparation run directory."),
+) -> None:
+    """Verify preparation artifact hashes, ordering, counts, and aggregate bindings."""
+    try:
+        payload = _run_json_helper(lambda: load_enron_preparation_run(run_dir))
+    except OSError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
 
 
 @app.command("regress-bank")
