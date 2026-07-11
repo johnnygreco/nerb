@@ -150,7 +150,8 @@ and exact population coverage. Unavailable requested dimensions are separate JSO
 Logical IDs and reason codes are bounded privacy-safe identifiers. The public result contains aggregates plus evaluator,
 policy, protocol, catalog-binding, bank, execution-adapter, contract-validator, and run fingerprints—never document IDs,
 text, surfaces, or per-span outcomes. `eval-enron-quality` and `eval-enron-cmu-train` exit nonzero for an invalid bank,
-unevaluated evidence, unsafe input, or failed standalone contract validation.
+unevaluated evidence, unsafe input, or failed standalone contract validation. Native collection stops at 100,000
+predictions per document, and the executor rejects more than 500,000 predictions across one quality run.
 
 The executor computes deterministic one-to-one exact-span/class counts and contract-compatible metrics:
 
@@ -236,7 +237,8 @@ Case IDs and reason codes are opaque bounded identifiers, text must be non-empty
 `casing`, `html`, `malformed`, `negative`, `overlap`, `punctuation`, `signature`, `unicode`, and `whitespace`. The frozen
 suite must cover every tag and include a boundary-negative case. The CLI commits raw cases and per-case outcomes only to
 the requested private audit directory; stdout remains aggregate-only. It exits nonzero for invalid/unevaluated inputs or
-any failed conformance gate.
+any failed conformance gate. The configured per-case match limit is enforced while the native engine is collecting
+matches, before Python enrichment or sorting.
 
 ## Fingerprints and guarantee boundary
 

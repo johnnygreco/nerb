@@ -29,9 +29,19 @@ impl RawMatch {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NativeMatchBuffer {
     matches: Vec<RawMatch>,
+    max_matches: usize,
+}
+
+impl Default for NativeMatchBuffer {
+    fn default() -> Self {
+        Self {
+            matches: Vec::new(),
+            max_matches: MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY,
+        }
+    }
 }
 
 impl NativeMatchBuffer {
@@ -43,7 +53,18 @@ impl NativeMatchBuffer {
         validate_capacity(capacity)?;
         let mut matches = Vec::new();
         try_reserve_exact(&mut matches, capacity)?;
-        Ok(Self { matches })
+        Ok(Self {
+            matches,
+            max_matches: MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY,
+        })
+    }
+
+    pub fn with_match_limit(max_matches: usize) -> Result<Self> {
+        validate_capacity(max_matches)?;
+        Ok(Self {
+            matches: Vec::new(),
+            max_matches,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -70,6 +91,7 @@ impl NativeMatchBuffer {
             )
         })?;
         validate_capacity(requested)?;
+        self.validate_match_limit(requested)?;
         try_reserve_exact(&mut self.matches, additional)
     }
 
@@ -81,8 +103,9 @@ impl NativeMatchBuffer {
             )
         })?;
         validate_capacity(requested)?;
+        self.validate_match_limit(requested)?;
         if self.matches.len() == self.matches.capacity() {
-            let additional = next_growth(self.matches.capacity(), requested)?;
+            let additional = next_growth(self.matches.capacity(), requested, self.max_matches)?;
             try_reserve_exact(&mut self.matches, additional)?;
         }
         self.matches.push(raw_match);
@@ -101,6 +124,19 @@ impl NativeMatchBuffer {
 
     pub fn get(&self, index: usize) -> Option<RawMatch> {
         self.matches.get(index).copied()
+    }
+
+    fn validate_match_limit(&self, requested: usize) -> Result<()> {
+        if requested > self.max_matches {
+            return Err(memory(
+                "/match_buffer",
+                format!(
+                    "requested match count {requested} exceeds configured match limit {}",
+                    self.max_matches
+                ),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -125,11 +161,12 @@ fn try_reserve_exact(matches: &mut Vec<RawMatch>, additional: usize) -> Result<(
     })
 }
 
-fn next_growth(current_capacity: usize, requested: usize) -> Result<usize> {
+fn next_growth(current_capacity: usize, requested: usize, max_matches: usize) -> Result<usize> {
     let doubled = current_capacity.saturating_mul(2).max(1);
     let target = doubled
         .max(requested)
-        .min(MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY);
+        .min(MAX_PRE_SCAN_MATCH_BUFFER_CAPACITY)
+        .min(max_matches);
     target.checked_sub(current_capacity).ok_or_else(|| {
         memory(
             "/match_buffer",
@@ -213,5 +250,17 @@ mod tests {
 
         assert!(first_capacity >= 1);
         assert!(buffer.capacity() >= 2);
+    }
+
+    #[test]
+    fn match_buffer_enforces_configured_match_limit_while_collecting() {
+        let mut buffer = NativeMatchBuffer::with_match_limit(2).unwrap();
+        buffer.push(RawMatch::new(0, 0, 1).unwrap()).unwrap();
+        buffer.push(RawMatch::new(0, 1, 2).unwrap()).unwrap();
+
+        let error = buffer.push(RawMatch::new(0, 2, 3).unwrap()).unwrap_err();
+
+        assert!(error.to_string().contains("configured match limit 2"));
+        assert!(buffer.capacity() <= 2);
     }
 }

@@ -199,6 +199,14 @@ impl NativeBank {
         self.engine.scan_bytes(haystack)
     }
 
+    pub fn scan_bytes_bounded(
+        &self,
+        haystack: &[u8],
+        max_matches: usize,
+    ) -> Result<NativeMatchBuffer> {
+        self.engine.scan_bytes_bounded(haystack, max_matches)
+    }
+
     pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
         self.engine.scan_bytes_into(haystack, buffer)
     }

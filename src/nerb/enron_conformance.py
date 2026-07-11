@@ -654,7 +654,9 @@ def _validate_case_set(positive: Sequence[Mapping[str, Any]], negative: Sequence
 
 def _scan_case(compiled: CompiledBank, text: str, options: EnronConformanceOptions) -> list[dict[str, Any]]:
     try:
-        records = compiled.finditer(text)
+        records = compiled.finditer(text, max_matches=options.max_matches_per_case)
+    except MemoryError:
+        raise EnronConformanceError("Conformance scan exceeded the per-case match limit.") from None
     except Exception:
         raise EnronConformanceError("Conformance case could not be scanned safely.") from None
     if len(records) > options.max_matches_per_case:

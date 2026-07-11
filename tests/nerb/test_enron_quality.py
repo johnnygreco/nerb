@@ -508,7 +508,8 @@ def test_quality_compile_and_scan_failures_do_not_echo_private_values(monkeypatc
         bank = real_compiled.bank
         bank_hash = real_compiled.bank_hash
 
-        def finditer(self, _text: str) -> Any:
+        def finditer(self, _text: str, *, max_matches: int | None = None) -> Any:
+            assert max_matches == enron_quality.DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT
             raise RuntimeError("private_doc Private Surface")
 
     monkeypatch.setattr(enron_quality, "compile_bank", lambda *_args, **_kwargs: (LeakingScanner(), False))
@@ -534,7 +535,8 @@ def test_quality_rejects_non_byte_native_offsets(monkeypatch: pytest.MonkeyPatch
         bank = real_compiled.bank
         bank_hash = real_compiled.bank_hash
 
-        def finditer(self, text: str) -> list[dict[str, Any]]:
+        def finditer(self, text: str, *, max_matches: int | None = None) -> list[dict[str, Any]]:
+            assert max_matches == enron_quality.DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT
             records = real_compiled.finditer(text)
             return [{**record, "offset_unit": "char"} for record in records]
 
@@ -815,6 +817,22 @@ def test_negative_documents_do_not_allocate_byte_boundary_maps(monkeypatch: pyte
 
     assert result["evaluated"] is True
     assert _quality_slice(result)["negative_documents"] == 1
+
+
+def test_quality_scan_enforces_native_and_cumulative_prediction_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    bank = _bank({"alice": ("Alice", "A")})
+    documents = [_document("doc_1", "AAA")]
+    slices = [_slice(["doc_1"])]
+
+    monkeypatch.setattr(enron_quality, "DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT", 2)
+    monkeypatch.setattr(enron_quality, "DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL", 10)
+    with pytest.raises(EnronQualityError, match="per-document prediction limit"):
+        evaluate_enron_quality(bank, documents=documents, gold_spans=[], slice_specs=slices)
+
+    monkeypatch.setattr(enron_quality, "DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT", 10)
+    monkeypatch.setattr(enron_quality, "DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL", 2)
+    with pytest.raises(EnronQualityError, match="cumulative prediction limit"):
+        evaluate_enron_quality(bank, documents=documents, gold_spans=[], slice_specs=slices)
 
 
 def test_quality_file_helper_enforces_cumulative_resource_limits(tmp_path: Any) -> None:

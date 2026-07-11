@@ -37,6 +37,8 @@ EVALUATOR_VERSION = "2.0.0"
 DEFAULT_MAX_QUALITY_LINE_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_QUALITY_INPUT_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_QUALITY_RECORDS = 2_000_000
+DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT = 100_000
+DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL = 500_000
 
 _DOCUMENT_FIELDS = frozenset({"document_id", "text", "text_view", "split_role"})
 _GOLD_FIELDS = frozenset({"document_id", "entity_class", "start", "end", "catalog_identity"})
@@ -95,6 +97,10 @@ _POLICY_DESCRIPTOR = {
     "character_sets": "document_disjoint_interval_unions",
     "partial_and_weak_policy": "labeled_span_and_catalog_diagnostics_only",
     "empty_policy": "fail_closed",
+    "prediction_limits": {
+        "per_document": DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT,
+        "total": DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL,
+    },
 }
 
 
@@ -860,11 +866,18 @@ def _scan_documents(compiled: Any, documents: Mapping[str, _Document]) -> tuple[
     for document_id in sorted(documents):
         document = documents[document_id]
         try:
-            records = compiled.finditer(document.text)
+            records = compiled.finditer(
+                document.text,
+                max_matches=DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT,
+            )
+        except MemoryError:
+            raise EnronQualityError("Quality scan exceeded the per-document prediction limit.") from None
         except Exception:
             raise EnronQualityError("A private quality document could not be scanned safely.") from None
         if not records:
             continue
+        if len(predictions) + len(records) > DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL:
+            raise EnronQualityError("Quality scan exceeded the cumulative prediction limit.")
         raw_offsets: set[int] = set()
         for record in records:
             try:

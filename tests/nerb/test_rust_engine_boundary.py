@@ -156,6 +156,15 @@ def test_native_scan_bytes_out_preserves_reserved_capacity(engine):
     assert _raw_tuples(buffer) == [(0, 0, 5)]
 
 
+def test_native_bounded_scan_aborts_while_collecting_matches(engine):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"A":"A"}}', format_hint="json")
+
+    with pytest.raises(MemoryError, match="configured match limit 2"):
+        bank.scan_bytes_bounded(b"AAA", 2)
+
+    assert _raw_tuples(bank.scan_bytes_bounded(b"AAA", 3)) == [(0, 0, 1), (0, 1, 2), (0, 2, 3)]
+
+
 def test_native_all_overlaps_scan_reports_raw_semantic_differences(engine):
     source = b"""
 {"entity":"PERSON","canonical_name":"Sam","surface_name":"Sam","regex":"Sam","priority":0}

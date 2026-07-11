@@ -130,11 +130,14 @@ class CompiledBank:
     cache_metadata: dict[str, Any]
     detector_index: Mapping[tuple[str, str, str], _DetectorIdentity]
 
-    def finditer(self, text: str) -> list[MatchRecord]:
+    def finditer(self, text: str, *, max_matches: int | None = None) -> list[MatchRecord]:
         if self.native_bank is None:
             return []
 
-        records = [_enrich_json_bank_record(record, self.detector_index) for record in self.native_bank.scan_text(text)]
+        records = [
+            _enrich_json_bank_record(record, self.detector_index)
+            for record in self.native_bank.scan_text(text, max_matches=max_matches)
+        ]
         records.sort(key=record_sort_key)
         return records
 

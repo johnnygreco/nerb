@@ -427,6 +427,10 @@ Example eval ref:
 | `provenance` | object | Total provenance count and counts by `source_type`. |
 | `failures` | array | Eval ref, record index, record type, expected/actual data, and diagnostics. |
 
+`nerb eval-bank` exits nonzero when the bank is invalid, no behavioral records were evaluated, or any eval failed.
+`nerb regress-bank` exits nonzero when either bank is invalid or any aggregate regression gate fails; JSON is still
+printed so CI can retain the evidence.
+
 ## Diagnostic Objects
 
 Diagnostics are JSON objects with stable core fields:

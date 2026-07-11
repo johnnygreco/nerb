@@ -2340,11 +2340,15 @@ def eval_json_bank(
     bank, path, invalid_payload = _load_json_bank_for_command(bank_path)
     if invalid_payload is not None:
         _echo_json(invalid_payload)
-        return
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
     if bank is None:
         _exit_error(f"Could not load bank at {path}.")
 
-    _echo_json(_run_json_helper(lambda: _eval_bank(bank, base_path=path.parent)))
+    payload = _run_json_helper(lambda: _eval_bank(bank, base_path=path.parent))
+    _echo_json(payload)
+    summary = payload.get("summary")
+    if not isinstance(summary, Mapping) or summary.get("evaluated") is not True or summary.get("passed") is not True:
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
 
 
 @app.command("benchmark-bank")
@@ -2738,7 +2742,7 @@ def regress_json_bank(
     invalid_payload = _invalid_bank_payloads_payload({"old_bank": old_invalid, "new_bank": new_invalid})
     if invalid_payload is not None:
         _echo_json(invalid_payload)
-        return
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
     if old_bank is None or new_bank is None:
         _exit_error("Could not load both regression banks.")
 
@@ -2747,7 +2751,11 @@ def regress_json_bank(
         options["benchmark_iterations"] = benchmark_iterations
     if stress_multiplier is not None:
         options["stress_multiplier"] = stress_multiplier
-    _echo_json(_run_json_helper(lambda: _regress_bank(old_bank, new_bank, options=options)))
+    payload = _run_json_helper(lambda: _regress_bank(old_bank, new_bank, options=options))
+    _echo_json(payload)
+    gates = payload.get("gates")
+    if not isinstance(gates, Mapping) or gates.get("passed") is not True:
+        raise typer.Exit(COMMAND_ERROR_EXIT_CODE)
 
 
 @app.command("extract")

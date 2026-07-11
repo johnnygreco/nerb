@@ -703,7 +703,8 @@ def test_scan_requires_native_byte_offset_records(monkeypatch) -> None:
         def __getattr__(self, name: str) -> Any:
             return getattr(self._compiled, name)
 
-        def finditer(self, text: str) -> list[dict[str, Any]]:
+        def finditer(self, text: str, *, max_matches: int | None = None) -> list[dict[str, Any]]:
+            assert max_matches is not None
             return [{**record, "offset_unit": "char"} for record in self._compiled.finditer(text)]
 
     def proxy_compile(*args: Any, **kwargs: Any) -> Any:

@@ -308,7 +308,7 @@ def test_json_bank_eval_command_serializes_invalid_utf8_eval_text(tmp_path, test
 
     result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     result.output.encode("utf-8")
     payload = json.loads(result.output)
     assert payload["summary"]["passed"] is False
@@ -329,7 +329,7 @@ def test_json_bank_eval_command_serializes_invalid_utf8_text_with_non_ascii_pref
 
     result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     result.output.encode("utf-8")
     payload = json.loads(result.output)
     assert payload["summary"]["passed"] is False
@@ -343,7 +343,7 @@ def test_json_bank_eval_command_serializes_invalid_utf8_eval_ref(tmp_path, test_
 
     result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     result.output.encode("utf-8")
     payload = json.loads(result.output)
     assert payload["summary"]["passed"] is False
@@ -363,7 +363,7 @@ def test_json_bank_eval_command_serializes_invalid_utf8_provenance_source_type(t
 
     result = runner.invoke(app, ["eval-bank", "--bank", str(bank_path)])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     result.output.encode("utf-8")
     payload = json.loads(result.output)
     assert payload["summary"]["passed"] is False
@@ -467,12 +467,41 @@ def test_json_bank_cli_invalid_bank_returns_diagnostics(tmp_path):
 
     validate_result = runner.invoke(app, ["validate-bank", "--bank", str(invalid_bank_path)])
     extract_result = runner.invoke(app, ["extract-text", "--bank", str(invalid_bank_path), "--text", "Acme Corp"])
+    eval_result = runner.invoke(app, ["eval-bank", "--bank", str(invalid_bank_path)])
+    regress_result = runner.invoke(
+        app,
+        [
+            "regress-bank",
+            "--old-bank",
+            str(invalid_bank_path),
+            "--new-bank",
+            str(invalid_bank_path),
+        ],
+    )
 
     assert validate_result.exit_code == 0
     assert extract_result.exit_code == 0
+    assert eval_result.exit_code == 1
+    assert regress_result.exit_code == 1
     assert json.loads(validate_result.output)["valid"] is False
     assert json.loads(extract_result.output)["valid"] is False
+    assert json.loads(eval_result.output)["valid"] is False
+    assert json.loads(regress_result.output)["valid"] is False
     assert json.loads(validate_result.output)["diagnostics"][0]["code"].startswith("schema.")
+
+
+def test_json_bank_eval_command_exits_nonzero_without_behavioral_evidence(test_data_path):
+    result = runner.invoke(app, ["eval-bank", "--bank", str(test_data_path / "minimal_bank.json")])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["summary"] == {
+        "evaluated": False,
+        "passed": False,
+        "positive_total": 0,
+        "positive_failed": 0,
+        "negative_total": 0,
+        "negative_failed": 0,
+    }
 
 
 def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_data_path):
@@ -516,7 +545,7 @@ def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_dat
     assert benchmark_payload["options"] == expected_projection["options"]
     assert benchmark_payload["summary"]["cache_hit_verified"] is True
 
-    assert regress_result.exit_code == 0
+    assert regress_result.exit_code == 1
     regress_payload = json.loads(regress_result.output)
     expected_regression = regress_bank(
         bank,

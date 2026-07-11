@@ -49,6 +49,19 @@ def test_public_bank_projects_byte_and_char_records_and_scans_paths(tmp_path):
     assert bank.scan_path(document_path) == bank.scan_text("Café Rush")
 
 
+def test_public_bank_bounded_scan_stops_native_match_collection() -> None:
+    bank = nerb.Bank.from_source_bytes(b'{"CODE":{"A":"A"}}', format_hint="json")
+
+    with pytest.raises(MemoryError, match="configured match limit 2"):
+        bank.scan_text("AAA", max_matches=2)
+    with pytest.raises(MemoryError, match="configured match limit 2"):
+        bank.scan_bytes(b"AAA", max_matches=2)
+
+    assert len(bank.scan_text("AAA", max_matches=3)) == 3
+    with pytest.raises(ValueError, match="positive integer"):
+        bank.scan_text("AAA", max_matches=0)
+
+
 def test_public_bank_scan_path_projects_native_scanned_bytes(tmp_path):
     class Raw:
         def __len__(self):
