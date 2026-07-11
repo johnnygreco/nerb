@@ -69,6 +69,42 @@ from .enron_bank_workflow import (
     verify_enron_bank_build,
 )
 from .enron_conformance import EnronConformanceError, evaluate_enron_conformance_files
+from .enron_performance import (
+    DEFAULT_CONCURRENCY as DEFAULT_ENRON_PERFORMANCE_CONCURRENCY,
+)
+from .enron_performance import (
+    DEFAULT_DOCUMENT_SAMPLES as DEFAULT_ENRON_PERFORMANCE_DOCUMENT_SAMPLES,
+)
+from .enron_performance import (
+    DEFAULT_REAL_INPUT_DOCUMENTS as DEFAULT_ENRON_PERFORMANCE_REAL_INPUT_DOCUMENTS,
+)
+from .enron_performance import (
+    DEFAULT_SCAN_SAMPLES as DEFAULT_ENRON_PERFORMANCE_SCAN_SAMPLES,
+)
+from .enron_performance import (
+    DEFAULT_SETUP_SAMPLES as DEFAULT_ENRON_PERFORMANCE_SETUP_SAMPLES,
+)
+from .enron_performance import (
+    DEFAULT_SMOKE_SAMPLES as DEFAULT_ENRON_PERFORMANCE_SMOKE_SAMPLES,
+)
+from .enron_performance import (
+    DEFAULT_SOURCE_BUILD_TIMEOUT_SECONDS as DEFAULT_ENRON_PERFORMANCE_SOURCE_BUILD_TIMEOUT_SECONDS,
+)
+from .enron_performance import (
+    DEFAULT_WARMUPS as DEFAULT_ENRON_PERFORMANCE_WARMUPS,
+)
+from .enron_performance import (
+    DEFAULT_WORKER_TIMEOUT_SECONDS as DEFAULT_ENRON_PERFORMANCE_WORKER_TIMEOUT_SECONDS,
+)
+from .enron_performance import (
+    EnronPerformanceError,
+    EnronPerformancePrepareOptions,
+    EnronPerformanceRunOptions,
+    PerformanceProfile,
+    prepare_enron_performance_manifest,
+    run_enron_performance,
+    verify_enron_performance_run,
+)
 from .enron_preparation import (
     DEFAULT_DATASET_ID as DEFAULT_ENRON_DATASET_ID,
 )
@@ -2688,6 +2724,180 @@ def verify_enron_bank_build_command(
     try:
         payload = verify_enron_bank_build(run_dir, annotation_run=annotation_run)
     except EnronBankBuildError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("prepare-enron-performance")
+def prepare_enron_performance(
+    bank_build_run: Path = typer.Option(
+        ...,
+        "--bank-build-run",
+        help="Committed private Enron bank-build run; no sealed-test path is accepted.",
+    ),
+    development_run: Path = typer.Option(
+        ...,
+        "--development-run",
+        help="Committed private train/validation development bundle.",
+    ),
+    output_dir: Path = typer.Option(
+        ...,
+        "--output-dir",
+        help="New ignored private directory for the frozen performance plan and fixtures.",
+    ),
+    annotation_run: Path | None = typer.Option(
+        None,
+        "--annotation-run",
+        help="Optional verified private CMU training-annotation bundle.",
+    ),
+    benchmark_version: str | None = typer.Option(
+        None,
+        "--benchmark-version",
+        help="Optional expected benchmark version; must match the verified bank build.",
+    ),
+    real_input_documents: int = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_REAL_INPUT_DOCUMENTS,
+        "--real-input-documents",
+        min=100,
+        max=100,
+        help="Validation documents in the frozen balanced real-input workload (exactly 100).",
+    ),
+    concurrency: int = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_CONCURRENCY,
+        "--concurrency",
+        min=2,
+        max=8,
+        help="Maximum worker count frozen into the concurrency sweep.",
+    ),
+    source_curation_seconds: float = typer.Option(
+        60.0,
+        "--source-curation-seconds",
+        min=0.001,
+        help="Shared curation-time scenario mirrored on both cache paths; not a measured model cost.",
+    ),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit private output outside ignored repository paths.",
+    ),
+) -> None:
+    """Freeze a private Enron performance plan without reading the sealed test."""
+
+    options = EnronPerformancePrepareOptions(
+        bank_build_run=bank_build_run,
+        development_run=development_run,
+        output_dir=output_dir,
+        annotation_run=annotation_run,
+        benchmark_version=benchmark_version,
+        real_input_documents=real_input_documents,
+        concurrency=concurrency,
+        source_curation_seconds=source_curation_seconds,
+        allow_unignored_output=allow_unignored_output,
+    )
+    try:
+        payload = prepare_enron_performance_manifest(options)
+    except EnronPerformanceError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("run-enron-performance")
+def run_enron_performance_command(
+    prepared_run: Path = typer.Option(
+        ...,
+        "--prepared-run",
+        help="Committed private run produced by prepare-enron-performance.",
+    ),
+    output_dir: Path = typer.Option(
+        ...,
+        "--output-dir",
+        help="New ignored private directory for measurements and aggregate evidence.",
+    ),
+    profile: str = typer.Option(
+        "smoke",
+        "--profile",
+        help="Execution profile: smoke is non-promotable; decision is long-running.",
+    ),
+    warmups: int = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_WARMUPS,
+        "--warmups",
+        min=0,
+        help="Reused-process warmups; must match the frozen policy.",
+    ),
+    smoke_samples: int = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_SMOKE_SAMPLES,
+        "--smoke-samples",
+        min=1,
+        help="Samples per smoke cell; smoke evidence is never promotable.",
+    ),
+    setup_samples: int = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_SETUP_SAMPLES,
+        "--setup-samples",
+        min=1,
+        help="Fresh samples for decision-grade setup cells; must match the frozen policy.",
+    ),
+    scan_samples: int = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_SCAN_SAMPLES,
+        "--scan-samples",
+        min=1,
+        help="Samples for decision-grade scan-bearing cells; must match the frozen policy.",
+    ),
+    document_samples: int = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_DOCUMENT_SAMPLES,
+        "--document-samples",
+        min=1,
+        help="Paired document timings across five balanced passes; must match the frozen policy.",
+    ),
+    worker_timeout_seconds: float = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_WORKER_TIMEOUT_SECONDS,
+        "--worker-timeout-seconds",
+        min=0.001,
+        max=3_600.0,
+        help="Timeout for one bounded measurement worker.",
+    ),
+    source_build_timeout_seconds: float = typer.Option(
+        DEFAULT_ENRON_PERFORMANCE_SOURCE_BUILD_TIMEOUT_SECONDS,
+        "--source-build-timeout-seconds",
+        min=0.001,
+        help="Timeout for one private source-build sample.",
+    ),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit private output outside ignored repository paths.",
+    ),
+) -> None:
+    """Run a private performance profile; decision runs are long and never read sealed test."""
+
+    options = EnronPerformanceRunOptions(
+        prepared_run=prepared_run,
+        output_dir=output_dir,
+        profile=cast(PerformanceProfile, profile),
+        warmups=warmups,
+        smoke_samples=smoke_samples,
+        setup_samples=setup_samples,
+        scan_samples=scan_samples,
+        document_samples=document_samples,
+        worker_timeout_seconds=worker_timeout_seconds,
+        source_build_timeout_seconds=source_build_timeout_seconds,
+        allow_unignored_output=allow_unignored_output,
+    )
+    try:
+        payload = run_enron_performance(options)
+    except EnronPerformanceError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("verify-enron-performance")
+def verify_enron_performance(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Committed private Enron performance-run directory."),
+) -> None:
+    """Deep-verify private performance evidence without reading the sealed test."""
+
+    try:
+        payload = verify_enron_performance_run(run_dir)
+    except EnronPerformanceError as exc:
         _exit_error(str(exc))
     _echo_json(payload)
 

@@ -29,6 +29,7 @@ nerb extract-text \
 [Split Enron v2](enron-splits.md){ .md-button }
 [Build an Enron v2 bank](enron-bank-building.md){ .md-button }
 [Evaluate Enron v2](enron-evaluation.md){ .md-button }
+[Measure Enron v2 performance](performance.md#enron-v2-cache-value-workflow){ .md-button }
 </p>
 
 </div>
@@ -48,10 +49,11 @@ so privacy evidence must report open-world recall and misses separately from cat
 !!! warning "Enron evidence is not yet promotable"
 
     The privacy-first Enron benchmark v2 contract, private preparation, immutable splits, independent quality executor,
-    train-only [bank construction](enron-bank-building.md), and catalog-conformance gate are implemented. A development
-    bank card remains non-promotable until the frozen one-shot sealed-test, privacy-verification, performance, and
-    lineage gates are completed. Historical v1 quality, autoresearch, and performance artifacts do not meet the v2
-    contract and do not support current public claims. See the [v2 charter](enron-benchmark.md),
+    train-only [bank construction](enron-bank-building.md), catalog-conformance gate, and private
+    [performance runner](performance.md#enron-v2-cache-value-workflow) are implemented. A development bank card remains
+    non-promotable until the frozen one-shot sealed-test, privacy-verification, decision-grade performance, and lineage
+    gates are completed. Historical v1 quality, autoresearch, and performance artifacts do not meet the v2 contract and
+    do not support current public claims. See the [v2 charter](enron-benchmark.md),
     [preparation guide](enron-preparation.md), [split guide](enron-splits.md), and
     [evaluation guide](enron-evaluation.md).
 
@@ -185,7 +187,7 @@ NERB returns deterministic JSON records:
 : Read the JSON bank, extraction record, eval, replacement DB, and diagnostic contracts.
 
 [Performance](performance.md)
-: Reproduce the Rust-backed gate evidence and understand cache, compile, and scan behavior.
+: Reproduce Rust-backed gates and run the private Enron v2 compile-once/cache-value workflow.
 </div>
 
 ## When NERB Fits

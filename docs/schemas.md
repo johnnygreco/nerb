@@ -449,6 +449,56 @@ Diagnostics are JSON objects with stable core fields:
 | `suggested_patch` | array | no | Optional RFC 6902 JSON Patch operations. |
 | `metadata` | object | no | Optional JSON-compatible metadata. |
 
+## Enron v2 benchmark evidence
+
+`nerb.enron_manifest.v2` and `nerb.enron_evidence.v2` use verifier `nerb-enron-contract` version 2.2.0. Bank provenance
+keeps the physical content-addressed artifact identity (`artifact_sha256` plus `artifact_bytes`) separate from
+`canonical_json_bytes` and `native_source_bytes`. A pretty-printed private bank may therefore have the same canonical
+bank hash while its physical file size differs from the canonical serialization size. Performance-bank artifact
+references always bind the physical artifact hash and byte count.
+
+`ENRON_PERFORMANCE_OUTPUT_SCHEMA` exposes the same closed performance object embedded in evidence, and
+`validate_enron_performance_output` performs standalone structure and schema validation. Full hash, provenance,
+sample-reference, bank/input, comparison, breakeven, and promotion semantics still require `validate_enron_evidence`
+with its surrounding evidence context.
+
+Performance scale descriptors use active matcher-pattern counts of 1k, 10k, 25k, and 100k. Their native matcher-shard,
+name, alias, literal, and regex totals remain independent truthful fields and must preserve the evaluated composition.
+The frozen 100k fixture records 318 native matcher shards under two semantic taxonomy classes; it is not a 100k
+small-shard-topology claim. One-time
+source-profile, source-build, and cold-compile decision cells use at least 20 samples with median, MAD, and p95; p99 is
+null. Whole-input decision cells retain at least 100 samples and p99; document latency uses 500 aligned samples over
+five balanced passes and a paired-relative-MAD noise method. Each materialized workload records its stable observed
+whole-input record count, so non-equivalent baselines compute their own records/second. Comparison descriptors identify
+same-path stability versus cross-path cache-value evidence and freeze their noise method. Cross-path timings are acquired
+in Williams-balanced blocks and use paired-block timing-ratio MAD; same-path document controls retain paired-relative
+MAD. The public helpers in
+`nerb.enron_contract`
+calculate canonical inventory summaries, phase-aware sample statistics, noise-aware comparisons, and additive breakeven
+results so evidence producers share the verifier's exact arithmetic. The promoted value model compares direct reuse
+against a semantically exact NERB helper-cache-miss alternative on the same bank and input; each phase has its own exact
+same-path stability control, and both value paths use the same whole-input population. Shared curation, profiling, and
+bank-build costs are recorded identically on both sides and cancel, leaving cold compile plus the two marginal scan
+rates to determine the crossing. Breakeven inputs
+whose bounded component/unit products cannot remain finite
+are rejected with `ValueError` rather than leaking an arithmetic overflow from the helper.
+
+The executable workflow adds four private-run contracts around that evidence object:
+
+| Schema | Role | Publication boundary |
+| --- | --- | --- |
+| `nerb.enron_performance_plan.v1` | Path-free, hashed workload plan with separate smoke and decision profiles. | Structurally public, but copied into a private prepared run until reviewed. |
+| `nerb.enron_performance_private_manifest.v1` | Hash, byte-count, kind, and relative-path bindings for evaluated/generated banks, inputs, inventories, plan, and private source locations. | Private. |
+| `nerb.enron_performance_run.v1` | Aggregate report containing the closed performance object, raw timing/resource samples, environment, decision summary, privacy status, and `sealed_test_accessed: false`. | Eligible for review only after verification and a privacy scan. |
+| `nerb.enron_performance_run_private_manifest.v1` | Transactional bindings for the aggregate report, correctness audit, frozen plan, and inventories. | Private. |
+
+The prepared and measured directories use the private-run commit marker and fail closed on changed hashes, unsafe
+relative paths, unexpected shapes, or privacy diagnostics. Inventories contain per-document byte and record counts, not
+text or matched surfaces. `verify_enron_performance_run` recomputes statistics, comparisons, break-even arithmetic,
+decision status, sample policy, ABBA and Williams-block sequence, execution-host CPU/memory bounds, fresh/reused process
+isolation, cross-path correctness, and audit bindings
+without accepting or opening a preparation-source or sealed-test input.
+
 ## Enron v2 bank-build artifacts
 
 The [Enron bank construction workflow](enron-bank-building.md) emits a strict, manifest-bound private run. These

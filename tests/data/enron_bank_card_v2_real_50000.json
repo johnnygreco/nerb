@@ -302,14 +302,14 @@
     "direct_identifiers_included": false,
     "private_paths_included": false,
     "raw_text_included": false,
-    "report_sha256": "sha256:e4d47c9c9a87d34a458bba523b3a2ec7be54d90b9f7bb0db93817126c0d27547",
+    "report_sha256": "sha256:9c5852711ac83ec0f0df838d70687cfd1b90779d405a6dabf5ac880735affca4",
     "scanner": "nerb.enron_bank_workflow.public_card_scan.v2",
-    "scanner_source_sha256": "sha256:2c41533f19b8619fc22214f9e0abbb194a486802f17a1ad9cbaefcdc80fa8457",
+    "scanner_source_sha256": "sha256:7a49fa66eacff9b8b8bc9a656b5c1ed41e6aec9e33e2a588a8724ae8b446b2cf",
     "status": "passed",
     "violation_count": 0
   },
   "promotable": false,
-  "run_sha256": "sha256:75c11e49db05c72ea6e14a4b5227f32b5297f93fa364aa6ea4461d2a29a50c9a",
+  "run_sha256": "sha256:7c1e6013fdbefe45bf5b3167ddce8d70dd45ae15abd39d0c79c93bf683ec0b72",
   "schema_version": "nerb.enron_bank_card.v2",
   "source": {
     "dataset_id": "corbt/enron-emails",

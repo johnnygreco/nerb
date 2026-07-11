@@ -20,6 +20,72 @@ Rust engine conformance, benchmark, dense-memory, mode-strategy, and distributio
 - `all_overlaps` and `global_leftmost` are internal measurement modes only; they are not public JSON-bank extraction
   semantics.
 
+## Enron v2 Cache-Value Workflow
+
+The Enron v2 workflow freezes a private workload before it measures anything. It accepts verified train/validation
+development and bank-build runs; there is deliberately no preparation-source or sealed-test input. Source profiling is
+restricted to the verified development-train artifact used by the builder. Use ignored directories
+for both outputs because the prepared run contains the evaluated bank, selected validation documents, generated scale
+fixtures, inventories, and private source locations.
+
+```shell
+uv run nerb prepare-enron-performance \
+  --bank-build-run .nerb/enron-v2/bank-build \
+  --development-run .nerb/enron-v2/development \
+  --output-dir .nerb/enron-v2/performance-plan
+
+# Five samples per cell: useful for correctness and workflow smoke only.
+uv run nerb run-enron-performance \
+  --prepared-run .nerb/enron-v2/performance-plan \
+  --output-dir .nerb/enron-v2/performance-smoke \
+  --profile smoke
+
+# Long-running evidence: 20 setup samples, 100 whole-input scans, and 500 paired document timings.
+uv run nerb run-enron-performance \
+  --prepared-run .nerb/enron-v2/performance-plan \
+  --output-dir .nerb/enron-v2/performance-decision \
+  --profile decision
+
+uv run nerb verify-enron-performance \
+  --run-dir .nerb/enron-v2/performance-decision
+```
+
+The decision plan keeps these paths separate:
+
+| Measurement | What it answers |
+| --- | --- |
+| Direct compiled-`Bank` reuse | Cost after constructing one native bank and scanning repeatedly through that same object. This is the primary cache-value path. |
+| Helper cache hit/miss | Cost of the higher-level compile/extract helper with its process-local canonical-bank cache either warm or cold. |
+| Uncached/end to end | Cost when validation, compilation, input handling, or application work is included as declared by the frozen harness. |
+| Exact same-path stability control | An ABBA-interleaved duplicate with the same operation, bank, input, process model, warmups, work, and sample policy. It estimates run noise and order effects; because both sides use the current implementation, it is not a historical regression baseline. |
+| Cross-path cache-value comparison | Direct reuse, helper-cache hit/miss, and end-to-end paths scan the same whole-input population in a four-path Williams-balanced schedule nested inside ABBA. Canonical aggregate digests prove identical mapped outputs before paired-block latency and throughput comparisons. |
+| Generic regex and Python literal scans | Exploratory, explicitly non-equivalent baselines. They cannot support a semantic regression claim or the promoted break-even comparison. |
+
+Scale banks contain 1k, 10k, 25k, and 100k **active matcher patterns**. Alias and canonical-name counts remain separate
+composition metrics; a matcher-pattern count must never be reported as an alias count. The 100k controlled fixture has
+two semantic taxonomy classes backed by 318 native matcher shards (159 per class, at most 502 patterns per shard). A
+non-promotable five-native-shard feasibility probe exceeded 5 GiB and did not complete, so the 100k result must not be
+presented as small-shard-topology evidence. One-time source profiling, source
+building, and cold compilation use 20 fresh-process samples and nearest-rank p95. Whole-input decision cells use 100
+samples and p99. Document latency uses 500 paired timings—five balanced passes over exactly 100 documents—so paired
+relative MAD measures timing variation instead of document-size heterogeneity. The five-sample smoke profile is
+non-promotable and intentionally limited to evaluated-bank compile/cache/direct/end-to-end paths plus 1k serial and
+bounded-concurrency cells and the two exploratory baselines. It does not rebuild/profile the source or load the 100k
+bank.
+
+Preparation and execution commit private transactional runs. The path-free plan and aggregate report contain hashes,
+counts, timing/resource samples, environment metadata, and privacy-safe inventories—not message text, detected surfaces,
+scan records, or local paths. Verification rechecks those bindings without reading protected corpus text, and every
+stage records `sealed_test_accessed: false`. Whole-input `records_per_second` uses the worker's stable observed aggregate
+count; this prevents non-equivalent regex/literal baselines from borrowing NERB's record denominator.
+
+The break-even model records source curation, train-source profiling, and bank building as the same shared acquisition
+cost on both paths, so those terms cancel. Direct reuse then adds one cold compile and its per-document scan cost; the
+helper-cache-miss alternative pays its measured per-document cost. Both marginal costs use the same whole-input
+population and document count; a median of heterogeneous per-document timings is never compared with a whole-input
+average. `--source-curation-seconds` is a shared declared scenario—not a measured model invocation, token,
+hosted-service, or dollar cost—and cannot manufacture the crossing.
+
 ## Reproducible Gate
 
 Routine local gate:

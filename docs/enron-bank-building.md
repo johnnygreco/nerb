@@ -282,11 +282,11 @@ Key commitments are:
 - bank artifact: `sha256:19b32bce6bff90423f524305661b3f07e12756ec295e68ff676f5af81f245082`;
 - candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
 - builder implementation: `sha256:f4dee1922eef085e2c73d83c3f97e46dea5426dbda981f7ff53d4fef1657b061`;
-- privacy scanner implementation: `sha256:2c41533f19b8619fc22214f9e0abbb194a486802f17a1ad9cbaefcdc80fa8457`;
+- privacy scanner implementation: `sha256:7a49fa66eacff9b8b8bc9a656b5c1ed41e6aec9e33e2a588a8724ae8b446b2cf`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
 - canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:75c11e49db05c72ea6e14a4b5227f32b5297f93fa364aa6ea4461d2a29a50c9a`;
-- committed bank-card file: `sha256:28a36f27136826fe33f5ce9c853bd90961fe73aee4ccbd47f68f1216642a233f`; and
+- bank-card run: `sha256:7c1e6013fdbefe45bf5b3167ddce8d70dd45ae15abd39d0c79c93bf683ec0b72`;
+- committed bank-card file: `sha256:b06ee961693890041727878822de094b4ff0bd8bc0cfbc08d6bd3c576e6b43cc`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
 The exact private commands were:
