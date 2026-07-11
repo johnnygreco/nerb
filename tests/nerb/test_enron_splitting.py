@@ -7,7 +7,7 @@ import shutil
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,8 @@ import nerb.enron_contract as enron_contract
 import nerb.enron_splitting as enron_splitting
 from nerb.enron_preparation import EnronPreparationOptions, prepare_enron_source
 from nerb.enron_splitting import (
+    EnronDevelopmentAdmissionError,
+    EnronDevelopmentAdmissionLimits,
     EnronDevelopmentSplit,
     EnronSplitError,
     EnronSplitOptions,
@@ -232,6 +234,19 @@ def _documents_by_subject(preparation: Path) -> dict[str, str]:
 
 def _file_sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _exact_development_admission(manifest: Mapping[str, Any]) -> EnronDevelopmentAdmissionLimits:
+    roles = manifest["development_roles"]
+    artifacts = manifest["artifacts"]
+    return EnronDevelopmentAdmissionLimits(
+        max_train_records=roles["train"]["records"],
+        max_train_artifact_bytes=artifacts["train"]["bytes"],
+        max_validation_records=roles["validation"]["records"],
+        max_validation_artifact_bytes=artifacts["validation"]["bytes"],
+        max_development_memberships_bytes=artifacts["memberships"]["bytes"],
+        max_development_samples_bytes=artifacts["samples"]["bytes"],
+    )
 
 
 def _frozen_target(run: SplitRun) -> dict[str, str]:
@@ -821,14 +836,253 @@ def test_development_membership_iterators_reject_tampered_schema_and_role(tmp_pa
     wrong_schema = [dict(row) for row in original]
     wrong_schema[0]["schema_version"] = "nerb.enron_split_membership.invalid"
     _write_jsonl(membership_path, wrong_schema)
-    with pytest.raises(EnronSplitError, match=r"(?i)(canonical|schema)"):
+    with pytest.raises(EnronSplitError, match=r"(?i)(canonical|schema|frozen|descriptor)"):
         tuple(run.loaded.iter_train_memberships())
 
     forbidden_role = [dict(row) for row in original]
     forbidden_role[0]["role"] = "test"
     _write_jsonl(membership_path, forbidden_role)
-    with pytest.raises(EnronSplitError, match=r"(?i)(schema|role)"):
+    with pytest.raises(EnronSplitError, match=r"(?i)(schema|role|frozen|descriptor)"):
         tuple(run.loaded.iter_train_memberships())
+
+
+@pytest.mark.parametrize("role", ["train", "validation"])
+def test_development_role_iterators_recheck_frozen_descriptor_after_load(tmp_path: Path, role: str) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix=f"{role}-post-load-tamper"))
+    run = _split(tmp_path, preparation)
+    role_path = run.development / f"{role}.jsonl"
+    changed = [dict(row) for row in _read_jsonl(role_path)]
+    changed[0]["views"] = dict(changed[0]["views"])
+    current_body = str(changed[0]["views"]["current_body"])
+    changed[0]["views"]["current_body"] = ("X" if not current_body.startswith("X") else "Y") + current_body[1:]
+    _write_jsonl(role_path, changed)
+
+    iterator = getattr(run.loaded, f"iter_{role}_records")
+    with pytest.raises(EnronSplitError, match=r"(?i)(frozen|descriptor|changed)"):
+        tuple(iterator())
+
+
+def test_development_membership_iterators_recheck_frozen_descriptor_after_load(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="membership-post-load-tamper"))
+    run = _split(tmp_path, preparation)
+    membership_path = run.development / "memberships.jsonl"
+    changed = [dict(row) for row in _read_jsonl(membership_path)]
+    group_id = str(changed[0]["group_id"])
+    changed[0]["group_id"] = group_id[:-1] + ("0" if group_id[-1] != "0" else "1")
+    _write_jsonl(membership_path, changed)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(frozen|descriptor|changed)"):
+        tuple(run.loaded.iter_train_memberships())
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "iterator_name"),
+    [
+        ("train.jsonl", "iter_train_records"),
+        ("validation.jsonl", "iter_validation_records"),
+        ("memberships.jsonl", "iter_train_memberships"),
+    ],
+)
+def test_development_iterators_reject_exact_file_replacement_during_stream(
+    tmp_path: Path,
+    artifact_name: str,
+    iterator_name: str,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix=f"stream-replacement-{iterator_name}"))
+    run = _split(tmp_path, preparation)
+    artifact_path = run.development / artifact_name
+    iterator = getattr(run.loaded, iterator_name)()
+    next(iterator)
+
+    replacement = run.development / f".{artifact_name}.replacement"
+    shutil.copyfile(artifact_path, replacement)
+    replacement.chmod(0o600)
+    replacement.replace(artifact_path)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(frozen|private|changed)"):
+        tuple(iterator)
+
+
+@pytest.mark.parametrize("metadata_name", ["manifest.json", "split-freeze-receipt.json"])
+def test_development_iterators_reject_exact_metadata_replacement_after_load(
+    tmp_path: Path,
+    metadata_name: str,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix=f"metadata-replacement-{metadata_name}"))
+    run = _split(tmp_path, preparation)
+    metadata_path = run.development / metadata_name
+    replacement = run.development / f".{metadata_name}.replacement"
+    shutil.copyfile(metadata_path, replacement)
+    replacement.chmod(0o600)
+    replacement.replace(metadata_path)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(private|changed|verified)"):
+        tuple(run.loaded.iter_train_records())
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"value":NaN}',
+        b'{"value":Infinity}',
+        b'{"value":1e999}',
+        b'{"value":1,"value":2}',
+        b'{"value":' + b"[" * 2_000 + b"0" + b"]" * 2_000 + b"}",
+    ],
+)
+def test_private_json_metadata_rejects_nonfinite_duplicate_recursive_and_overflow_values(
+    tmp_path: Path,
+    raw: bytes,
+) -> None:
+    path = tmp_path / "metadata.json"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(json|finite|duplicate|valid)"):
+        enron_splitting._read_json_object(path)  # noqa: SLF001
+
+
+def test_private_json_and_jsonl_use_an_explicit_integer_digit_limit(tmp_path: Path) -> None:
+    digits = b"9" * (enron_splitting._MAX_PRIVATE_JSON_INTEGER_DIGITS + 1)  # noqa: SLF001
+    raw = b'{"value":' + digits + b"}"
+    path = tmp_path / "metadata.json"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(integer|digit|json)"):
+        enron_splitting._read_json_object(path)  # noqa: SLF001
+    with pytest.raises(EnronSplitError, match=r"(?i)(integer|digit|json)"):
+        enron_splitting._parse_frozen_jsonl_object(path, 1, raw + b"\n")  # noqa: SLF001
+
+
+def test_private_json_metadata_rejects_aba_path_replacement_during_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "metadata.json"
+    parked_original = tmp_path / "metadata.original.json"
+    path.write_bytes(b'{"version":"original"}')
+    path.chmod(0o600)
+    path.replace(parked_original)
+    path.write_bytes(b'{"version":"replacement"}')
+    path.chmod(0o600)
+    real_loads = json.loads
+
+    def restore_original(payload: str | bytes | bytearray, **kwargs: Any) -> Any:
+        parked_original.replace(path)
+        return real_loads(payload, **kwargs)
+
+    monkeypatch.setattr(enron_splitting.json, "loads", restore_original)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(changed|verified)"):
+        enron_splitting._read_json_object(path)  # noqa: SLF001
+    assert real_loads(path.read_bytes()) == {"version": "original"}
+
+
+def test_descriptor_hash_and_size_are_bound_to_one_file_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "artifact.jsonl"
+    replacement = tmp_path / "artifact.replacement.jsonl"
+    payload = b'{"value":"same bytes"}\n'
+    path.write_bytes(payload)
+    replacement.write_bytes(payload)
+    path.chmod(0o600)
+    replacement.chmod(0o600)
+    descriptor = {
+        "id": "artifact",
+        "name": path.name,
+        "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        "bytes": len(payload),
+        "records": 1,
+    }
+    real_identity = enron_splitting._private_regular_identity  # noqa: SLF001
+    identity_calls = 0
+
+    def replace_after_first_fstat(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+        nonlocal identity_calls
+        identity = real_identity(info)
+        identity_calls += 1
+        if identity_calls == 1:
+            replacement.replace(path)
+        return identity
+
+    monkeypatch.setattr(enron_splitting, "_private_regular_identity", replace_after_first_fstat)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(changed|verified|private|single-link)"):
+        enron_splitting._verify_descriptor(tmp_path, descriptor, path.name)  # noqa: SLF001
+
+
+def test_development_admission_accepts_exact_frozen_manifest_capacities(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="admission-exact"))
+    run = _split(tmp_path, preparation)
+    limits = _exact_development_admission(run.loaded.manifest)
+
+    loaded = load_enron_development_split(run.development, admission_limits=limits)
+
+    assert loaded.manifest == run.loaded.manifest
+    assert tuple(loaded.iter_train_records()) == tuple(run.loaded.iter_train_records())
+    assert tuple(loaded.iter_validation_records()) == tuple(run.loaded.iter_validation_records())
+
+
+@pytest.mark.parametrize(
+    "limited_field",
+    [
+        "max_train_records",
+        "max_train_artifact_bytes",
+        "max_validation_records",
+        "max_validation_artifact_bytes",
+        "max_development_memberships_bytes",
+        "max_development_samples_bytes",
+    ],
+)
+def test_development_admission_rejects_manifest_capacity_before_large_artifact_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limited_field: str,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix=f"admission-{limited_field}"))
+    run = _split(tmp_path, preparation)
+    exact = _exact_development_admission(run.loaded.manifest)
+    limits = replace(exact, **{limited_field: getattr(exact, limited_field) - 1})
+    snapshots: list[Path] = []
+
+    def unexpected_snapshot(path: Path, expected_bytes: int) -> Any:
+        snapshots.append(path)
+        raise AssertionError(f"admission must precede hashing {path} ({expected_bytes})")
+
+    monkeypatch.setattr(enron_splitting, "_snapshot_private_artifact", unexpected_snapshot)
+
+    with pytest.raises(EnronDevelopmentAdmissionError, match="admission limit"):
+        load_enron_development_split(run.development, admission_limits=limits)
+
+    assert snapshots == []
+
+
+def test_development_loader_validates_every_descriptor_before_hashing_large_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="admission-descriptor"))
+    run = _split(tmp_path, preparation)
+    manifest_path = run.development / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["samples"]["bytes"] = "invalid"
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    manifest_path.chmod(0o600)
+    snapshots: list[Path] = []
+
+    def unexpected_snapshot(path: Path, expected_bytes: int) -> Any:
+        snapshots.append(path)
+        raise AssertionError(f"descriptor validation must precede hashing {path} ({expected_bytes})")
+
+    monkeypatch.setattr(enron_splitting, "_snapshot_private_artifact", unexpected_snapshot)
+
+    with pytest.raises(EnronSplitError, match="descriptor"):
+        load_enron_development_split(run.development)
+
+    assert snapshots == []
 
 
 def test_steward_projection_matches_the_closed_v2_split_contract(tmp_path: Path) -> None:
@@ -1050,6 +1304,42 @@ def test_deep_verifier_rejects_deliberate_cross_role_contamination(tmp_path: Pat
         file.write(train_line)
     with pytest.raises(EnronSplitError, match=r"(?i)(artifact|hash|leakage|cross|duplicate|role)"):
         verify_enron_splits(run.development, run.sealed, seed=run.seed)
+
+
+def test_deep_verifier_rejects_same_byte_artifact_aba_during_ingestion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="ingestion-aba"))
+    run = _split(tmp_path, preparation)
+    train_path = run.development / "train.jsonl"
+    parked_original = tmp_path / "train.original.jsonl"
+    replacement = tmp_path / "train.replacement.jsonl"
+    shutil.copyfile(train_path, replacement)
+    replacement.chmod(0o600)
+    real_ingest = enron_splitting._ingest_prepared  # noqa: SLF001
+    replaced = False
+
+    def ingest_with_aba(*args: Any, **kwargs: Any) -> int:
+        nonlocal replaced
+        prepared_path = Path(args[1])
+        expected_snapshot = kwargs.get("expected_snapshot")
+        if not replaced and expected_snapshot is not None and prepared_path == train_path:
+            replaced = True
+            train_path.replace(parked_original)
+            replacement.replace(train_path)
+            try:
+                return real_ingest(*args, **kwargs)
+            finally:
+                train_path.replace(replacement)
+                parked_original.replace(train_path)
+        return real_ingest(*args, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "_ingest_prepared", ingest_with_aba)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(artifact|identity|snapshot|changed|private)"):
+        verify_enron_splits(run.development, run.sealed, seed=run.seed)
+    assert replaced is True
 
 
 def test_small_corpora_require_explicit_non_promotable_fixture_mode(tmp_path: Path) -> None:

@@ -2643,6 +2643,11 @@ def build_enron_bank(
         "--annotation-run",
         help="Optional verified private CMU bundle for auxiliary training-only person diagnostics.",
     ),
+    cmu_catalog_bindings_path: Path | None = typer.Option(
+        None,
+        "--cmu-catalog-bindings",
+        help="Separately reviewed private CMU catalog-binding JSONL; requires --annotation-run.",
+    ),
     benchmark_version: str = typer.Option("enron-v2", "--benchmark-version"),
     created_at: str = typer.Option(BANK_BUILD_TIMESTAMP, "--created-at"),
     allow_unignored_output: bool = typer.Option(
@@ -2657,6 +2662,7 @@ def build_enron_bank(
         development_run=development_run,
         output_dir=output_dir,
         annotation_run=annotation_run,
+        cmu_catalog_bindings_path=cmu_catalog_bindings_path,
         benchmark_version=benchmark_version,
         created_at=created_at,
         allow_unignored_output=allow_unignored_output,

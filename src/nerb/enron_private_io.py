@@ -26,6 +26,7 @@ _COMMIT_PAYLOAD = b"nerb.enron.private-run.v2\n"
 _DIRECTORY_MODE = 0o700
 _FILE_MODE = 0o600
 _JSONL_BUFFER_BYTES = 64 * 1024
+_MAX_JSON_INTEGER_DIGITS = 256
 _LINUX_PROC_FD_CHMOD_AVAILABLE = (
     sys.platform.startswith("linux") and bool(getattr(os, "O_PATH", 0)) and Path("/proc/self/fd").is_dir()
 )
@@ -416,6 +417,7 @@ def _iter_strict_jsonl(path: Path, max_line_bytes: int) -> Iterator[tuple[int, b
                     payload,
                     parse_constant=_reject_json_constant,
                     parse_float=_parse_finite_float,
+                    parse_int=_parse_bounded_int,
                     object_pairs_hook=_reject_duplicate_json_keys,
                 )
             except _StrictJSONError as exc:
@@ -442,6 +444,16 @@ def _parse_finite_float(value: str) -> float:
     if not math.isfinite(parsed):
         raise _StrictJSONError("contains a non-finite number")
     return parsed
+
+
+def _parse_bounded_int(value: str) -> int:
+    digits = value[1:] if value.startswith("-") else value
+    if len(digits) > _MAX_JSON_INTEGER_DIGITS:
+        raise _StrictJSONError("contains an integer exceeding the digit limit")
+    try:
+        return int(value)
+    except (OverflowError, ValueError):
+        raise _StrictJSONError("contains an invalid integer") from None
 
 
 def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

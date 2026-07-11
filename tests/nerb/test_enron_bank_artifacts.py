@@ -8,10 +8,12 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 import nerb.enron_bank_builder as bank_builder
 import nerb.enron_bank_workflow as bank_workflow
 from nerb.bank import bank_stats, hash_bank
-from nerb.enron_bank_builder import _canonical_json_bytes
+from nerb.enron_bank_builder import EnronBankBuildError, _canonical_hash, _canonical_json_bytes
 from nerb.enron_bank_workflow import (
     _builder_implementation_sha256,
     _conformance_cases,
@@ -63,10 +65,60 @@ def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
     assert card["bank"]["canonical_json_bytes"] == len(_canonical_json_bytes(bank))
     assert card["bank"]["stats"] == bank_stats(bank)
     assert card["bank"]["artifact_sha256"] == "sha256:" + hashlib.sha256(bank_path.read_bytes()).hexdigest()
+    privacy = card["privacy"]
+    assert privacy["report_sha256"] == _canonical_hash(
+        {key: value for key, value in privacy.items() if key != "report_sha256"}
+    )
+    iteration_fields = {
+        "schema_version",
+        "id",
+        "parent_id",
+        "policy_sha256",
+        "bank_sha256",
+        "validation_protocol_sha256",
+        "catalog_binding_sha256",
+        "quality_run_sha256",
+        "contact_labeled_spans",
+        "contact_labeled_true_positive",
+        "contact_labeled_false_negative",
+        "contact_labeled_recall",
+        "contact_cataloged_false_negative",
+        "contact_cataloged_wrong_canonical",
+        "person_labeled_spans",
+        "person_cataloged_false_negative",
+        "person_cataloged_wrong_canonical",
+        "open_world_metrics_supported",
+        "utility_metrics_supported",
+        "active_patterns",
+        "canonical_json_bytes",
+        "decision",
+        "decision_reason_code",
+        "selected",
+    }
+    assert all(set(item) == iteration_fields for item in card["iterations"])
     positives, negatives = _conformance_cases(bank)
     conformance = evaluate_enron_conformance(bank, positives, negatives)["catalog_conformance"]
     for key in ("active_patterns", "approved_positive_cases", "correctly_mapped", "negative_cases"):
         assert card["catalog_conformance"][key] == conformance[key]
+
+
+def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tampering() -> None:
+    card = _load("enron_bank_card_v2_fake.json")
+    missing_iteration_field = copy.deepcopy(card)
+    del missing_iteration_field["iterations"][0]["policy_sha256"]
+    missing_iteration_field["run_sha256"] = _canonical_hash(
+        {key: value for key, value in missing_iteration_field.items() if key != "run_sha256"}
+    )
+    with pytest.raises(EnronBankBuildError, match="nested schema"):
+        _validate_public_card(missing_iteration_field)
+
+    stale_privacy_commitment = copy.deepcopy(card)
+    stale_privacy_commitment["privacy"]["scanner_source_sha256"] = "sha256:" + "5" * 64
+    stale_privacy_commitment["run_sha256"] = _canonical_hash(
+        {key: value for key, value in stale_privacy_commitment.items() if key != "run_sha256"}
+    )
+    with pytest.raises(EnronBankBuildError, match="privacy report commitment"):
+        _validate_public_card(stale_privacy_commitment)
 
 
 def test_committed_fake_artifacts_contain_only_fictitious_identifier_shapes() -> None:
@@ -118,8 +170,10 @@ def test_generated_conformance_cases_exercise_case_whitespace_and_boundaries() -
 
 
 def test_auxiliary_catalog_binding_uses_declared_literal_semantics() -> None:
-    assert _person_literal_catalog_key("Kenneth   Lay") == _person_literal_catalog_key("kenneth lay")
-    assert _person_literal_catalog_key("Lay, Kenneth") != _person_literal_catalog_key("Kenneth Lay")
-    text = "(Kenneth Lay) xKenneth Lay"
-    assert _person_literal_boundaries_match(text, 1, 12) is True
-    assert _person_literal_boundaries_match(text, 15, 26) is False
+    assert _person_literal_catalog_key("Maribel   Quill") == _person_literal_catalog_key("maribel quill")
+    assert _person_literal_catalog_key("Quill, Maribel") != _person_literal_catalog_key("Maribel Quill")
+    assert _person_literal_catalog_key("Straße") == _person_literal_catalog_key("STRAẞE")
+    assert _person_literal_catalog_key("Straße") != _person_literal_catalog_key("STRASSE")
+    text = "(Maribel Quill) xMaribel Quill"
+    assert _person_literal_boundaries_match(text, 1, 14) is True
+    assert _person_literal_boundaries_match(text, 17, 30) is False

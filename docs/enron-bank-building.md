@@ -27,12 +27,14 @@ uv run nerb build-enron-bank \
 ```
 
 An optional verified [CMU annotation bundle](enron-evaluation.md#private-ingestion) adds an independent,
-training-only person-name diagnostic. It remains auxiliary and non-promotable.
+training-only person-name diagnostic. It must be paired with a separately reviewed private catalog-binding JSONL that
+exactly covers the bundle's training labels. It remains auxiliary and non-promotable.
 
 ```shell
 uv run nerb build-enron-bank \
   --development-run .nerb/enron-splits/enron-v2-development \
   --annotation-run .nerb/enron-annotations/cmu-v2 \
+  --cmu-catalog-bindings .nerb/enron-annotations/cmu-v2-reviewed-catalog-bindings.jsonl \
   --output-dir .nerb/enron-bank-builds/enron-v2 \
   --benchmark-version enron-v2
 ```
@@ -48,9 +50,11 @@ uv run nerb verify-enron-bank-build \
   --annotation-run .nerb/enron-annotations/cmu-v2
 ```
 
-Omit `--annotation-run` from both commands when no auxiliary bundle is available. The build command also supports a
-fixed `--created-at` value for reproducible metadata. `--allow-unignored-output` is an explicit escape hatch for a
-private destination outside an ignored Git path; it does not make that destination or its contents public-safe.
+Omit both `--annotation-run` and `--cmu-catalog-bindings` from the build when no auxiliary bundle is available; supplying
+only one fails closed. Verification needs the annotation run because it replays the exact reviewed bindings already
+copied into the private build. The build command also supports a fixed `--created-at` value for reproducible metadata.
+`--allow-unignored-output` is an explicit escape hatch for a private destination outside an ignored Git path; it does
+not make that destination or its contents public-safe.
 
 ## Train-only candidate policy
 
@@ -64,7 +68,7 @@ The initial taxonomy is deliberately narrow:
 | Class | Train evidence and selected-bank treatment |
 | --- | --- |
 | Contact | Valid structured-header addresses recur in at least two distinct train leakage groups before activation. The selected policy also activates one bounded, low-precedence unknown-email fallback. |
-| Person | Full names come from structured display names or a sender-local-part name that is also observed near the end of that sender's current body. An alias needs support from at least two train leakage groups, one unambiguous recurring contact-address anchor, and a locally compatible full-name anchor; compatible recurring nickname aliases may join that identity. The contact literal may remain draft only because of the compile-safe active cap. First-name-only aliases are prohibited. |
+| Person | Full names come from structured display names or a sender-local-part name that is also observed near the end of that sender's current body. Support is counted separately for each matcher-equivalent case/whitespace surface, so reordered or punctuated forms do not pool recurrence; independently recurring compatible surfaces may still share one address identity. An alias needs support from at least two train leakage groups, one unambiguous recurring contact-address anchor retained as active or draft, and a locally compatible full-name anchor; compatible recurring nickname aliases may join that identity. The contact literal may remain draft only because of the compile-safe active cap. First-name-only aliases are prohibited. |
 | Organization domain | Observed domains are retained as draft because the current literal boundary model cannot express the intended exact domain span without unsafe expansion. |
 | Phone number | The bounded US phone fallback is an experiment only. It remains draft in the selected bank because independent negative and over-redaction evidence is unavailable. |
 
@@ -123,9 +127,12 @@ document contains no PII. The optional CMU Meetings train diagnostic is independ
 person-name scope, but it is auxiliary training evidence: it does not measure contacts, domains, phones, the main email
 corpus, or sealed-test performance.
 
-CMU labels count as cataloged only when their surface is case/whitespace-equivalent to an active literal and its actual
-document context satisfies that literal's word boundaries. Name-normalization conveniences such as reversing
-`Last, First` do not manufacture catalog coverage for a differently ordered pattern.
+The builder never manufactures CMU catalog qualification from scan output, label text, or active-bank aliases. A human
+or independent review process must explicitly adjudicate every label as either `null` or one active person identity in
+the caller-supplied JSONL. The strict evaluator requires that file to cover the verified annotation spans exactly and
+rejects invalid catalog identities. The builder evaluates a canonical private copy of those exact reviewed records and
+retains it for deep replay. Reviewers must not use name-normalization conveniences such as reversing `Last, First` to
+manufacture catalog coverage for a differently ordered pattern.
 
 ## Catalog conformance
 
@@ -153,7 +160,7 @@ Private artifacts include:
 - validation documents, weak labels, unsupported-dimension declarations, per-iteration gold bindings, quality results,
   and structural reports;
 - generated conformance cases and results;
-- optional CMU catalog bindings and quality results; and
+- the exact caller-supplied, separately reviewed CMU catalog bindings and optional quality results; and
 - the private manifest and aggregate bank card.
 
 Do not publish an artifact merely because its filename sounds aggregate. The candidate ledger, bank, validation files,
@@ -175,25 +182,34 @@ or unexpectedly large source from causing unbounded work. The default v2 policy 
 
 | Resource | Limit |
 | --- | ---: |
-| Train records | 1,000,000 |
-| Validation records | 200,000 |
-| Validation structured header entries | 2,000,000 |
-| Validation structured labeled spans | 4,000,000 |
-| Validation structured-view UTF-8 bytes | 512 MiB |
+| Train records | 600,000 |
+| Train role artifact | 512 MiB |
+| Validation records | 10,000 |
+| Validation role artifact | 96 MiB |
+| Validation structured header entries | 250,000 |
+| Validation structured labeled spans | 150,000 |
+| Validation structured-view UTF-8 bytes | 64 MiB |
+| Quality predictions per validation iteration | 500,000 |
+| Development memberships artifact | 48 MiB |
+| Development samples artifact | 24 MiB |
 | Structured header entries per document | 8,192 |
-| Candidate observations | 20,000,000 |
-| Unique candidates | 1,000,000 |
+| Candidate observations | 2,000,000 |
+| Unique candidates | 50,000 |
 | UTF-8 bytes per candidate value | 4,096 |
 | Active contacts | 500 |
 | Active person identities | 500 |
 | Active person aliases | 500 |
 | Reserved active-domain capacity | 500 |
-| Observed draft candidates per class | 5,000 |
+| Observed draft candidates per class | 2,000 |
 | Active patterns in the selected bank | 25,000 |
 | Total active-pattern UTF-8 bytes | 5 MiB |
-| Canonical bank JSON | 64 MiB |
-| Private JSONL records per artifact | 3,000,000 |
+| Canonical bank JSON | 32 MiB |
+| Private JSON artifact bytes | 64 MiB |
+| Private JSONL records per artifact | 750,000 |
+| Private JSONL bytes per artifact | 256 MiB |
 | Private JSONL bytes per line | 16 MiB |
+| Private SQLite spool bytes | 2 GiB |
+| Private artifact-tree entries / nesting depth | 256 / 8 |
 
 Ingestion, candidate-value, and bank-size limit violations abort the build. Curation overflow moves into draft or
 rejected decisions with aggregate funnel accounting; it is never silently dropped. These limits establish bounded
@@ -204,6 +220,22 @@ The per-class active ceilings include headroom beneath the current Rust entity-i
 the builder proved larger single-class banks fail closed during deep compilation. The 25,000-pattern global ceiling is
 still a bank-wide safety limit, not permission for one entity class to consume that entire budget. Issue #152 measures
 and, if justified, improves larger realistic shapes without weakening this builder's compile-before-commit guarantee.
+
+These are the reviewed #151 development-build limits, not a claim that the current in-memory evaluator can process the
+full pinned source. The measured 50,000-row evidence run used 721,302 candidate observations and 15,171 unique
+candidates. Its train, validation, membership, and sample artifacts used 419,355,677, 64,931,388, 29,093,619, and
+13,477,581 bytes respectively. The defaults retain explicit measured headroom while bounding I/O and Python object
+amplification. Manifest-declared record and artifact-byte capacities are checked before hashing large role artifacts or
+starting candidate mining. The two non-selected iterations retain only aggregate funnel counters; only the selected
+iteration materializes the private candidate ledger needed for audit and replay.
+
+The 150,000-span ceiling bounds retained weak-label and per-iteration gold objects; it is not a prediction-count
+preflight. A bank can produce matches outside labeled spans, so the evaluator independently enforces its frozen
+500,000-prediction runtime ceiling and still fails closed if scanning reaches it.
+
+Raising these limits for the full pinned source requires #152 to demonstrate a streaming/capacity design with peak-RSS
+and runtime evidence and to review any evaluator-capacity change separately. The #153 run must fail before any sealed-test
+access if that development-stage proof has not landed; a higher numeric limit alone is not evidence of acceptable scale.
 
 ## Sealed-test boundary
 

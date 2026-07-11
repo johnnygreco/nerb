@@ -4,19 +4,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
+import sqlite3
 import stat
+import tempfile
 import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 
 from . import enron_bank_builder as _bank_builder_module
 from .bank import bank_stats, hash_bank
-from .enron_annotations import EnronAnnotationError, load_cmu_enron_training_quality_source
+from .enron_annotations import EnronAnnotationError
 from .enron_bank_builder import (
     BANK_BUILD_ITERATION_SCHEMA_VERSION,
     BANK_BUILD_MANIFEST_SCHEMA_VERSION,
@@ -29,10 +33,14 @@ from .enron_bank_builder import (
     CuratedIteration,
     EnronBankBuildError,
     EnronBankPolicy,
+    _candidate_pool_hash,
     _canonical_hash,
     _canonical_json_bytes,
     _normalize_email,
     _normalize_person_name,
+    _person_literal_catalog_key,
+    _read_candidate_evidence,
+    _validate_policy,
     candidate_funnel,
     curate_enron_iteration,
     mine_enron_candidates,
@@ -44,6 +52,7 @@ from .enron_conformance import (
     EnronConformanceError,
     evaluate_enron_conformance,
 )
+from .enron_contract import EnronContractValidator, _public_serialization_diagnostics
 from .enron_private_io import (
     EnronPrivateIOError,
     PrivateRun,
@@ -51,11 +60,20 @@ from .enron_private_io import (
     open_private_binary_input,
 )
 from .enron_quality import (
+    DEFAULT_MAX_QUALITY_INPUT_BYTES,
+    DEFAULT_MAX_QUALITY_LINE_BYTES,
+    DEFAULT_MAX_QUALITY_RECORDS,
     EnronQualityError,
     evaluate_cmu_enron_training_quality,
+    evaluate_cmu_enron_training_quality_files,
     evaluate_enron_quality,
 )
-from .enron_splitting import EnronSplitError, load_enron_development_split
+from .enron_splitting import (
+    EnronDevelopmentAdmissionError,
+    EnronDevelopmentAdmissionLimits,
+    EnronSplitError,
+    load_enron_development_split,
+)
 from .validation import validate_bank
 
 __all__ = [
@@ -87,12 +105,17 @@ _PUBLIC_CARD_FIELDS = frozenset(
 )
 _SHA256_PREFIX = "sha256:"
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_EMAIL_SHAPE_RE = re.compile(r"[^\s@]+@[^\s@]+")
-_PHONE_SHAPE_RE = re.compile(r"(?<![0-9])[0-9]{3}[ .-][0-9]{3}[ .-][0-9]{4}(?![0-9])")
 _DOCUMENT_ID_RE = re.compile(r"^doc_[0-9a-f]{64}$")
-_MAX_PRIVATE_JSON_BYTES = 512 * 1024 * 1024
+_MAX_PRIVATE_MANIFEST_BYTES = 16 * 1024 * 1024
+_MAX_PRIVATE_JSON_BYTES = 64 * 1024 * 1024
+_MAX_PRIVATE_JSONL_BYTES = 256 * 1024 * 1024
+_MAX_PRIVATE_SQLITE_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_PRIVATE_SQLITE_PROJECTION_BYTES = 16 * 1024 * 1024
 _MAX_PRIVATE_JSONL_LINE_BYTES = 16 * 1024 * 1024
-_MAX_PRIVATE_JSONL_RECORDS = 3_000_000
+_MAX_PRIVATE_JSONL_RECORDS = 750_000
+_MAX_PRIVATE_TREE_ENTRIES = 256
+_MAX_PRIVATE_TREE_DEPTH = 8
+_MAX_PRIVATE_COMMIT_MARKER_BYTES = 128
 _PRIVATE_COMMIT_MARKER_SHA256 = _SHA256_PREFIX + hashlib.sha256(b"nerb.enron.private-run.v2\n").hexdigest()
 
 _REQUIRED_ARTIFACT_NAMES = {
@@ -128,11 +151,349 @@ _OPTIONAL_CMU_ARTIFACT_NAMES = {
 }
 
 
+def _closed_card_object(properties: Mapping[str, Any], *, required: Sequence[str] | None = None) -> dict[str, Any]:
+    fields = tuple(properties)
+    return {
+        "type": "object",
+        "required": list(fields if required is None else required),
+        "properties": dict(properties),
+        "additionalProperties": False,
+    }
+
+
+_CARD_STRING = {"type": "string", "minLength": 1, "maxLength": 4_096}
+_CARD_HASH = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
+_CARD_COUNT = {"type": "integer", "minimum": 0}
+_CARD_POSITIVE_COUNT = {"type": "integer", "minimum": 1}
+_CARD_RATIO = {"type": "number", "minimum": 0.0, "maximum": 1.0}
+_CARD_OPTIONAL_RATIO = {"anyOf": [_CARD_RATIO, {"type": "null"}]}
+_CARD_STAT_COUNTS = _closed_card_object({"entities": _CARD_COUNT, "names": _CARD_COUNT, "patterns": _CARD_COUNT})
+_CARD_STATS = _closed_card_object(
+    {
+        "totals": _CARD_STAT_COUNTS,
+        "active_totals": _CARD_STAT_COUNTS,
+        "by_status": _closed_card_object(
+            {
+                "active": _CARD_STAT_COUNTS,
+                "draft": _CARD_STAT_COUNTS,
+                "inactive": _CARD_STAT_COUNTS,
+                "deprecated": _CARD_STAT_COUNTS,
+            }
+        ),
+        "by_kind": _closed_card_object({"literal": _CARD_COUNT, "regex": _CARD_COUNT}),
+    }
+)
+_CARD_SOURCE = _closed_card_object(
+    {
+        "dataset_id": _CARD_STRING,
+        "dataset_revision": _CARD_STRING,
+        "dataset_split": _CARD_STRING,
+        "development_manifest_sha256": _CARD_HASH,
+        "full_split_manifest_sha256": _CARD_HASH,
+        "split_policy_sha256": _CARD_HASH,
+        "preparation_manifest_sha256": _CARD_HASH,
+        "train_artifact_sha256": _CARD_HASH,
+        "train_records": _CARD_POSITIVE_COUNT,
+        "train_groups": _CARD_POSITIVE_COUNT,
+        "validation_artifact_sha256": _CARD_HASH,
+        "validation_records": _CARD_POSITIVE_COUNT,
+        "validation_groups": _CARD_POSITIVE_COUNT,
+        "development_memberships_sha256": _CARD_HASH,
+        "sealed_test_accessed": {"const": False},
+    }
+)
+_CARD_CHARTER_ENTITY_CLASS = _closed_card_object(
+    {"id": _CARD_STRING, "user_value": _CARD_STRING, "label_source": _CARD_STRING, "active_scope": _CARD_STRING}
+)
+_CARD_CHARTER = _closed_card_object(
+    {
+        "id": _CARD_STRING,
+        "primary_user_value": _CARD_STRING,
+        "recall_priority": {"const": True},
+        "guarantee_boundary": _CARD_STRING,
+        "entity_classes": {
+            "type": "array",
+            "minItems": 4,
+            "maxItems": 4,
+            "items": _CARD_CHARTER_ENTITY_CLASS,
+        },
+    }
+)
+_CARD_BUILDER = _closed_card_object(
+    {
+        "policy_sha256": _CARD_HASH,
+        "source_sha256": _CARD_HASH,
+        "candidate_source_sha256": _CARD_HASH,
+        "candidate_ledger_sha256": _CARD_HASH,
+        "train_records": _CARD_POSITIVE_COUNT,
+        "observations": _CARD_COUNT,
+        "iteration_count": {"const": 3},
+        "selected_iteration_id": {"const": "iteration_02_email_recall"},
+    }
+)
+_CARD_BANK = _closed_card_object(
+    {
+        "id": _CARD_STRING,
+        "version": _CARD_STRING,
+        "canonical_sha256": _CARD_HASH,
+        "artifact_sha256": _CARD_HASH,
+        "canonical_json_bytes": _CARD_POSITIVE_COUNT,
+        "stats": _CARD_STATS,
+    }
+)
+_CARD_FUNNEL_COUNTS = _closed_card_object(
+    {"total": _CARD_COUNT, "active": _CARD_COUNT, "draft": _CARD_COUNT, "rejected": _CARD_COUNT}
+)
+_CARD_FUNNEL = _closed_card_object(
+    {
+        "schema_version": {"const": CANDIDATE_FUNNEL_SCHEMA_VERSION},
+        "total_candidates": _CARD_POSITIVE_COUNT,
+        "by_decision": _closed_card_object({"active": _CARD_COUNT, "draft": _CARD_COUNT, "rejected": _CARD_COUNT}),
+        "by_type": {
+            "type": "object",
+            "required": ["contact_fallback", "phone_fallback"],
+            "properties": {
+                name: _CARD_FUNNEL_COUNTS
+                for name in (
+                    "contact",
+                    "contact_fallback",
+                    "organization_domain",
+                    "person_alias",
+                    "phone_fallback",
+                )
+            },
+            "additionalProperties": False,
+        },
+        "by_primary_reason": {
+            "type": "object",
+            "minProperties": 1,
+            "propertyNames": {"type": "string", "minLength": 1, "maxLength": 256},
+            "additionalProperties": _CARD_COUNT,
+        },
+    }
+)
+_CARD_ITERATION = _closed_card_object(
+    {
+        "schema_version": {"const": BANK_BUILD_ITERATION_SCHEMA_VERSION},
+        "id": _CARD_STRING,
+        "parent_id": {"anyOf": [_CARD_STRING, {"type": "null"}]},
+        "policy_sha256": _CARD_HASH,
+        "bank_sha256": _CARD_HASH,
+        "validation_protocol_sha256": _CARD_HASH,
+        "catalog_binding_sha256": _CARD_HASH,
+        "quality_run_sha256": _CARD_HASH,
+        "contact_labeled_spans": _CARD_POSITIVE_COUNT,
+        "contact_labeled_true_positive": _CARD_COUNT,
+        "contact_labeled_false_negative": _CARD_COUNT,
+        "contact_labeled_recall": _CARD_RATIO,
+        "contact_cataloged_false_negative": _CARD_COUNT,
+        "contact_cataloged_wrong_canonical": _CARD_COUNT,
+        "person_labeled_spans": {"anyOf": [_CARD_COUNT, {"type": "null"}]},
+        "person_cataloged_false_negative": {"anyOf": [_CARD_COUNT, {"type": "null"}]},
+        "person_cataloged_wrong_canonical": {"anyOf": [_CARD_COUNT, {"type": "null"}]},
+        "open_world_metrics_supported": {"const": False},
+        "utility_metrics_supported": {"const": False},
+        "active_patterns": _CARD_POSITIVE_COUNT,
+        "canonical_json_bytes": _CARD_POSITIVE_COUNT,
+        "decision": {"type": "string", "enum": ["keep", "discard"]},
+        "decision_reason_code": _CARD_STRING,
+        "selected": {"type": "boolean"},
+    }
+)
+_CARD_VALIDATION_SLICE_FIELDS = {
+    "documents": _CARD_COUNT,
+    "documents_with_sensitive_gold": _CARD_COUNT,
+    "gold_spans": _CARD_COUNT,
+    "true_positive": _CARD_COUNT,
+    "false_negative": _CARD_COUNT,
+    "cataloged_gold_spans": _CARD_COUNT,
+    "cataloged_true_positive": _CARD_COUNT,
+    "cataloged_false_negative": _CARD_COUNT,
+    "cataloged_wrong_canonical": _CARD_COUNT,
+    "labeled_span_recall": _CARD_OPTIONAL_RATIO,
+    "catalog_coverage": _CARD_OPTIONAL_RATIO,
+    "cataloged_recall": _CARD_OPTIONAL_RATIO,
+    "open_world_recall": {"type": "null"},
+    "precision": {"type": "null"},
+    "over_redaction_rate": {"type": "null"},
+    "negative_document_false_alarm_rate": {"type": "null"},
+}
+_CARD_VALIDATION_SLICE = _closed_card_object(_CARD_VALIDATION_SLICE_FIELDS)
+_CARD_UNSUPPORTED_VALIDATION_SLICE = _closed_card_object(
+    {"evaluated": {"const": False}, "reason_code": _CARD_STRING, **_CARD_VALIDATION_SLICE_FIELDS}
+)
+_CARD_VALIDATION = _closed_card_object(
+    {
+        "label_strength": {"const": "structured_weak"},
+        "protocol_sha256": _CARD_HASH,
+        "quality_run_sha256": _CARD_HASH,
+        "contact": _CARD_VALIDATION_SLICE,
+        "person": {"oneOf": [_CARD_VALIDATION_SLICE, _CARD_UNSUPPORTED_VALIDATION_SLICE]},
+        "open_world_metrics_supported": {"const": False},
+        "utility_metrics_supported": {"const": False},
+        "unsupported_reason_code": {"const": "independent_exhaustive_validation_labels_unavailable"},
+    }
+)
+_CARD_CONFORMANCE = _closed_card_object(
+    {
+        "evaluated": {"const": True},
+        "label_artifact_id": _CARD_STRING,
+        "passed": {"const": True},
+        "active_patterns": _CARD_POSITIVE_COUNT,
+        "patterns_with_positive_cases": _CARD_POSITIVE_COUNT,
+        "approved_positive_cases": _CARD_POSITIVE_COUNT,
+        "correctly_mapped": _CARD_COUNT,
+        "missed": _CARD_COUNT,
+        "wrong_canonical": _CARD_COUNT,
+        "recall": _CARD_RATIO,
+        "negative_cases": _CARD_POSITIVE_COUNT,
+        "unexpected_negative_matches": _CARD_COUNT,
+        "positive_cases_artifact": _closed_card_object(
+            {"id": _CARD_STRING, "sha256": _CARD_HASH, "bytes": _CARD_POSITIVE_COUNT}
+        ),
+        "negative_cases_artifact": _closed_card_object(
+            {"id": _CARD_STRING, "sha256": _CARD_HASH, "bytes": _CARD_POSITIVE_COUNT}
+        ),
+        "policy_sha256": _CARD_HASH,
+    }
+)
+_CARD_AUXILIARY_METRICS = _closed_card_object(
+    {
+        name: _CARD_OPTIONAL_RATIO
+        for name in (
+            "precision",
+            "open_world_recall",
+            "f1",
+            "catalog_coverage",
+            "cataloged_recall",
+            "document_leak_rate",
+            "cataloged_document_leak_rate",
+            "sensitive_character_recall",
+            "sensitive_character_leak_rate",
+            "negative_document_false_alarm_rate",
+            "over_redaction_rate",
+        )
+    }
+)
+_CARD_AUXILIARY = {
+    "oneOf": [
+        _closed_card_object({"evaluated": {"const": False}, "reason_code": {"const": "annotation_run_not_supplied"}}),
+        _closed_card_object(
+            {
+                "evaluated": {"const": True},
+                "scope": {"const": "cmu_meetings_person_train_auxiliary_nonpromotable"},
+                "label_strength": _CARD_STRING,
+                "annotation_completeness": _CARD_STRING,
+                "documents": _CARD_POSITIVE_COUNT,
+                "gold_spans": _CARD_COUNT,
+                "true_positive": _CARD_COUNT,
+                "false_negative": _CARD_COUNT,
+                "false_positive": _CARD_COUNT,
+                "metrics": _CARD_AUXILIARY_METRICS,
+                "protocol_sha256": _CARD_HASH,
+                "run_sha256": _CARD_HASH,
+                "nonpromotable": {"const": True},
+            }
+        ),
+    ]
+}
+_CARD_PRIVACY = _closed_card_object(
+    {
+        "status": {"const": "passed"},
+        "raw_text_included": {"const": False},
+        "direct_identifiers_included": {"const": False},
+        "private_paths_included": {"const": False},
+        "scanner": {"const": "nerb.enron_bank_workflow.public_card_scan.v2"},
+        "scanner_source_sha256": _CARD_HASH,
+        "violation_count": {"const": 0},
+        "report_sha256": _CARD_HASH,
+    }
+)
+_PUBLIC_CARD_SCHEMA = _closed_card_object(
+    {
+        "schema_version": {"const": BANK_CARD_SCHEMA_VERSION},
+        "benchmark_version": _CARD_STRING,
+        "artifact_kind": {"const": "aggregate_private_bank_build"},
+        "fixture_mode": {"type": "boolean"},
+        "promotable": {"const": False},
+        "nonpromotable_reasons": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 4,
+            "uniqueItems": True,
+            "items": {
+                "type": "string",
+                "enum": [
+                    "fixture_development_split",
+                    "main_validation_independent_exhaustive_labels_unavailable",
+                    "main_validation_utility_metrics_unsupported",
+                    "sealed_final_test_unopened",
+                ],
+            },
+        },
+        "source": _CARD_SOURCE,
+        "charter": _CARD_CHARTER,
+        "builder": _CARD_BUILDER,
+        "bank": _CARD_BANK,
+        "candidate_funnel": _CARD_FUNNEL,
+        "iterations": {"type": "array", "minItems": 3, "maxItems": 3, "items": _CARD_ITERATION},
+        "validation": _CARD_VALIDATION,
+        "catalog_conformance": _CARD_CONFORMANCE,
+        "independent_auxiliary": _CARD_AUXILIARY,
+        "privacy": _CARD_PRIVACY,
+        "run_sha256": _CARD_HASH,
+    }
+)
+_PUBLIC_CARD_VALIDATOR = EnronContractValidator(_PUBLIC_CARD_SCHEMA)
+_EXPECTED_CARD_CHARTER: dict[str, Any] = {
+    "id": "privacy_first_enron_intelligence_v2",
+    "primary_user_value": "prevent_sensitive_contact_and_person_name_leakage",
+    "recall_priority": True,
+    "guarantee_boundary": "active_catalog_patterns_only",
+    "entity_classes": [
+        {
+            "id": "contact",
+            "user_value": "known_contact_identity_and_unknown_structured_email_discovery",
+            "label_source": "train_and_validation_structured_headers",
+            "active_scope": "recurring_exact_addresses_plus_bounded_unknown_email_fallback",
+        },
+        {
+            "id": "person",
+            "user_value": "canonical_person_identity_from_observed_full_name_aliases",
+            "label_source": (
+                "train_display_names_sender_body_confirmed_local_parts_and_auxiliary_independent_person_labels"
+            ),
+            "active_scope": "recurring_unique_address_anchored_full_names",
+        },
+        {
+            "id": "organization_domain",
+            "user_value": "organization_domain_intelligence",
+            "label_source": "train_structured_headers",
+            "active_scope": "draft_until_exact_domain_boundary_is_expressible",
+        },
+        {
+            "id": "phone_number",
+            "user_value": "unknown_structured_phone_discovery",
+            "label_source": "synthetic_only",
+            "active_scope": "draft_because_independent_negative_evidence_is_unavailable",
+        },
+    ],
+}
+
+
+def _card_charter() -> dict[str, Any]:
+    return {
+        **_EXPECTED_CARD_CHARTER,
+        "entity_classes": [dict(item) for item in _EXPECTED_CARD_CHARTER["entity_classes"]],
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class EnronBankBuildOptions:
     development_run: Path
     output_dir: Path
     annotation_run: Path | None = None
+    cmu_catalog_bindings_path: Path | None = None
     benchmark_version: str = "enron-v2"
     created_at: str = BANK_BUILD_TIMESTAMP
     policy: EnronBankPolicy = EnronBankPolicy()
@@ -165,6 +526,7 @@ class _PrivateEntryIdentity:
 class _PrivateFileFingerprint:
     identity: _PrivateEntryIdentity
     sha256: str
+    records: int | None = None
 
 
 def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, Any]:
@@ -172,15 +534,45 @@ def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, A
 
     if not isinstance(options, EnronBankBuildOptions):
         raise EnronBankBuildError("Bank-build options are invalid.")
+    if (options.annotation_run is None) != (options.cmu_catalog_bindings_path is None):
+        raise EnronBankBuildError(
+            "Auxiliary CMU annotation run and reviewed catalog-binding JSONL must be supplied together."
+        )
+    if not isinstance(options.policy, EnronBankPolicy):
+        raise EnronBankBuildError("Bank-build policy is invalid.")
+    _validate_policy(options.policy)
+    admission_limits = EnronDevelopmentAdmissionLimits(
+        max_train_records=options.policy.max_train_records,
+        max_train_artifact_bytes=options.policy.max_train_artifact_bytes,
+        max_validation_records=options.policy.max_validation_records,
+        max_validation_artifact_bytes=options.policy.max_validation_artifact_bytes,
+        max_development_memberships_bytes=options.policy.max_development_memberships_bytes,
+        max_development_samples_bytes=options.policy.max_development_samples_bytes,
+    )
     try:
-        development = load_enron_development_split(Path(options.development_run))
+        development = load_enron_development_split(
+            Path(options.development_run),
+            admission_limits=admission_limits,
+        )
+    except EnronDevelopmentAdmissionError:
+        raise EnronBankBuildError("Development split exceeds the bank-build admission limits.") from None
     except (EnronPrivateIOError, EnronSplitError):
         raise EnronBankBuildError("Development split could not be loaded safely.") from None
-    source_binding = _source_binding(development, Path(options.development_run), options.benchmark_version)
+    source_binding = _source_binding(development, options.benchmark_version)
     if source_binding["benchmark_version"] != options.benchmark_version:
         raise EnronBankBuildError("Development split benchmark version does not match the build target.")
+    _preflight_source_capacity(source_binding, options.policy)
 
     try:
+        validation = _validation_projection(
+            _paired_role(
+                development.iter_validation_records(),
+                development.iter_validation_memberships(),
+                role="validation",
+            ),
+            source_binding=source_binding,
+            policy=options.policy,
+        )
         with PrivateRun(
             Path(options.output_dir),
             allow_unignored_output=options.allow_unignored_output,
@@ -197,24 +589,22 @@ def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, A
                 train_artifact_sha256=str(source_binding["train_artifact_sha256"]),
                 policy=options.policy,
             )
+            implementation_sha256 = _builder_implementation_sha256()
             curated = tuple(
-                curate_enron_iteration(
-                    pool,
+                _bind_curated_iteration(
+                    curate_enron_iteration(
+                        pool,
+                        policy=options.policy,
+                        iteration=iteration,
+                        source_binding=source_binding,
+                        created_at=options.created_at,
+                        retain_candidate_ledger=iteration == ITERATION_POLICIES[1],
+                    ),
+                    pool=pool,
                     policy=options.policy,
-                    iteration=iteration,
-                    source_binding=source_binding,
-                    created_at=options.created_at,
+                    implementation_sha256=implementation_sha256,
                 )
                 for iteration in ITERATION_POLICIES
-            )
-            validation = _validation_projection(
-                _paired_role(
-                    development.iter_validation_records(),
-                    development.iter_validation_memberships(),
-                    role="validation",
-                ),
-                source_binding=source_binding,
-                policy=options.policy,
             )
             evaluated = tuple(_evaluate_iteration(item, validation, options.policy) for item in curated)
             iteration_records = _decide_iterations(evaluated)
@@ -236,9 +626,12 @@ def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, A
                 cmu_bindings: tuple[dict[str, Any], ...] = ()
                 cmu_quality: dict[str, Any] | None = None
             else:
-                cmu_bindings, cmu_quality = _evaluate_cmu_auxiliary(
+                assert options.cmu_catalog_bindings_path is not None
+                cmu_bindings, cmu_quality = _stage_and_evaluate_cmu_auxiliary(
+                    run,
                     selected.bank,
                     Path(options.annotation_run),
+                    Path(options.cmu_catalog_bindings_path),
                 )
 
             artifacts = _write_private_artifacts(
@@ -280,13 +673,43 @@ def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, A
             with run.open_binary("manifest.json") as file:
                 file.write(_pretty_json_bytes(manifest))
             run.commit()
+    except EnronSplitError:
+        raise EnronBankBuildError("Development split changed or became unsafe during the private bank build.") from None
     except EnronPrivateIOError:
         raise EnronBankBuildError("Private bank-build run failed safely.") from None
 
     return card
 
 
-def _source_binding(development: Any, root: Path, benchmark_version: str) -> dict[str, Any]:
+def _bind_curated_iteration(
+    curated: CuratedIteration,
+    *,
+    pool: CandidatePool,
+    policy: EnronBankPolicy,
+    implementation_sha256: str,
+) -> CuratedIteration:
+    """Bind an otherwise deterministic curation result to its executable inputs."""
+
+    bank = dict(curated.bank)
+    raw_metadata = bank.get("metadata")
+    if not isinstance(raw_metadata, Mapping):
+        raise EnronBankBuildError("Curated bank metadata is invalid.")
+    metadata = dict(raw_metadata)
+    metadata["builder_implementation_sha256"] = implementation_sha256
+    metadata["candidate_source_sha256"] = pool.source_sha256
+    bank["metadata"] = metadata
+    if len(_canonical_json_bytes(bank)) > policy.max_bank_json_bytes:
+        raise EnronBankBuildError("Curated bank exceeds the canonical JSON byte limit after commitment binding.")
+    return CuratedIteration(
+        iteration=curated.iteration,
+        bank=bank,
+        candidates=curated.candidates,
+        funnel=curated.funnel,
+        collisions=curated.collisions,
+    )
+
+
+def _source_binding(development: Any, benchmark_version: str) -> dict[str, Any]:
     manifest = development.manifest
     if manifest.get("benchmark_version") != benchmark_version:
         raise EnronBankBuildError("Development split benchmark version does not match the build target.")
@@ -313,7 +736,7 @@ def _source_binding(development: Any, root: Path, benchmark_version: str) -> dic
         "dataset_id": preparation.get("dataset_id"),
         "dataset_revision": preparation.get("dataset_revision"),
         "dataset_split": preparation.get("dataset_split"),
-        "development_manifest_sha256": _hash_private_file(root / "manifest.json"),
+        "development_manifest_sha256": development.manifest_sha256,
         "full_split_manifest_sha256": manifest.get("full_split_manifest_sha256"),
         "split_policy_sha256": policy.get("sha256"),
         "preparation_manifest_sha256": preparation.get("manifest_sha256"),
@@ -329,6 +752,28 @@ def _source_binding(development: Any, root: Path, benchmark_version: str) -> dic
         "fixture_mode": manifest.get("fixture_mode"),
         "sealed_test_accessed": False,
     }
+
+
+def _preflight_source_capacity(source_binding: Mapping[str, Any], policy: EnronBankPolicy) -> None:
+    """Reject a declared split that cannot fit the reviewed development envelope."""
+
+    _validate_policy(policy)
+    limits = (
+        ("train_records", policy.max_train_records, "train record count"),
+        ("train_artifact_bytes", policy.max_train_artifact_bytes, "train artifact byte count"),
+        ("validation_records", policy.max_validation_records, "validation record count"),
+        (
+            "validation_artifact_bytes",
+            policy.max_validation_artifact_bytes,
+            "validation artifact byte count",
+        ),
+    )
+    for field, limit, description in limits:
+        value = source_binding.get(field)
+        if type(value) is not int or value <= 0:
+            raise EnronBankBuildError("Development split capacity binding is invalid.")
+        if value > limit:
+            raise EnronBankBuildError(f"Declared {description} exceeds the bank-build limit.")
 
 
 def _paired_role(
@@ -551,13 +996,7 @@ def _evaluate_iteration(
     policy: EnronBankPolicy,
 ) -> dict[str, Any]:
     structural = validate_bank(curated.bank, level="deep", strict=True, check_engine_compile=True)
-    structural_summary = {
-        "valid": structural["valid"],
-        "hash": structural["hash"],
-        "stats": structural["stats"],
-        "diagnostic_codes": sorted({str(item["code"]) for item in structural["diagnostics"]}),
-        "engine_compatible": structural["engine_compatibility"]["compatible"],
-    }
+    structural_summary = _structural_summary(structural)
     if structural_summary["valid"] is not True or structural_summary["engine_compatible"] is not True:
         raise EnronBankBuildError(f"Iteration {curated.iteration.id} failed private structural validation.")
     gold = _qualified_validation_gold(curated.bank, validation.spans)
@@ -595,6 +1034,26 @@ def _evaluate_iteration(
             "max_canonical_json_bytes": policy.max_bank_json_bytes,
             "passed": True,
         },
+    }
+
+
+def _structural_summary(structural: Mapping[str, Any]) -> dict[str, Any]:
+    diagnostics = structural.get("diagnostics")
+    compatibility = structural.get("engine_compatibility")
+    if not isinstance(diagnostics, list) or not isinstance(compatibility, Mapping):
+        raise EnronBankBuildError("Private structural validation result is invalid.")
+    return {
+        "valid": structural.get("valid"),
+        "hash": structural.get("hash"),
+        "stats": structural.get("stats"),
+        "diagnostic_codes": sorted(
+            {
+                str(item["code"])
+                for item in diagnostics
+                if isinstance(item, Mapping) and isinstance(item.get("code"), str)
+            }
+        ),
+        "engine_compatible": compatibility.get("compatible"),
     }
 
 
@@ -636,11 +1095,11 @@ def _qualified_validation_gold(
                     if normalized:
                         contact_exact[normalized] = pattern_identity
                 elif entity_id == "person" and pattern.get("kind") == "literal":
-                    normalized_name = _normalize_person_name(value)
-                    if normalized_name:
-                        if normalized_name in person_aliases and person_aliases[normalized_name] != pattern_identity:
+                    surface_key = _person_literal_catalog_key(value)
+                    if surface_key:
+                        if surface_key in person_aliases and person_aliases[surface_key] != pattern_identity:
                             raise EnronBankBuildError("Active person alias maps to multiple canonical identities.")
-                        person_aliases[normalized_name] = pattern_identity
+                        person_aliases[surface_key] = pattern_identity
 
     gold: list[dict[str, Any]] = []
     for item in spans:
@@ -651,8 +1110,7 @@ def _qualified_validation_gold(
             normalized = _normalize_email(surface)
             identity = contact_exact.get(normalized or "")
         elif entity_class == "person":
-            normalized_name = _normalize_person_name(surface)
-            identity = person_aliases.get(normalized_name or "")
+            identity = person_aliases.get(_person_literal_catalog_key(surface))
         else:  # pragma: no cover - closed projection invariant
             identity = None
         gold.append(
@@ -675,6 +1133,9 @@ def _decide_iterations(evaluated: Sequence[Mapping[str, Any]]) -> tuple[dict[str
     if len(evaluated) != 3:
         raise EnronBankBuildError("Bank build requires exactly three frozen construction iterations.")
     contact_summaries = [_slice_by_id(item["quality"], "validation_contact_structured_weak") for item in evaluated]
+    person_summaries = [
+        _slice_by_id_or_none(item["quality"], "validation_person_structured_weak") for item in evaluated
+    ]
     protocol_sha256s = {str(item["quality"]["protocol_sha256"]) for item in evaluated}
     if len(protocol_sha256s) != 1:
         raise EnronBankBuildError("Validation protocol changed across construction iterations.")
@@ -684,6 +1145,11 @@ def _decide_iterations(evaluated: Sequence[Mapping[str, Any]]) -> tuple[dict[str
         raise EnronBankBuildError("Selected email fallback leaves structured validation contact misses.")
     if contact_summaries[1]["cataloged_false_negative"] != 0 or contact_summaries[1]["cataloged_wrong_canonical"] != 0:
         raise EnronBankBuildError("Selected bank has a cataloged contact miss or wrong mapping.")
+    selected_person = person_summaries[1]
+    if selected_person is not None and (
+        selected_person["cataloged_false_negative"] != 0 or selected_person["cataloged_wrong_canonical"] != 0
+    ):
+        raise EnronBankBuildError("Selected bank has a cataloged person miss or wrong mapping.")
 
     decisions = (
         ("discard", "superseded_by_bounded_email_fallback", False),
@@ -691,7 +1157,9 @@ def _decide_iterations(evaluated: Sequence[Mapping[str, Any]]) -> tuple[dict[str
         ("discard", "independent_phone_negative_evidence_unavailable", False),
     )
     records: list[dict[str, Any]] = []
-    for item, contact, (decision, reason, selected) in zip(evaluated, contact_summaries, decisions, strict=True):
+    for item, contact, person, (decision, reason, selected) in zip(
+        evaluated, contact_summaries, person_summaries, decisions, strict=True
+    ):
         iteration = item["iteration"]
         quality = cast(Mapping[str, Any], item["quality"])
         records.append(
@@ -710,6 +1178,9 @@ def _decide_iterations(evaluated: Sequence[Mapping[str, Any]]) -> tuple[dict[str
                 "contact_labeled_recall": _ratio(contact["true_positive"], contact["gold_spans"]),
                 "contact_cataloged_false_negative": contact["cataloged_false_negative"],
                 "contact_cataloged_wrong_canonical": contact["cataloged_wrong_canonical"],
+                "person_labeled_spans": None if person is None else person["gold_spans"],
+                "person_cataloged_false_negative": None if person is None else person["cataloged_false_negative"],
+                "person_cataloged_wrong_canonical": None if person is None else person["cataloged_wrong_canonical"],
                 "open_world_metrics_supported": False,
                 "utility_metrics_supported": False,
                 "active_patterns": item["structural"]["stats"]["active_totals"]["patterns"],
@@ -739,84 +1210,42 @@ def _slice_by_id_or_none(quality: Mapping[str, Any], slice_id: str) -> Mapping[s
     return None
 
 
-def _evaluate_cmu_auxiliary(
+def _stage_and_evaluate_cmu_auxiliary(
+    run: PrivateRun,
     bank: Mapping[str, Any],
     annotation_run: Path,
+    catalog_bindings_path: Path,
 ) -> tuple[tuple[dict[str, Any], ...], dict[str, Any]]:
+    bindings = _load_reviewed_cmu_catalog_bindings(catalog_bindings_path)
+    staged_path = run.stage_dir / _OPTIONAL_CMU_ARTIFACT_NAMES["cmu_catalog_bindings"]
+    _write_run_jsonl(run, _OPTIONAL_CMU_ARTIFACT_NAMES["cmu_catalog_bindings"], bindings)
     try:
-        source = load_cmu_enron_training_quality_source(annotation_run)
-    except EnronAnnotationError:
-        raise EnronBankBuildError("Auxiliary CMU annotation run could not be loaded safely.") from None
-    documents = {
-        str(item["document_id"]): str(item["text"]) for item in cast(Sequence[Mapping[str, Any]], source["documents"])
-    }
-    person_aliases = _active_person_alias_inventory(bank)
-    bindings: list[dict[str, Any]] = []
-    for label in cast(Sequence[Mapping[str, Any]], source["labels"]):
-        document_id = str(label["document_id"])
-        start = int(label["start"])
-        end = int(label["end"])
-        text = documents.get(document_id)
-        if text is None or end > len(text):
-            raise EnronBankBuildError("Auxiliary CMU label differs from its bound document.")
-        surface_key = _person_literal_catalog_key(text[start:end])
-        identity = person_aliases.get(surface_key)
-        if identity is not None and not _person_literal_boundaries_match(text, start, end):
-            identity = None
-        bindings.append(
-            {
-                "document_id": document_id,
-                "start": start,
-                "end": end,
-                "catalog_identity": (
-                    None
-                    if identity is None
-                    else {"entity_id": identity[0], "name_id": identity[1], "pattern_id": identity[2]}
-                ),
-            }
-        )
-    bindings.sort(key=lambda item: (str(item["document_id"]), int(item["start"]), int(item["end"])))
-    try:
-        quality = evaluate_cmu_enron_training_quality(
+        quality = evaluate_cmu_enron_training_quality_files(
             bank,
             annotation_run_dir=annotation_run,
-            catalog_bindings=bindings,
+            catalog_bindings_path=staged_path,
         )
     except (EnronAnnotationError, EnronQualityError):
         raise EnronBankBuildError("Auxiliary CMU quality evaluation failed safely.") from None
     if quality["evaluated"] is not True or quality["contract_validation"]["valid"] is not True:
         raise EnronBankBuildError("Auxiliary CMU quality evaluation failed closed.")
-    return tuple(bindings), quality
+    return bindings, quality
 
 
-def _active_person_alias_inventory(bank: Mapping[str, Any]) -> dict[str, tuple[str, str, str]]:
-    result: dict[str, tuple[str, str, str]] = {}
-    entities = cast(Mapping[str, Any], bank.get("entities", {}))
-    person = entities.get("person")
-    if not isinstance(person, Mapping) or person.get("status") != "active":
-        return result
-    for name_id, name in cast(Mapping[str, Any], person.get("names", {})).items():
-        if not isinstance(name_id, str) or not isinstance(name, Mapping) or name.get("status") != "active":
-            continue
-        for pattern_id, pattern in cast(Mapping[str, Any], name.get("patterns", {})).items():
-            if (
-                isinstance(pattern_id, str)
-                and isinstance(pattern, Mapping)
-                and pattern.get("status") == "active"
-                and pattern.get("kind") == "literal"
-                and isinstance(pattern.get("value"), str)
-            ):
-                normalized = _person_literal_catalog_key(str(pattern["value"]))
-                identity = ("person", name_id, pattern_id)
-                if normalized in result and result[normalized] != identity:
-                    raise EnronBankBuildError("Person catalog contains an ambiguous active alias.")
-                if normalized:
-                    result[normalized] = identity
-    return result
-
-
-def _person_literal_catalog_key(value: str) -> str:
-    return " ".join(value.split()).casefold()
+def _load_reviewed_cmu_catalog_bindings(path: Path) -> tuple[dict[str, Any], ...]:
+    bindings: list[dict[str, Any]] = []
+    total_bytes = 0
+    try:
+        for _line_no, raw, value in iter_strict_jsonl(path, DEFAULT_MAX_QUALITY_LINE_BYTES):
+            total_bytes += len(raw)
+            if total_bytes > DEFAULT_MAX_QUALITY_INPUT_BYTES:
+                raise EnronBankBuildError("Reviewed CMU catalog-binding JSONL exceeds the cumulative byte limit.")
+            bindings.append(dict(value))
+            if len(bindings) > DEFAULT_MAX_QUALITY_RECORDS:
+                raise EnronBankBuildError("Reviewed CMU catalog-binding JSONL exceeds the record limit.")
+    except EnronPrivateIOError:
+        raise EnronBankBuildError("Reviewed CMU catalog-binding JSONL could not be read safely.") from None
+    return tuple(bindings)
 
 
 def _person_literal_boundaries_match(text: str, start: int, end: int) -> bool:
@@ -1085,7 +1514,6 @@ def _write_private_artifacts(
     )
 
     if cmu_quality is not None:
-        _write_run_jsonl(run, "auxiliary/cmu-train-catalog-bindings.jsonl", cmu_bindings)
         _write_run_json(run, "auxiliary/cmu-train-quality.json", cmu_quality)
         artifacts["cmu_catalog_bindings"] = _artifact_descriptor(
             run.stage_dir / "auxiliary/cmu-train-catalog-bindings.jsonl",
@@ -1173,40 +1601,7 @@ def _bank_card(
                 "sealed_test_accessed",
             )
         },
-        "charter": {
-            "id": "privacy_first_enron_intelligence_v2",
-            "primary_user_value": "prevent_sensitive_contact_and_person_name_leakage",
-            "recall_priority": True,
-            "guarantee_boundary": "active_catalog_patterns_only",
-            "entity_classes": [
-                {
-                    "id": "contact",
-                    "user_value": "known_contact_identity_and_unknown_structured_email_discovery",
-                    "label_source": "train_and_validation_structured_headers",
-                    "active_scope": "recurring_exact_addresses_plus_bounded_unknown_email_fallback",
-                },
-                {
-                    "id": "person",
-                    "user_value": "canonical_person_identity_from_observed_full_name_aliases",
-                    "label_source": (
-                        "train_display_names_sender_body_confirmed_local_parts_and_auxiliary_independent_person_labels"
-                    ),
-                    "active_scope": "recurring_unique_address_anchored_full_names",
-                },
-                {
-                    "id": "organization_domain",
-                    "user_value": "organization_domain_intelligence",
-                    "label_source": "train_structured_headers",
-                    "active_scope": "draft_until_exact_domain_boundary_is_expressible",
-                },
-                {
-                    "id": "phone_number",
-                    "user_value": "unknown_structured_phone_discovery",
-                    "label_source": "synthetic_only",
-                    "active_scope": "draft_because_independent_negative_evidence_is_unavailable",
-                },
-            ],
-        },
+        "charter": _card_charter(),
         "builder": {
             "policy_sha256": options.policy.sha256,
             "source_sha256": _builder_implementation_sha256(),
@@ -1338,52 +1733,567 @@ def _private_manifest(
 
 
 def _validate_public_card(card: Mapping[str, Any]) -> None:
-    if set(card) != _PUBLIC_CARD_FIELDS or card.get("schema_version") != BANK_CARD_SCHEMA_VERSION:
-        raise EnronBankBuildError("Public bank card schema is invalid.")
+    try:
+        schema_error = next(_PUBLIC_CARD_VALIDATOR.iter_errors(card), None)
+    except (RecursionError, TypeError, ValueError):
+        schema_error = True
+    if schema_error is not None or set(card) != _PUBLIC_CARD_FIELDS:
+        raise EnronBankBuildError("Public bank card nested schema is invalid.")
+
+    try:
+        mapping_keys, string_values = _public_card_string_inventory(card)
+        privacy_diagnostics = [
+            *_public_serialization_diagnostics(cast(dict[str, Any], card)),
+            *_public_serialization_diagnostics({"mapping_keys": mapping_keys}),
+        ]
+    except (RecursionError, TypeError, ValueError):
+        raise EnronBankBuildError(
+            "Public bank card privacy scanner could not inspect the serialization safely."
+        ) from None
+    if privacy_diagnostics or any(_DOCUMENT_ID_RE.fullmatch(value) for value in (*mapping_keys, *string_values)):
+        raise EnronBankBuildError(
+            "Public bank card privacy scanner rejected a direct identifier or private path shape."
+        )
+
+    _validate_public_card_invariants(card)
     expected_run = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
     if card.get("run_sha256") != expected_run:
         raise EnronBankBuildError("Public bank card run commitment is invalid.")
-    violations: list[str] = []
-    for path, value in _iter_strings(card):
-        if _EMAIL_SHAPE_RE.search(value) or "@" in value:
-            violations.append(path)
-        elif _PHONE_SHAPE_RE.search(value):
-            violations.append(path)
-        elif _DOCUMENT_ID_RE.fullmatch(value):
-            violations.append(path)
-        elif _looks_like_private_path(value):
-            violations.append(path)
-    if violations:
-        raise EnronBankBuildError("Public bank card contains a direct identifier or private path shape.")
-    privacy = card.get("privacy")
+
+
+def _public_card_string_inventory(value: Any) -> tuple[list[str], list[str]]:
+    mapping_keys: list[str] = []
+    string_values: list[str] = []
+    active_containers: set[int] = set()
+
+    def visit(item: Any, depth: int) -> None:
+        if depth > 100:
+            raise RecursionError
+        if type(item) is str:
+            string_values.append(item)
+            return
+        if type(item) is dict:
+            identity = id(item)
+            if identity in active_containers:
+                raise RecursionError
+            active_containers.add(identity)
+            try:
+                for key, child in item.items():
+                    if type(key) is not str:
+                        raise TypeError
+                    mapping_keys.append(key)
+                    visit(child, depth + 1)
+            finally:
+                active_containers.remove(identity)
+            return
+        if type(item) is list:
+            identity = id(item)
+            if identity in active_containers:
+                raise RecursionError
+            active_containers.add(identity)
+            try:
+                for child in item:
+                    visit(child, depth + 1)
+            finally:
+                active_containers.remove(identity)
+
+    visit(value, 0)
+    return mapping_keys, string_values
+
+
+def _validate_public_card_invariants(card: Mapping[str, Any]) -> None:
+    source = cast(Mapping[str, Any], card["source"])
+    builder = cast(Mapping[str, Any], card["builder"])
+    bank = cast(Mapping[str, Any], card["bank"])
+    stats = cast(Mapping[str, Any], bank["stats"])
+    funnel = cast(Mapping[str, Any], card["candidate_funnel"])
+    iterations = cast(Sequence[Mapping[str, Any]], card["iterations"])
+    validation = cast(Mapping[str, Any], card["validation"])
+    conformance = cast(Mapping[str, Any], card["catalog_conformance"])
+    auxiliary = cast(Mapping[str, Any], card["independent_auxiliary"])
+    privacy = cast(Mapping[str, Any], card["privacy"])
+
+    expected_reasons = {
+        "sealed_final_test_unopened",
+        "main_validation_independent_exhaustive_labels_unavailable",
+        "main_validation_utility_metrics_unsupported",
+    }
+    if card["fixture_mode"] is True:
+        expected_reasons.add("fixture_development_split")
     if (
-        not isinstance(privacy, Mapping)
-        or privacy.get("status") != "passed"
-        or privacy.get("violation_count") != 0
-        or privacy.get("raw_text_included") is not False
-        or privacy.get("direct_identifiers_included") is not False
-        or privacy.get("private_paths_included") is not False
+        card["charter"] != _EXPECTED_CARD_CHARTER
+        or card["nonpromotable_reasons"] != sorted(expected_reasons)
+        or source["sealed_test_accessed"] is not False
+        or builder["train_records"] != source["train_records"]
+        or not _card_stats_are_consistent(stats)
+        or not _card_funnel_is_consistent(funnel)
+        or not _card_iterations_are_consistent(iterations, bank, validation)
+        or not _card_validation_is_consistent(validation)
+        or not _card_conformance_is_consistent(conformance, bank)
+        or not _card_auxiliary_is_consistent(auxiliary)
     ):
-        raise EnronBankBuildError("Public bank card privacy declaration is invalid.")
+        raise EnronBankBuildError("Public bank card semantic invariants are invalid.")
+
+    expected_privacy = _canonical_hash({key: value for key, value in privacy.items() if key != "report_sha256"})
+    if privacy["report_sha256"] != expected_privacy:
+        raise EnronBankBuildError("Public bank card privacy report commitment is invalid.")
 
 
-def _iter_strings(value: Any, path: str = "") -> Iterator[tuple[str, str]]:
-    if isinstance(value, str):
-        yield path, value
-    elif isinstance(value, Mapping):
-        for key, item in value.items():
-            yield from _iter_strings(item, f"{path}/{key}")
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        for index, item in enumerate(value):
-            yield from _iter_strings(item, f"{path}/{index}")
+def _card_stats_are_consistent(stats: Mapping[str, Any]) -> bool:
+    totals = cast(Mapping[str, int], stats["totals"])
+    active_totals = cast(Mapping[str, int], stats["active_totals"])
+    by_status = cast(Mapping[str, Mapping[str, int]], stats["by_status"])
+    by_kind = cast(Mapping[str, int], stats["by_kind"])
+    for field in ("entities", "names", "patterns"):
+        if totals[field] != sum(item[field] for item in by_status.values()):
+            return False
+        if active_totals[field] != by_status["active"][field]:
+            return False
+    return sum(by_kind.values()) == totals["patterns"]
 
 
-def _looks_like_private_path(value: str) -> bool:
-    if value.startswith(("~/", "~\\", "file://")) or "../" in value or "..\\" in value:
+def _card_funnel_is_consistent(funnel: Mapping[str, Any]) -> bool:
+    total = cast(int, funnel["total_candidates"])
+    by_decision = cast(Mapping[str, int], funnel["by_decision"])
+    by_type = cast(Mapping[str, Mapping[str, int]], funnel["by_type"])
+    by_reason = cast(Mapping[str, int], funnel["by_primary_reason"])
+    observed_decisions = {name: 0 for name in ("active", "draft", "rejected")}
+    for counts in by_type.values():
+        if counts["total"] != sum(counts[name] for name in observed_decisions):
+            return False
+        for name in observed_decisions:
+            observed_decisions[name] += counts[name]
+    return (
+        sum(by_decision.values()) == total
+        and sum(item["total"] for item in by_type.values()) == total
+        and sum(by_reason.values()) == total
+        and observed_decisions == dict(by_decision)
+    )
+
+
+def _card_iterations_are_consistent(
+    iterations: Sequence[Mapping[str, Any]],
+    bank: Mapping[str, Any],
+    validation: Mapping[str, Any],
+) -> bool:
+    expected = (
+        (None, "discard", "superseded_by_bounded_email_fallback", False),
+        (
+            "iteration_01_catalog",
+            "keep",
+            "best_supported_privacy_recall_without_unsupported_phone_activation",
+            True,
+        ),
+        ("iteration_02_email_recall", "discard", "independent_phone_negative_evidence_unavailable", False),
+    )
+    for row, policy, (parent_id, decision, reason, is_selected) in zip(
+        iterations, ITERATION_POLICIES, expected, strict=True
+    ):
+        spans = cast(int, row["contact_labeled_spans"])
+        true_positive = cast(int, row["contact_labeled_true_positive"])
+        false_negative = cast(int, row["contact_labeled_false_negative"])
+        person_values = (
+            row["person_labeled_spans"],
+            row["person_cataloged_false_negative"],
+            row["person_cataloged_wrong_canonical"],
+        )
+        if (
+            row["id"] != policy.id
+            or row["parent_id"] != parent_id
+            or row["policy_sha256"] != policy.sha256
+            or row["decision"] != decision
+            or row["decision_reason_code"] != reason
+            or row["selected"] is not is_selected
+            or spans != true_positive + false_negative
+            or row["contact_labeled_recall"] != _ratio(true_positive, spans)
+            or row["validation_protocol_sha256"] != validation["protocol_sha256"]
+            or (any(value is None for value in person_values) and any(value is not None for value in person_values))
+            or (
+                all(value is not None for value in person_values)
+                and cast(int, person_values[1]) + cast(int, person_values[2]) > cast(int, person_values[0])
+            )
+        ):
+            return False
+
+    selected_iteration = iterations[1]
+    contact = cast(Mapping[str, Any], validation["contact"])
+    person = cast(Mapping[str, Any], validation["person"])
+    stats = cast(Mapping[str, Any], bank["stats"])
+    active_stats = cast(Mapping[str, Any], stats["active_totals"])
+    if person.get("evaluated") is False:
+        person_matches = all(
+            selected_iteration[field] is None
+            for field in (
+                "person_labeled_spans",
+                "person_cataloged_false_negative",
+                "person_cataloged_wrong_canonical",
+            )
+        )
+    else:
+        person_matches = bool(
+            selected_iteration["person_labeled_spans"] == person["gold_spans"]
+            and selected_iteration["person_cataloged_false_negative"] == person["cataloged_false_negative"]
+            and selected_iteration["person_cataloged_wrong_canonical"] == person["cataloged_wrong_canonical"]
+        )
+    return bool(
+        selected_iteration["bank_sha256"] == bank["canonical_sha256"]
+        and selected_iteration["quality_run_sha256"] == validation["quality_run_sha256"]
+        and selected_iteration["canonical_json_bytes"] == bank["canonical_json_bytes"]
+        and selected_iteration["active_patterns"] == active_stats["patterns"]
+        and selected_iteration["contact_labeled_spans"] == contact["gold_spans"]
+        and selected_iteration["contact_labeled_true_positive"] == contact["true_positive"]
+        and selected_iteration["contact_labeled_false_negative"] == contact["false_negative"]
+        and selected_iteration["contact_cataloged_false_negative"] == contact["cataloged_false_negative"]
+        and selected_iteration["contact_cataloged_wrong_canonical"] == contact["cataloged_wrong_canonical"]
+        and person_matches
+    )
+
+
+def _card_validation_is_consistent(validation: Mapping[str, Any]) -> bool:
+    contact = cast(Mapping[str, Any], validation["contact"])
+    person = cast(Mapping[str, Any], validation["person"])
+    if not _card_validation_slice_is_consistent(contact) or contact["gold_spans"] <= 0:
+        return False
+    if person.get("evaluated") is False:
+        count_fields = (
+            "documents",
+            "documents_with_sensitive_gold",
+            "gold_spans",
+            "true_positive",
+            "false_negative",
+            "cataloged_gold_spans",
+            "cataloged_true_positive",
+            "cataloged_false_negative",
+            "cataloged_wrong_canonical",
+        )
+        ratio_fields = (
+            "labeled_span_recall",
+            "catalog_coverage",
+            "cataloged_recall",
+            "open_world_recall",
+            "precision",
+            "over_redaction_rate",
+            "negative_document_false_alarm_rate",
+        )
+        return all(person[field] == 0 for field in count_fields) and all(
+            person[field] is None for field in ratio_fields
+        )
+    return _card_validation_slice_is_consistent(person)
+
+
+def _card_validation_slice_is_consistent(item: Mapping[str, Any]) -> bool:
+    documents = cast(int, item["documents"])
+    sensitive_documents = cast(int, item["documents_with_sensitive_gold"])
+    gold = cast(int, item["gold_spans"])
+    true_positive = cast(int, item["true_positive"])
+    false_negative = cast(int, item["false_negative"])
+    cataloged = cast(int, item["cataloged_gold_spans"])
+    cataloged_true = cast(int, item["cataloged_true_positive"])
+    cataloged_false = cast(int, item["cataloged_false_negative"])
+    cataloged_wrong = cast(int, item["cataloged_wrong_canonical"])
+    return bool(
+        sensitive_documents <= documents
+        and gold == true_positive + false_negative
+        and cataloged <= gold
+        and cataloged == cataloged_true + cataloged_false + cataloged_wrong
+        and item["labeled_span_recall"] == _ratio(true_positive, gold)
+        and item["catalog_coverage"] == _ratio(cataloged, gold)
+        and item["cataloged_recall"] == _ratio(cataloged_true, cataloged)
+        and item["open_world_recall"] is None
+        and item["precision"] is None
+        and item["over_redaction_rate"] is None
+        and item["negative_document_false_alarm_rate"] is None
+    )
+
+
+def _card_conformance_is_consistent(conformance: Mapping[str, Any], bank: Mapping[str, Any]) -> bool:
+    approved = cast(int, conformance["approved_positive_cases"])
+    correctly_mapped = cast(int, conformance["correctly_mapped"])
+    missed = cast(int, conformance["missed"])
+    wrong = cast(int, conformance["wrong_canonical"])
+    stats = cast(Mapping[str, Any], bank["stats"])
+    active_stats = cast(Mapping[str, Any], stats["active_totals"])
+    return bool(
+        conformance["active_patterns"] == active_stats["patterns"]
+        and conformance["patterns_with_positive_cases"] == conformance["active_patterns"]
+        and approved == correctly_mapped + missed + wrong
+        and conformance["recall"] == _ratio(correctly_mapped, approved)
+        and missed == 0
+        and wrong == 0
+        and conformance["unexpected_negative_matches"] == 0
+    )
+
+
+def _card_auxiliary_is_consistent(auxiliary: Mapping[str, Any]) -> bool:
+    if auxiliary["evaluated"] is False:
         return True
-    if re.search(r"(?i)(?:^|\s)[a-z]:[\\/]", value) or value.startswith("\\\\"):
-        return True
-    return value.startswith("/")
+    true_positive = cast(int, auxiliary["true_positive"])
+    false_positive = cast(int, auxiliary["false_positive"])
+    false_negative = cast(int, auxiliary["false_negative"])
+    gold = cast(int, auxiliary["gold_spans"])
+    metrics = cast(Mapping[str, Any], auxiliary["metrics"])
+    return bool(
+        auxiliary["label_strength"] == "independent"
+        and auxiliary["annotation_completeness"] == "exhaustive_within_scope"
+        and gold == true_positive + false_negative
+        and metrics["precision"] == _ratio(true_positive, true_positive + false_positive)
+        and metrics["open_world_recall"] == _ratio(true_positive, gold)
+        and metrics["f1"] == _ratio(2 * true_positive, 2 * true_positive + false_positive + false_negative)
+    )
+
+
+_PRIVATE_MANIFEST_FIELDS = {
+    "schema_version",
+    "benchmark_version",
+    "artifact_kind",
+    "created_at",
+    "source",
+    "builder",
+    "selected_bank_sha256",
+    "bank_card_run_sha256",
+    "artifacts",
+    "privacy",
+}
+_PRIVATE_SOURCE_FIELDS = {
+    "benchmark_version",
+    "dataset_id",
+    "dataset_revision",
+    "dataset_split",
+    "development_manifest_sha256",
+    "full_split_manifest_sha256",
+    "split_policy_sha256",
+    "preparation_manifest_sha256",
+    "train_artifact_sha256",
+    "train_artifact_bytes",
+    "train_records",
+    "train_groups",
+    "validation_artifact_sha256",
+    "validation_artifact_bytes",
+    "validation_records",
+    "validation_groups",
+    "development_memberships_sha256",
+    "fixture_mode",
+    "sealed_test_accessed",
+}
+_CARD_SOURCE_FIELDS = _PRIVATE_SOURCE_FIELDS - {
+    "benchmark_version",
+    "fixture_mode",
+    "train_artifact_bytes",
+    "validation_artifact_bytes",
+}
+_PRIVATE_BUILDER_FIELDS = {
+    "source_sha256",
+    "policy",
+    "policy_sha256",
+    "candidate_source_sha256",
+    "candidate_ledger_sha256",
+}
+_POLICY_THRESHOLD_FIELDS = {
+    "minimum_contact_groups",
+    "minimum_person_alias_groups",
+    "minimum_domain_groups",
+}
+_POLICY_CAPACITY_FIELDS = {
+    "max_active_contacts",
+    "max_active_people",
+    "max_active_person_aliases",
+    "max_active_domains",
+    "max_draft_per_class",
+    "max_active_patterns",
+    "max_pattern_utf8_bytes",
+    "max_bank_json_bytes",
+    "max_train_records",
+    "max_train_artifact_bytes",
+    "max_validation_records",
+    "max_validation_artifact_bytes",
+    "max_validation_entries",
+    "max_validation_spans",
+    "max_validation_text_utf8_bytes",
+    "max_development_memberships_bytes",
+    "max_development_samples_bytes",
+    "max_quality_predictions",
+    "max_header_entries_per_document",
+    "max_observations",
+    "max_unique_candidates",
+    "max_candidate_value_bytes",
+}
+
+
+def _validate_private_manifest(manifest: Mapping[str, Any]) -> tuple[Mapping[str, Any], EnronBankPolicy]:
+    if (
+        set(manifest) != _PRIVATE_MANIFEST_FIELDS
+        or manifest.get("schema_version") != BANK_BUILD_MANIFEST_SCHEMA_VERSION
+        or manifest.get("artifact_kind") != "private_enron_bank_build"
+        or not isinstance(manifest.get("benchmark_version"), str)
+        or not manifest.get("benchmark_version")
+        or not isinstance(manifest.get("created_at"), str)
+        or not manifest.get("created_at")
+        or not isinstance(manifest.get("artifacts"), Mapping)
+    ):
+        raise EnronBankBuildError("Private bank-build manifest is invalid.")
+    source = manifest.get("source")
+    builder = manifest.get("builder")
+    privacy = manifest.get("privacy")
+    if (
+        not isinstance(source, Mapping)
+        or set(source) != _PRIVATE_SOURCE_FIELDS
+        or not isinstance(builder, Mapping)
+        or set(builder) != _PRIVATE_BUILDER_FIELDS
+        or not isinstance(privacy, Mapping)
+        or set(privacy)
+        != {
+            "private_pii_present",
+            "public_card_privacy_passed",
+            "sealed_test_accessed",
+        }
+    ):
+        raise EnronBankBuildError("Private bank-build manifest nested schema is invalid.")
+    string_fields = {"benchmark_version", "dataset_id", "dataset_revision", "dataset_split"}
+    count_fields = {
+        "train_artifact_bytes",
+        "train_records",
+        "train_groups",
+        "validation_artifact_bytes",
+        "validation_records",
+        "validation_groups",
+    }
+    hash_fields = (
+        _PRIVATE_SOURCE_FIELDS
+        - string_fields
+        - count_fields
+        - {
+            "fixture_mode",
+            "sealed_test_accessed",
+        }
+    )
+    if (
+        any(not isinstance(source.get(field), str) or not source[field] for field in string_fields)
+        or any(type(source.get(field)) is not int or cast(int, source[field]) <= 0 for field in count_fields)
+        or any(not _is_sha256(source.get(field)) for field in hash_fields)
+        or type(source.get("fixture_mode")) is not bool
+        or source.get("sealed_test_accessed") is not False
+        or source.get("benchmark_version") != manifest.get("benchmark_version")
+        or privacy
+        != {
+            "private_pii_present": True,
+            "public_card_privacy_passed": True,
+            "sealed_test_accessed": False,
+        }
+        or not _is_sha256(manifest.get("selected_bank_sha256"))
+        or not _is_sha256(manifest.get("bank_card_run_sha256"))
+    ):
+        raise EnronBankBuildError("Private bank-build manifest values are invalid.")
+    policy = _policy_from_descriptor(builder.get("policy"))
+    if (
+        any(
+            not _is_sha256(builder.get(field))
+            for field in (
+                "source_sha256",
+                "policy_sha256",
+                "candidate_source_sha256",
+                "candidate_ledger_sha256",
+            )
+        )
+        or builder.get("policy_sha256") != policy.sha256
+    ):
+        raise EnronBankBuildError("Private bank-build builder commitment is invalid.")
+    return source, policy
+
+
+def _policy_from_descriptor(value: Any) -> EnronBankPolicy:
+    if not isinstance(value, Mapping):
+        raise EnronBankBuildError("Private bank-build policy descriptor is invalid.")
+    expected_fields = set(EnronBankPolicy().descriptor())
+    thresholds = value.get("thresholds")
+    capacity = value.get("capacity")
+    internal_domains = value.get("internal_domains")
+    if (
+        set(value) != expected_fields
+        or not isinstance(thresholds, Mapping)
+        or set(thresholds) != _POLICY_THRESHOLD_FIELDS
+        or not isinstance(capacity, Mapping)
+        or set(capacity) != _POLICY_CAPACITY_FIELDS
+        or not isinstance(internal_domains, list)
+        or not internal_domains
+        or len(internal_domains) != len(set(internal_domains))
+        or any(not isinstance(item, str) or not item for item in internal_domains)
+        or any(type(thresholds.get(field)) is not int for field in _POLICY_THRESHOLD_FIELDS)
+        or any(type(capacity.get(field)) is not int for field in _POLICY_CAPACITY_FIELDS)
+    ):
+        raise EnronBankBuildError("Private bank-build policy descriptor is invalid.")
+    kwargs: dict[str, Any] = {
+        "internal_domains": tuple(internal_domains),
+        **{field: thresholds[field] for field in _POLICY_THRESHOLD_FIELDS},
+        **{field: capacity[field] for field in _POLICY_CAPACITY_FIELDS},
+    }
+    try:
+        policy = EnronBankPolicy(**kwargs)
+        _validate_policy(policy)
+    except (TypeError, EnronBankBuildError):
+        raise EnronBankBuildError("Private bank-build policy descriptor is invalid.") from None
+    if policy.descriptor() != value:
+        raise EnronBankBuildError("Private bank-build policy descriptor is not canonical.")
+    return policy
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and _SHA256_RE.fullmatch(value) is not None
+
+
+def _validate_build_commitments(
+    manifest: Mapping[str, Any],
+    *,
+    source: Mapping[str, Any],
+    policy: EnronBankPolicy,
+    card: Mapping[str, Any],
+    bank: Mapping[str, Any],
+    artifacts: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    manifest_builder = cast(Mapping[str, Any], manifest["builder"])
+    card_builder = card.get("builder")
+    card_source = card.get("source")
+    bank_metadata = bank.get("metadata")
+    current_implementation = _builder_implementation_sha256()
+    if (
+        not isinstance(card_builder, Mapping)
+        or not isinstance(card_source, Mapping)
+        or not isinstance(bank_metadata, Mapping)
+        or card.get("benchmark_version") != manifest.get("benchmark_version")
+        or source.get("benchmark_version") != manifest.get("benchmark_version")
+        or card_source != {field: source[field] for field in _CARD_SOURCE_FIELDS}
+        or manifest_builder.get("source_sha256") != current_implementation
+        or card_builder.get("source_sha256") != current_implementation
+        or bank_metadata.get("builder_implementation_sha256") != current_implementation
+        or manifest_builder.get("policy_sha256") != policy.sha256
+        or card_builder.get("policy_sha256") != policy.sha256
+        or bank_metadata.get("builder_policy_sha256") != policy.sha256
+        or manifest_builder.get("candidate_source_sha256") != card_builder.get("candidate_source_sha256")
+        or manifest_builder.get("candidate_source_sha256") != bank_metadata.get("candidate_source_sha256")
+        or manifest_builder.get("candidate_ledger_sha256") != card_builder.get("candidate_ledger_sha256")
+        or manifest_builder.get("candidate_ledger_sha256") != bank_metadata.get("candidate_ledger_sha256")
+        or bank_metadata.get("source") != source
+        or bank_metadata.get("iteration_id") != ITERATION_POLICIES[1].id
+        or bank_metadata.get("iteration_policy_sha256") != ITERATION_POLICIES[1].sha256
+        or manifest.get("selected_bank_sha256") != hash_bank(bank)
+        or card.get("bank")
+        != {
+            "id": bank.get("id"),
+            "version": bank.get("version"),
+            "canonical_sha256": hash_bank(bank),
+            "artifact_sha256": artifacts["selected_bank"]["sha256"],
+            "canonical_json_bytes": len(_canonical_json_bytes(bank)),
+            "stats": bank_stats(bank),
+        }
+    ):
+        raise EnronBankBuildError("Private bank-build commitments are inconsistent.")
+    if (
+        source.get("sealed_test_accessed") is not False
+        or cast(Mapping[str, Any], manifest["privacy"]).get("sealed_test_accessed") is not False
+        or card_source.get("sealed_test_accessed") is not False
+        or bank_metadata.get("sealed_test_accessed") is not False
+    ):
+        raise EnronBankBuildError("Private bank-build sealed-test declaration is inconsistent.")
+    return False
 
 
 def verify_enron_bank_build(
@@ -1395,30 +2305,38 @@ def verify_enron_bank_build(
 
     root = _assert_private_run(Path(run_dir))
     initial_tree = _snapshot_private_tree(root)
-    initial_marker = _fingerprint_private_artifact(root / "COMMITTED")
-    initial_manifest = _fingerprint_private_artifact(root / "manifest.json")
+    initial_marker = _fingerprint_private_artifact(
+        root / "COMMITTED",
+        max_bytes=_MAX_PRIVATE_COMMIT_MARKER_BYTES,
+    )
+    initial_manifest = _fingerprint_private_artifact(
+        root / "manifest.json",
+        max_bytes=_MAX_PRIVATE_MANIFEST_BYTES,
+    )
     if (
         initial_tree.get("COMMITTED") != initial_marker.identity
         or initial_marker.sha256 != _PRIVATE_COMMIT_MARKER_SHA256
         or initial_tree.get("manifest.json") != initial_manifest.identity
     ):
         raise EnronBankBuildError("Private bank-build tree changed while verification started.")
-    manifest = _read_private_json(root / "manifest.json")
-    if (
-        not isinstance(manifest, Mapping)
-        or manifest.get("schema_version") != BANK_BUILD_MANIFEST_SCHEMA_VERSION
-        or not isinstance(manifest.get("artifacts"), Mapping)
-    ):
+    manifest = _read_private_json(
+        root / "manifest.json",
+        expected_fingerprint=initial_manifest,
+        max_bytes=_MAX_PRIVATE_MANIFEST_BYTES,
+    )
+    if not isinstance(manifest, Mapping):
         raise EnronBankBuildError("Private bank-build manifest is invalid.")
+    source, policy = _validate_private_manifest(manifest)
     raw_artifacts = cast(Mapping[str, Any], manifest["artifacts"])
     artifact_names = _expected_artifact_names(raw_artifacts)
     _verify_private_tree_inventory(initial_tree, artifact_names)
     artifacts: dict[str, Mapping[str, Any]] = {}
+    artifact_fingerprints: dict[str, _PrivateFileFingerprint] = {}
     for artifact_id, expected_name in artifact_names.items():
         descriptor = raw_artifacts.get(artifact_id)
         if not isinstance(descriptor, Mapping):
             raise EnronBankBuildError("Private artifact descriptor schema is invalid.")
-        _verify_artifact_descriptor(
+        artifact_fingerprints[artifact_id] = _verify_artifact_descriptor(
             root,
             artifact_id,
             descriptor,
@@ -1427,14 +2345,20 @@ def verify_enron_bank_build(
         )
         artifacts[artifact_id] = cast(Mapping[str, Any], descriptor)
 
-    card = _read_private_json(root / "bank-card.json")
+    card = _read_private_json(
+        root / "bank-card.json",
+        expected_fingerprint=artifact_fingerprints["bank_card"],
+    )
     if not isinstance(card, Mapping):
         raise EnronBankBuildError("Private bank card is invalid.")
     _validate_public_card(card)
     if manifest.get("bank_card_run_sha256") != card.get("run_sha256"):
         raise EnronBankBuildError("Private manifest does not bind the bank card.")
 
-    bank = _read_private_json(root / "bank.json")
+    bank = _read_private_json(
+        root / "bank.json",
+        expected_fingerprint=artifact_fingerprints["selected_bank"],
+    )
     if not isinstance(bank, Mapping):
         raise EnronBankBuildError("Selected private bank is invalid.")
     structural = validate_bank(bank, level="deep", strict=True, check_engine_compile=True)
@@ -1442,10 +2366,27 @@ def verify_enron_bank_build(
         raise EnronBankBuildError("Selected private bank failed deep verification.")
     if hash_bank(bank) != manifest.get("selected_bank_sha256") or hash_bank(bank) != card["bank"]["canonical_sha256"]:
         raise EnronBankBuildError("Selected private bank commitment is invalid.")
+    sealed_test_accessed = _validate_build_commitments(
+        manifest,
+        source=source,
+        policy=policy,
+        card=card,
+        bank=bank,
+        artifacts=artifacts,
+    )
 
-    positive = _read_private_jsonl(root / "conformance/positive.jsonl")
-    negative = _read_private_jsonl(root / "conformance/negative.jsonl")
-    expected_conformance = _read_private_json(root / "conformance/result.json")
+    positive = _read_private_jsonl(
+        root / "conformance/positive.jsonl",
+        expected_fingerprint=artifact_fingerprints["conformance_positive"],
+    )
+    negative = _read_private_jsonl(
+        root / "conformance/negative.jsonl",
+        expected_fingerprint=artifact_fingerprints["conformance_negative"],
+    )
+    expected_conformance = _read_private_json(
+        root / "conformance/result.json",
+        expected_fingerprint=artifact_fingerprints["conformance_result"],
+    )
     try:
         actual_conformance = evaluate_enron_conformance(bank, positive, negative)
     except EnronConformanceError:
@@ -1456,22 +2397,97 @@ def verify_enron_bank_build(
     ):
         raise EnronBankBuildError("Private conformance evidence changed during verification.")
 
-    documents = _read_private_jsonl(root / "validation/documents.jsonl")
-    slices = _read_private_jsonl(root / "validation/slices.jsonl")
-    unsupported = _read_private_jsonl(root / "validation/unsupported.jsonl")
-    iteration_rows = _read_private_jsonl(root / "iterations.jsonl")
+    documents = _read_private_jsonl(
+        root / "validation/documents.jsonl",
+        expected_fingerprint=artifact_fingerprints["validation_documents"],
+    )
+    slices = _read_private_jsonl(
+        root / "validation/slices.jsonl",
+        expected_fingerprint=artifact_fingerprints["validation_slices"],
+    )
+    unsupported = _read_private_jsonl(
+        root / "validation/unsupported.jsonl",
+        expected_fingerprint=artifact_fingerprints["validation_unsupported"],
+    )
+    iteration_rows = _read_private_jsonl(
+        root / "iterations.jsonl",
+        expected_fingerprint=artifact_fingerprints["iterations"],
+    )
     if len(iteration_rows) != 3:
         raise EnronBankBuildError("Private iteration ledger is incomplete.")
-    replayed_iterations: list[dict[str, Any]] = []
-    iteration_banks: list[Mapping[str, Any]] = []
+
+    replayed_pool = _replay_candidate_pool(
+        root / "mining.sqlite3",
+        train_artifact_sha256=str(source["train_artifact_sha256"]),
+        policy=policy,
+        expected_fingerprint=artifact_fingerprints["mining_spool"],
+    )
+    manifest_builder = cast(Mapping[str, Any], manifest["builder"])
+    raw_card_builder = card.get("builder")
+    if not isinstance(raw_card_builder, Mapping):
+        raise EnronBankBuildError("Private bank card builder commitment is invalid.")
+    card_builder = cast(Mapping[str, Any], raw_card_builder)
+    if (
+        replayed_pool.source_sha256 != manifest_builder.get("candidate_source_sha256")
+        or replayed_pool.source_sha256 != card_builder.get("candidate_source_sha256")
+        or replayed_pool.ledger_sha256 != manifest_builder.get("candidate_ledger_sha256")
+        or replayed_pool.ledger_sha256 != card_builder.get("candidate_ledger_sha256")
+        or replayed_pool.train_records != card_builder.get("train_records")
+        or replayed_pool.train_records != source.get("train_records")
+        or replayed_pool.observations != card_builder.get("observations")
+        or replayed_pool.observations != artifacts["mining_spool"].get("records")
+    ):
+        raise EnronBankBuildError("Private mining spool commitments differ from replay.")
+
+    implementation_sha256 = _builder_implementation_sha256()
+    replayed_curated = tuple(
+        _bind_curated_iteration(
+            curate_enron_iteration(
+                replayed_pool,
+                policy=policy,
+                iteration=iteration,
+                source_binding=source,
+                created_at=str(manifest["created_at"]),
+                retain_candidate_ledger=iteration == ITERATION_POLICIES[1],
+            ),
+            pool=replayed_pool,
+            policy=policy,
+            implementation_sha256=implementation_sha256,
+        )
+        for iteration in ITERATION_POLICIES
+    )
+
+    iteration_banks: list[dict[str, Any]] = []
     for index in range(1, 4):
-        iteration_bank = _read_private_json(root / f"banks/{ITERATION_POLICIES[index - 1].id}.json")
-        gold = _read_private_jsonl(root / f"validation/gold-iteration-{index:02d}.jsonl")
-        expected_quality = _read_private_json(root / f"validation/quality-iteration-{index:02d}.json")
-        if not isinstance(iteration_bank, Mapping) or not isinstance(expected_quality, Mapping):
+        iteration_policy = ITERATION_POLICIES[index - 1]
+        iteration_bank = _read_private_json(
+            root / f"banks/{iteration_policy.id}.json",
+            expected_fingerprint=artifact_fingerprints[f"iteration_{index:02d}_bank"],
+        )
+        if not isinstance(iteration_bank, Mapping):
+            raise EnronBankBuildError("Private iteration artifact is invalid.")
+        replayed_bank = replayed_curated[index - 1].bank
+        if _canonical_json_bytes(iteration_bank) != _canonical_json_bytes(replayed_bank):
+            raise EnronBankBuildError("Private iteration bank differs from replayed mining and curation.")
+        iteration_banks.append(replayed_bank)
+
+    replayed_iterations: list[dict[str, Any]] = []
+    for index, (iteration_policy, replayed_bank) in enumerate(
+        zip(ITERATION_POLICIES, iteration_banks, strict=True),
+        start=1,
+    ):
+        gold = _read_private_jsonl(
+            root / f"validation/gold-iteration-{index:02d}.jsonl",
+            expected_fingerprint=artifact_fingerprints[f"validation_gold_{index:02d}"],
+        )
+        expected_quality = _read_private_json(
+            root / f"validation/quality-iteration-{index:02d}.json",
+            expected_fingerprint=artifact_fingerprints[f"validation_quality_{index:02d}"],
+        )
+        if not isinstance(expected_quality, Mapping):
             raise EnronBankBuildError("Private iteration artifact is invalid.")
         iteration_structural = validate_bank(
-            iteration_bank,
+            replayed_bank,
             level="deep",
             strict=True,
             check_engine_compile=True,
@@ -1481,9 +2497,16 @@ def verify_enron_bank_build(
             or iteration_structural["engine_compatibility"]["compatible"] is not True
         ):
             raise EnronBankBuildError("Private iteration bank failed deep verification.")
+        structural_summary = _structural_summary(iteration_structural)
+        stored_structural = _read_private_json(
+            root / f"validation/structural-iteration-{index:02d}.json",
+            expected_fingerprint=artifact_fingerprints[f"validation_structural_{index:02d}"],
+        )
+        if stored_structural != structural_summary:
+            raise EnronBankBuildError("Private structural summary differs from recomputation.")
         try:
             actual_quality = evaluate_enron_quality(
-                iteration_bank,
+                replayed_bank,
                 documents=documents,
                 gold_spans=gold,
                 slice_specs=slices,
@@ -1495,22 +2518,19 @@ def verify_enron_bank_build(
             raise EnronBankBuildError("Private validation evidence changed during verification.")
         if iteration_rows[index - 1]["quality_run_sha256"] != actual_quality["run_sha256"]:
             raise EnronBankBuildError("Private iteration ledger does not bind quality evidence.")
-        iteration_banks.append(iteration_bank)
         replayed_iterations.append(
             {
-                "iteration": ITERATION_POLICIES[index - 1],
-                "bank": iteration_bank,
+                "iteration": iteration_policy,
+                "bank": replayed_bank,
                 "quality": actual_quality,
-                "structural": {"stats": iteration_structural["stats"]},
-                "limits": {"canonical_json_bytes": len(_canonical_json_bytes(iteration_bank))},
+                "structural": structural_summary,
+                "limits": {"canonical_json_bytes": len(_canonical_json_bytes(replayed_bank))},
             }
         )
 
     replayed_ledger = _decide_iterations(replayed_iterations)
-    card_builder = card.get("builder")
     if (
-        not isinstance(card_builder, Mapping)
-        or tuple(iteration_rows) != replayed_ledger
+        tuple(iteration_rows) != replayed_ledger
         or card.get("iterations") != [dict(item) for item in replayed_ledger]
         or card_builder.get("selected_iteration_id") != ITERATION_POLICIES[1].id
         or _canonical_json_bytes(bank) != _canonical_json_bytes(iteration_banks[1])
@@ -1519,8 +2539,14 @@ def verify_enron_bank_build(
 
     cmu_reverified = False
     if "cmu_quality" in artifacts:
-        stored_cmu = _read_private_json(root / "auxiliary/cmu-train-quality.json")
-        bindings = _read_private_jsonl(root / "auxiliary/cmu-train-catalog-bindings.jsonl")
+        stored_cmu = _read_private_json(
+            root / "auxiliary/cmu-train-quality.json",
+            expected_fingerprint=artifact_fingerprints["cmu_quality"],
+        )
+        bindings = _read_private_jsonl(
+            root / "auxiliary/cmu-train-catalog-bindings.jsonl",
+            expected_fingerprint=artifact_fingerprints["cmu_catalog_bindings"],
+        )
         if annotation_run is not None:
             try:
                 actual_cmu = evaluate_cmu_enron_training_quality(
@@ -1534,18 +2560,47 @@ def verify_enron_bank_build(
                 raise EnronBankBuildError("Auxiliary CMU evidence changed during verification.")
             cmu_reverified = True
 
-    candidates = _read_private_jsonl(root / "candidates.jsonl")
+    replayed_selected = replayed_curated[1]
+
+    candidates = _read_private_jsonl(
+        root / "candidates.jsonl",
+        expected_fingerprint=artifact_fingerprints["candidates"],
+    )
     actual_funnel = _verify_candidate_ledger(candidates, bank)
-    funnel = _read_private_json(root / "candidate-funnel.json")
+    funnel = _read_private_json(
+        root / "candidate-funnel.json",
+        expected_fingerprint=artifact_fingerprints["candidate_funnel"],
+    )
+    collisions = _read_private_json(
+        root / "collision-report.json",
+        expected_fingerprint=artifact_fingerprints["collision_report"],
+    )
     if not isinstance(funnel, Mapping) or funnel.get("schema_version") != CANDIDATE_FUNNEL_SCHEMA_VERSION:
         raise EnronBankBuildError("Private candidate funnel is invalid.")
     candidate_count = int(artifacts["candidates"]["records"])
-    if len(candidates) != candidate_count or funnel != actual_funnel or funnel != card.get("candidate_funnel"):
+    if candidates != replayed_selected.candidates:
+        raise EnronBankBuildError("Private candidate ledger differs from replayed mining and curation.")
+    if _canonical_json_bytes(bank) != _canonical_json_bytes(replayed_selected.bank):
+        raise EnronBankBuildError("Selected private bank differs from replayed curation.")
+    if (
+        len(candidates) != candidate_count
+        or funnel != actual_funnel
+        or funnel != card.get("candidate_funnel")
+        or funnel != replayed_selected.funnel
+    ):
         raise EnronBankBuildError("Private candidate funnel does not conserve the candidate ledger.")
+    if collisions != replayed_selected.collisions:
+        raise EnronBankBuildError("Private collision report differs from replayed curation.")
 
     final_tree = _snapshot_private_tree(root)
-    final_marker = _fingerprint_private_artifact(root / "COMMITTED")
-    final_manifest = _fingerprint_private_artifact(root / "manifest.json")
+    final_marker = _fingerprint_private_artifact(
+        root / "COMMITTED",
+        max_bytes=_MAX_PRIVATE_COMMIT_MARKER_BYTES,
+    )
+    final_manifest = _fingerprint_private_artifact(
+        root / "manifest.json",
+        max_bytes=_MAX_PRIVATE_MANIFEST_BYTES,
+    )
     if final_tree != initial_tree or final_marker != initial_marker or final_manifest != initial_manifest:
         raise EnronBankBuildError("Private bank-build tree changed during verification.")
 
@@ -1563,9 +2618,305 @@ def verify_enron_bank_build(
         "catalog_conformance_passed": True,
         "validation_reverified": True,
         "cmu_reverified": cmu_reverified,
-        "sealed_test_accessed": False,
+        "sealed_test_accessed": sealed_test_accessed,
         "privacy": card["privacy"],
     }
+
+
+_MINING_SQLITE_SCHEMA = {
+    "candidate_values": """
+        CREATE TABLE candidate_values (
+            kind TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            PRIMARY KEY (kind, normalized_value)
+        ) WITHOUT ROWID
+    """,
+    "observations": """
+        CREATE TABLE observations (
+            kind TEXT NOT NULL,
+            normalized_value TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            related TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            group_id TEXT NOT NULL,
+            observed_at TEXT,
+            occurrences INTEGER NOT NULL,
+            PRIMARY KEY (kind, normalized_value, surface, related, source_type, document_id)
+        ) WITHOUT ROWID
+    """,
+    "source_projections": """
+        CREATE TABLE source_projections (
+            document_id TEXT NOT NULL PRIMARY KEY,
+            payload BLOB NOT NULL
+        ) WITHOUT ROWID
+    """,
+}
+_MINING_SQLITE_COLUMNS = {
+    "candidate_values": (
+        (0, "kind", "TEXT", 1, None, 1, 0),
+        (1, "normalized_value", "TEXT", 1, None, 2, 0),
+    ),
+    "observations": (
+        (0, "kind", "TEXT", 1, None, 1, 0),
+        (1, "normalized_value", "TEXT", 1, None, 2, 0),
+        (2, "surface", "TEXT", 1, None, 3, 0),
+        (3, "related", "TEXT", 1, None, 4, 0),
+        (4, "source_type", "TEXT", 1, None, 5, 0),
+        (5, "document_id", "TEXT", 1, None, 6, 0),
+        (6, "group_id", "TEXT", 1, None, 0, 0),
+        (7, "observed_at", "TEXT", 0, None, 0, 0),
+        (8, "occurrences", "INTEGER", 1, None, 0, 0),
+    ),
+    "source_projections": (
+        (0, "document_id", "TEXT", 1, None, 1, 0),
+        (1, "payload", "BLOB", 1, None, 0, 0),
+    ),
+}
+
+
+def _replay_candidate_pool(
+    sqlite_path: Path,
+    *,
+    train_artifact_sha256: str,
+    policy: EnronBankPolicy,
+    expected_fingerprint: _PrivateFileFingerprint,
+) -> CandidatePool:
+    """Reconstruct the train candidate pool from a verified private snapshot."""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="nerb-private-mining-spool-") as temporary:
+            temporary_path = Path(temporary)
+            temporary_path.chmod(0o700)
+            snapshot_path = temporary_path / "mining.sqlite3"
+            _copy_verified_private_artifact(
+                sqlite_path,
+                snapshot_path,
+                expected_fingerprint=expected_fingerprint,
+                max_bytes=_MAX_PRIVATE_SQLITE_BYTES,
+            )
+            return _replay_candidate_pool_snapshot(
+                snapshot_path,
+                train_artifact_sha256=train_artifact_sha256,
+                policy=policy,
+            )
+    except EnronBankBuildError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise EnronBankBuildError("Private mining spool could not be snapshotted safely.") from None
+
+
+def _replay_candidate_pool_snapshot(
+    sqlite_path: Path,
+    *,
+    train_artifact_sha256: str,
+    policy: EnronBankPolicy,
+) -> CandidatePool:
+    """Replay a process-owned, bounded, immutable SQLite snapshot."""
+
+    uri = f"file:{quote(str(sqlite_path), safe='/')}?mode=ro&immutable=1"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        raise EnronBankBuildError("Private mining spool could not be opened read-only.") from None
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA trusted_schema=OFF")
+        quick_check = connection.execute("PRAGMA quick_check(1)").fetchall()
+        if quick_check != [("ok",)]:
+            raise EnronBankBuildError("Private mining spool failed its integrity check.")
+        _validate_mining_sqlite_schema(connection)
+
+        source_digest = hashlib.sha256(b"nerb/enron/bank-mining-source/v2\0")
+        train_records = 0
+        for document_id, payload in connection.execute(
+            "SELECT document_id, payload FROM source_projections ORDER BY document_id"
+        ):
+            train_records += 1
+            if train_records > policy.max_train_records:
+                raise EnronBankBuildError("Private mining spool exceeds the train-record limit.")
+            if not isinstance(document_id, str) or _DOCUMENT_ID_RE.fullmatch(document_id) is None:
+                raise EnronBankBuildError("Private mining source projection identifier is invalid.")
+            if not isinstance(payload, bytes):
+                raise EnronBankBuildError("Private mining source projection payload is invalid.")
+            if len(payload) > _MAX_PRIVATE_SQLITE_PROJECTION_BYTES:
+                raise EnronBankBuildError("Private mining source projection exceeds its byte limit.")
+            try:
+                projection = json.loads(
+                    payload,
+                    object_pairs_hook=_reject_duplicate_keys,
+                    parse_constant=_reject_constant,
+                    parse_float=_parse_finite_float,
+                )
+            except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
+                raise EnronBankBuildError("Private mining source projection payload is invalid.") from None
+            if (
+                not isinstance(projection, Mapping)
+                or set(projection)
+                != {
+                    "document_id",
+                    "group_id",
+                    "observed_at",
+                    "structured_entries",
+                    "sender_body_aliases",
+                }
+                or projection.get("document_id") != document_id
+                or not _is_sha256(projection.get("group_id"))
+                or (projection.get("observed_at") is not None and not isinstance(projection.get("observed_at"), str))
+                or type(projection.get("structured_entries")) is not int
+                or cast(int, projection["structured_entries"]) < 0
+                or type(projection.get("sender_body_aliases")) is not int
+                or cast(int, projection["sender_body_aliases"]) < 0
+                or _canonical_json_bytes(projection) != payload
+            ):
+                raise EnronBankBuildError("Private mining source projection is not canonical.")
+            source_digest.update(payload)
+        if train_records == 0:
+            raise EnronBankBuildError("Private mining spool has no train source projections.")
+
+        malformed_observation = connection.execute(
+            """
+            SELECT 1
+            FROM observations
+            WHERE typeof(kind) != 'text'
+               OR kind NOT IN ('contact', 'organization_domain', 'person_alias')
+               OR typeof(normalized_value) != 'text' OR length(normalized_value) = 0
+               OR typeof(surface) != 'text' OR length(surface) = 0
+               OR typeof(related) != 'text'
+               OR typeof(source_type) != 'text'
+               OR source_type NOT IN (
+                    'structured_header', 'structured_display_name', 'sender_body_local_link'
+               )
+               OR (kind IN ('contact', 'organization_domain') AND source_type != 'structured_header')
+               OR (kind = 'person_alias' AND source_type NOT IN (
+                    'structured_display_name', 'sender_body_local_link'
+               ))
+               OR (kind = 'person_alias' AND length(related) = 0)
+               OR (kind != 'person_alias' AND length(related) != 0)
+               OR typeof(document_id) != 'text' OR length(document_id) = 0
+               OR typeof(group_id) != 'text' OR length(group_id) = 0
+               OR (observed_at IS NOT NULL AND typeof(observed_at) != 'text')
+               OR typeof(occurrences) != 'integer' OR occurrences <= 0
+            LIMIT 1
+            """
+        ).fetchone()
+        malformed_candidate = connection.execute(
+            """
+            SELECT 1
+            FROM candidate_values
+            WHERE typeof(kind) != 'text'
+               OR kind NOT IN ('contact', 'organization_domain', 'person_alias')
+               OR typeof(normalized_value) != 'text'
+               OR length(normalized_value) = 0
+            LIMIT 1
+            """
+        ).fetchone()
+        source_mismatch = connection.execute(
+            """
+            SELECT 1
+            FROM observations AS observation
+            LEFT JOIN source_projections AS source
+              ON source.document_id = observation.document_id
+            WHERE source.document_id IS NULL
+               OR observation.group_id != json_extract(CAST(source.payload AS TEXT), '$.group_id')
+               OR NOT (
+                    (observation.observed_at IS NULL
+                     AND json_type(CAST(source.payload AS TEXT), '$.observed_at') = 'null')
+                    OR observation.observed_at = json_extract(
+                        CAST(source.payload AS TEXT), '$.observed_at'
+                    )
+               )
+            LIMIT 1
+            """
+        ).fetchone()
+        missing_candidate = connection.execute(
+            """
+            SELECT kind, normalized_value FROM observations
+            EXCEPT
+            SELECT kind, normalized_value FROM candidate_values
+            LIMIT 1
+            """
+        ).fetchone()
+        unused_candidate = connection.execute(
+            """
+            SELECT kind, normalized_value FROM candidate_values
+            EXCEPT
+            SELECT kind, normalized_value FROM observations
+            LIMIT 1
+            """
+        ).fetchone()
+        if any(
+            item is not None
+            for item in (
+                malformed_observation,
+                malformed_candidate,
+                source_mismatch,
+                missing_candidate,
+                unused_candidate,
+            )
+        ):
+            raise EnronBankBuildError("Private mining spool relational invariants are invalid.")
+
+        observation_row = connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(occurrences), 0) FROM observations"
+        ).fetchone()
+        candidate_row = connection.execute("SELECT COUNT(*) FROM candidate_values").fetchone()
+        if observation_row is None or candidate_row is None:
+            raise EnronBankBuildError("Private mining spool counts are invalid.")
+        observations = int(observation_row[1])
+        unique_candidates = int(candidate_row[0])
+        if (
+            observations <= 0
+            or observations > policy.max_observations
+            or unique_candidates <= 0
+            or unique_candidates > policy.max_unique_candidates
+        ):
+            raise EnronBankBuildError("Private mining spool exceeds its candidate limits.")
+
+        evidence = _read_candidate_evidence(connection)
+        if len(evidence) != unique_candidates:
+            raise EnronBankBuildError("Private mining candidate evidence is incomplete.")
+        ledger_sha256 = _candidate_pool_hash(evidence, train_artifact_sha256, policy.sha256)
+        return CandidatePool(
+            contacts=tuple(item for item in evidence if item.kind == "contact"),
+            person_aliases=tuple(item for item in evidence if item.kind == "person_alias"),
+            organization_domains=tuple(item for item in evidence if item.kind == "organization_domain"),
+            train_records=train_records,
+            observations=observations,
+            source_sha256=_SHA256_PREFIX + source_digest.hexdigest(),
+            ledger_sha256=ledger_sha256,
+        )
+    except EnronBankBuildError:
+        raise
+    except (OverflowError, sqlite3.Error, TypeError, UnicodeError, ValueError):
+        raise EnronBankBuildError("Private mining spool could not be replayed safely.") from None
+    finally:
+        connection.close()
+
+
+def _validate_mining_sqlite_schema(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name").fetchmany(
+        len(_MINING_SQLITE_SCHEMA) + 1
+    )
+    if len(rows) != len(_MINING_SQLITE_SCHEMA):
+        raise EnronBankBuildError("Private mining spool schema inventory is invalid.")
+    expected_sql = {name: " ".join(statement.split()) for name, statement in _MINING_SQLITE_SCHEMA.items()}
+    for object_type, name, table_name, statement in rows:
+        if (
+            object_type != "table"
+            or name not in expected_sql
+            or table_name != name
+            or not isinstance(statement, str)
+            or " ".join(statement.split()) != expected_sql[name]
+        ):
+            raise EnronBankBuildError("Private mining spool schema is invalid.")
+        expected_columns = _MINING_SQLITE_COLUMNS[name]
+        columns = connection.execute(f"PRAGMA table_xinfo({name})").fetchmany(len(expected_columns) + 1)
+        if tuple(columns) != expected_columns:
+            raise EnronBankBuildError("Private mining spool table layout is invalid.")
+        indexes = connection.execute(f"PRAGMA index_list({name})").fetchmany(2)
+        if len(indexes) != 1 or indexes[0][2:] != (1, "pk", 0):
+            raise EnronBankBuildError("Private mining spool primary-key layout is invalid.")
 
 
 def _verify_candidate_ledger(
@@ -1685,7 +3036,7 @@ def _verify_candidate_ledger(
                 corresponds = (
                     isinstance(normalized_value, str)
                     and isinstance(pattern_value, str)
-                    and _normalize_person_name(pattern_value) == normalized_value
+                    and _person_literal_catalog_key(pattern_value) == normalized_value
                 )
             elif candidate_type == "organization_domain":
                 corresponds = (
@@ -1702,6 +3053,17 @@ def _verify_candidate_ledger(
                 "evidence_sha256"
             ) != evidence.get("evidence_sha256"):
                 raise EnronBankBuildError("Private candidate evidence commitment differs from its bank pattern.")
+            if candidate_type == "person_alias" and decision == "active":
+                contact_ref = metadata.get("contact_ref")
+                contact_entity = entities.get("contact")
+                contact_names = contact_entity.get("names") if isinstance(contact_entity, Mapping) else None
+                contact_name = contact_names.get(contact_ref) if isinstance(contact_names, Mapping) else None
+                if (
+                    not isinstance(contact_ref, str)
+                    or not isinstance(contact_name, Mapping)
+                    or contact_name.get("status") not in {"active", "draft"}
+                ):
+                    raise EnronBankBuildError("Active person candidate contact reference does not resolve.")
     try:
         return candidate_funnel(candidates)
     except (KeyError, TypeError, ValueError):
@@ -1790,7 +3152,7 @@ def _snapshot_private_tree(root: Path) -> dict[str, _PrivateEntryIdentity]:
         root_identity = _private_entry_identity(os.fstat(root_fd), kind="directory")
         _require_private_entry(root_identity)
         entries["."] = root_identity
-        _snapshot_private_directory(root_fd, relative="", entries=entries)
+        _snapshot_private_directory(root_fd, relative="", depth=0, entries=entries)
         if _private_entry_identity(os.fstat(root_fd), kind="directory") != root_identity:
             raise EnronBankBuildError("Private bank-build root changed while it was inspected.")
     except EnronBankBuildError:
@@ -1806,13 +3168,24 @@ def _snapshot_private_directory(
     directory_fd: int,
     *,
     relative: str,
+    depth: int,
     entries: dict[str, _PrivateEntryIdentity],
 ) -> None:
     try:
-        names = sorted(os.listdir(directory_fd))
+        names: list[str] = []
+        with os.scandir(directory_fd) as iterator:
+            for entry in iterator:
+                if len(entries) + len(names) >= _MAX_PRIVATE_TREE_ENTRIES:
+                    raise EnronBankBuildError("Private bank-build tree exceeds its entry limit.")
+                names.append(entry.name)
+        names.sort()
+    except EnronBankBuildError:
+        raise
     except OSError:
         raise EnronBankBuildError("Private bank-build directory could not be listed safely.") from None
     for name in names:
+        if len(entries) >= _MAX_PRIVATE_TREE_ENTRIES:
+            raise EnronBankBuildError("Private bank-build tree exceeds its entry limit.")
         if not isinstance(name, str) or name in {os.curdir, os.pardir} or "/" in name:
             raise EnronBankBuildError("Private bank-build entry name is invalid.")
         entry_name = f"{relative}/{name}" if relative else name
@@ -1823,6 +3196,8 @@ def _snapshot_private_directory(
         if stat.S_ISLNK(before.st_mode):
             raise EnronBankBuildError("Private bank-build tree must not contain symlinks.")
         if stat.S_ISDIR(before.st_mode):
+            if depth >= _MAX_PRIVATE_TREE_DEPTH:
+                raise EnronBankBuildError("Private bank-build tree exceeds its depth limit.")
             flags = (
                 os.O_RDONLY
                 | getattr(os, "O_CLOEXEC", 0)
@@ -1841,7 +3216,12 @@ def _snapshot_private_directory(
                 identity = _private_entry_identity(after, kind="directory")
                 _require_private_entry(identity)
                 entries[entry_name] = identity
-                _snapshot_private_directory(child_fd, relative=entry_name, entries=entries)
+                _snapshot_private_directory(
+                    child_fd,
+                    relative=entry_name,
+                    depth=depth + 1,
+                    entries=entries,
+                )
                 if _private_entry_identity(os.fstat(child_fd), kind="directory") != identity:
                     raise EnronBankBuildError("Private bank-build directory changed while it was inspected.")
             finally:
@@ -1901,20 +3281,51 @@ def _verify_private_tree_inventory(
         raise EnronBankBuildError("Private bank-build file inventory is invalid.")
 
 
-def _fingerprint_private_artifact(path: Path) -> _PrivateFileFingerprint:
+def _fingerprint_private_artifact(
+    path: Path,
+    *,
+    max_bytes: int,
+    jsonl_record_limit: int | None = None,
+) -> _PrivateFileFingerprint:
     digest = hashlib.sha256()
+    observed_bytes = 0
+    records: int | None = 0 if jsonl_record_limit is not None else None
     try:
         with open_private_binary_input(path) as file:
             before = _private_entry_identity(os.fstat(file.fileno()), kind="file")
             _require_private_entry(before)
-            while chunk := file.read(1024 * 1024):
-                digest.update(chunk)
+            if before.size > max_bytes:
+                raise EnronBankBuildError("Private artifact exceeds its resource limit.")
+            if jsonl_record_limit is None:
+                while chunk := file.read(min(1024 * 1024, max_bytes - observed_bytes + 1)):
+                    observed_bytes += len(chunk)
+                    if observed_bytes > max_bytes:
+                        raise EnronBankBuildError("Private artifact exceeds its resource limit.")
+                    digest.update(chunk)
+            else:
+                while raw := file.readline(_MAX_PRIVATE_JSONL_LINE_BYTES + 1):
+                    if len(raw) > _MAX_PRIVATE_JSONL_LINE_BYTES:
+                        raise EnronBankBuildError("Private JSONL artifact line exceeds its byte limit.")
+                    observed_bytes += len(raw)
+                    if observed_bytes > max_bytes:
+                        raise EnronBankBuildError("Private artifact exceeds its resource limit.")
+                    digest.update(raw)
+                    assert records is not None
+                    records += 1
+                    if records > jsonl_record_limit:
+                        raise EnronBankBuildError("Private JSONL artifact exceeds its record limit.")
             after = _private_entry_identity(os.fstat(file.fileno()), kind="file")
-    except (EnronPrivateIOError, OSError):
+    except EnronBankBuildError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError):
         raise EnronBankBuildError("Private artifact could not be fingerprinted safely.") from None
-    if before != after:
+    if before != after or observed_bytes != after.size:
         raise EnronBankBuildError("Private artifact changed while it was fingerprinted.")
-    return _PrivateFileFingerprint(identity=after, sha256=_SHA256_PREFIX + digest.hexdigest())
+    return _PrivateFileFingerprint(
+        identity=after,
+        sha256=_SHA256_PREFIX + digest.hexdigest(),
+        records=records,
+    )
 
 
 def _verify_artifact_descriptor(
@@ -1924,7 +3335,7 @@ def _verify_artifact_descriptor(
     *,
     expected_name: str,
     tree: Mapping[str, _PrivateEntryIdentity],
-) -> None:
+) -> _PrivateFileFingerprint:
     if set(descriptor) != {"id", "name", "sha256", "bytes", "records"} or descriptor.get("id") != artifact_id:
         raise EnronBankBuildError("Private artifact descriptor schema is invalid.")
     name = descriptor.get("name")
@@ -1955,20 +3366,28 @@ def _verify_artifact_descriptor(
     expected_identity = tree.get(name)
     if expected_identity is None or expected_identity.kind != "file":
         raise EnronBankBuildError("Private artifact is missing.") from None
-    fingerprint = _fingerprint_private_artifact(path)
+    byte_limit = _private_artifact_byte_limit(name)
+    if (
+        byte_count > byte_limit
+        or expected_identity.size > byte_limit
+        or byte_count != expected_identity.size
+        or (name.endswith(".jsonl") and record_count > _MAX_PRIVATE_JSONL_RECORDS)
+    ):
+        raise EnronBankBuildError("Private artifact descriptor exceeds its resource limit.")
+    fingerprint = _fingerprint_private_artifact(
+        path,
+        max_bytes=byte_limit,
+        jsonl_record_limit=_MAX_PRIVATE_JSONL_RECORDS if name.endswith(".jsonl") else None,
+    )
     if (
         fingerprint.identity != expected_identity
         or byte_count != fingerprint.identity.size
         or sha256 != fingerprint.sha256
     ):
         raise EnronBankBuildError("Private artifact descriptor does not match its file.")
-    if name.endswith(".jsonl"):
-        try:
-            observed_records = sum(1 for _ in iter_strict_jsonl(path, _MAX_PRIVATE_JSONL_LINE_BYTES))
-        except EnronPrivateIOError:
-            raise EnronBankBuildError("Private JSONL artifact could not be counted safely.") from None
-        if observed_records != descriptor.get("records"):
-            raise EnronBankBuildError("Private JSONL artifact count is invalid.")
+    if name.endswith(".jsonl") and fingerprint.records != record_count:
+        raise EnronBankBuildError("Private JSONL artifact count is invalid.")
+    return fingerprint
 
 
 def _write_run_json(run: PrivateRun, name: str, value: Mapping[str, Any]) -> None:
@@ -1989,6 +3408,10 @@ def _write_run_jsonl(run: PrivateRun, name: str, values: Sequence[Mapping[str, A
 
 def _artifact_descriptor(path: Path, artifact_id: str, *, records: int = 0) -> dict[str, Any]:
     size = path.stat().st_size
+    if size > _private_artifact_byte_limit(path.name):
+        raise EnronBankBuildError("Private artifact exceeds its byte limit.")
+    if path.name.endswith(".jsonl") and records > _MAX_PRIVATE_JSONL_RECORDS:
+        raise EnronBankBuildError("Private artifact exceeds its record limit.")
     return {
         "id": artifact_id,
         "name": path.name
@@ -1998,6 +3421,14 @@ def _artifact_descriptor(path: Path, artifact_id: str, *, records: int = 0) -> d
         "bytes": size,
         "records": records,
     }
+
+
+def _private_artifact_byte_limit(name: str) -> int:
+    if name.endswith(".jsonl"):
+        return _MAX_PRIVATE_JSONL_BYTES
+    if name.endswith(".sqlite3"):
+        return _MAX_PRIVATE_SQLITE_BYTES
+    return _MAX_PRIVATE_JSON_BYTES
 
 
 def _builder_implementation_sha256() -> str:
@@ -2027,32 +3458,206 @@ def _hash_private_file(path: Path) -> str:
     return _SHA256_PREFIX + digest.hexdigest()
 
 
-def _read_private_json(path: Path) -> Any:
+def _copy_verified_private_artifact(
+    source: Path,
+    destination: Path,
+    *,
+    expected_fingerprint: _PrivateFileFingerprint,
+    max_bytes: int,
+) -> None:
+    """Copy one exact verified inode into a process-owned private snapshot."""
+
+    digest = hashlib.sha256()
+    observed_bytes = 0
+    destination_fd: int | None = None
     try:
-        with open_private_binary_input(path) as file:
-            payload = file.read(_MAX_PRIVATE_JSON_BYTES + 1)
-    except (EnronPrivateIOError, OSError):
-        raise EnronBankBuildError("Private JSON artifact could not be read safely.") from None
-    if len(payload) > _MAX_PRIVATE_JSON_BYTES:
-        raise EnronBankBuildError("Private JSON artifact exceeds the byte limit.")
+        with open_private_binary_input(source) as file:
+            before = _private_entry_identity(os.fstat(file.fileno()), kind="file")
+            _require_private_entry(before)
+            if before != expected_fingerprint.identity:
+                raise EnronBankBuildError("Private artifact changed during verification.")
+            if before.size > max_bytes:
+                raise EnronBankBuildError("Private artifact exceeds its resource limit.")
+            destination_fd = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(destination_fd, 0o600)
+            with os.fdopen(destination_fd, "wb", buffering=0) as snapshot:
+                destination_fd = None
+                while chunk := file.read(min(1024 * 1024, max_bytes - observed_bytes + 1)):
+                    observed_bytes += len(chunk)
+                    if observed_bytes > max_bytes:
+                        raise EnronBankBuildError("Private artifact exceeds its resource limit.")
+                    digest.update(chunk)
+                    snapshot.write(chunk)
+                snapshot.flush()
+                os.fsync(snapshot.fileno())
+            after = _private_entry_identity(os.fstat(file.fileno()), kind="file")
+    except EnronBankBuildError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError):
+        raise EnronBankBuildError("Private artifact could not be snapshotted safely.") from None
+    finally:
+        if destination_fd is not None:
+            try:
+                os.close(destination_fd)
+            except OSError:
+                pass
+    observed = _PrivateFileFingerprint(
+        identity=after,
+        sha256=_SHA256_PREFIX + digest.hexdigest(),
+    )
+    if before != after or observed_bytes != after.size or observed != expected_fingerprint:
+        raise EnronBankBuildError("Private artifact changed during verification.")
+
+
+def _read_private_json(
+    path: Path,
+    *,
+    expected_fingerprint: _PrivateFileFingerprint | None = None,
+    max_bytes: int = _MAX_PRIVATE_JSON_BYTES,
+) -> Any:
+    payload = _read_verified_private_bytes(
+        path,
+        expected_fingerprint=expected_fingerprint,
+        max_bytes=max_bytes,
+        description="JSON",
+    )
     try:
-        return json.loads(payload, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
-    except (TypeError, ValueError, UnicodeError):
+        return json.loads(
+            payload,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+            parse_float=_parse_finite_float,
+        )
+    except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
         raise EnronBankBuildError("Private JSON artifact is invalid.") from None
 
 
-def _read_private_jsonl(path: Path) -> tuple[dict[str, Any], ...]:
-    rows: list[dict[str, Any]] = []
+def _read_verified_private_bytes(
+    path: Path,
+    *,
+    expected_fingerprint: _PrivateFileFingerprint | None,
+    max_bytes: int,
+    description: str,
+) -> bytes:
+    digest = hashlib.sha256()
+    chunks: list[bytes] = []
+    observed_bytes = 0
     try:
-        for _line_no, raw, row in iter_strict_jsonl(path, _MAX_PRIVATE_JSONL_LINE_BYTES):
-            if raw != _canonical_json_bytes(row) + b"\n":
-                raise EnronBankBuildError("Private JSONL artifact is not canonical.")
-            rows.append(dict(row))
-            if len(rows) > _MAX_PRIVATE_JSONL_RECORDS:
-                raise EnronBankBuildError("Private JSONL artifact exceeds the record limit.")
-    except EnronPrivateIOError:
+        with open_private_binary_input(path) as file:
+            before = _private_entry_identity(os.fstat(file.fileno()), kind="file")
+            _require_private_entry(before)
+            _require_expected_private_identity(before, expected_fingerprint)
+            if before.size > max_bytes:
+                raise EnronBankBuildError(f"Private {description} artifact exceeds the byte limit.")
+            while chunk := file.read(min(1024 * 1024, max_bytes - observed_bytes + 1)):
+                observed_bytes += len(chunk)
+                if observed_bytes > max_bytes:
+                    raise EnronBankBuildError(f"Private {description} artifact exceeds the byte limit.")
+                digest.update(chunk)
+                chunks.append(chunk)
+            after = _private_entry_identity(os.fstat(file.fileno()), kind="file")
+    except EnronBankBuildError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError):
+        raise EnronBankBuildError(f"Private {description} artifact could not be read safely.") from None
+    _require_expected_private_consumption(
+        before=before,
+        after=after,
+        observed_bytes=observed_bytes,
+        sha256=_SHA256_PREFIX + digest.hexdigest(),
+        records=None,
+        expected_fingerprint=expected_fingerprint,
+    )
+    return b"".join(chunks)
+
+
+def _read_private_jsonl(
+    path: Path,
+    *,
+    expected_fingerprint: _PrivateFileFingerprint | None = None,
+) -> tuple[dict[str, Any], ...]:
+    rows: list[dict[str, Any]] = []
+    digest = hashlib.sha256()
+    observed_bytes = 0
+    try:
+        with open_private_binary_input(path) as file:
+            before = _private_entry_identity(os.fstat(file.fileno()), kind="file")
+            _require_private_entry(before)
+            _require_expected_private_identity(before, expected_fingerprint)
+            if before.size > _MAX_PRIVATE_JSONL_BYTES:
+                raise EnronBankBuildError("Private JSONL artifact exceeds the byte limit.")
+            while raw := file.readline(_MAX_PRIVATE_JSONL_LINE_BYTES + 1):
+                if len(raw) > _MAX_PRIVATE_JSONL_LINE_BYTES:
+                    raise EnronBankBuildError("Private JSONL artifact line exceeds the byte limit.")
+                observed_bytes += len(raw)
+                if observed_bytes > _MAX_PRIVATE_JSONL_BYTES:
+                    raise EnronBankBuildError("Private JSONL artifact exceeds the byte limit.")
+                digest.update(raw)
+                if len(rows) >= _MAX_PRIVATE_JSONL_RECORDS:
+                    raise EnronBankBuildError("Private JSONL artifact exceeds the record limit.")
+                try:
+                    row = json.loads(
+                        raw,
+                        object_pairs_hook=_reject_duplicate_keys,
+                        parse_constant=_reject_constant,
+                        parse_float=_parse_finite_float,
+                    )
+                except (OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
+                    raise EnronBankBuildError("Private JSONL artifact is invalid.") from None
+                if not isinstance(row, dict):
+                    raise EnronBankBuildError("Private JSONL artifact is not canonical.")
+                try:
+                    canonical = _canonical_json_bytes(row) + b"\n"
+                except (EnronBankBuildError, OverflowError, RecursionError, TypeError, ValueError, UnicodeError):
+                    raise EnronBankBuildError("Private JSONL artifact is invalid.") from None
+                if raw != canonical:
+                    raise EnronBankBuildError("Private JSONL artifact is not canonical.")
+                rows.append(row)
+            after = _private_entry_identity(os.fstat(file.fileno()), kind="file")
+    except EnronBankBuildError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError):
         raise EnronBankBuildError("Private JSONL artifact could not be read safely.") from None
+    _require_expected_private_consumption(
+        before=before,
+        after=after,
+        observed_bytes=observed_bytes,
+        sha256=_SHA256_PREFIX + digest.hexdigest(),
+        records=len(rows),
+        expected_fingerprint=expected_fingerprint,
+    )
     return tuple(rows)
+
+
+def _require_expected_private_identity(
+    observed: _PrivateEntryIdentity,
+    expected_fingerprint: _PrivateFileFingerprint | None,
+) -> None:
+    if expected_fingerprint is not None and observed != expected_fingerprint.identity:
+        raise EnronBankBuildError("Private artifact changed during verification.")
+
+
+def _require_expected_private_consumption(
+    *,
+    before: _PrivateEntryIdentity,
+    after: _PrivateEntryIdentity,
+    observed_bytes: int,
+    sha256: str,
+    records: int | None,
+    expected_fingerprint: _PrivateFileFingerprint | None,
+) -> None:
+    if before != after or observed_bytes != after.size:
+        raise EnronBankBuildError("Private artifact changed while it was read.")
+    if expected_fingerprint is not None and (
+        after != expected_fingerprint.identity
+        or sha256 != expected_fingerprint.sha256
+        or (expected_fingerprint.records is not None and records != expected_fingerprint.records)
+    ):
+        raise EnronBankBuildError("Private artifact changed during verification.")
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -2066,6 +3671,13 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _reject_constant(_value: str) -> None:
     raise ValueError("nonfinite value")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("nonfinite value")
+    return parsed
 
 
 def _pretty_json_bytes(value: Mapping[str, Any]) -> bytes:

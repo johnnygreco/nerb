@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from .bank import bank_stats, hash_bank
+from .enron_quality import DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL
 
 BANK_BUILD_POLICY_VERSION = "nerb.enron_bank_build_policy.v2"
 CANDIDATE_SCHEMA_VERSION = "nerb.enron_bank_candidate.v2"
@@ -95,18 +96,23 @@ class EnronBankPolicy:
     max_active_people: int = 500
     max_active_person_aliases: int = 500
     max_active_domains: int = 500
-    max_draft_per_class: int = 5_000
+    max_draft_per_class: int = 2_000
     max_active_patterns: int = 25_000
     max_pattern_utf8_bytes: int = 5 * 1024 * 1024
-    max_bank_json_bytes: int = 64 * 1024 * 1024
-    max_train_records: int = 1_000_000
-    max_validation_records: int = 200_000
-    max_validation_entries: int = 2_000_000
-    max_validation_spans: int = 4_000_000
-    max_validation_text_utf8_bytes: int = 512 * 1024 * 1024
+    max_bank_json_bytes: int = 32 * 1024 * 1024
+    max_train_records: int = 600_000
+    max_train_artifact_bytes: int = 512 * 1024 * 1024
+    max_validation_records: int = 10_000
+    max_validation_artifact_bytes: int = 96 * 1024 * 1024
+    max_validation_entries: int = 250_000
+    max_validation_spans: int = 150_000
+    max_validation_text_utf8_bytes: int = 64 * 1024 * 1024
+    max_development_memberships_bytes: int = 48 * 1024 * 1024
+    max_development_samples_bytes: int = 24 * 1024 * 1024
+    max_quality_predictions: int = DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL
     max_header_entries_per_document: int = 8_192
-    max_observations: int = 20_000_000
-    max_unique_candidates: int = 1_000_000
+    max_observations: int = 2_000_000
+    max_unique_candidates: int = 50_000
     max_candidate_value_bytes: int = 4_096
 
     def descriptor(self) -> dict[str, Any]:
@@ -117,13 +123,15 @@ class EnronBankPolicy:
             "candidate_source": "train_structured_headers_plus_sender_body_confirmed_local_parts",
             "validation_source": "validation_structured_headers_only_no_literal_promotion",
             "person_alias_policy": (
-                "recurring_observed_full_name_unique_address_owner_local_part_compatible_no_unobserved_aliases"
+                "recurring_match_distinct_observed_surface_unique_address_owner_local_part_compatible_"
+                "resolvable_contact_anchor_no_unobserved_aliases"
             ),
             "contact_policy": "recurring_valid_exact_address",
             "organization_policy": "recurring_exact_at_domain_surface",
             "generic_email_policy": "bounded_rust_regex_lowest_contact_priority",
             "generic_phone_policy": "draft_without_independent_negative_evidence",
-            "normalization": "NFKC_casefold_collapsed_whitespace",
+            "identity_normalization": "NFKC_casefold_name_tokens_with_last_first_reordering",
+            "person_pattern_equivalence": "unicode_simple_casefold_collapsed_whitespace_without_reordering",
             "internal_domains": list(self.internal_domains),
             "thresholds": {
                 "minimum_contact_groups": self.minimum_contact_groups,
@@ -140,10 +148,15 @@ class EnronBankPolicy:
                 "max_pattern_utf8_bytes": self.max_pattern_utf8_bytes,
                 "max_bank_json_bytes": self.max_bank_json_bytes,
                 "max_train_records": self.max_train_records,
+                "max_train_artifact_bytes": self.max_train_artifact_bytes,
                 "max_validation_records": self.max_validation_records,
+                "max_validation_artifact_bytes": self.max_validation_artifact_bytes,
                 "max_validation_entries": self.max_validation_entries,
                 "max_validation_spans": self.max_validation_spans,
                 "max_validation_text_utf8_bytes": self.max_validation_text_utf8_bytes,
+                "max_development_memberships_bytes": self.max_development_memberships_bytes,
+                "max_development_samples_bytes": self.max_development_samples_bytes,
+                "max_quality_predictions": self.max_quality_predictions,
                 "max_header_entries_per_document": self.max_header_entries_per_document,
                 "max_observations": self.max_observations,
                 "max_unique_candidates": self.max_unique_candidates,
@@ -396,26 +409,28 @@ def mine_enron_candidates(
                     projected.append(("contact", normalized_address, normalized_address, "", "structured_header"))
                     domain = normalized_address.rsplit("@", 1)[1]
                     projected.append(("organization_domain", domain, domain, "", "structured_header"))
-                normalized_name = _normalize_person_name(name)
+                person_surface = _person_literal_surface(name)
+                normalized_name = _normalize_person_name(person_surface)
                 if normalized_name and normalized_address:
                     projected.append(
                         (
                             "person_alias",
-                            normalized_name,
-                            _normalized_surface(name),
+                            _person_literal_catalog_key(person_surface),
+                            person_surface,
                             normalized_address,
                             "structured_display_name",
                         )
                     )
             for name, address in body_aliases:
-                normalized_name = _normalize_person_name(name)
+                person_surface = _person_literal_surface(name)
+                normalized_name = _normalize_person_name(person_surface)
                 normalized_address = _normalize_email(address)
                 if normalized_name and normalized_address:
                     projected.append(
                         (
                             "person_alias",
-                            normalized_name,
-                            _normalized_surface(name),
+                            _person_literal_catalog_key(person_surface),
+                            person_surface,
                             normalized_address,
                             "sender_body_local_link",
                         )
@@ -580,7 +595,7 @@ def _sender_body_aliases(
         expression = r"(?<!\w)" + r"\s+".join(re.escape(token) for token in tokens) + r"(?!\w)"
         match = re.search(expression, tail, flags=re.IGNORECASE)
         if match is not None:
-            aliases.add((_normalized_surface(match.group(0)), normalized_address))
+            aliases.add((_person_literal_surface(match.group(0)), normalized_address))
     return tuple(sorted(aliases))
 
 
@@ -633,6 +648,37 @@ class CuratedIteration:
     collisions: dict[str, Any]
 
 
+@dataclass(slots=True)
+class _CandidateLedger:
+    """Accumulate an aggregate funnel without retaining private candidate rows."""
+
+    retain_rows: bool
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    decisions: Counter[str] = field(default_factory=Counter)
+    types: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
+    reasons: Counter[str] = field(default_factory=Counter)
+    total: int = 0
+
+    def append(self, row: dict[str, Any]) -> None:
+        decision = str(row["decision"])
+        candidate_type = str(row["candidate_type"])
+        reason = str(row["primary_reason_code"])
+        self.total += 1
+        self.decisions[decision] += 1
+        self.types[candidate_type][decision] += 1
+        self.reasons[reason] += 1
+        if self.retain_rows:
+            self.rows.append(row)
+
+    def funnel(self) -> dict[str, Any]:
+        return _candidate_funnel_from_counts(
+            total=self.total,
+            decisions=self.decisions,
+            types=self.types,
+            reasons=self.reasons,
+        )
+
+
 def curate_enron_iteration(
     pool: CandidatePool,
     *,
@@ -640,14 +686,17 @@ def curate_enron_iteration(
     iteration: IterationPolicy,
     source_binding: Mapping[str, Any],
     created_at: str = BANK_BUILD_TIMESTAMP,
+    retain_candidate_ledger: bool = True,
 ) -> CuratedIteration:
-    """Create one deterministic bank candidate from the frozen train pool."""
+    """Create one deterministic bank candidate; optionally retain its private row ledger."""
 
     if iteration not in ITERATION_POLICIES:
         raise EnronBankBuildError("Unknown bank-build iteration policy.")
+    if type(retain_candidate_ledger) is not bool:
+        raise EnronBankBuildError("Candidate-ledger retention flag must be boolean.")
     _validate_policy(policy)
     policy_sha256 = policy.sha256
-    candidate_rows: list[dict[str, Any]] = []
+    candidate_rows = _CandidateLedger(retain_rows=retain_candidate_ledger)
     collision_counts: Counter[str] = Counter()
     entities: dict[str, Any] = {}
 
@@ -657,6 +706,7 @@ def curate_enron_iteration(
         raise EnronBankBuildError("Active-pattern limit leaves no room for catalog patterns.")
 
     contact_names: dict[str, Any] = {}
+    retained_contact_values: set[str] = set()
     active_contact_patterns = 0
     draft_contacts = 0
     contacts_ranked = sorted(
@@ -720,6 +770,7 @@ def curate_enron_iteration(
                 "patterns": {pattern_id: pattern},
                 "metadata": metadata,
             }
+            retained_contact_values.add(evidence.normalized_value)
             bank_ref = {"entity_id": "contact", "name_id": name_id, "pattern_ids": [pattern_id]}
         candidate_rows.append(_candidate_row(evidence, decision, reason, bank_ref))
 
@@ -768,10 +819,24 @@ def curate_enron_iteration(
         },
     }
 
-    aliases_by_address: dict[str, list[CandidateEvidence]] = defaultdict(list)
+    person_identity_owners: dict[str, set[str]] = defaultdict(set)
     for evidence in pool.person_aliases:
         if len(evidence.related_values) == 1:
-            aliases_by_address[evidence.related_values[0]].append(evidence)
+            identity_value = _person_identity_value(evidence)
+            if identity_value is not None:
+                person_identity_owners[identity_value].add(evidence.related_values[0])
+
+    aliases_by_address: dict[str, list[CandidateEvidence]] = defaultdict(list)
+    for evidence in pool.person_aliases:
+        identity_value = _person_identity_value(evidence)
+        if len(evidence.related_values) == 1 and identity_value is not None:
+            if len(person_identity_owners[identity_value]) == 1:
+                aliases_by_address[evidence.related_values[0]].append(evidence)
+            else:
+                collision_counts["person_alias_multiple_addresses"] += 1
+                candidate_rows.append(
+                    _candidate_row(evidence, "rejected", "ambiguous_address_ownership", bank_ref=None)
+                )
         else:
             collision_counts["person_alias_multiple_addresses"] += 1
             candidate_rows.append(_candidate_row(evidence, "rejected", "ambiguous_address_ownership", bank_ref=None))
@@ -802,7 +867,12 @@ def curate_enron_iteration(
             key=lambda item: (-item.leakage_group_count, -item.document_count, item.normalized_value),
         )
         recurring = [alias for alias in aliases if alias.leakage_group_count >= policy.minimum_person_alias_groups]
-        anchors = [alias for alias in recurring if _name_matches_address(alias.normalized_value, address)]
+        anchors = [
+            alias
+            for alias in recurring
+            if (identity_value := _person_identity_value(alias)) is not None
+            and _name_matches_address(identity_value, address)
+        ]
         compatible = (
             _compatible_person_aliases([anchors[0], *(alias for alias in recurring if alias is not anchors[0])])
             if anchors
@@ -819,6 +889,7 @@ def curate_enron_iteration(
             and active_people < policy.max_active_people
             and remaining_budget > 0
             and address in eligible_contact_values
+            and address in retained_contact_values
         )
         active_alias_values = (
             {alias.normalized_value for alias in compatible[: max(0, remaining_budget)]}
@@ -833,7 +904,11 @@ def curate_enron_iteration(
         name_decisions: list[str] = []
         retained_aliases: list[CandidateEvidence] = []
         for alias in aliases:
-            if alias.normalized_value in active_alias_values:
+            identity_value = _person_identity_value(alias)
+            if address not in retained_contact_values:
+                decision = "rejected"
+                reason = "contact_anchor_not_retained"
+            elif alias.normalized_value in active_alias_values:
                 decision = "active"
                 reason = "recurring_unique_full_name_alias"
             elif draft_person_patterns < policy.max_draft_per_class:
@@ -844,7 +919,7 @@ def curate_enron_iteration(
                 elif alias not in compatible:
                     reason = (
                         "address_local_part_incompatible"
-                        if not _name_matches_address(alias.normalized_value, address)
+                        if identity_value is None or not _name_matches_address(identity_value, address)
                         else "incompatible_alias_set"
                     )
                 elif not can_activate_identity:
@@ -857,7 +932,11 @@ def curate_enron_iteration(
             pattern_id = _opaque_id("alias", alias.normalized_value)
             bank_ref = None
             if decision == "rejected":
-                collision_counts["person_alias_draft_capacity"] += 1
+                collision_counts[
+                    "person_contact_anchor_not_retained"
+                    if reason == "contact_anchor_not_retained"
+                    else "person_alias_draft_capacity"
+                ] += 1
                 candidate_rows.append(_candidate_row(alias, decision, reason, bank_ref=None))
                 continue
             metadata = _evidence_metadata(
@@ -1141,8 +1220,8 @@ def curate_enron_iteration(
     if len(bank_bytes) > policy.max_bank_json_bytes:
         raise EnronBankBuildError("Curated bank exceeds the canonical JSON byte limit.")
 
-    candidate_rows.sort(key=lambda item: (str(item["candidate_type"]), str(item["candidate_id"])))
-    funnel = candidate_funnel(candidate_rows)
+    candidate_rows.rows.sort(key=lambda item: (str(item["candidate_type"]), str(item["candidate_id"])))
+    funnel = candidate_rows.funnel()
     collisions = {
         "schema_version": "nerb.enron_bank_collisions.v2",
         "active_exact_identity_collisions": 0,
@@ -1153,7 +1232,7 @@ def curate_enron_iteration(
     return CuratedIteration(
         iteration=iteration,
         bank=bank,
-        candidates=tuple(candidate_rows),
+        candidates=tuple(candidate_rows.rows),
         funnel=funnel,
         collisions=collisions,
     )
@@ -1170,9 +1249,19 @@ def candidate_funnel(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         decisions[decision] += 1
         types[candidate_type][decision] += 1
         reasons[reason] += 1
+    return _candidate_funnel_from_counts(total=len(rows), decisions=decisions, types=types, reasons=reasons)
+
+
+def _candidate_funnel_from_counts(
+    *,
+    total: int,
+    decisions: Mapping[str, int],
+    types: Mapping[str, Mapping[str, int]],
+    reasons: Mapping[str, int],
+) -> dict[str, Any]:
     return {
         "schema_version": CANDIDATE_FUNNEL_SCHEMA_VERSION,
-        "total_candidates": len(rows),
+        "total_candidates": total,
         "by_decision": {name: decisions[name] for name in ("active", "draft", "rejected")},
         "by_type": {
             name: {
@@ -1386,14 +1475,29 @@ def _compatible_person_aliases(values: Sequence[CandidateEvidence]) -> list[Cand
     if not values:
         return []
     accepted = [values[0]]
-    first_tokens = values[0].normalized_value.split()
+    first_value = _person_identity_value(values[0])
+    if first_value is None:
+        return []
+    first_tokens = first_value.split()
     first_initial = first_tokens[0][:1]
     last = first_tokens[-1]
     for value in values[1:]:
-        tokens = value.normalized_value.split()
+        identity_value = _person_identity_value(value)
+        tokens = [] if identity_value is None else identity_value.split()
         if tokens and tokens[0][:1] == first_initial and tokens[-1] == last:
             accepted.append(value)
     return accepted
+
+
+def _person_identity_value(evidence: CandidateEvidence) -> str | None:
+    values = {
+        normalized
+        for surface, _count in evidence.surfaces
+        if (normalized := _normalize_person_name(surface)) is not None
+    }
+    if len(values) != 1:
+        return None
+    return next(iter(values))
 
 
 def _contact_scope(address: str, policy: EnronBankPolicy) -> str:
@@ -1419,6 +1523,22 @@ def _normalize_email(value: str) -> str | None:
 
 def _normalized_surface(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).split())
+
+
+def _person_literal_surface(value: str) -> str:
+    return " ".join(value.split())
+
+
+def _person_literal_catalog_key(value: str) -> str:
+    return "".join(_simple_casefold_scalar(character) for character in _person_literal_surface(value))
+
+
+def _simple_casefold_scalar(value: str) -> str:
+    folded = value.casefold()
+    if len(folded) == 1:
+        return folded
+    lowered = value.lower()
+    return lowered if len(lowered) == 1 else value
 
 
 def _normalize_person_name(value: str) -> str | None:
@@ -1473,10 +1593,15 @@ def _validate_policy(policy: EnronBankPolicy) -> None:
         policy.max_pattern_utf8_bytes,
         policy.max_bank_json_bytes,
         policy.max_train_records,
+        policy.max_train_artifact_bytes,
         policy.max_validation_records,
+        policy.max_validation_artifact_bytes,
         policy.max_validation_entries,
         policy.max_validation_spans,
         policy.max_validation_text_utf8_bytes,
+        policy.max_development_memberships_bytes,
+        policy.max_development_samples_bytes,
+        policy.max_quality_predictions,
         policy.max_header_entries_per_document,
         policy.max_observations,
         policy.max_unique_candidates,
@@ -1484,6 +1609,10 @@ def _validate_policy(policy: EnronBankPolicy) -> None:
     )
     if any(type(value) is not int or value <= 0 for value in values):
         raise EnronBankBuildError("Bank-build policy limits must be positive integers.")
+    if policy.max_quality_predictions != DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL:
+        raise EnronBankBuildError("Bank-build prediction capacity must match the frozen quality evaluator limit.")
+    if policy.max_validation_spans > policy.max_quality_predictions:
+        raise EnronBankBuildError("Validation span capacity must not exceed the quality prediction capacity.")
     domains = tuple(_normalize_domain(value) for value in policy.internal_domains)
     if not domains or any(value is None for value in domains) or len(set(domains)) != len(domains):
         raise EnronBankBuildError("Internal-domain policy must contain unique valid domains.")

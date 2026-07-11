@@ -780,6 +780,7 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
     development = tmp_path / "development"
     output = tmp_path / "build"
     annotations = tmp_path / "annotations"
+    bindings = tmp_path / "reviewed-bindings.jsonl"
     build_result = runner.invoke(
         app,
         [
@@ -790,6 +791,8 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
             str(output),
             "--annotation-run",
             str(annotations),
+            "--cmu-catalog-bindings",
+            str(bindings),
             "--benchmark-version",
             "enron-v2-fixture",
             "--created-at",
@@ -804,6 +807,7 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
     assert options.development_run == development
     assert options.output_dir == output
     assert options.annotation_run == annotations
+    assert options.cmu_catalog_bindings_path == bindings
     assert options.benchmark_version == "enron-v2-fixture"
     assert options.allow_unignored_output is True
 
@@ -839,6 +843,7 @@ def test_enron_bank_build_cli_has_no_sealed_or_role_selector() -> None:
 
     assert help_result.exit_code == 0
     assert "--development-run" in help_result.output
+    assert "--cmu-catalog-bindings" in help_result.output
     assert "--sealed" not in help_result.output
     assert "--role" not in help_result.output
 
