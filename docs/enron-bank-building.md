@@ -237,6 +237,56 @@ Raising these limits for the full pinned source requires #152 to demonstrate a s
 and runtime evidence and to review any evaluator-capacity change separately. The #153 run must fail before any sealed-test
 access if that development-stage proof has not landed; a higher numeric limit alone is not evidence of acceptable scale.
 
+## Reviewed 50k development evidence
+
+The committed aggregate-only evidence files `tests/data/enron_bank_card_v2_real_50000.json` and
+`tests/data/enron_candidate_funnel_v2_real_50000.json` come from a frozen 50,000-row real-source development fixture.
+The fixture is deliberately marked `fixture_mode: true` and non-promotable; it contains 40,007 train and 4,995
+validation records, and the sealed test remained unopened.
+
+The final train-only run mined 721,302 observations into 15,171 candidates: 628 active, 3,667 draft, and 10,876
+rejected. The selected bank has 500 recurring exact contacts, one bounded unknown-email fallback, and 127 recurring
+person aliases. Structured-weak contact validation detected 59,854 of 59,854 labeled spans; known-catalog coverage was
+0.447121, with cataloged recall 1.0 and zero cataloged misses or wrong canonical mappings. Conformance covered all 628
+active patterns, 1,885 transformed positives, and 137 adversarial negatives with zero misses, wrong mappings, or
+unexpected negative matches.
+
+The separately adjudicated CMU-train binding contains 94 cataloged and 1,802 explicitly uncataloged person labels.
+Independent review found zero decision, identity, ambiguity, or exact-offset mismatches. Its auxiliary diagnostic reports
+cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.789916, document leak rate 0.968519, and
+over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
+hidden by the catalog guarantee.
+
+On an Apple M4 with 16 GiB RAM, the CMU-enabled build took 129.28 seconds and 1,179,648,000 bytes peak RSS. Deep replay
+took 117.88 seconds and 1,249,312,768 bytes peak RSS. These are one-time construction/audit costs, not steady-state scan
+latency claims; #152 owns runtime benchmarks.
+
+Key commitments are:
+
+- selected bank: `sha256:cb98a29f1cfc685421adffbc009a0d3cbf5e374d79c96f12154b997c993b2c44`;
+- candidate ledger: `sha256:0dedb4bca10ef2c42d5a084fc58ae087921e64cce895672c3dc40c9e4a19386f`;
+- builder implementation: `sha256:e5d41137dcefb7e4bbf46f4800cda02f15904f8339f5f41382a13c002c812e9a`;
+- reviewed CMU binding file: `sha256:355efe9dea0dbadaf4653ff464504c66623de07c178ef38e9f129d2a76145e01`;
+- canonical CMU catalog binding: `sha256:29454424cec4f29b36cd650ac302597e0e804958108a737b4f57b646d994c412`;
+- bank-card run: `sha256:68089a1b4dad9fc6d2c6720e1bade2a22012809ccf3375e968a54c23880d946d`;
+- committed bank-card file: `sha256:8734907c1a3bc3a4af66ac1c98bafa07afaab3c53939d44cd35824cea8cf5d71`; and
+- committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
+
+The exact private commands were:
+
+```shell
+/usr/bin/time -l uv run nerb build-enron-bank \
+  --development-run .nerb/issue149-development-50000-v6 \
+  --output-dir .nerb/issue151-real-50000-v3-final \
+  --annotation-run .nerb/issue150-cmu/annotations-run-final4 \
+  --cmu-catalog-bindings .nerb/issue151-cmu-v3-proposal.jsonl \
+  --benchmark-version enron-v2-issue149-scale-50000
+
+/usr/bin/time -l uv run nerb verify-enron-bank-build \
+  --run-dir .nerb/issue151-real-50000-v3-final \
+  --annotation-run .nerb/issue150-cmu/annotations-run-final4
+```
+
 ## Sealed-test boundary
 
 The CLI deliberately accepts `--development-run`, not a role selector or sealed-test path. The source binding recorded

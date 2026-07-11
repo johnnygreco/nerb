@@ -102,6 +102,54 @@ def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
         assert card["catalog_conformance"][key] == conformance[key]
 
 
+def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_bound() -> None:
+    card_path = _DATA / "enron_bank_card_v2_real_50000.json"
+    funnel_path = _DATA / "enron_candidate_funnel_v2_real_50000.json"
+    card = _load(card_path.name)
+    funnel = _load(funnel_path.name)
+
+    _validate_public_card(card)
+    assert hashlib.sha256(card_path.read_bytes()).hexdigest() == (
+        "8734907c1a3bc3a4af66ac1c98bafa07afaab3c53939d44cd35824cea8cf5d71"
+    )
+    assert hashlib.sha256(funnel_path.read_bytes()).hexdigest() == (
+        "3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f"
+    )
+    assert card["run_sha256"] == "sha256:68089a1b4dad9fc6d2c6720e1bade2a22012809ccf3375e968a54c23880d946d"
+    assert card["bank"]["canonical_sha256"] == (
+        "sha256:cb98a29f1cfc685421adffbc009a0d3cbf5e374d79c96f12154b997c993b2c44"
+    )
+    assert card["builder"]["candidate_ledger_sha256"] == (
+        "sha256:0dedb4bca10ef2c42d5a084fc58ae087921e64cce895672c3dc40c9e4a19386f"
+    )
+    assert card["candidate_funnel"] == funnel
+    assert sum(funnel["by_decision"].values()) == funnel["total_candidates"] == 15_171
+    assert sum(item["total"] for item in funnel["by_type"].values()) == funnel["total_candidates"]
+    assert sum(funnel["by_primary_reason"].values()) == funnel["total_candidates"]
+    assert card["bank"]["stats"]["active_totals"]["patterns"] == 628
+    assert card["validation"]["contact"]["labeled_span_recall"] == 1.0
+    assert card["validation"]["contact"]["cataloged_false_negative"] == 0
+    assert card["validation"]["contact"]["cataloged_wrong_canonical"] == 0
+    assert card["catalog_conformance"]["passed"] is True
+    assert card["catalog_conformance"]["missed"] == 0
+    assert card["catalog_conformance"]["wrong_canonical"] == 0
+    auxiliary = card["independent_auxiliary"]
+    assert auxiliary["evaluated"] is True
+    assert auxiliary["true_positive"] == 94
+    assert auxiliary["false_negative"] == 1_802
+    assert auxiliary["metrics"]["cataloged_recall"] == 1.0
+    assert card["fixture_mode"] is True
+    assert card["promotable"] is False
+    assert card["source"]["sealed_test_accessed"] is False
+    assert card["privacy"]["status"] == "passed"
+
+    serialized = json.dumps((card, funnel), ensure_ascii=False, sort_keys=True)
+    assert "@" not in serialized
+    assert not _PHONE_SHAPE.search(serialized)
+    assert not re.search(r"doc_[0-9a-f]{64}", serialized)
+    assert all(not value.startswith(("/", "~/", "file://")) for value in _strings((card, funnel)))
+
+
 def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tampering() -> None:
     card = _load("enron_bank_card_v2_fake.json")
     missing_iteration_field = copy.deepcopy(card)
