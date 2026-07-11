@@ -33,8 +33,10 @@ from nerb.enron_contract import (
     hash_enron_workload,
     load_enron_evidence,
     load_enron_manifest,
+    validate_enron_conformance_output,
     validate_enron_evidence,
     validate_enron_manifest,
+    validate_enron_quality_output,
 )
 
 JsonObject = dict[str, Any]
@@ -69,6 +71,24 @@ def _codes(result: JsonObject) -> set[str]:
 def _assert_code(result: JsonObject, code: str) -> None:
     assert result["valid"] is False
     assert code in _codes(result), result["diagnostics"]
+
+
+def test_standalone_quality_and_conformance_outputs_reuse_contract_semantics(evidence: JsonObject) -> None:
+    quality = copy.deepcopy(evidence["quality"])
+    conformance = copy.deepcopy(evidence["catalog_conformance"])
+
+    assert validate_enron_quality_output(quality) == {"valid": True, "diagnostics": []}
+    assert validate_enron_conformance_output(conformance, active_patterns=5) == {
+        "valid": True,
+        "diagnostics": [],
+    }
+
+    quality["slices"][0]["metrics"]["open_world_recall"] = 0.5
+    _assert_code(validate_enron_quality_output(quality), "contract.metric_arithmetic")
+    _assert_code(
+        validate_enron_conformance_output(conformance, active_patterns=4),
+        "contract.conformance_bank_mismatch",
+    )
 
 
 def _at(value: Any, path: JsonPath) -> Any:

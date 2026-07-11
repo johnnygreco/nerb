@@ -369,23 +369,41 @@ class Bank:
     def metadata(self) -> dict[str, Any]:
         return dict(self._native.metadata())
 
-    def scan_bytes(self, haystack: bytes | bytearray | memoryview) -> list[dict[str, Any]]:
+    def scan_bytes(
+        self,
+        haystack: bytes | bytearray | memoryview,
+        *,
+        max_matches: int | None = None,
+    ) -> list[dict[str, Any]]:
         text_bytes = bytes(haystack)
-        raw = self._native.scan_bytes(text_bytes)
+        raw = self._scan_native_bytes(text_bytes, max_matches=max_matches)
         return _project_raw_matches(self.metadata(), raw, text_bytes, offset_unit="byte")
 
-    def scan_text(self, text: str, *, offsets: OffsetUnit = "byte") -> list[dict[str, Any]]:
+    def scan_text(
+        self,
+        text: str,
+        *,
+        offsets: OffsetUnit = "byte",
+        max_matches: int | None = None,
+    ) -> list[dict[str, Any]]:
         if not isinstance(text, str):
             raise TypeError("Bank.scan_text text must be a string.")
         if offsets not in {"byte", "char"}:
             raise ValueError('Bank.scan_text offsets must be "byte" or "char".')
 
         text_bytes = text.encode("utf-8")
-        raw = self._native.scan_bytes(text_bytes)
+        raw = self._scan_native_bytes(text_bytes, max_matches=max_matches)
         records = _project_raw_matches(self.metadata(), raw, text_bytes, offset_unit="byte")
         if offsets == "byte":
             return records
         return _project_char_offsets(records, text)
+
+    def _scan_native_bytes(self, text_bytes: bytes, *, max_matches: int | None) -> Any:
+        if max_matches is None:
+            return self._native.scan_bytes(text_bytes)
+        if isinstance(max_matches, bool) or not isinstance(max_matches, int) or max_matches <= 0:
+            raise ValueError("Bank scan max_matches must be a positive integer.")
+        return self._native.scan_bytes_bounded(text_bytes, max_matches)
 
     def scan_path(self, path: str | Path) -> list[dict[str, Any]]:
         source_path = Path(path).expanduser()

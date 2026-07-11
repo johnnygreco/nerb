@@ -234,6 +234,10 @@ may explicitly ask for character offsets:
 assert bank.scan_text("Café Rush", offsets="char")[0]["offset_unit"] == "char"
 ```
 
+`scan_text` and `scan_bytes` also accept a positive `max_matches` keyword. The native collector aborts as soon as that
+count would be exceeded, before Python record projection or sorting; evaluator code uses this boundary for resource
+limits.
+
 `Bank.scan_path(path)` reads the exact file bytes and then uses the native UTF-8 scan path. Invalid UTF-8 raises
 `ValueError`; callers that need lossy or custom decoding must decode text explicitly and pass it to `scan_text`.
 

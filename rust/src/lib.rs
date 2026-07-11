@@ -155,6 +155,18 @@ impl PyBank {
         })
     }
 
+    fn scan_bytes_bounded(
+        &self,
+        py: Python<'_>,
+        haystack: &[u8],
+        max_matches: usize,
+    ) -> PyResult<Py<PyMatchBuffer>> {
+        ffi_boundary(|| {
+            let buffer = py.detach(|| self.inner.scan_bytes_bounded(haystack, max_matches))?;
+            Py::new(py, PyMatchBuffer { inner: buffer })
+        })
+    }
+
     #[pyo3(signature = (haystack, out=None))]
     fn scan_bytes_leftmost_from_all_overlaps(
         &self,

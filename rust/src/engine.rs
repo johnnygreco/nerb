@@ -121,6 +121,16 @@ impl NativeEngine {
         Ok(buffer)
     }
 
+    pub fn scan_bytes_bounded(
+        &self,
+        haystack: &[u8],
+        max_matches: usize,
+    ) -> Result<NativeMatchBuffer> {
+        let mut buffer = NativeMatchBuffer::with_match_limit(max_matches)?;
+        self.scan_bytes_into(haystack, &mut buffer)?;
+        Ok(buffer)
+    }
+
     pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
         buffer.clear();
         std::str::from_utf8(haystack).map_err(|error| {

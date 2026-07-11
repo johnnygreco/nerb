@@ -1,9 +1,9 @@
 # Enron Benchmark v2 Charter
 
-> **Status: executable contract, private preparation, and immutable splitting implemented; benchmark execution staged.**
+> **Status: contract, private preparation, immutable splitting, independent quality execution, and catalog conformance implemented.**
 > The v2 manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
-> and [group-aware split and sealing workflow](enron-splits.md) are implemented. The evaluator, bank, and real-corpus
-> evidence will land in later work.
+> [group-aware split and sealing workflow](enron-splits.md), and [privacy evaluation workflow](enron-evaluation.md) are
+> implemented. Bank construction and frozen real-corpus evidence will land in later work.
 > The existing `scripts/enron_bank_build_benchmark.py`, its `nerb.enron_benchmark.v1` output, the v1 autoresearch
 > harness, committed hero measurements, and previously published Enron numbers are historical. They do **not** satisfy
 > this charter and must not support a public quality, privacy, performance, or product claim.

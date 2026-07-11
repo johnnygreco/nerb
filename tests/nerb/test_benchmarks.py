@@ -286,6 +286,92 @@ def test_regress_bank_reports_diff_eval_benchmark_deltas_and_quality_gate(tmp_pa
     )
 
 
+def test_regress_bank_quality_gate_rejects_equal_empty_evaluations(minimal_bank):
+    result = regress_bank(
+        minimal_bank,
+        minimal_bank,
+        options={"benchmark_iterations": 1, "stress_multiplier": 2},
+    )
+
+    assert result["deltas"]["quality"]["evaluated"] == {"old": False, "new": False}
+    assert result["gates"]["quality"]["passed"] is False
+    checks = {check["name"]: check for check in result["gates"]["quality"]["checks"]}
+    assert checks["old_eval_evaluated"]["passed"] is False
+    assert checks["new_eval_evaluated"]["passed"] is False
+    assert result["gates"]["passed"] is False
+
+
+def test_regress_bank_quality_gate_rejects_equal_failing_evaluations(tmp_path, minimal_bank):
+    eval_ref = _write_jsonl(
+        tmp_path / "miss.jsonl",
+        [
+            {
+                "type": "positive",
+                "text": "No expected match",
+                "matches": [{"string": "expected", "start": 3, "end": 11}],
+                "metadata": {},
+            }
+        ],
+    )
+    minimal_bank["eval_refs"] = [eval_ref]
+
+    result = regress_bank(
+        minimal_bank,
+        minimal_bank,
+        base_path=tmp_path,
+        options={"benchmark_iterations": 1, "stress_multiplier": 2},
+    )
+
+    assert result["evaluations"]["old"]["summary"]["evaluated"] is True
+    assert result["evaluations"]["new"]["summary"]["passed"] is False
+    checks = {check["name"]: check for check in result["gates"]["quality"]["checks"]}
+    assert checks["new_eval_passed"]["passed"] is False
+    assert result["gates"]["quality"]["passed"] is False
+
+
+def test_regress_bank_quality_gate_rejects_same_size_eval_suite_replacement(tmp_path, minimal_bank):
+    old_ref = _write_jsonl(
+        tmp_path / "old.jsonl",
+        [
+            {
+                "type": "positive",
+                "text": "Acme Corp",
+                "matches": [{"string": "Acme Corp", "start": 0, "end": 9}],
+                "metadata": {},
+            }
+        ],
+    )
+    new_ref = _write_jsonl(
+        tmp_path / "new.jsonl",
+        [
+            {
+                "type": "positive",
+                "text": "For Acme Corp",
+                "matches": [{"string": "Acme Corp", "start": 4, "end": 13}],
+                "metadata": {},
+            }
+        ],
+    )
+    old_bank = copy.deepcopy(minimal_bank)
+    new_bank = copy.deepcopy(minimal_bank)
+    old_bank["eval_refs"] = [old_ref]
+    new_bank["eval_refs"] = [new_ref]
+
+    result = regress_bank(
+        old_bank,
+        new_bank,
+        base_path=tmp_path,
+        options={"benchmark_iterations": 1, "stress_multiplier": 2},
+    )
+
+    assert result["evaluations"]["old"]["summary"]["passed"] is True
+    assert result["evaluations"]["new"]["summary"]["passed"] is True
+    assert result["deltas"]["quality"]["positive_total_delta"] == 0
+    checks = {check["name"]: check for check in result["gates"]["quality"]["checks"]}
+    assert checks["eval_suite_sha256_match"]["passed"] is False
+    assert result["gates"]["quality"]["passed"] is False
+
+
 @pytest.mark.parametrize(
     "options",
     [

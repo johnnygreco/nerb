@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, cast
 
 from .bank import bank_stats, canonicalize_bank, hash_bank
@@ -31,6 +34,7 @@ __all__ = [
     "CompiledBank",
     "ExtractionError",
     "compile_bank_with_report",
+    "extraction_execution_sha256",
     "resolve_extraction_options",
 ]
 
@@ -45,6 +49,52 @@ class ExtractionError(ValueError):
     def __init__(self, message: str, diagnostics: list[Diagnostic] | None = None) -> None:
         super().__init__(message)
         self.diagnostics = diagnostics or []
+
+
+@lru_cache(maxsize=1)
+def extraction_execution_sha256() -> str:
+    """Fingerprint the Python scan adapters and loaded native engine binary."""
+
+    from . import bank as bank_module
+    from . import engine as engine_module
+    from . import records as records_module
+
+    native_module = importlib.import_module("nerb._engine")
+    sources = (
+        ("bank.py", bank_module.__file__),
+        ("engine.py", engine_module.__file__),
+        ("engines.py", __file__),
+        ("records.py", records_module.__file__),
+        ("native_engine", getattr(native_module, "__file__", None)),
+    )
+    descriptors: list[dict[str, Any]] = []
+    try:
+        for logical_id, source_path in sources:
+            if not isinstance(source_path, str) or not source_path:
+                raise OSError
+            payload = Path(source_path).read_bytes()
+            descriptors.append(
+                {
+                    "id": logical_id,
+                    "bytes": len(payload),
+                    "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                }
+            )
+    except OSError:
+        raise ExtractionError("Extraction execution sources could not be fingerprinted safely.") from None
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                {
+                    "schema_version": "nerb.extraction_execution.v1",
+                    "sources": descriptors,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 @dataclass(frozen=True)
@@ -80,11 +130,14 @@ class CompiledBank:
     cache_metadata: dict[str, Any]
     detector_index: Mapping[tuple[str, str, str], _DetectorIdentity]
 
-    def finditer(self, text: str) -> list[MatchRecord]:
+    def finditer(self, text: str, *, max_matches: int | None = None) -> list[MatchRecord]:
         if self.native_bank is None:
             return []
 
-        records = [_enrich_json_bank_record(record, self.detector_index) for record in self.native_bank.scan_text(text)]
+        records = [
+            _enrich_json_bank_record(record, self.detector_index)
+            for record in self.native_bank.scan_text(text, max_matches=max_matches)
+        ]
         records.sort(key=record_sort_key)
         return records
 
