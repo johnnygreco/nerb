@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -914,7 +915,44 @@ def test_private_receipt_publication_is_atomic_after_interrupted_write(
         )
 
     assert list(root.iterdir()) == []
-    assert not tuple(tmp_path.glob(".private-receipts.ACCESS_CLAIMED.json.stage-*"))
+    assert not tuple(root.glob(".ACCESS_CLAIMED.json.stage-*"))
+
+
+def test_private_receipt_publication_needs_no_parent_write_permission(tmp_path: Path) -> None:
+    parent = tmp_path / "read-only-parent"
+    root = parent / "private-receipts"
+    root.mkdir(parents=True, mode=0o700)
+    parent.chmod(0o500)
+    try:
+        enron_splitting._write_exclusive_private_json(  # noqa: SLF001
+            root,
+            "ACCESS_CLAIMED.json",
+            {"schema_version": "test", "commitment": "sha256:" + "1" * 64},
+        )
+        receipt = root / "ACCESS_CLAIMED.json"
+        assert receipt.is_file()
+        assert receipt.stat().st_mode & 0o777 == 0o600
+        assert receipt.stat().st_nlink == 1
+    finally:
+        parent.chmod(0o700)
+
+
+def test_stale_internal_receipt_stage_is_recovered_before_inventory_validation(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="stale-receipt"))
+    run = _split(tmp_path, preparation)
+    stage = run.sealed / (".ACCESS_CLAIMED.json.stage-" + "a" * 24)
+    stage.write_bytes(b'{"partial":')
+    stage.chmod(0o600)
+    stale_time = time.time_ns() - 10_000_000_000
+    os.utime(stage, ns=(stale_time, stale_time))
+
+    root = enron_splitting._assert_committed_run(  # noqa: SLF001
+        run.sealed,
+        enron_splitting._SEALED_FILES,  # noqa: SLF001
+        allow_access_files=True,
+    )
+    assert root == run.sealed.absolute()
+    assert not stage.exists()
 
 
 def test_crash_stranded_claim_can_be_finalized_as_aborted_without_reopening_test(tmp_path: Path) -> None:

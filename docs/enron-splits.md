@@ -43,7 +43,10 @@ The sealed transaction commits first and the development transaction commits sec
 does the splitter create `PAIR_COMMITTED.json` in the sealed root, binding both manifests and the development freeze
 receipt. Steward verification and final-test access reject a missing or mismatched pair receipt, so an orphaned sealed
 transaction cannot become an access capability after a partial two-directory commit. Pair, claim, and outcome receipts
-are written to private sibling staging files, synchronized, and then published atomically without replacement.
+are written to private staging files inside the pinned bundle, synchronized, inode-checked, and then published atomically
+without replacement. This needs write access only to the 0700 bundle, not its parent. A recognizable partial staging
+file left by process death is lock-checked and removed before later inventory validation; a published receipt is always
+complete.
 
 - The **development bundle** contains train and validation records, their private group membership and cohort material,
   and bounded diagnostic samples. Candidate miners, bank builders, reviewers, and validation experiments may use this

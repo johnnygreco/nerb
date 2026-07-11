@@ -17,6 +17,7 @@ import secrets
 import sqlite3
 import stat
 import tempfile
+import time
 from array import array
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
@@ -107,6 +108,10 @@ _PREPARATION_BINDING_KEYS = {
     "grouping_policy_sha256",
     "date_policy_sha256",
 }
+_RECEIPT_NAMES = frozenset({"PAIR_COMMITTED.json", "ACCESS_CLAIMED.json", "ACCESS_OUTCOME.json"})
+_RECEIPT_STAGE_RE = re.compile(
+    r"^\.(?:PAIR_COMMITTED\.json|ACCESS_CLAIMED\.json|ACCESS_OUTCOME\.json)\.stage-[0-9a-f]{24}$"
+)
 
 _DEVELOPMENT_FILES = (
     "train.jsonl",
@@ -1834,6 +1839,8 @@ def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_ac
         raise EnronSplitError("Split run does not exist.") from exc
     if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
         raise EnronSplitError("Split run must be a non-symlink directory.")
+    if stat.S_IMODE(root_info.st_mode) & 0o077:
+        raise EnronSplitError("Split run directory is not private.")
     marker = root / _COMMIT_MARKER
     with open_private_binary_input(marker) as handle:
         if handle.read(len(_COMMIT_PAYLOAD) + 1) != _COMMIT_PAYLOAD:
@@ -1845,6 +1852,12 @@ def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_ac
         actual = set(os.listdir(root))
     except OSError as exc:
         raise EnronSplitError("Split run could not be enumerated safely.") from exc
+    if any(_RECEIPT_STAGE_RE.fullmatch(name) for name in actual):
+        _cleanup_stale_receipt_stages(root)
+        try:
+            actual = set(os.listdir(root))
+        except OSError as exc:
+            raise EnronSplitError("Split run could not be re-enumerated after receipt recovery.") from exc
     if actual != allowed and not (allow_access_files and set(expected_files) | {_COMMIT_MARKER} <= actual <= allowed):
         raise EnronSplitError("Split run file inventory is invalid.")
     for name in actual:
@@ -1856,8 +1869,6 @@ def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_ac
             or stat.S_IMODE(info.st_mode) & 0o077
         ):
             raise EnronSplitError("Split run contains an unsafe file.")
-    if stat.S_IMODE(root_info.st_mode) & 0o077:
-        raise EnronSplitError("Split run directory is not private.")
     return root
 
 
@@ -2633,18 +2644,16 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
-def _open_pinned_private_root(root: Path) -> tuple[int, int]:
+def _open_pinned_private_root(root: Path) -> int:
     if root.parent == root or not root.name:
         raise EnronSplitError("Private receipt root is invalid.")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         before = root.lstat()
-        parent_fd = os.open(root.parent, flags)
+        directory_fd = os.open(root, flags)
     except OSError as exc:
         raise EnronSplitError("Private receipt root could not be opened safely.") from exc
-    directory_fd: int | None = None
     try:
-        directory_fd = os.open(root.name, flags, dir_fd=parent_fd)
         after = os.fstat(directory_fd)
         if (
             not stat.S_ISDIR(after.st_mode)
@@ -2652,35 +2661,33 @@ def _open_pinned_private_root(root: Path) -> tuple[int, int]:
             or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
         ):
             raise EnronSplitError("Private receipt root changed while it was opened.")
-        return parent_fd, directory_fd
+        return directory_fd
     except BaseException as exc:
-        if directory_fd is not None:
-            os.close(directory_fd)
-        os.close(parent_fd)
+        os.close(directory_fd)
         if isinstance(exc, EnronSplitError):
             raise
         raise EnronSplitError("Private receipt root could not be pinned safely.") from exc
 
 
 def _write_exclusive_private_json_at(
-    root: Path,
-    parent_fd: int,
     directory_fd: int,
     name: str,
     value: Mapping[str, Any],
 ) -> None:
-    if Path(name).name != name or name in {"", ".", ".."}:
+    import fcntl
+
+    if name not in _RECEIPT_NAMES:
         raise EnronSplitError("Private receipt name is invalid.")
     payload = _canonical_line(value)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     temporary_name: str | None = None
     file_fd: int | None = None
     published = False
     try:
         for _ in range(128):
-            candidate = f".{root.name}.{name}.stage-{secrets.token_hex(12)}"
+            candidate = f".{name}.stage-{secrets.token_hex(12)}"
             try:
-                file_fd = os.open(candidate, flags, 0o600, dir_fd=parent_fd)
+                file_fd = os.open(candidate, flags, 0o600, dir_fd=directory_fd)
             except FileExistsError:
                 continue
             temporary_name = candidate
@@ -2688,6 +2695,7 @@ def _write_exclusive_private_json_at(
         if file_fd is None or temporary_name is None:
             raise EnronSplitError("A unique private receipt staging file could not be created.")
         os.fchmod(file_fd, 0o600)
+        fcntl.flock(file_fd, fcntl.LOCK_EX)
         offset = 0
         while offset < len(payload):
             written = os.write(file_fd, payload[offset:])
@@ -2695,12 +2703,17 @@ def _write_exclusive_private_json_at(
                 raise OSError("Private receipt write made no progress.")
             offset += written
         os.fsync(file_fd)
-        os.close(file_fd)
-        file_fd = None
-        _rename_noreplace_at(parent_fd, temporary_name, directory_fd, name)
+        staged = os.fstat(file_fd)
+        _rename_noreplace_at(directory_fd, temporary_name, directory_fd, name)
         published = True
+        destination = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(destination.st_mode)
+            or destination.st_nlink != 1
+            or (staged.st_dev, staged.st_ino) != (destination.st_dev, destination.st_ino)
+        ):
+            raise EnronSplitError("Published private receipt does not match its staged inode.")
         os.fsync(directory_fd)
-        os.fsync(parent_fd)
     except FileExistsError:
         raise EnronSplitError("Final-test access has already been claimed; retries are forbidden.") from None
     except EnronPrivateIOError as exc:
@@ -2712,20 +2725,64 @@ def _write_exclusive_private_json_at(
             os.close(file_fd)
         if temporary_name is not None and not published:
             try:
-                os.unlink(temporary_name, dir_fd=parent_fd)
-                os.fsync(parent_fd)
+                os.unlink(temporary_name, dir_fd=directory_fd)
+                os.fsync(directory_fd)
             except FileNotFoundError:
                 pass
 
 
-def _write_exclusive_private_json(root: Path, name: str, value: Mapping[str, Any]) -> None:
-    normalized = root.expanduser().absolute()
-    parent_fd, directory_fd = _open_pinned_private_root(normalized)
+def _cleanup_stale_receipt_stages(root: Path) -> None:
+    import fcntl
+
+    directory_fd = _open_pinned_private_root(root)
+    removed = False
     try:
-        _write_exclusive_private_json_at(normalized, parent_fd, directory_fd, name, value)
+        names = os.listdir(directory_fd)
+        for name in names:
+            if not _RECEIPT_STAGE_RE.fullmatch(name):
+                continue
+            stage_fd: int | None = None
+            try:
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if time.time_ns() - before.st_mtime_ns < 5_000_000_000:
+                    raise EnronSplitError("Private receipt publication is still in progress; retry shortly.")
+                stage_fd = os.open(
+                    name,
+                    os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                after = os.fstat(stage_fd)
+                if (
+                    not stat.S_ISREG(after.st_mode)
+                    or after.st_nlink != 1
+                    or stat.S_IMODE(after.st_mode) & 0o077
+                    or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                ):
+                    raise EnronSplitError("Stale private receipt staging file is unsafe.")
+                try:
+                    fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise EnronSplitError("Private receipt publication is still in progress; retry shortly.") from exc
+                os.unlink(name, dir_fd=directory_fd)
+                removed = True
+            except FileNotFoundError:
+                continue
+            finally:
+                if stage_fd is not None:
+                    os.close(stage_fd)
+        if removed:
+            os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-        os.close(parent_fd)
+
+
+def _write_exclusive_private_json(root: Path, name: str, value: Mapping[str, Any]) -> None:
+    normalized = root.expanduser().absolute()
+    directory_fd = _open_pinned_private_root(normalized)
+    try:
+        _write_exclusive_private_json_at(directory_fd, name, value)
+    finally:
+        os.close(directory_fd)
 
 
 class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
@@ -2741,7 +2798,6 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         "_benchmark_version",
         "_accessed_at",
         "_claim_sha256",
-        "_parent_fd",
         "_directory_fd",
         "_entered",
         "_iterated",
@@ -2758,7 +2814,6 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         self._benchmark_version = ""
         self._accessed_at = ""
         self._claim_sha256 = ""
-        self._parent_fd: int | None = None
         self._directory_fd: int | None = None
         self._entered = False
         self._iterated = False
@@ -2816,7 +2871,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         if manifest.get("artifacts", {}).get("test") != role["artifact"]:
             raise EnronSplitError("Sealed test artifact binding is invalid.")
         _verify_descriptor(root, role["artifact"], "test.jsonl", int(role["records"]))
-        parent_fd, directory_fd = _open_pinned_private_root(root)
+        directory_fd = _open_pinned_private_root(root)
         handle: BinaryIO | None = None
         try:
             handle = open_private_binary_input(root / "test.jsonl")
@@ -2833,7 +2888,6 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             self._expected_sha256 = str(artifact["sha256"])
             self._expected_bytes = int(artifact["bytes"])
             self._handle = handle
-            self._parent_fd = parent_fd
             self._directory_fd = directory_fd
             self._target = target
             self._benchmark_version = str(manifest["benchmark_version"])
@@ -2846,15 +2900,13 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             }
             self._claim_sha256 = _hash_bytes(_canonical_json(claim_core).encode("utf-8"))
             claim = {**claim_core, "claim_sha256": self._claim_sha256}
-            _write_exclusive_private_json_at(root, parent_fd, directory_fd, "ACCESS_CLAIMED.json", claim)
+            _write_exclusive_private_json_at(directory_fd, "ACCESS_CLAIMED.json", claim)
         except BaseException:
             if handle is not None:
                 handle.close()
             self._handle = None
-            self._parent_fd = None
             self._directory_fd = None
             os.close(directory_fd)
-            os.close(parent_fd)
             raise
         return self
 
@@ -2914,14 +2966,11 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             "frozen_target_sha256": _hash_bytes(_canonical_json(self._target).encode("utf-8")),
             "claim_sha256": self._claim_sha256,
         }
-        parent_fd = self._parent_fd
         directory_fd = self._directory_fd
-        if parent_fd is None or directory_fd is None:
+        if directory_fd is None:
             raise EnronSplitError("Final-test access directory is no longer pinned.")
         try:
             _write_exclusive_private_json_at(
-                self._root,
-                parent_fd,
                 directory_fd,
                 "ACCESS_OUTCOME.json",
                 outcome,
@@ -2931,9 +2980,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
                 raise
         finally:
             os.close(directory_fd)
-            os.close(parent_fd)
             self._directory_fd = None
-            self._parent_fd = None
 
 
 def begin_enron_final_test_access(
