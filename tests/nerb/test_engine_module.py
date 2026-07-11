@@ -11,6 +11,82 @@ import nerb
 import nerb.engine as engine_module
 
 
+class _FakeNativeBank:
+    def __init__(self) -> None:
+        self.metadata_calls = 0
+        self.detector_metadata_calls: list[int] = []
+        self.path: str | None = None
+        self._detectors = (
+            ("NAME", "Alpha", "Alpha"),
+            ("NAME", "Beta", "Beta"),
+        )
+        self._metadata = {
+            "detectors": [
+                {
+                    "detector_index": 0,
+                    "entity": "NAME",
+                    "canonical_name": "Alpha",
+                    "surface_name": "Alpha",
+                },
+                {
+                    "detector_index": 1,
+                    "entity": "NAME",
+                    "canonical_name": "Beta",
+                    "surface_name": "Beta",
+                },
+            ]
+        }
+
+    def metadata(self):
+        self.metadata_calls += 1
+        return json.loads(json.dumps(self._metadata))
+
+    def detector_metadata(self, detector_index):
+        self.detector_metadata_calls.append(detector_index)
+        return self._detectors[detector_index]
+
+    def scan_bytes(self, source):
+        return self._matches(source)
+
+    def scan_path_with_bytes(self, path):
+        self.path = path
+        source = b"Beta Alpha"
+        return self._matches(source), source
+
+    @staticmethod
+    def _matches(source):
+        matches = []
+        for detector_index, token in enumerate((b"Alpha", b"Beta")):
+            start = source.find(token)
+            while start >= 0:
+                matches.append((detector_index, start, start + len(token)))
+                start = source.find(token, start + len(token))
+        return matches
+
+
+def _fake_scan_records():
+    return [
+        {
+            "entity": "NAME",
+            "canonical_name": "Beta",
+            "surface_name": "Beta",
+            "string": "Beta",
+            "start": 0,
+            "end": 4,
+            "offset_unit": "byte",
+        },
+        {
+            "entity": "NAME",
+            "canonical_name": "Alpha",
+            "surface_name": "Alpha",
+            "string": "Alpha",
+            "start": 5,
+            "end": 10,
+            "offset_unit": "byte",
+        },
+    ]
+
+
 def test_native_engine_module_imports():
     engine = importlib.import_module("nerb._engine")
 
@@ -49,6 +125,36 @@ def test_public_bank_projects_byte_and_char_records_and_scans_paths(tmp_path):
     assert bank.scan_path(document_path) == bank.scan_text("Café Rush")
 
 
+def test_public_bank_lazily_caches_detector_projection_for_repeated_scans():
+    native = _FakeNativeBank()
+    bank = nerb.Bank(native)
+
+    assert native.metadata_calls == 0
+    assert bank.scan_bytes(b"no matches") == []
+    assert native.detector_metadata_calls == []
+
+    assert [record["start"] for record in bank.scan_bytes(b"Alpha Alpha")] == [0, 6]
+    assert native.detector_metadata_calls == [0]
+    assert bank.scan_bytes(b"Beta Alpha") == _fake_scan_records()
+    assert bank.scan_text("Beta Alpha") == _fake_scan_records()
+    assert native.detector_metadata_calls == [0, 1]
+    assert native.metadata_calls == 0
+
+
+def test_public_bank_metadata_mutation_cannot_change_cached_scan_projection():
+    native = _FakeNativeBank()
+    bank = nerb.Bank(native)
+
+    metadata = bank.metadata()
+    metadata["detectors"][0]["entity"] = "MUTATED"
+    metadata["detectors"].clear()
+
+    assert native.metadata_calls == 1
+    assert bank.scan_text("Beta Alpha") == _fake_scan_records()
+    assert native.metadata_calls == 1
+    assert bank.metadata()["detectors"][0]["entity"] == "NAME"
+
+
 def test_public_bank_bounded_scan_stops_native_match_collection() -> None:
     bank = nerb.Bank.from_source_bytes(b'{"CODE":{"A":"A"}}', format_hint="json")
 
@@ -63,50 +169,14 @@ def test_public_bank_bounded_scan_stops_native_match_collection() -> None:
 
 
 def test_public_bank_scan_path_projects_native_scanned_bytes(tmp_path):
-    class Raw:
-        def __len__(self):
-            return 1
-
-        def __getitem__(self, index):
-            assert index == 0
-            return (0, 0, 5)
-
-    class Native:
-        def __init__(self):
-            self.path = None
-
-        def scan_path_with_bytes(self, path):
-            self.path = path
-            return Raw(), b"Alpha"
-
-        def metadata(self):
-            return {
-                "detectors": [
-                    {
-                        "detector_index": 0,
-                        "entity": "CODE",
-                        "canonical_name": "Alpha",
-                        "surface_name": "Alpha",
-                    }
-                ]
-            }
-
-    native = Native()
+    native = _FakeNativeBank()
     bank = nerb.Bank(native)
     missing_path = tmp_path / "missing.txt"
 
-    assert bank.scan_path(missing_path) == [
-        {
-            "entity": "CODE",
-            "canonical_name": "Alpha",
-            "surface_name": "Alpha",
-            "string": "Alpha",
-            "start": 0,
-            "end": 5,
-            "offset_unit": "byte",
-        }
-    ]
+    assert bank.scan_path(missing_path) == _fake_scan_records()
     assert native.path == str(missing_path)
+    assert native.detector_metadata_calls == [0, 1]
+    assert native.metadata_calls == 0
 
 
 def test_public_bank_scan_path_rejects_invalid_utf8(tmp_path):

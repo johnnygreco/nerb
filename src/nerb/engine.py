@@ -7,7 +7,7 @@ import sys
 import sysconfig
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -85,6 +85,7 @@ class Bank:
         self._native = native_bank
         self._cache_key = cache_key
         self._cache_hit = cache_hit
+        self._detector_projection: dict[int, tuple[str, str, str]] = {}
 
     @classmethod
     def from_source_bytes(
@@ -377,7 +378,13 @@ class Bank:
     ) -> list[dict[str, Any]]:
         text_bytes = bytes(haystack)
         raw = self._scan_native_bytes(text_bytes, max_matches=max_matches)
-        return _project_raw_matches(self.metadata(), raw, text_bytes, offset_unit="byte")
+        return _project_raw_matches(
+            self._detector_projection,
+            self._native.detector_metadata,
+            raw,
+            text_bytes,
+            offset_unit="byte",
+        )
 
     def scan_text(
         self,
@@ -393,7 +400,13 @@ class Bank:
 
         text_bytes = text.encode("utf-8")
         raw = self._scan_native_bytes(text_bytes, max_matches=max_matches)
-        records = _project_raw_matches(self.metadata(), raw, text_bytes, offset_unit="byte")
+        records = _project_raw_matches(
+            self._detector_projection,
+            self._native.detector_metadata,
+            raw,
+            text_bytes,
+            offset_unit="byte",
+        )
         if offsets == "byte":
             return records
         return _project_char_offsets(records, text)
@@ -408,7 +421,13 @@ class Bank:
     def scan_path(self, path: str | Path) -> list[dict[str, Any]]:
         source_path = Path(path).expanduser()
         raw, source = self._native.scan_path_with_bytes(str(source_path))
-        return _project_raw_matches(self.metadata(), raw, bytes(source), offset_unit="byte")
+        return _project_raw_matches(
+            self._detector_projection,
+            self._native.detector_metadata,
+            raw,
+            bytes(source),
+            offset_unit="byte",
+        )
 
 
 def clear_bank_cache() -> None:
@@ -664,22 +683,27 @@ def _flag_list(raw_flags: Any) -> list[str]:
 
 
 def _project_raw_matches(
-    metadata: Mapping[str, Any],
+    detector_projection: dict[int, tuple[str, str, str]],
+    detector_metadata: Callable[[int], tuple[str, str, str]],
     raw: Any,
     text_bytes: bytes,
     *,
     offset_unit: OffsetUnit,
 ) -> list[dict[str, Any]]:
-    detectors = {detector["detector_index"]: detector for detector in metadata["detectors"]}
     records: list[dict[str, Any]] = []
     for index in range(len(raw)):
         detector_index, start, end = raw[index]
-        detector = detectors[detector_index]
+        detector = detector_projection.get(detector_index)
+        if detector is None:
+            entity, canonical_name, surface_name = detector_metadata(detector_index)
+            detector = (str(entity), str(canonical_name), str(surface_name))
+            detector_projection[detector_index] = detector
+        entity, canonical_name, surface_name = detector
         records.append(
             {
-                "entity": detector["entity"],
-                "canonical_name": detector["canonical_name"],
-                "surface_name": detector["surface_name"],
+                "entity": entity,
+                "canonical_name": canonical_name,
+                "surface_name": surface_name,
                 "string": text_bytes[start:end].decode("utf-8"),
                 "start": start,
                 "end": end,
