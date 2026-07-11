@@ -2278,6 +2278,192 @@ def test_typed_gates_recompute_target_actual_and_result(evidence: JsonObject, mu
     _assert_code(validate_enron_evidence(evidence), code)
 
 
+def test_gate_actual_must_be_an_exact_copy_of_its_target(evidence: JsonObject) -> None:
+    check = evidence["promotion"]["checks"][3]
+    check["actual"] = math.nextafter(check["actual"], math.inf)
+
+    _assert_code(validate_enron_evidence(evidence), "contract.gate_actual")
+
+
+@pytest.mark.parametrize(
+    ("actual", "operator", "threshold"),
+    [
+        (2**53 + 1, "eq", 2**53),
+        (2**53, "gte", 2**53 + 1),
+        (2**53 + 1, "lte", 2**53),
+    ],
+)
+def test_gate_comparisons_preserve_large_integer_precision(actual: int, operator: str, threshold: int) -> None:
+    assert enron_contract._compare_gate(actual, operator, threshold) is False
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "/performance/comparisons/0/candidate_value",
+        "/performance/breakeven_models/0/candidate_fixed_value",
+        "/performance/inputs/0/document_length_distribution/mean_bytes",
+    ],
+)
+def test_performance_gates_cannot_target_tolerance_accepted_display_fields(
+    manifest: JsonObject, evidence: JsonObject, target: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    actual = _resolve_pointer(promoted, target)
+    promoted["promotion"]["checks"].append(
+        _gate(
+            "unsupported_performance_display_gate",
+            "performance",
+            target,
+            "gte",
+            actual,
+            actual,
+        )
+    )
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.gate_target",
+    )
+
+
+def test_claim_cannot_round_quality_in_the_favorable_direction(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, value, inventories = _real_nonpromoted(manifest, evidence)
+    claim = next(item for item in value["promotion"]["claims"] if item["metric"] == "open_world_recall")
+    claim["value"] = math.nextafter(claim["value"], math.inf)
+
+    _assert_code(
+        _validate_promoted(value, bound_manifest, inventories),
+        "contract.unsupported_claim",
+    )
+
+
+def test_quality_gate_uses_exact_count_ratio_at_gte_threshold(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    quality = promoted["quality"]["slices"][0]
+    quality.update(
+        {
+            "gold_spans": 2_000_000_001,
+            "true_positive": 1_900_000_000,
+            "false_negative": 100_000_001,
+            "false_positive": 10,
+            "predicted_spans": 1_900_000_010,
+            "cataloged_gold_spans": 1_600_000_001,
+            "cataloged_true_positive": 1_600_000_001,
+        }
+    )
+    quality["metrics"].update(
+        {
+            "precision": quality["true_positive"] / quality["predicted_spans"],
+            "open_world_recall": 0.95,
+            "f1": 2
+            * quality["true_positive"]
+            / (2 * quality["true_positive"] + quality["false_positive"] + quality["false_negative"]),
+            "catalog_coverage": quality["cataloged_gold_spans"] / quality["gold_spans"],
+            "cataloged_recall": 1.0,
+        }
+    )
+    label = bound_manifest["labels"][0]
+    next(item for item in label["role_populations"] if item["role"] == "test")["spans"] = quality["gold_spans"]
+    label["span_count"] = quality["gold_spans"]
+    plan = bound_manifest["quality_plan"][0]
+    plan["gold_spans"] = quality["gold_spans"]
+    plan["cataloged_gold_spans"] = quality["cataloged_gold_spans"]
+    for claim in promoted["promotion"]["claims"]:
+        if claim["kind"] == "open_world_quality":
+            claim["value"] = quality["metrics"][claim["metric"]]
+    _refresh_check_actuals(promoted, target_prefix="/quality/")
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    exact_recall = quality["true_positive"] / quality["gold_spans"]
+    assert exact_recall < 0.95
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+
+    assert "contract.metric_arithmetic" not in _codes(result)
+    assert "contract.unsupported_claim" in _codes(result)
+    _assert_code(result, "contract.gate_result")
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_performance_gate_uses_raw_samples_at_lte_threshold(
+    manifest: JsonObject, evidence: JsonObject, referenced: bool
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
+    candidate = workloads["direct_bank_latency"]
+    baseline = workloads["baseline_direct_bank_latency"]
+    candidate["samples_seconds"] = sorted(candidate["samples_seconds"])
+    candidate["samples_seconds"][-2:] = [0.05000000002, 0.05000000003]
+    baseline["samples_seconds"] = sorted(baseline["samples_seconds"])
+    baseline["samples_seconds"][-2:] = [0.06000000002, 0.06000000003]
+    _refresh_workload(promoted, candidate)
+    raw_p99 = candidate["stats"]["p99_seconds"]
+    _refresh_workload(promoted, baseline)
+    candidate["stats"]["p99_seconds"] = 0.05
+
+    comparison = next(
+        item
+        for item in promoted["performance"]["comparisons"]
+        if item["candidate_workload_id"] == candidate["id"] and item["metric"] == "p99_seconds"
+    )
+    candidate_value = candidate["stats"]["p99_seconds"]
+    baseline_value = baseline["stats"]["p99_seconds"]
+    relative_degradation = (candidate_value - baseline_value) / baseline_value
+    noise_floor = (
+        max(
+            candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
+            baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
+        )
+        * comparison["noise_multiplier"]
+    )
+    boundary = noise_floor + comparison["regression_tolerance"]
+    comparison.update(
+        {
+            "candidate_value": candidate_value,
+            "baseline_value": baseline_value,
+            "relative_degradation": relative_degradation,
+            "noise_floor": noise_floor,
+            "result": (
+                "regressed"
+                if relative_degradation > boundary
+                else "improved"
+                if relative_degradation < -boundary
+                else "equivalent_within_noise"
+            ),
+        }
+    )
+    candidate_index = promoted["performance"]["workloads"].index(candidate)
+    _refresh_check_actuals(promoted, target_prefix=f"/performance/workloads/{candidate_index}/")
+    for claim in promoted["promotion"]["claims"]:
+        if claim["kind"] == "performance" and claim["performance_workload_id"] == candidate["id"]:
+            claim["value"] = candidate["stats"]["p99_seconds"]
+
+    referenced_samples = None
+    if referenced:
+        samples = list(candidate["samples_seconds"])
+        candidate["samples_seconds"] = []
+        candidate["samples_ref"] = {
+            "id": "boundary_samples",
+            "sha256": hash_enron_samples(samples),
+            "bytes": _sample_payload_bytes(samples),
+        }
+        referenced_samples = {"boundary_samples": samples}
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    assert raw_p99 > 0.05
+    result = _validate_promoted(
+        promoted,
+        bound_manifest,
+        inventories,
+        referenced_samples=referenced_samples,
+    )
+
+    assert "contract.performance_arithmetic" not in _codes(result)
+    assert "contract.unsupported_claim" in _codes(result)
+    _assert_code(result, "contract.gate_result")
+
+
 def test_threshold_hash_binds_typed_gate_configuration(evidence: JsonObject) -> None:
     evidence["promotion"]["checks"][3]["threshold"] = 0.99
 

@@ -338,7 +338,12 @@ is an error.
 Quality is explicitly `evaluated` or `not_evaluated`. Missing slices, zero eligible gold, absent independent labels, and
 empty conformance cases cannot silently become zero-filled success. Non-finite numbers are invalid. A verifier recomputes
 all possible rates from integer counts, checks totals and slice identities, checks manifest/evidence hashes and version
-freshness, validates gate implications, and rejects any claim whose scope or label strength exceeds its evidence. This
+freshness, evaluates gates from recomputed source values rather than declared derived scalars, and rejects any claim
+whose scope or label strength exceeds its evidence. Count-derived quality gates use exact rational comparisons against
+their frozen decimal thresholds; performance gates, comparisons, value-model inputs, and claims reuse statistics
+recomputed from the verified raw timing samples. Gate actuals must exactly copy their public targets, and tolerated
+numeric serialization drift can never round a structured claim in the favorable direction. Performance gates may
+target only those recomputed workload statistics or raw peak RSS, not downstream display fields. This
 lets a clean clone verify arithmetic and claim consistency without access to private email text.
 
 The schema and synthetic fixtures are part of the v2 contract, but a schema-valid fixture is not real-corpus evidence.

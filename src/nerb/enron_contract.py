@@ -13,6 +13,7 @@ import os
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
+from fractions import Fraction
 from hashlib import sha256
 from heapq import nsmallest
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -88,6 +89,17 @@ PERFORMANCE_PHASE_PROCESS_MODELS = {
     "helper_cache_hit": "reused_process",
     "direct_bank_scan": "reused_process",
     "end_to_end": "fresh_process_per_sample",
+}
+PERFORMANCE_GATE_STAT_FIELDS = {
+    "sample_count",
+    "median_seconds",
+    "p95_seconds",
+    "p99_seconds",
+    "mad_seconds",
+    "documents_per_second",
+    "mib_per_second",
+    "records_per_second",
+    "seconds_per_document",
 }
 PERFORMANCE_SCALE_ALIASES = (1_000, 10_000, 25_000, 100_000)
 MIN_DECISION_GRADE_SAMPLES = 100
@@ -1539,6 +1551,7 @@ def validate_enron_evidence(
     conformance = evidence["catalog_conformance"]
     performance = evidence["performance"]
     promotion = evidence["promotion"]
+    recomputed_performance_stats: dict[str, Mapping[str, Any]] = {}
     sample_resolver = referenced_samples if _is_external_resolver(referenced_samples) else None
     inventory_resolver = referenced_input_inventories if _is_external_resolver(referenced_input_inventories) else None
     if referenced_samples is not None and sample_resolver is None:
@@ -1577,11 +1590,12 @@ def validate_enron_evidence(
             evidence["commands"],
             sample_resolver,
             inventory_resolver,
+            recomputed_performance_stats,
             promotion_passed=promotion["passed"] or evidence["verifier"]["passed"],
         )
     )
-    diagnostics.extend(_gate_diagnostics(evidence))
-    diagnostics.extend(_promotion_diagnostics(evidence))
+    diagnostics.extend(_gate_diagnostics(evidence, recomputed_performance_stats))
+    diagnostics.extend(_promotion_diagnostics(evidence, recomputed_performance_stats))
     if promotion["passed"] or evidence["verifier"]["passed"]:
         diagnostics.extend(_decision_grade_diagnostics(evidence, manifest))
     if manifest is not None:
@@ -2976,6 +2990,7 @@ def _performance_diagnostics(
     commands: Sequence[Mapping[str, Any]],
     referenced_samples: Mapping[str, Sequence[float]] | None,
     referenced_input_inventories: Mapping[str, Sequence[Mapping[str, int]]] | None,
+    recomputed_statistics: dict[str, Mapping[str, Any]],
     *,
     promotion_passed: bool,
 ) -> list[Diagnostic]:
@@ -3345,6 +3360,7 @@ def _performance_diagnostics(
             workload["sample_unit"],
             workload["work_per_sample"],
         )
+        recomputed_statistics[str(workload["id"])] = expected
         for field, value in expected.items():
             if not _same_metric(stats[field], value):
                 diagnostics.append(
@@ -3438,8 +3454,16 @@ def _performance_diagnostics(
                     "Promoted decision-grade denominators require all referenced input inventories.",
                 )
             )
-    diagnostics.extend(_performance_comparison_diagnostics(comparisons, workloads, baseline_by_id, harness_by_id))
-    diagnostics.extend(_performance_breakeven_diagnostics(breakeven_models, workloads))
+    diagnostics.extend(
+        _performance_comparison_diagnostics(
+            comparisons,
+            workloads,
+            baseline_by_id,
+            harness_by_id,
+            recomputed_statistics,
+        )
+    )
+    diagnostics.extend(_performance_breakeven_diagnostics(breakeven_models, workloads, recomputed_statistics))
     return diagnostics
 
 
@@ -3630,6 +3654,7 @@ def _performance_comparison_diagnostics(
     workloads: Sequence[Mapping[str, Any]],
     baseline_by_id: Mapping[str, Mapping[str, Any]],
     harness_by_id: Mapping[str, Mapping[str, Any]],
+    recomputed_statistics: Mapping[str, Mapping[str, Any]],
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     workload_by_id = {str(item["id"]): item for item in workloads}
@@ -3696,8 +3721,10 @@ def _performance_comparison_diagnostics(
             )
             continue
         metric = str(comparison["metric"])
-        candidate_value = candidate["stats"][metric]
-        baseline_value = baseline["stats"][metric]
+        candidate_stats = recomputed_statistics.get(str(candidate["id"]), candidate["stats"])
+        baseline_stats = recomputed_statistics.get(str(baseline["id"]), baseline["stats"])
+        candidate_value = candidate_stats[metric]
+        baseline_value = baseline_stats[metric]
         direction = "lower_is_better" if metric in lower_is_better else "higher_is_better"
         if candidate_value is None or baseline_value is None or not baseline_value:
             diagnostics.append(
@@ -3715,8 +3742,8 @@ def _performance_comparison_diagnostics(
         )
         noise_floor = (
             max(
-                candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
-                baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
+                candidate_stats["mad_seconds"] / candidate_stats["median_seconds"],
+                baseline_stats["mad_seconds"] / baseline_stats["median_seconds"],
             )
             * comparison["noise_multiplier"]
         )
@@ -3755,7 +3782,9 @@ def _performance_comparison_diagnostics(
 
 
 def _performance_breakeven_diagnostics(
-    models: Sequence[Mapping[str, Any]], workloads: Sequence[Mapping[str, Any]]
+    models: Sequence[Mapping[str, Any]],
+    workloads: Sequence[Mapping[str, Any]],
+    recomputed_statistics: Mapping[str, Mapping[str, Any]],
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     workload_by_id = {str(item["id"]): item for item in workloads}
@@ -3783,7 +3812,7 @@ def _performance_breakeven_diagnostics(
         referenced_bank_hashes: set[str] = set()
         for component_index, component in enumerate(components):
             component_path = f"{path}/components/{component_index}"
-            expected_value = _breakeven_component_value(component, model, workload_by_id)
+            expected_value = _breakeven_component_value(component, model, workload_by_id, recomputed_statistics)
             if expected_value is None:
                 diagnostics.append(
                     _error(
@@ -3883,6 +3912,7 @@ def _breakeven_component_value(
     component: Mapping[str, Any],
     model: Mapping[str, Any],
     workload_by_id: Mapping[str, Mapping[str, Any]],
+    recomputed_statistics: Mapping[str, Mapping[str, Any]],
 ) -> float | None:
     source = str(component["source"])
     category = str(component["category"])
@@ -3907,6 +3937,7 @@ def _breakeven_component_value(
     workload = workload_by_id.get(str(workload_id))
     if workload is None:
         return None
+    workload_statistics = recomputed_statistics.get(str(workload["id"]), workload["stats"])
     candidate_side = component["side"] == "candidate"
     if candidate_side != (workload["baseline_id"] is None):
         return None
@@ -3918,7 +3949,7 @@ def _breakeven_component_value(
         }.get(category)
         if component["application"] != "fixed" or expected_phase is None or workload["phase"] != expected_phase:
             return None
-        return float(workload["stats"]["median_seconds"])
+        return float(workload_statistics["median_seconds"])
     if component["application"] != "per_unit" or category != "scan" or workload["phase"] != "direct_bank_scan":
         return None
     metric_by_source = {
@@ -3930,7 +3961,7 @@ def _breakeven_component_value(
     expected_unit, metric = metric_by_source[source]
     if model["parameter_unit"] != expected_unit:
         return None
-    metric_value = workload["stats"][metric]
+    metric_value = workload_statistics[metric]
     if metric_value is None or metric_value <= 0:
         return None
     if source in {"workload_seconds_per_mib", "workload_seconds_per_record"}:
@@ -4430,7 +4461,9 @@ def _performance_promotion_diagnostics(
     return diagnostics, required_gate_specs
 
 
-def _gate_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
+def _gate_diagnostics(
+    evidence: Mapping[str, Any], recomputed_statistics: Mapping[str, Mapping[str, Any]]
+) -> list[Diagnostic]:
     promotion = evidence["promotion"]
     diagnostics: list[Diagnostic] = []
     checks = promotion["checks"]
@@ -4471,6 +4504,15 @@ def _gate_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 )
             )
             continue
+        if check["category"] == "performance" and not _supported_performance_gate_target(check["target"]):
+            diagnostics.append(
+                _error(
+                    "contract.gate_target",
+                    f"{path}/target",
+                    "Performance gates must target a recomputed workload statistic or raw peak RSS.",
+                )
+            )
+            continue
         try:
             actual = _resolve_pointer(evidence, check["target"])
         except (KeyError, IndexError, TypeError, ValueError):
@@ -4478,7 +4520,7 @@ def _gate_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 _error("contract.gate_target", f"{path}/target", "Gate target does not resolve to evidence.")
             )
             continue
-        if not _same_scalar(check["actual"], actual):
+        if not _same_json_scalar(check["actual"], actual):
             diagnostics.append(
                 _error(
                     "contract.gate_actual",
@@ -4486,7 +4528,8 @@ def _gate_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                     "Declared gate actual value differs from the targeted evidence value.",
                 )
             )
-        expected_pass = _compare_gate(actual, check["operator"], check["threshold"])
+        comparison_actual = _recomputed_gate_value(evidence, check["target"], actual, recomputed_statistics)
+        expected_pass = _compare_gate(comparison_actual, check["operator"], check["threshold"])
         if expected_pass is None:
             diagnostics.append(
                 _error(
@@ -4500,10 +4543,124 @@ def _gate_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 _error(
                     "contract.gate_result",
                     f"{path}/passed",
-                    "Gate result does not match the recomputed comparison.",
+                    "Gate result does not match the recomputed source-value comparison.",
                 )
             )
     return diagnostics
+
+
+def _supported_performance_gate_target(target: str) -> bool:
+    parts = target.split("/")
+    if len(parts) == 5 and parts[1:3] == ["performance", "workloads"]:
+        return parts[3].isdigit() and parts[4] == "peak_rss_bytes"
+    return (
+        len(parts) == 6
+        and parts[1:3] == ["performance", "workloads"]
+        and parts[3].isdigit()
+        and parts[4] == "stats"
+        and parts[5] in PERFORMANCE_GATE_STAT_FIELDS
+    )
+
+
+def _recomputed_gate_value(
+    evidence: Mapping[str, Any],
+    target: str,
+    stored_value: Any,
+    recomputed_statistics: Mapping[str, Mapping[str, Any]],
+) -> Any:
+    parts = target.split("/")
+    if len(parts) == 6 and parts[1:3] == ["quality", "slices"] and parts[4] == "metrics":
+        try:
+            item = evidence["quality"]["slices"][int(parts[3])]
+        except (IndexError, TypeError, ValueError):
+            return stored_value
+        metric_value = _quality_gate_metric_value(item, parts[5])
+        return stored_value if metric_value is _UNSUPPORTED_GATE_SOURCE else metric_value
+    if target == "/catalog_conformance/recall":
+        conformance = evidence["catalog_conformance"]
+        support = conformance["approved_positive_cases"]
+        return Fraction(conformance["correctly_mapped"], support) if support else None
+    if len(parts) == 6 and parts[1:3] == ["performance", "workloads"] and parts[4] == "stats":
+        return _recomputed_performance_gate_value(
+            evidence,
+            parts[3],
+            parts[5],
+            stored_value,
+            recomputed_statistics,
+        )
+    return stored_value
+
+
+_UNSUPPORTED_GATE_SOURCE = object()
+
+
+def _quality_gate_metric_value(item: Mapping[str, Any], field: str) -> Fraction | None | object:
+    open_world_eligible = (
+        item["label_strength"] == "independent" and item["annotation_completeness"] == "exhaustive_within_scope"
+    )
+    open_world_fields = {
+        "precision",
+        "open_world_recall",
+        "f1",
+        "document_leak_rate",
+        "cataloged_document_leak_rate",
+        "sensitive_character_recall",
+        "sensitive_character_leak_rate",
+        "negative_document_false_alarm_rate",
+        "over_redaction_rate",
+    }
+    if field in open_world_fields and not open_world_eligible:
+        return None
+    ratios = {
+        "precision": (item["true_positive"], item["predicted_spans"]),
+        "open_world_recall": (item["true_positive"], item["gold_spans"]),
+        "f1": (
+            2 * item["true_positive"],
+            2 * item["true_positive"] + item["false_positive"] + item["false_negative"],
+        ),
+        "catalog_coverage": (item["cataloged_gold_spans"], item["gold_spans"]),
+        "cataloged_recall": (item["cataloged_true_positive"], item["cataloged_gold_spans"]),
+        "document_leak_rate": (item["documents_with_any_miss"], item["documents_with_sensitive_gold"]),
+        "cataloged_document_leak_rate": (
+            item["documents_with_any_cataloged_miss"],
+            item["documents_with_cataloged_gold"],
+        ),
+        "sensitive_character_recall": (
+            item["covered_sensitive_characters"],
+            item["sensitive_gold_characters"],
+        ),
+        "sensitive_character_leak_rate": (
+            item["leaked_sensitive_characters"],
+            item["sensitive_gold_characters"],
+        ),
+        "negative_document_false_alarm_rate": (
+            item["negative_documents_with_predictions"],
+            item["negative_documents"],
+        ),
+        "over_redaction_rate": (item["over_redacted_characters"], item["evaluated_characters"]),
+    }
+    ratio = ratios.get(field)
+    if ratio is None:
+        return _UNSUPPORTED_GATE_SOURCE
+    numerator, denominator = ratio
+    return Fraction(numerator, denominator) if denominator else None
+
+
+def _recomputed_performance_gate_value(
+    evidence: Mapping[str, Any],
+    workload_index: str,
+    field: str,
+    stored_value: Any,
+    recomputed_statistics: Mapping[str, Mapping[str, Any]],
+) -> Any:
+    try:
+        workload = evidence["performance"]["workloads"][int(workload_index)]
+    except (IndexError, TypeError, ValueError):
+        return stored_value
+    statistics = recomputed_statistics.get(str(workload["id"]))
+    if statistics is None:
+        return stored_value
+    return statistics[field] if field in statistics else stored_value
 
 
 def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any] | None) -> list[Diagnostic]:
@@ -4602,7 +4759,7 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
         if check is None:
             continue
         if check["operator"] != operator or (
-            exact_threshold is not None and not _same_scalar(check["threshold"], exact_threshold)
+            exact_threshold is not None and not _same_json_scalar(check["threshold"], exact_threshold)
         ):
             diagnostics.append(
                 _error(
@@ -4669,9 +4826,11 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
     return diagnostics
 
 
-def _promotion_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
+def _promotion_diagnostics(
+    evidence: Mapping[str, Any], recomputed_statistics: Mapping[str, Mapping[str, Any]]
+) -> list[Diagnostic]:
     promotion = evidence["promotion"]
-    diagnostics = _claim_diagnostics(evidence)
+    diagnostics = _claim_diagnostics(evidence, recomputed_statistics)
     if promotion["claims"] and not evidence["verifier"]["passed"]:
         diagnostics.append(
             _error(
@@ -4873,7 +5032,9 @@ def _quality_decision_grade_diagnostics(
     return diagnostics, required_gate_specs
 
 
-def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
+def _claim_diagnostics(
+    evidence: Mapping[str, Any], recomputed_statistics: Mapping[str, Mapping[str, Any]]
+) -> list[Diagnostic]:
     claims = evidence["promotion"]["claims"]
     diagnostics = _duplicate_id_diagnostics(claims, "/promotion/claims", "claim")
     decision_grade = evidence["promotion"]["passed"] or evidence["verifier"]["passed"]
@@ -4898,6 +5059,14 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
         "sensitive_character_leak_rate",
         "negative_document_false_alarm_rate",
         "over_redaction_rate",
+    }
+    higher_is_better_quality = {
+        "precision",
+        "open_world_recall",
+        "f1",
+        "catalog_coverage",
+        "cataloged_recall",
+        "sensitive_character_recall",
     }
     performance_metrics = {
         "direct_bank_scan_median_seconds": "median_seconds",
@@ -4930,6 +5099,11 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                     )
                 )
         if claim["kind"] == "catalog_conformance":
+            conformance = evidence["catalog_conformance"]
+            conformance_support = conformance["approved_positive_cases"]
+            canonical_conformance_value = (
+                Fraction(conformance["correctly_mapped"], conformance_support) if conformance_support else None
+            )
             valid = (
                 claim["metric"] == "catalog_conformance_recall"
                 and claim["quality_slice_id"] is None
@@ -4938,7 +5112,12 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 and claim["label_strength"] == "synthetic_conformance"
                 and claim["annotation_completeness"] == "exhaustive_within_scope"
                 and claim["bank_hash"] == evidence["bank"]["canonical_hash"]
-                and _same_metric(claim["value"], evidence["catalog_conformance"]["recall"])
+                and _claim_value_supported(
+                    claim["value"],
+                    conformance["recall"],
+                    canonical_conformance_value,
+                    higher_is_better=True,
+                )
                 and (not decision_grade or evidence["catalog_conformance"]["passed"])
             )
         elif claim["kind"] == "open_world_quality":
@@ -4956,6 +5135,11 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
             expected_value = (
                 None if item is None or claim["metric"] not in quality_metrics else item["metrics"][claim["metric"]]
             )
+            canonical_quality_value = (
+                _UNSUPPORTED_GATE_SOURCE
+                if item is None or claim["metric"] not in quality_metrics
+                else _quality_gate_metric_value(item, str(claim["metric"]))
+            )
             valid = (
                 item is not None
                 and claim["metric"] in quality_metrics
@@ -4965,13 +5149,22 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 and claim["annotation_completeness"] == item["annotation_completeness"] == "exhaustive_within_scope"
                 and claim["bank_hash"] == evidence["bank"]["canonical_hash"]
                 and expected_value is not None
-                and _same_metric(claim["value"], expected_value)
+                and _claim_value_supported(
+                    claim["value"],
+                    expected_value,
+                    canonical_quality_value,
+                    higher_is_better=claim["metric"] in higher_is_better_quality,
+                )
                 and (not decision_grade or item["promotion_gate"])
             )
         else:
             workload = workloads.get(str(claim["performance_workload_id"]))
             stat_field = performance_metrics.get(str(claim["metric"]))
             expected_value = None if workload is None or stat_field is None else workload["stats"][stat_field]
+            canonical_stats = None if workload is None else recomputed_statistics.get(str(workload["id"]))
+            canonical_performance_value = (
+                None if canonical_stats is None or stat_field is None else canonical_stats[stat_field]
+            )
             valid = (
                 workload is not None
                 and workload["phase"] == "direct_bank_scan"
@@ -4982,7 +5175,12 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 and claim["annotation_completeness"] == "not_applicable"
                 and claim["bank_hash"] == workload["bank_hash"]
                 and expected_value is not None
-                and _same_metric(claim["value"], expected_value)
+                and _claim_value_supported(
+                    claim["value"],
+                    expected_value,
+                    canonical_performance_value,
+                    higher_is_better=claim["metric"] in throughput_metrics,
+                )
                 and (
                     (claim["metric"] in document_metrics and workload["sample_unit"] == "document")
                     or (claim["metric"] in throughput_metrics and workload["sample_unit"] == "whole_input")
@@ -5005,6 +5203,29 @@ def _claim_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
                 )
             )
     return diagnostics
+
+
+def _claim_value_supported(
+    claimed_value: Any,
+    stored_value: Any,
+    canonical_value: Any,
+    *,
+    higher_is_better: bool,
+) -> bool:
+    if (
+        canonical_value is _UNSUPPORTED_GATE_SOURCE
+        or canonical_value is None
+        or not _same_json_scalar(claimed_value, stored_value)
+        or not _same_metric(claimed_value, canonical_value)
+    ):
+        return False
+    if isinstance(canonical_value, Fraction):
+        try:
+            exact_claim = Fraction(str(claimed_value))
+        except (ValueError, ZeroDivisionError):
+            return False
+        return exact_claim <= canonical_value if higher_is_better else exact_claim >= canonical_value
+    return claimed_value <= canonical_value if higher_is_better else claimed_value >= canonical_value
 
 
 def _binding_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[Diagnostic]:
@@ -5534,9 +5755,30 @@ def _same_scalar(actual: Any, expected: Any) -> bool:
     return type(actual) is type(expected) and actual == expected
 
 
+def _same_json_scalar(actual: Any, expected: Any) -> bool:
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        return actual == expected
+    return type(actual) is type(expected) and actual == expected
+
+
 def _compare_gate(actual: Any, operator: str, threshold: Any) -> bool | None:
+    if isinstance(actual, Fraction):
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            return None
+        try:
+            threshold_value = float(threshold)
+            exact_threshold = Fraction(str(threshold))
+        except (OverflowError, ValueError, ZeroDivisionError):
+            return None
+        if not math.isfinite(threshold_value):
+            return None
+        if operator == "eq":
+            return actual == exact_threshold
+        return actual >= exact_threshold if operator == "gte" else actual <= exact_threshold
     if operator == "eq":
-        return _same_scalar(actual, threshold)
+        return _same_json_scalar(actual, threshold)
     if (
         isinstance(actual, bool)
         or isinstance(threshold, bool)
@@ -5544,14 +5786,11 @@ def _compare_gate(actual: Any, operator: str, threshold: Any) -> bool | None:
         or not isinstance(threshold, (int, float))
     ):
         return None
-    try:
-        actual_value = float(actual)
-        threshold_value = float(threshold)
-    except (OverflowError, ValueError):
+    if (isinstance(actual, float) and not math.isfinite(actual)) or (
+        isinstance(threshold, float) and not math.isfinite(threshold)
+    ):
         return None
-    if not math.isfinite(actual_value) or not math.isfinite(threshold_value):
-        return None
-    return actual_value >= threshold_value if operator == "gte" else actual_value <= threshold_value
+    return actual >= threshold if operator == "gte" else actual <= threshold
 
 
 def _resolve_pointer(value: Any, pointer: str) -> Any:
