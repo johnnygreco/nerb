@@ -109,15 +109,13 @@ lineage are recorded; and the aggregate result passes privacy and integrity veri
 the compile-once/scan-many runtime path. It is not a recall claim or final publication approval: quality, full-source
 capacity, and the one-shot sealed evaluation retain their own gates.
 
-The recorded decision profile passed the plan bound to its existing hashes on Apple M4 arm64 hardware with 10 logical
-CPUs, 16 GiB RAM, macOS, and Python 3.13.12. Its measurements remain unchanged below while the exact-block protocol is
-adopted, but a refreshed run must pass the current protocol before these results can support promotion. The run used
-package and native engine 0.0.11 at clean commit
-`270c5e1fddcd9afecf1c15df118e172325c540a6`, passed its aggregate privacy scan with zero violations, and recorded
+The recorded decision profile passed the frozen exact-block plan on Apple M4 arm64 hardware with 10 logical CPUs,
+16 GiB RAM, macOS, and Python 3.13.12. The run used package and native engine 0.0.11 at clean commit
+`7dd1128d3b2f7ade7caf86b7fc5d9cb633e05f0b`, passed its aggregate privacy scan with zero violations, and recorded
 `sealed_test_accessed: false`. Its frozen plan is
-`sha256:f28c6a1d24515ad942f8601f59de01f94fe06b1ce17638e9a7f2b7ceb3ee0693`, its performance manifest is
-`sha256:f19018f5a897d1b7ef285e9874bc35964f0ad190ad1ca39708183585f685b778`, and the deep-verified run is
-`sha256:9819206cba50b81850f99a08e2237b3b9458af44a7b440f18209f52a01703593`.
+`sha256:5ac7496f85867ef71ed91305db2c87ca38a9092abef5c58a331fefa07f165650`, its performance manifest is
+`sha256:b5dfb33fb2ab351a9fb95d4f14a6bf1224b3aee1715e9a344880d4b7c2c290f0`, and the deep-verified run is
+`sha256:99ed7abddd34c9edf4c3dc2f43868885c5af768fae7eb9e3b57e973fb075f53c`.
 
 This is development evidence over the frozen 50,000-row train/validation build, not the final public full-source claim.
 The mandatory full 517,401-row streaming/resource proof and one-shot sealed evaluation remain separate gates. The real
@@ -129,45 +127,45 @@ bytes, and a 13,293,272-byte private bank artifact.
 
 | Gate | Frozen threshold | Measured result | Status |
 | --- | ---: | ---: | --- |
-| Real document p99 | at most 50 ms | 0.140 ms | passed |
-| Real whole-input documents/s | at least 100 | 116,130 | passed |
-| Real whole-input MiB/s | at least 1 | 39.69 | passed |
-| 100k-pattern MiB/s | at least 1 | 99.54 | passed |
-| Peak RSS | at most 8 GiB | 485.9 MiB maximum measured cell | passed |
-| Cross-path paired-ratio MAD noise floor | at most 25% | not evaluated under the current protocol | refresh required |
+| Real document p99 | at most 50 ms | 0.259 ms | passed |
+| Real whole-input documents/s | at least 100 | 128,994 | passed |
+| Real whole-input MiB/s | at least 1 | 44.09 | passed |
+| 100k-pattern MiB/s | at least 1 | 99.69 | passed |
+| Peak RSS | at most 8 GiB | 555.6 MiB maximum measured cell | passed |
+| Exact-twin symmetric gap | at most 5% | 2.14% maximum across 20 comparisons | passed |
+| Cross-path paired-ratio MAD noise floor | at most 25% | 5.32% maximum across 12 comparisons | passed |
 
 ### Lifecycle and cache value
 
-The table retains the recorded run's measured values. Under the current plan, setup stability uses the median of 20
-fresh-process samples, slow cache-path stability uses the median of 100 samples, and direct/document p99 stability uses
-1,000 pooled samples. The separate direct comparison-support proxy uses 100 samples and median stability. All
-candidate/exact-twin pairs are acquired in ten frozen paired blocks.
+Setup stability uses the median of 20 fresh-process samples, slow cache-path stability uses the median of 100 samples,
+and direct/document p99 stability uses 1,000 pooled samples. The separate direct comparison-support proxy uses 100
+samples and median stability. All candidate/exact-twin pairs are acquired in ten frozen paired blocks.
 
 | Path | Median | Tail | Throughput | Peak RSS |
 | --- | ---: | ---: | ---: | ---: |
-| Train-source profile | 2.676 s | p95 2.684 s | one-time setup | 38.6 MiB |
-| Intelligence-bank build, including private snapshot setup | 45.211 s | p95 45.526 s | one-time setup | 438.2 MiB |
-| Cold compile | 3.177 s | p95 3.207 s | one-time setup | 130.6 MiB |
-| Direct compiled `Bank`, one document | 0.0043 ms | p99 0.140 ms | document sample | 121.0 MiB |
-| Direct compiled `Bank`, 100 documents | 0.861 ms | p99 0.929 ms | 116,130 docs/s; 39.69 MiB/s; 1.53M records/s | 121.8 MiB |
-| Helper cache hit | 3.103 s | p99 3.164 s | 32.2 docs/s; 0.0110 MiB/s | 155.0 MiB |
-| Helper cache miss | 3.235 s | p99 3.297 s | 30.9 docs/s; 0.0106 MiB/s | 123.5 MiB |
-| End to end | 3.282 s | p99 3.361 s | 30.5 docs/s; 0.0104 MiB/s | 143.4 MiB |
+| Train-source profile | 2.680 s | p95 2.692 s | one-time setup | 38.5 MiB |
+| Intelligence-bank build, including private snapshot setup | 45.382 s | p95 45.798 s | one-time setup | 555.6 MiB |
+| Cold compile | 3.188 s | p95 3.246 s | one-time setup | 130.8 MiB |
+| Direct compiled `Bank`, one document | 0.0062 ms | p99 0.259 ms | document sample | 122.3 MiB |
+| Direct compiled `Bank`, 100 documents | 0.775 ms | p99 0.831 ms | 128,994 docs/s; 44.09 MiB/s; 1.69M records/s | 122.3 MiB |
+| Helper cache hit | 3.117 s | p99 3.198 s | 32.1 docs/s; 0.0110 MiB/s | 155.7 MiB |
+| Helper cache miss | 3.241 s | p99 3.313 s | 30.9 docs/s; 0.0105 MiB/s | 123.5 MiB |
+| End to end | 3.293 s | p99 3.346 s | 30.4 docs/s; 0.0104 MiB/s | 143.4 MiB |
 
-Direct reuse is about 3,757× faster than the exact helper-cache-miss path on median whole-input time. That comparison is
-not a generic promise: helper paths include JSON-bank validation, canonicalization, hashing, and adapter work that a
-caller avoids by retaining the compiled `Bank`. After shared profiling, curation, and bank-build costs cancel, the
-direct path pays 3.177056 seconds to compile plus 0.000861 seconds for its first frozen whole-input request, versus
-3.234750 seconds for one helper-cache-miss request. It is therefore already ahead by about 56.8 ms at the model's
-minimum of one complete 100-document request; the result must not be translated into a per-document crossing.
+The promoted break-even model's measured per-request inputs differ by about 4,181×: 0.000775 seconds for direct reuse
+versus 3.241025 seconds for the exact helper-cache-miss path. This ratio is a model-input summary, not the paired
+directional estimator or a generic speed promise. Helper paths include JSON-bank validation, canonicalization, hashing,
+and adapter work that a caller avoids by retaining the compiled `Bank`. After shared profiling, curation, and bank-build
+costs cancel, the direct path pays 3.188219 seconds to compile plus its 0.000775-second first frozen whole-input request.
+It is already ahead by about 52.0 ms at the model's minimum of one complete 100-document request; the result must not be
+translated into a per-document crossing.
 
-The exploratory generic email regex reached 77.74 MiB/s and happened to emit the same aggregate record count, but it
+The exploratory generic email regex reached 78.05 MiB/s and happened to emit the same aggregate record count, but it
 cannot map a mention to a known canonical identity or implement the full bank semantics. The Python literal baseline
-reached 2.73 MiB/s and emitted only 631 records, so neither is a semantically exact correctness baseline. The recorded
-report contains 34 same-path and 12 cross-path comparison outcomes, including nine directional cross-path improvements
-and three other directional outcomes. Those comparison outcomes remain bound to the displayed run hash but do not
-satisfy the current exact-block stability protocol; a refreshed run must materialize one `within_tolerance` same-path
-metric for every true decision cell and the comparison-support proxy.
+reached 2.72 MiB/s and emitted only 631 records, so neither is a semantically exact correctness baseline. All 20
+same-path comparisons—including every true decision cell and the support proxy—were `within_tolerance`. Of the 12
+cross-path outcomes, nine were `improved` and three were `equivalent_within_noise`; none regressed or exceeded the
+unconditional noise ceiling.
 
 ### Matcher scale
 
@@ -178,10 +176,10 @@ exact-match fixtures.
 
 | Active patterns | Native shards | Aliases | Canonical JSON | Native source | Median / 100 docs | p99 | MiB/s | Peak RSS |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 4 | 202 | 226,280 B | 138,016 B | 0.172 ms | 0.178 ms | 5,688.70 | 40.8 MiB |
-| 10,000 | 32 | 2,022 | 2,261,206 B | 1,380,158 B | 1.015 ms | 1.048 ms | 962.11 | 80.0 MiB |
-| 25,000 | 80 | 5,056 | 5,652,792 B | 3,450,400 B | 2.486 ms | 2.518 ms | 392.80 | 143.7 MiB |
-| 100,000 | 318 | 20,223 | 22,610,648 B | 13,801,592 B | 9.811 ms | 9.956 ms | 99.54 | 485.9 MiB |
+| 1,000 | 4 | 202 | 226,280 B | 138,016 B | 0.172 ms | 0.187 ms | 5,669.45 | 40.9 MiB |
+| 10,000 | 32 | 2,022 | 2,261,206 B | 1,380,158 B | 1.021 ms | 1.059 ms | 956.63 | 80.2 MiB |
+| 25,000 | 80 | 5,056 | 5,652,792 B | 3,450,400 B | 2.492 ms | 2.567 ms | 391.95 | 143.8 MiB |
+| 100,000 | 318 | 20,223 | 22,610,648 B | 13,801,592 B | 9.796 ms | 10.148 ms | 99.69 | 485.9 MiB |
 
 Four-thread scanning of the tiny 1k negative cell was slower than single-thread scanning because coordination and Python
 projection overhead dominate sub-millisecond work. Concurrency is deterministic and bounded, but this cell does not
