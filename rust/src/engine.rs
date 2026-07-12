@@ -1462,9 +1462,18 @@ fn compile_literal_matcher<'a>(
 }
 
 fn layer_literal_pattern(pattern: &CanonicalPattern, hir: &Hir) -> Option<SimpleLiteralPattern> {
-    simple_literal_pattern(pattern)
+    let literal = simple_literal_pattern(pattern)
         .or_else(|| bounded_simple_literal_pattern(pattern, hir))
-        .or_else(|| exact_hir_literal_pattern(hir))
+        .or_else(|| exact_hir_literal_pattern(hir))?;
+
+    // A right-boundary-only literal may have to reject every overlapping
+    // occurrence before the one ending at the next word boundary. A
+    // leftmost-first Aho-Corasick layer cannot advance past those starts
+    // without changing semantics, and rechecking a long prefix at each one
+    // makes a word-length run quadratic. Keep this shape in the linear-time
+    // residual regex layer. Left-bounded and fully unbounded literals retain
+    // the optimized Aho-Corasick paths.
+    (!literal.right_unicode_word_boundary || literal.left_unicode_word_boundary).then_some(literal)
 }
 
 fn exact_hir_literal_pattern(hir: &Hir) -> Option<SimpleLiteralPattern> {
@@ -2093,6 +2102,7 @@ mod tests {
             .without_left_boundary
             .as_ref()
             .unwrap();
+        let residual = shard.residual_regex.as_ref().unwrap();
         let text = "tokenx";
         let bounded_lookup =
             indexed_valid_literal_at_start(bounded_layer, text.as_bytes(), text, 0);
@@ -2100,9 +2110,14 @@ mod tests {
             indexed_valid_literal_at_start(unbounded_layer, text.as_bytes(), text, 0);
 
         assert_eq!(bounded_layer.patterns.len(), 2_048);
-        assert_eq!(unbounded_layer.patterns.len(), 2_048);
+        assert_eq!(unbounded_layer.patterns.len(), 1_024);
+        assert_eq!(residual.local_to_pattern_order.len(), 1_024);
+        assert!(residual
+            .local_to_pattern_order
+            .iter()
+            .all(|pattern_order| pattern_order % 4 == 1));
         assert_eq!(bounded_layer.prefix_index.sorted_pattern_indices.len(), 2);
-        assert_eq!(unbounded_layer.prefix_index.sorted_pattern_indices.len(), 2);
+        assert_eq!(unbounded_layer.prefix_index.sorted_pattern_indices.len(), 1);
         assert!(bounded_lookup.terminal_candidates_examined <= 2);
         assert!(unbounded_lookup.terminal_candidates_examined <= 2);
         assert_eq!(bounded_lookup.candidate.unwrap().pattern_order, 2);
@@ -2176,6 +2191,46 @@ mod tests {
         assert_eq!(
             engine_raw_matches(&engine, &text),
             monolithic_raw_matches(&patterns, &text)
+        );
+    }
+
+    #[test]
+    fn right_boundary_only_long_literal_stays_in_residual_regex_layer() {
+        let literal = "a".repeat(512);
+        let patterns = vec![
+            canonical_pattern(&format!(r"(?:{literal})\b"), &[]),
+            canonical_pattern("needle", &[]),
+        ];
+        let engine = engine_for_patterns(patterns.clone());
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("mixed right-boundary and unbounded literals should use the layered matcher");
+        };
+        let unbounded_layer = shard
+            .case_sensitive_literals
+            .without_left_boundary
+            .as_ref()
+            .unwrap();
+        let residual = shard.residual_regex.as_ref().unwrap();
+
+        assert_eq!(
+            unbounded_layer
+                .patterns
+                .iter()
+                .map(|pattern| pattern.pattern_order)
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(residual.local_to_pattern_order, [0]);
+
+        let text = "a".repeat(literal.len() * 2);
+        let actual = engine_raw_matches(&engine, &text);
+        assert_eq!(
+            actual,
+            monolithic_raw_matches(&patterns, &text)
+        );
+        assert_eq!(
+            actual,
+            [(0, literal.len() as u64, text.len() as u64)]
         );
     }
 
