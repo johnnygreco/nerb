@@ -36,6 +36,15 @@ def test_load_config_valid_yaml(tmp_path):
     }
 
 
+def test_load_config_falls_back_without_c_loader(monkeypatch, tmp_path):
+    config_path = tmp_path / "entities.yaml"
+    config_path.write_text("ENTITY:\n  Example: example\n", encoding="utf-8")
+
+    monkeypatch.delattr(yaml, "CSafeLoader", raising=False)
+
+    assert load_config(config_path) == {"ENTITY": {"Example": "example"}}
+
+
 def test_load_config_rejects_malformed_yaml(tmp_path):
     config_path = tmp_path / "entities.yaml"
     config_path.write_text("ARTIST:\n  Coheed: [unterminated\n", encoding="utf-8")

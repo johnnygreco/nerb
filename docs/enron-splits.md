@@ -9,13 +9,19 @@ benchmark result promotable.
 For a production split, keep the steward output outside the builder's access boundary:
 
 ```shell
+install -d -m 700 .nerb/enron-scratch
 uv run nerb split-enron \
   --preparation-run .nerb/enron-preparation/run \
   --development-output-dir .nerb/enron-splits/development \
   --sealed-output-dir /authorized/steward/enron-test \
-  --benchmark-version enron-v2 \
-  --seed nerb-enron-v2-split-v1
+  --scratch-dir .nerb/enron-scratch \
+  --seed nerb-enron-split
 ```
+
+`--scratch-dir` is required because split construction first deep-verifies the preparation bundle. It must be an
+existing directory owned by the current user with owner-only permissions. Verification creates a pinned
+private child, wipes every authenticated sensitive payload, and may retain an owner-only, zero-byte cleanup tombstone when
+safe path removal cannot be proven. SQLite temporary storage never falls back to the system temporary directory.
 
 Verify both committed bundles from the steward environment:
 
@@ -23,11 +29,15 @@ Verify both committed bundles from the steward environment:
 uv run nerb verify-enron-splits \
   --development-dir .nerb/enron-splits/development \
   --sealed-dir /authorized/steward/enron-test \
-  --seed nerb-enron-v2-split-v1
+  --seed nerb-enron-split
 ```
 
 Verification requires the original seed and checks it against the aggregate seed commitment; a custom split seed must
 be supplied again to the steward verifier without being published in the development manifest.
+The benchmark identity itself is fixed to `enron`; there is no alternate benchmark-version selector. The verifier's
+closed result includes both development and sealed manifest hashes plus the pre-seal verification hash, and it accepts
+an observational activity callback for large development-artifact hashing. Metadata verification never opens sealed
+test content.
 
 For a tiny synthetic fixture, add `--fixture-mode` to `split-enron`. Fixture mode relaxes the production support floors
 so leakage and sealing behavior can be tested on small inputs. Its manifests are permanently marked non-promotable and
@@ -101,12 +111,11 @@ earlier role. Boundaries are deterministic component boundaries, not row cutoffs
 to preserve leakage integrity.
 
 A component with no eligible date cannot support a temporal or future-data claim. Those components follow a separate,
-deterministic seeded assignment policy based on their component identity, benchmark version, and split seed. They stay
+deterministic seeded assignment policy based on their component identity, benchmark identity, and split seed. They stay
 explicitly ineligible in cohort and audit counts and are never silently included in the dated temporal denominator.
-Changing the preparation run, benchmark version, split seed, or split policy creates a different split commitment.
-Input row order does not. A version bump by itself is not a fresh final test: most temporal membership can remain the
-same. After any final-test access, a successor must bind a genuinely different test population or split policy and the
-lineage verifier must reject a repeated test artifact hash.
+Changing the preparation run, split seed, or split policy creates a different split commitment. Input row order does
+not. Renaming an evidence target is not a fresh final test: after any final-test access, another claim must bind a
+genuinely different frozen population or policy, and the lineage verifier rejects a repeated test artifact hash.
 
 ## Cohorts and samples
 
@@ -155,10 +164,13 @@ diagnostics to development callers.
 Final-test bytes are available only through the explicit steward release-access path for a fully frozen benchmark
 target, including the exact final-test artifact hash. That path durably creates the one-shot access claim **before**
 yielding the first test byte. A crash, exception, partial read, or caller cancellation after the claim still counts as
-the benchmark's single access. There is no retry for that benchmark version, because retry semantics would turn
-failures into selective test access. An aborted or failed outcome enters the append-only benchmark lineage; further
-tuning requires a disclosed successor benchmark version and a newly sealed test whose artifact hash has not already
-appeared in the trusted lineage.
+the benchmark's single access. There is no retry for that frozen target, because retry semantics would turn failures
+into selective test access. An aborted or failed outcome enters the append-only benchmark lineage; further tuning
+requires a newly frozen test population whose artifact hash has not already appeared in the trusted lineage.
+
+The durable transition is `sealed_unbound → evidence_bound → claimed → completed | failed | aborted`. Transition
+validation and publication use one pinned, exclusively locked steward directory. A crash finalizer can write `aborted`
+only after the live owner lock has been released; it never opens the test artifact.
 
 If a steward process dies after the valid claim is durable but before an outcome is written, the claim still consumes
 the one permitted access. `finalize_aborted_enron_final_test_access` can append an `aborted` outcome after validating the

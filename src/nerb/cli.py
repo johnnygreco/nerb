@@ -64,6 +64,8 @@ from .enron_annotations import (
 )
 from .enron_bank_builder import BANK_BUILD_TIMESTAMP, EnronBankBuildError
 from .enron_bank_workflow import (
+    DEFAULT_MAX_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+    MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES,
     EnronBankBuildOptions,
     build_enron_intelligence_bank,
     verify_enron_bank_build,
@@ -1594,7 +1596,6 @@ def init_replacement_db(
     db_id: str = typer.Option("replacements", "--id", help="Replacement database id."),
     description: str = typer.Option("", "--description", help="Replacement database description."),
     reversible: bool = typer.Option(False, "--reversible", help="Store originals by default for reversible workflows."),
-    store_originals: bool = typer.Option(False, "--store-originals", help="Alias for --reversible."),
     assignment_scope: str = typer.Option(
         "name",
         "--assignment-scope",
@@ -1614,7 +1615,7 @@ def init_replacement_db(
     replacement_db = create_replacement_db(
         db_id=db_id,
         description=description,
-        reversible=reversible or store_originals,
+        reversible=reversible,
         assignment_scope=assignment_scope,
     )
     expected_hash: str | None = None
@@ -2493,10 +2494,18 @@ def prepare_enron(
 @app.command("verify-enron-preparation")
 def verify_enron_preparation(
     run_dir: Path = typer.Option(..., "--run-dir", help="Committed private Enron preparation run directory."),
+    scratch_dir: Path = typer.Option(
+        ...,
+        "--scratch-dir",
+        help=(
+            "Existing owned owner-only verifier scratch root; sensitive payloads are wiped after use, and an "
+            "owner-only zero-byte tombstone may remain."
+        ),
+    ),
 ) -> None:
     """Verify preparation artifact hashes, ordering, counts, and aggregate bindings."""
     try:
-        payload = _run_json_helper(lambda: load_enron_preparation_run(run_dir))
+        payload = _run_json_helper(lambda: load_enron_preparation_run(run_dir, scratch_dir=scratch_dir))
     except OSError as exc:
         _exit_error(str(exc))
     _echo_json(payload)
@@ -2519,7 +2528,11 @@ def split_enron(
         "--sealed-output-dir",
         help="New steward-only sealed-test bundle directory.",
     ),
-    benchmark_version: str = typer.Option("enron-v2", "--benchmark-version"),
+    scratch_dir: Path = typer.Option(
+        ...,
+        "--scratch-dir",
+        help="Existing owned owner-only directory for preparation-verification scratch.",
+    ),
     seed: str = typer.Option(DEFAULT_SPLIT_SEED, "--seed"),
     sample_per_role: int = typer.Option(
         10_000,
@@ -2549,7 +2562,7 @@ def split_enron(
         preparation_run=preparation_run,
         development_output_dir=development_output_dir,
         sealed_output_dir=sealed_output_dir,
-        benchmark_version=benchmark_version,
+        scratch_dir=scratch_dir,
         seed=seed,
         sample_per_role=sample_per_role,
         max_near_candidate_pairs=max_near_candidate_pairs,
@@ -2684,7 +2697,6 @@ def build_enron_bank(
         "--cmu-catalog-bindings",
         help="Separately reviewed private CMU catalog-binding JSONL; requires --annotation-run.",
     ),
-    benchmark_version: str = typer.Option("enron-v2", "--benchmark-version"),
     created_at: str = typer.Option(BANK_BUILD_TIMESTAMP, "--created-at"),
     allow_unignored_output: bool = typer.Option(
         False,
@@ -2699,7 +2711,6 @@ def build_enron_bank(
         output_dir=output_dir,
         annotation_run=annotation_run,
         cmu_catalog_bindings_path=cmu_catalog_bindings_path,
-        benchmark_version=benchmark_version,
         created_at=created_at,
         allow_unignored_output=allow_unignored_output,
     )
@@ -2713,19 +2724,150 @@ def build_enron_bank(
 @app.command("verify-enron-bank-build")
 def verify_enron_bank_build_command(
     run_dir: Path = typer.Option(..., "--run-dir", help="Committed private bank-build run directory."),
+    development_run: Path = typer.Option(
+        ...,
+        "--development-run",
+        help="Exact committed train/validation bundle required for streaming deep replay.",
+    ),
     annotation_run: Path | None = typer.Option(
         None,
         "--annotation-run",
         help="Optional verified CMU bundle for deep auxiliary evidence re-evaluation.",
     ),
+    scratch_root: Path = typer.Option(
+        ...,
+        "--scratch-root",
+        help=(
+            "Existing private caller-owned verifier scratch root; sensitive payloads are wiped, and an owner-only "
+            "zero-byte tombstone may remain."
+        ),
+    ),
+    max_scratch_bytes: int = typer.Option(
+        DEFAULT_MAX_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+        "--max-scratch-bytes",
+        min=MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+        help="Hard high-water budget for each sequential deep-verification scratch artifact.",
+    ),
 ) -> None:
     """Deep-verify bank artifacts, all iterations, quality, conformance, and privacy-safe aggregates."""
 
     try:
-        payload = verify_enron_bank_build(run_dir, annotation_run=annotation_run)
+        payload = verify_enron_bank_build(
+            run_dir,
+            development_run=development_run,
+            annotation_run=annotation_run,
+            scratch_root=scratch_root,
+            max_scratch_bytes=max_scratch_bytes,
+        )
     except EnronBankBuildError as exc:
         _exit_error(str(exc))
     _echo_json(payload)
+
+
+@app.command("run-enron-capacity")
+def run_enron_capacity_command(
+    output_dir: Path = typer.Option(..., "--output-dir", help="New ignored private full-capacity run directory."),
+    attempt_ledger_dir: Path = typer.Option(
+        ...,
+        "--attempt-ledger-dir",
+        help="Owned owner-only directory for the durable append-only attempt chain.",
+    ),
+    workspace_root: Path | None = typer.Option(
+        None,
+        "--workspace-root",
+        help="Optional repository root used to enforce ignored private output paths.",
+    ),
+    allow_unignored_output: bool = typer.Option(
+        False,
+        "--allow-unignored-output",
+        help="Explicitly permit private output outside ignored repository paths.",
+    ),
+) -> None:
+    """Run the pinned full-source train/validation-only capacity workflow in a fresh worker."""
+
+    capacity = _load_enron_capacity_api()
+
+    try:
+        capacity._validated_capacity_bootstrap()
+        payload = capacity.run_enron_capacity(
+            capacity.EnronCapacityOptions(
+                output_dir=output_dir,
+                attempt_ledger_dir=attempt_ledger_dir,
+                workspace_root=workspace_root,
+                allow_unignored_output=allow_unignored_output,
+            )
+        )
+    except capacity.EnronCapacityError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("verify-enron-capacity")
+def verify_enron_capacity_command(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Committed private capacity run directory."),
+    attempt_ledger_dir: Path = typer.Option(
+        ...,
+        "--attempt-ledger-dir",
+        help="Durable attempt-ledger directory bound to the run.",
+    ),
+) -> None:
+    """Verify private artifacts, the complete attempt chain, and the uniquely terminal passed decision."""
+
+    capacity = _load_enron_capacity_api()
+
+    try:
+        capacity._validated_capacity_bootstrap()
+        payload = capacity.verify_capacity_run(run_dir, attempt_ledger_dir)
+    except capacity.EnronCapacityError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("export-enron-capacity")
+def export_enron_capacity_command(
+    run_dir: Path = typer.Option(..., "--run-dir", help="Committed private capacity run directory."),
+    attempt_ledger_dir: Path = typer.Option(..., "--attempt-ledger-dir", help="Bound durable attempt ledger."),
+    output_path: Path = typer.Option(
+        ...,
+        "--output",
+        help="New path under an existing directory for the aggregate portable decision artifact.",
+    ),
+) -> None:
+    """Verify private evidence first, then export one path-free aggregate decision artifact."""
+
+    capacity = _load_enron_capacity_api()
+
+    try:
+        capacity._validated_capacity_bootstrap()
+        payload = capacity.export_capacity_decision(run_dir, attempt_ledger_dir, output_path)
+    except capacity.EnronCapacityError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("verify-portable-enron-capacity")
+def verify_portable_enron_capacity_command(
+    artifact_path: Path = typer.Option(..., "--artifact", help="Exported aggregate capacity decision JSON."),
+) -> None:
+    """Verify portable decision arithmetic, receipt chain, and measured Git source identity."""
+
+    capacity = _load_enron_capacity_api()
+
+    try:
+        payload = capacity.verify_portable_capacity_decision(artifact_path)
+    except capacity.EnronCapacityError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+def _load_enron_capacity_api() -> Any:
+    """Load the POSIX-only capacity harness without breaking the portable CLI."""
+
+    if os.name != "posix":
+        _exit_error("The Enron capacity workflow requires a POSIX host with fcntl and resource support.")
+    from . import enron_capacity
+
+    return enron_capacity
 
 
 @app.command("prepare-enron-performance")
@@ -2745,15 +2887,15 @@ def prepare_enron_performance(
         "--output-dir",
         help="New ignored private directory for the frozen performance plan and fixtures.",
     ),
+    scratch_root: Path = typer.Option(
+        ...,
+        "--scratch-root",
+        help="Existing private caller-owned root for deep-verification scratch.",
+    ),
     annotation_run: Path | None = typer.Option(
         None,
         "--annotation-run",
         help="Optional verified private CMU training-annotation bundle.",
-    ),
-    benchmark_version: str | None = typer.Option(
-        None,
-        "--benchmark-version",
-        help="Optional expected benchmark version; must match the verified bank build.",
     ),
     real_input_documents: int = typer.Option(
         DEFAULT_ENRON_PERFORMANCE_REAL_INPUT_DOCUMENTS,
@@ -2775,6 +2917,12 @@ def prepare_enron_performance(
         min=0.001,
         help="Shared curation-time scenario mirrored on both cache paths; not a measured model cost.",
     ),
+    max_scratch_bytes: int = typer.Option(
+        DEFAULT_MAX_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+        "--max-scratch-bytes",
+        min=MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+        help="Hard high-water budget for the owned deep-verification scratch tree.",
+    ),
     allow_unignored_output: bool = typer.Option(
         False,
         "--allow-unignored-output",
@@ -2787,8 +2935,9 @@ def prepare_enron_performance(
         bank_build_run=bank_build_run,
         development_run=development_run,
         output_dir=output_dir,
+        scratch_root=scratch_root,
         annotation_run=annotation_run,
-        benchmark_version=benchmark_version,
+        max_scratch_bytes=max_scratch_bytes,
         real_input_documents=real_input_documents,
         concurrency=concurrency,
         source_curation_seconds=source_curation_seconds,
@@ -2911,8 +3060,11 @@ def verify_enron_performance(
 @app.command("eval-enron-quality")
 def eval_enron_quality(
     bank_path: Path = typer.Option(..., "--bank", help="JSON bank path."),
-    documents_path: Path = typer.Option(..., "--documents", help="Strict private document JSONL."),
-    gold_spans_path: Path = typer.Option(..., "--gold-spans", help="Strict private gold-span JSONL."),
+    records_path: Path = typer.Option(
+        ...,
+        "--records",
+        help="Strict private per-document quality-envelope JSONL.",
+    ),
     slice_specs_path: Path = typer.Option(..., "--slice-plan", help="Frozen strict private slice-plan JSONL."),
     unsupported_slice_specs_path: Path | None = typer.Option(
         None,
@@ -2931,8 +3083,7 @@ def eval_enron_quality(
     try:
         payload = evaluate_enron_quality_files(
             bank,
-            documents_path=documents_path,
-            gold_spans_path=gold_spans_path,
+            records_path=records_path,
             slice_specs_path=slice_specs_path,
             unsupported_slice_specs_path=unsupported_slice_specs_path,
         )

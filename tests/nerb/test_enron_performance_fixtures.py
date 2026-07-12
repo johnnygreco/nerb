@@ -330,3 +330,82 @@ def test_invalid_evaluated_composition_and_incomplete_scale_family_are_rejected(
 
     with pytest.raises(EnronPerformanceFixtureError, match="frozen active-pattern counts"):
         make_enron_performance_bank_fixture(active_patterns=2_000, evaluated_bank=_evaluated_bank())
+
+
+def test_imbalanced_taxonomy_can_round_one_class_to_zero_without_dividing_by_zero() -> None:
+    evaluated = {
+        "id": "imbalanced_evaluated_bank",
+        "bank_hash": "sha256:" + "2" * 64,
+        "active_entities": 2,
+        "active_names": 100_000,
+        "active_aliases": 0,
+        "active_patterns": 100_000,
+        "composition": {
+            "taxonomy": [
+                {
+                    "entity_class": "contact",
+                    "entities": 1,
+                    "canonical_names": 1,
+                    "aliases": 0,
+                    "literal_patterns": 1,
+                    "regex_patterns": 0,
+                },
+                {
+                    "entity_class": "person",
+                    "entities": 1,
+                    "canonical_names": 99_999,
+                    "aliases": 0,
+                    "literal_patterns": 99_999,
+                    "regex_patterns": 0,
+                },
+            ]
+        },
+    }
+
+    fixture = make_enron_performance_bank_fixture(active_patterns=1_000, evaluated_bank=evaluated)
+
+    taxonomy = {item["entity_class"]: item for item in fixture.descriptor["composition"]["taxonomy"]}
+    assert taxonomy["contact"] == {
+        "entity_class": "contact",
+        "entities": 0,
+        "canonical_names": 0,
+        "aliases": 0,
+        "literal_patterns": 0,
+        "regex_patterns": 0,
+    }
+    assert taxonomy["person"]["literal_patterns"] == 1_000
+    assert taxonomy["person"]["entities"] == 1
+
+
+def test_scaled_taxonomy_rejects_names_allocated_to_a_zero_pattern_class() -> None:
+    evaluated = {
+        "id": "divergent_name_pattern_ratios",
+        "bank_hash": "sha256:" + "3" * 64,
+        "active_entities": 2,
+        "active_names": 150,
+        "active_aliases": 0,
+        "active_patterns": 100_000,
+        "composition": {
+            "taxonomy": [
+                {
+                    "entity_class": "contact",
+                    "entities": 1,
+                    "canonical_names": 40,
+                    "aliases": 0,
+                    "literal_patterns": 40,
+                    "regex_patterns": 0,
+                },
+                {
+                    "entity_class": "person",
+                    "entities": 1,
+                    "canonical_names": 110,
+                    "aliases": 0,
+                    "literal_patterns": 99_960,
+                    "regex_patterns": 0,
+                },
+            ]
+        },
+    }
+
+    with pytest.raises(EnronPerformanceFixtureError, match="assigned truthfully"):
+        make_enron_performance_bank_fixture(active_patterns=1_000, evaluated_bank=evaluated)

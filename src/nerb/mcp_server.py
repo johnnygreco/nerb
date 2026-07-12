@@ -8,6 +8,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast
 
+from pydantic import ConfigDict, with_config
+from typing_extensions import TypedDict
+
 from . import __version__
 from .bank import (
     BankError,
@@ -112,6 +115,28 @@ MCP_UNAVAILABLE_MESSAGE = (
     "NERB MCP support requires Python 3.10 or newer and the MCP SDK dependency. "
     "Install NERB with the current package metadata on Python 3.10 or newer."
 )
+
+
+@with_config(ConfigDict(extra="forbid"))
+class _ReplacementDbSaveOptions(TypedDict, total=False):
+    expected_replacement_db_hash: str
+    expected_version: int
+    include_sensitive_metadata: bool
+
+
+class _AnonymizeSaveOptions(_ReplacementDbSaveOptions, total=False):
+    save: bool
+    word_boundaries: bool
+    mode: str
+    include_originals: bool
+    on_missing_assignment: str
+    source_surface_limit: int
+    include_statuses: Sequence[str]
+    engine: str
+    engine_options: Mapping[str, Any]
+    max_text_bytes: int
+    max_batch_documents: int
+    max_batch_text_bytes: int
 
 
 class NerbMcpUnavailableError(RuntimeError):
@@ -537,23 +562,15 @@ def _resolve_replacement_db_source(
 def _save_options(options: Mapping[str, Any] | None) -> tuple[dict[str, Any], bool, str | None, int | None, bool]:
     resolved = _options_mapping(options)
     save = _tool_bool_option(resolved, "save", False)
-    expected_hash = _tool_string_option(resolved, "expected_replacement_db_hash")
-    legacy_expected_hash = _tool_string_option(resolved, "expected_hash")
-    if expected_hash is not None and legacy_expected_hash is not None and expected_hash != legacy_expected_hash:
-        _raise_tool_error(
-            "options.expected_replacement_db_hash and options.expected_hash must match when both are set."
-        )
-    if expected_hash is None:
-        expected_hash = legacy_expected_hash
+    expected_replacement_db_hash = _tool_string_option(resolved, "expected_replacement_db_hash")
     expected_version = _tool_int_option(resolved, "expected_version")
     include_sensitive_metadata = _tool_bool_option(resolved, "include_sensitive_metadata", False)
-    return resolved, save, expected_hash, expected_version, include_sensitive_metadata
+    return resolved, save, expected_replacement_db_hash, expected_version, include_sensitive_metadata
 
 
 def _operation_options(options: Mapping[str, Any]) -> dict[str, Any]:
     operation_options = dict(options)
     operation_options.pop("save", None)
-    operation_options.pop("expected_hash", None)
     operation_options.pop("expected_replacement_db_hash", None)
     operation_options.pop("expected_version", None)
     return operation_options
@@ -572,25 +589,27 @@ def _save_replacement_db_for_tool(
         _raise_tool_error("save_db_path must be a non-empty string.")
 
     save_path = Path(save_db_path).expanduser()
-    resolved_options, _save, expected_hash, expected_version, include_sensitive_metadata = _save_options(options)
-    if expected_hash is None and source_path is not None and _same_path(source_path, save_path):
-        expected_hash = source_hash
+    resolved_options, _save, expected_replacement_db_hash, expected_version, include_sensitive_metadata = _save_options(
+        options
+    )
+    if expected_replacement_db_hash is None and source_path is not None and _same_path(source_path, save_path):
+        expected_replacement_db_hash = source_hash
         if expected_version is None:
             expected_version = source_version
     require_missing = False
-    if save_path.is_file() and expected_hash is None:
+    if save_path.is_file() and expected_replacement_db_hash is None:
         return _replacement_db_stale_write_payload(
             save_path,
             include_sensitive_metadata=include_sensitive_metadata,
         )
-    elif source_path is None and expected_hash is None:
+    elif source_path is None and expected_replacement_db_hash is None:
         require_missing = True
 
     try:
         saved_path = _save_replacement_db(
             replacement_db,
             save_path,
-            expected_hash=expected_hash,
+            expected_hash=expected_replacement_db_hash,
             expected_version=expected_version,
             require_missing=require_missing,
         )
@@ -606,10 +625,10 @@ def _save_replacement_db_for_tool(
     response_options: dict[str, Any] = {
         "expected_version": expected_version,
         "save": bool(resolved_options.get("save", False)),
-        "stale_guard": "hash" if expected_hash is not None else "missing_destination",
+        "stale_guard": "hash" if expected_replacement_db_hash is not None else "missing_destination",
     }
-    if include_sensitive_metadata and expected_hash is not None:
-        response_options["expected_replacement_db_hash"] = expected_hash
+    if include_sensitive_metadata and expected_replacement_db_hash is not None:
+        response_options["expected_replacement_db_hash"] = expected_replacement_db_hash
     response = {
         "saved": True,
         "path": str(saved_path),
@@ -633,7 +652,13 @@ def _saved_anonymize_payload_for_tool(
     save_db_path: str | None,
     options: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
-    resolved_options, save, _expected_hash, _expected_version, include_sensitive_metadata = _save_options(options)
+    (
+        resolved_options,
+        save,
+        _expected_replacement_db_hash,
+        _expected_version,
+        include_sensitive_metadata,
+    ) = _save_options(options)
     if save and save_db_path is None:
         _raise_tool_error("options.save requires save_db_path.")
     if save_db_path is not None and not save:
@@ -924,7 +949,7 @@ def save_replacement_db(
     replacement_db: Any | None = None,
     replacement_db_path: str | None = None,
     save_db_path: str = "",
-    options: Mapping[str, Any] | None = None,
+    options: _ReplacementDbSaveOptions | None = None,
 ) -> dict[str, Any]:
     """Save a replacement database only to explicit save_db_path with stale-write protection."""
     resolved_options = _options_mapping(options)
@@ -957,7 +982,7 @@ def anonymize_text(
     replacement_db: Any | None = None,
     replacement_db_path: str | None = None,
     save_db_path: str | None = None,
-    options: Mapping[str, Any] | None = None,
+    options: _AnonymizeSaveOptions | None = None,
 ) -> dict[str, Any]:
     """Anonymize text with a JSON bank and optional explicit replacement DB save."""
     resolved_options = _options_mapping(options)
@@ -1011,7 +1036,7 @@ def anonymize_file(
     replacement_db: Any | None = None,
     replacement_db_path: str | None = None,
     save_db_path: str | None = None,
-    options: Mapping[str, Any] | None = None,
+    options: _AnonymizeSaveOptions | None = None,
 ) -> dict[str, Any]:
     """Anonymize one explicit UTF-8 file with a JSON bank and optional explicit replacement DB save."""
     resolved_options = _options_mapping(options)
@@ -1066,7 +1091,7 @@ def anonymize_config_text(
     replacement_db: Any | None = None,
     replacement_db_path: str | None = None,
     save_db_path: str | None = None,
-    options: Mapping[str, Any] | None = None,
+    options: _AnonymizeSaveOptions | None = None,
 ) -> dict[str, Any]:
     """Anonymize text with a YAML detector config and optional explicit replacement DB save."""
     resolved_options = _options_mapping(options)
@@ -1109,7 +1134,7 @@ def anonymize_config_file(
     replacement_db: Any | None = None,
     replacement_db_path: str | None = None,
     save_db_path: str | None = None,
-    options: Mapping[str, Any] | None = None,
+    options: _AnonymizeSaveOptions | None = None,
 ) -> dict[str, Any]:
     """Anonymize one explicit UTF-8 file with a YAML detector config and optional explicit replacement DB save."""
     resolved_options = _options_mapping(options)

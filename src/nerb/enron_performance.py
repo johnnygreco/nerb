@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -33,9 +33,13 @@ from .bank import bank_stats, canonicalize_bank, hash_bank
 from .engines import compile_bank_with_report, extraction_execution_sha256
 from .enron_bank_builder import EnronBankPolicy
 from .enron_bank_workflow import (
+    DEFAULT_MAX_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+    MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES,
     EnronBankBuildError,
     EnronBankBuildOptions,
     _builder_implementation_sha256,
+    _iter_validation_documents,
+    _paired_role,
     _verify_enron_bank_build_snapshot,
     build_enron_intelligence_bank,
 )
@@ -83,7 +87,7 @@ PERFORMANCE_PLAN_SCHEMA_VERSION = "nerb.enron_performance_plan.v1"
 PERFORMANCE_RUN_SCHEMA_VERSION = "nerb.enron_performance_run.v1"
 PERFORMANCE_PRIVATE_MANIFEST_SCHEMA_VERSION = "nerb.enron_performance_private_manifest.v1"
 PERFORMANCE_RUN_PRIVATE_MANIFEST_SCHEMA_VERSION = "nerb.enron_performance_run_private_manifest.v1"
-PERFORMANCE_SUITE_ID = "enron_v2_cache_value"
+PERFORMANCE_SUITE_ID = "enron_cache_value"
 PERFORMANCE_OPERATION_SPEC_VERSION = "1"
 PERFORMANCE_EXACT_CONTROL_ID = "nerb_exact_same_path_control"
 PERFORMANCE_UNCACHED_BASELINE_ID = "nerb_uncached_recompile"
@@ -180,8 +184,9 @@ class EnronPerformancePrepareOptions:
     bank_build_run: Path
     development_run: Path
     output_dir: Path
+    scratch_root: Path
     annotation_run: Path | None = None
-    benchmark_version: str | None = None
+    max_scratch_bytes: int = DEFAULT_MAX_ENRON_BANK_VERIFY_SCRATCH_BYTES
     real_input_documents: int = DEFAULT_REAL_INPUT_DOCUMENTS
     concurrency: int = DEFAULT_CONCURRENCY
     source_curation_seconds: float = 60.0
@@ -782,7 +787,7 @@ def _evaluated_bank_descriptor(
 
 
 def _select_real_documents(
-    rows: Sequence[Mapping[str, Any]],
+    rows: Iterable[Mapping[str, Any]],
     *,
     count: int,
     seed: str,
@@ -1770,6 +1775,12 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
         "Source curation scenario",
         maximum=MAX_SOURCE_BUILD_SECONDS,
     )
+    max_scratch_bytes = _positive_int(
+        options.max_scratch_bytes,
+        "Deep-verification scratch byte budget",
+    )
+    if max_scratch_bytes < MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES:
+        raise EnronPerformanceError("Deep-verification scratch byte budget is below the frozen minimum.")
     bank_root = _absolute_private_path(options.bank_build_run, description="Bank-build run")
     development_root, development_tree = _snapshot_performance_private_tree(
         options.development_run,
@@ -1778,13 +1789,17 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
     try:
         bank_snapshot = _verify_enron_bank_build_snapshot(
             options.bank_build_run,
+            development_run=development_root,
+            scratch_root=options.scratch_root,
             annotation_run=options.annotation_run,
+            max_scratch_bytes=max_scratch_bytes,
         )
         verification = bank_snapshot.summary
         card = bank_snapshot.card
         bank_payload = bank_snapshot.bank_payload
         bank_value = bank_snapshot.bank
-        validation_documents = bank_snapshot.validation_documents
+        validation_plan = bank_snapshot.validation_plan
+        bank_policy = bank_snapshot.policy
         build_created_at = bank_snapshot.build_created_at
         bank_tree = getattr(bank_snapshot, "private_tree", None)
         bank_artifact_fingerprints = getattr(bank_snapshot, "artifact_fingerprints", None)
@@ -1811,8 +1826,6 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
     ):
         raise EnronPerformanceError("Verified bank card differs from its deep-verification result.")
     benchmark_version = str(card.get("benchmark_version", ""))
-    if options.benchmark_version is not None and options.benchmark_version != benchmark_version:
-        raise EnronPerformanceError("Requested benchmark version does not match the verified bank build.")
     _bounded_private_string(
         benchmark_version,
         maximum_bytes=MAX_BENCHMARK_VERSION_BYTES,
@@ -1837,11 +1850,19 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
     evaluated_descriptor = _evaluated_bank_descriptor(bank_value, evaluated_artifact, native_source_bytes)
 
     documents = _select_real_documents(
-        validation_documents,
+        _iter_validation_documents(
+            _paired_role(
+                development.iter_validation_records(),
+                development.iter_validation_memberships(),
+                role="validation",
+            ),
+            plan=validation_plan,
+            policy=bank_policy,
+        ),
         count=real_input_documents,
-        seed=f"{benchmark_version}:performance-real-input-v1",
+        seed=f"{benchmark_version}:performance-real-input",
     )
-    del validation_documents
+    del validation_plan, bank_policy
     real_input, real_input_bytes, real_inventory_bytes, _real_inventory = _real_input_fixture(
         documents,
         bank_descriptor=evaluated_descriptor,
@@ -2487,7 +2508,7 @@ def _worker_request(
             parameters = {
                 "concurrency": workload["concurrency"],
                 "max_records": 5_000_000,
-                "pattern_set": "email_format_v1",
+                "pattern_set": "email_format",
             }
             operation = "generic_regex_scan"
         elif harness["id"] == "python_literal_harness":
@@ -4097,7 +4118,6 @@ def _source_build_worker_result(raw: bytes) -> dict[str, Any]:
                 output_dir=output_dir,
                 annotation_run=source_snapshot.annotation_run,
                 cmu_catalog_bindings_path=source_snapshot.cmu_catalog_bindings,
-                benchmark_version=request["benchmark_version"],
                 created_at=request["created_at"],
                 allow_unignored_output=True,
             )

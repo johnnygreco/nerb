@@ -10,13 +10,9 @@ Implementation issue: <https://github.com/johnnygreco/nerb/issues/46>
 
 ## Context
 
-The Rust engine migration changed NERB into a package with Python as the authoring/control plane and Rust as the matching
-data plane. The Rust engine behavior is the target, and the removed Python regex object model does not constrain the
-design. Silent semantic drift is unacceptable. Every engine mode must either satisfy this record or be documented as a
+NERB uses Python as the authoring/control plane and Rust as the matching data plane. Rust engine behavior is the target.
+Silent semantic drift is unacceptable. Every engine mode must either satisfy this record or be documented as a
 deliberate divergence.
-
-The pre-removal Python surfaces were useful differential oracles during migration. They helped identify and name semantic
-changes, but they do not define the target surface.
 
 The Rust engine will store and sort raw byte spans. Python projection can optionally convert to character offsets for
 explicit text callers, but that conversion is outside the Rust scan benchmark.
@@ -29,7 +25,7 @@ NERB is a text detector. Native file/path scanning accepts valid UTF-8 and repor
 clearly on invalid UTF-8 instead of applying lossy decoding. Callers that need a different error policy must decode in
 Python first and pass text explicitly.
 
-New public Rust-backed records use this schema:
+Public Rust-backed records use this schema:
 
 ```json
 {
@@ -73,7 +69,7 @@ collected.
 
 `all_overlaps` has a different semantic contract. It reports cross-entity overlap, within-entity overlap, and all
 matching spans for each detector pattern unless a reconstruction step restores leftmost-first behavior. It does not
-preserve branch identity inside one regex; attribution remains at the NERB detector index. Historical Slice 6 showed
+preserve branch identity inside one regex; attribution remains at the NERB detector index. Differential conformance shows
 that a span-only raw-candidate post-filter is not sufficient to prove exact reconstruction: `MatchKind::All` can expose the
 shorter span of one detector such as `Sam` from `Samwise|Sam`, while leftmost-first semantics choose `Samwise` when that
 branch appears first. The prototype therefore keeps raw `all_overlaps` output separate from an exact reconstruction
@@ -95,9 +91,8 @@ separate product decision. Native metadata labels it `internal_benchmark_only` w
 ### Regex Profile
 
 The Rust regex profile rejects constructs that require a backtracking engine, including backreferences and lookaround.
-Earlier Python validation accepted some of these patterns because they were valid Python `re`; those cases are deliberate
-semantic divergences from the removed implementation. ReDoS-shaped patterns and compile-bomb-shaped patterns are fixture
-categories for the conformance and validation gates even when the removed Python path could compile them.
+ReDoS-shaped patterns and compile-bomb-shaped patterns remain fixture categories for the conformance and validation
+gates.
 
 Entity-level `_flags` map into per-pattern engine flags during Rust canonicalization. The current direct flag set is
 `IGNORECASE`, `MULTILINE`, `DOTALL`, `VERBOSE`, and `ASCII`. `ASCII` lowers only ASCII-sensitive escapes and boundaries
@@ -109,15 +104,15 @@ it with explicit boundary rules rather than Python-side regex string substitutio
 
 ## Entity Cardinality Assumption
 
-The repository's example banks are examples only and do not define the engine target. Historical issue #73 set the
-bank-owner target as a representative synthetic medium bank with 1,000 top-level entities. Final gate evidence validates
+The repository's example banks are examples only and do not define the engine target. The bank-owner target is a
+representative synthetic medium bank with 1,000 top-level entities. Gate evidence validates
 the production default against that generated 1,000-entity target while keeping the dense raw `all_overlaps` stress probe
 bounded to 64 entities. If the target grows beyond the validated 1,000-entity range, open a new issue before changing the
 default mode strategy.
 
 ## Final Gate Decision
 
-Historical Slice 10 gate evidence keeps `entity_independent` as the production default for the current Rust engine path.
+Gate evidence keeps `entity_independent` as the production default for the current Rust engine path.
 The routine gate report in `docs/rust-engine-gates.md` measured a dense two-entity prefix workload where production
 `entity_independent` emitted 32 matches, raw `all_overlaps` emitted 31,776 matches, exact `all_overlaps` reconstruction
 matched the production raw tuples, and `global_leftmost` emitted 16 matches. That means raw `all_overlaps` amplified
@@ -146,9 +141,8 @@ assumption:
 - `global_leftmost` remains an internal throughput baseline only and must not be used for production extraction because
   it violates the cross-entity overlap contract.
 
-Issue #73 records the bank-owner signoff target as 1,000 current entities and 1,000 expected-growth entities for the
-representative synthetic medium bank. Any target beyond the validated 1,000-entity range requires a new mode-strategy
-issue.
+The bank-owner signoff target is 1,000 current entities and 1,000 expected-growth entities for the representative
+synthetic medium bank. Any target beyond the validated range requires a fresh mode-strategy decision.
 
 ## Deterministic Output Order
 
@@ -179,6 +173,9 @@ The conformance suite covers these categories as evidence for the Rust-backed ma
 
 ## Consequences
 
-The first Rust implementation can stay thin and correct by compiling one matcher per entity. It does not need recursive
-walking, chunked streaming, serialized automata, DFA caches, or Hyperscan/Vectorscan. Those remain backlog unless the
-benchmark gate proves a concrete gap.
+Production presents one logical matcher and one shared leftmost-first cursor per entity. Bounded physical residual-regex
+layers and exact/mapped Aho-Corasick acceleration are implementation details under that entity-wide semantic contract.
+Deterministic size-limit bisection may add physical regex layers only for advancing patterns; singleton failures,
+per-entity layer exhaustion, or aggregate static/cache-memory exhaustion fail compilation. Production metadata exposes
+the realized entity-independent layer, bisection, and accounted-memory profile. Alternative matcher architectures
+require fresh semantic, scale, latency, and memory evidence.

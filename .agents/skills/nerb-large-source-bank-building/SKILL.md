@@ -13,11 +13,13 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 
 ## Operating Stance
 
-- Build for measured utility, not maximal coverage. A smaller bank with clear evals is better than a giant brittle bank.
+- Build for the charter's measured utility. For privacy detection, missed sensitive spans, documents, and characters are
+  the primary harms, so maximize measured recall within explicit runtime, memory, and over-redaction constraints.
 - Treat the corpus as evidence, not as the taxonomy owner. User goals decide which entity classes matter.
 - Keep raw or sensitive corpora out of git. Commit scripts, schemas, tiny fixtures, aggregate metrics, and redacted examples.
-- Freeze data prep and held-out evals before claiming benchmark or quality improvements; report precision, recall, and F1
-  when train/test labels exist.
+- Freeze data prep and held-out evals before claiming benchmark or quality improvements. Report the metrics the charter
+  needs: privacy work starts with open-world span, document, and sensitive-character recall plus leak rates; precision,
+  false alarms, over-redaction, and F1 are secondary constraints only when labels support them.
 - Separate evaluator changes from bank or engine changes. If both must change, say so explicitly in the PR/tracker.
 
 ## Workflow
@@ -30,12 +32,14 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 2. Define a bank charter.
    - State the intended user value: what decisions, workflows, or agent memory this bank should support.
    - Choose entity classes from that value plus corpus evidence. Do not force a universal taxonomy.
-   - For each entity class, define what should match, what should not match, and the minimum precision bar.
+   - For each entity class, define what should match, what should not match, and metric floors or ceilings tied to the
+     harm model. Privacy charters must put explicit missed-span, leaked-document, and leaked-character limits first.
 
 3. Create reproducible private artifacts.
    - Clean obvious transport noise, quoted/replied boilerplate, control characters, empty fields, and pathological records.
    - Create deterministic train/test or train/validation/test splits before candidate tuning.
-   - Preserve or derive gold labels needed for exact-span precision, recall, and F1 when the source supports it.
+   - Preserve or derive independent, exhaustive-within-scope gold labels needed for open-world recall and leakage
+     metrics. Add precision, false-alarm, over-redaction, and F1 evidence only where the annotation scope supports them.
    - Store large or sensitive generated corpora under ignored paths such as `.nerb/`.
 
 4. Seed the bank conservatively.
@@ -76,14 +80,37 @@ For detailed checklists, read `references/build-checklist.md` only when planning
      ```shell
      uv run nerb build-enron-bank \
        --development-run .nerb/enron-splits/development \
-       --output-dir .nerb/enron-bank-builds/run \
-       --benchmark-version enron-v2
+       --output-dir .nerb/enron-bank-builds/run
+     install -d -m 700 .nerb/enron-scratch
      uv run nerb verify-enron-bank-build \
-       --run-dir .nerb/enron-bank-builds/run
+       --run-dir .nerb/enron-bank-builds/run \
+       --development-run .nerb/enron-splits/development \
+       --scratch-root .nerb/enron-scratch
      ```
    - Treat the builder's structured-header validation as `structured_weak` labeled-span evidence. It is not open-world
      recall; unsupported precision, false-alarm, and over-redaction metrics stay `null`. Perfect synthetic conformance
      proves active-catalog behavior, not catalog completeness.
+   - Do not use `benchmark-bank`, `regress-bank`, a partial-corpus run, or the builder's deep verification to support a
+     decision-grade full-source capacity claim. For that claim, freeze the corpus, gates, measured commit, reader lock,
+     and run policy first; then follow the isolated full-corpus run, verification, and aggregate-only export workflow in
+     `docs/enron-bank-building.md`. Keep its run directory and attempt ledger private.
+
+     ```shell
+     uv sync --locked --no-default-groups --group enron-capacity --python 3.13 --reinstall-package nerb
+     uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+       python -I -S -B scripts/run_enron_capacity.py run-enron-capacity \
+       --output-dir .nerb/enron/capacity \
+       --attempt-ledger-dir .nerb/enron/capacity-attempts
+     uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+       python -I -S -B scripts/run_enron_capacity.py verify-enron-capacity \
+       --run-dir .nerb/enron/capacity \
+       --attempt-ledger-dir .nerb/enron/capacity-attempts
+     uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+       python -I -S -B scripts/run_enron_capacity.py export-enron-capacity \
+       --run-dir .nerb/enron/capacity \
+       --attempt-ledger-dir .nerb/enron/capacity-attempts \
+       --output capacity-decision.json
+     ```
    - Do not optimize against an Enron final-test score. Stop after train mining, validation-only policy selection,
      optional auxiliary-train diagnostics, and catalog conformance. Only a release steward may use the one-shot sealed
      final-test path after the bank, evaluator, thresholds, claims, and workloads are frozen.

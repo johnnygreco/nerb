@@ -441,7 +441,7 @@ def test_adapter_config_and_non_equivalent_exploratory_operations(tmp_path: Path
         _request(
             "generic_regex_scan",
             artifacts=email_inputs,
-            parameters={"concurrency": 1, "max_records": 10, "pattern_set": "email_format_v1"},
+            parameters={"concurrency": 1, "max_records": 10, "pattern_set": "email_format"},
             workload="generic",
         ),
         _request(

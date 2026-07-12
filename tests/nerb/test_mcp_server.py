@@ -4,6 +4,7 @@ import asyncio
 import json
 from importlib.metadata import entry_points
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -139,6 +140,23 @@ from nerb.replacements import (
 pytest.importorskip("mcp", reason="The MCP SDK supports Python 3.10+.")
 
 
+def _call_mcp_json_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    result: Any = asyncio.run(mcp.call_tool(name, arguments))
+    if isinstance(result, tuple):
+        assert len(result) == 2
+        payload = result[1]
+        assert isinstance(payload, dict)
+        return payload
+
+    content = result
+    assert len(content) == 1
+    text = getattr(content[0], "text", None)
+    assert isinstance(text, str)
+    payload = json.loads(text)
+    assert isinstance(payload, dict)
+    return payload
+
+
 def _console_script_entry_points():
     discovered_entry_points = entry_points()
     if hasattr(discovered_entry_points, "select"):
@@ -246,7 +264,9 @@ def test_console_script_entry_point_is_registered():
 def test_mcp_server_registers_expected_tools():
     tools = asyncio.run(mcp.list_tools())
 
-    assert {tool.name for tool in tools} >= {
+    tools_by_name = {tool.name: tool for tool in tools}
+
+    assert tools_by_name.keys() >= {
         "validate_config",
         "load_config",
         "engine_cache_info",
@@ -281,6 +301,35 @@ def test_mcp_server_registers_expected_tools():
         "deanonymize_text",
         "deanonymize_file",
     }
+
+    save_options = tools_by_name["save_replacement_db"].inputSchema["$defs"]["_ReplacementDbSaveOptions"]
+    assert set(save_options["properties"]) == {
+        "expected_replacement_db_hash",
+        "expected_version",
+        "include_sensitive_metadata",
+    }
+    assert save_options["additionalProperties"] is False
+    expected_anonymize_options = {
+        "engine",
+        "engine_options",
+        "expected_replacement_db_hash",
+        "expected_version",
+        "include_originals",
+        "include_sensitive_metadata",
+        "include_statuses",
+        "max_batch_documents",
+        "max_batch_text_bytes",
+        "max_text_bytes",
+        "mode",
+        "on_missing_assignment",
+        "save",
+        "source_surface_limit",
+        "word_boundaries",
+    }
+    for tool_name in ("anonymize_text", "anonymize_file", "anonymize_config_text", "anonymize_config_file"):
+        anonymize_options = tools_by_name[tool_name].inputSchema["$defs"]["_AnonymizeSaveOptions"]
+        assert set(anonymize_options["properties"]) == expected_anonymize_options
+        assert anonymize_options["additionalProperties"] is False
 
 
 def test_validate_and_load_config_return_json_compatible_data(test_data_path):
@@ -492,11 +541,11 @@ def test_mcp_replacement_db_create_validate_and_save_are_explicit(tmp_path):
     assert version_only_overwrite["diagnostics"][0]["code"] == "replacement_db.stale_write"
     assert load_replacement_db(db_path)["description"] == ""
 
-    expected_hash = hash_replacement_db(load_replacement_db(db_path))
+    expected_replacement_db_hash = hash_replacement_db(load_replacement_db(db_path))
     safe_overwrite = save_replacement_db_tool(
         replacement_db=changed,
         save_db_path=str(db_path),
-        options={"expected_replacement_db_hash": expected_hash},
+        options={"expected_replacement_db_hash": expected_replacement_db_hash},
     )
 
     assert safe_overwrite["saved"] is True
@@ -506,19 +555,19 @@ def test_mcp_replacement_db_create_validate_and_save_are_explicit(tmp_path):
     changed_again = load_replacement_db(db_path)
     changed_again["description"] = "changed again"
     changed_again["version"] = 3
-    expected_hash = hash_replacement_db(load_replacement_db(db_path))
+    expected_replacement_db_hash = hash_replacement_db(load_replacement_db(db_path))
     sensitive_overwrite = save_replacement_db_tool(
         replacement_db=changed_again,
         save_db_path=str(db_path),
         options={
-            "expected_replacement_db_hash": expected_hash,
+            "expected_replacement_db_hash": expected_replacement_db_hash,
             "expected_version": 2,
             "include_sensitive_metadata": True,
         },
     )
 
     assert sensitive_overwrite["saved"] is True
-    assert sensitive_overwrite["options"]["expected_replacement_db_hash"] == expected_hash
+    assert sensitive_overwrite["options"]["expected_replacement_db_hash"] == expected_replacement_db_hash
     assert load_replacement_db(db_path)["description"] == "changed again"
 
     wrong_version_save = anonymize_text_tool(
@@ -705,6 +754,41 @@ def test_mcp_anonymize_config_tools_use_config_scopes_and_explicit_save(tmp_path
     assert saved["replacement_db"]["saved"] is True
     assert len(load_replacement_db(db_path)["assignments"]) == 2
     assert restored["text"] == "A-123 then A-124"
+
+
+def test_mcp_config_anonymize_tool_schemas_accept_word_boundaries_at_runtime(tmp_path):
+    config_path = save_config({"ANIMAL": {"Cat": "cat"}}, tmp_path / "entities.yaml")
+    document_path = tmp_path / "source.txt"
+    document_path.write_text("concatenate cat", encoding="utf-8")
+    replacement_db = create_replacement_db_helper(
+        assignment_scope="surface",
+        now="2026-06-13T00:00:00Z",
+    )
+    options = {"mode": "redact", "word_boundaries": True}
+
+    text_result = _call_mcp_json_tool(
+        "anonymize_config_text",
+        {
+            "text": "concatenate cat",
+            "config_path": str(config_path),
+            "replacement_db": replacement_db,
+            "options": options,
+        },
+    )
+    file_result = _call_mcp_json_tool(
+        "anonymize_config_file",
+        {
+            "file_path": str(document_path),
+            "config_path": str(config_path),
+            "replacement_db": replacement_db,
+            "options": options,
+        },
+    )
+
+    assert text_result["text"].startswith("concatenate [ANIMAL_")
+    assert text_result["text"].endswith("_0001]")
+    assert text_result["summary"]["record_count"] == 1
+    assert file_result["text"] == text_result["text"]
 
 
 def test_mcp_replacement_db_diagnostics_are_sanitized_by_default(tmp_path):

@@ -13,7 +13,7 @@ import heapq
 import json
 import re
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TextIO, cast
@@ -131,12 +131,32 @@ class _Evaluation:
     negative_details: tuple[dict[str, Any], ...]
 
 
+@dataclass(slots=True)
+class _ActivityReporter:
+    callback: Callable[[], None] | None
+    pending: int = 0
+
+    def worked(self) -> None:
+        self.pending += 1
+        if self.pending == 10_000:
+            self.boundary()
+
+    def boundary(self) -> None:
+        if self.callback is not None:
+            try:
+                self.callback()
+            except Exception:
+                raise EnronConformanceError("Conformance activity callback failed.") from None
+        self.pending = 0
+
+
 def evaluate_enron_conformance(
     bank: Mapping[str, Any],
     positive_cases: Sequence[Mapping[str, Any]],
     negative_cases: Sequence[Mapping[str, Any]],
     *,
     options: EnronConformanceOptions | None = None,
+    activity_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate strict synthetic cases and return only aggregates and digests.
 
@@ -150,6 +170,7 @@ def evaluate_enron_conformance(
         negative_cases,
         options or EnronConformanceOptions(),
         capture_private_audit=False,
+        activity_callback=activity_callback,
     ).public
 
 
@@ -161,6 +182,7 @@ def evaluate_enron_conformance_files(
     *,
     options: EnronConformanceOptions | None = None,
     allow_unignored_output: bool = False,
+    activity_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Evaluate strict JSONL cases and atomically commit a private audit run."""
 
@@ -169,7 +191,14 @@ def evaluate_enron_conformance_files(
     try:
         positive_cases = _load_jsonl_cases(Path(positive_cases_path), resolved)
         negative_cases = _load_jsonl_cases(Path(negative_cases_path), resolved)
-        evaluation = _evaluate(bank, positive_cases, negative_cases, resolved, capture_private_audit=True)
+        evaluation = _evaluate(
+            bank,
+            positive_cases,
+            negative_cases,
+            resolved,
+            capture_private_audit=True,
+            activity_callback=activity_callback,
+        )
         if evaluation.positive_bytes is None or evaluation.negative_bytes is None:
             raise EnronConformanceError("Conformance private audit capture failed safely.")
         with PrivateRun(Path(output_dir), allow_unignored_output=allow_unignored_output) as run:
@@ -214,7 +243,12 @@ def _evaluate(
     options: EnronConformanceOptions,
     *,
     capture_private_audit: bool,
+    activity_callback: Callable[[], None] | None = None,
 ) -> _Evaluation:
+    if activity_callback is not None and not callable(activity_callback):
+        raise EnronConformanceError("Conformance activity callback must be callable when provided.")
+    activity = _ActivityReporter(activity_callback)
+    activity.boundary()
     _validate_options(options)
     if not isinstance(bank, Mapping):
         raise EnronConformanceError("Conformance bank must be a mapping.")
@@ -230,19 +264,31 @@ def _evaluate(
     except Exception:
         raise EnronConformanceError("Conformance bank could not be compiled safely.") from None
     active_patterns = _active_pattern_catalog(compiled)
-    normalized_positive = _normalize_positive_cases(positive_cases, active_patterns, options)
-    normalized_negative = _normalize_negative_cases(negative_cases, options)
+    activity.boundary()
+    normalized_positive = _normalize_positive_cases(
+        positive_cases,
+        active_patterns,
+        options,
+        activity_reporter=activity,
+    )
+    normalized_negative = _normalize_negative_cases(
+        negative_cases,
+        options,
+        activity_reporter=activity,
+    )
     _validate_case_set(normalized_positive, normalized_negative)
 
     positive_bytes, positive_size, positive_sha256 = _canonical_jsonl_artifact(
         normalized_positive,
         max_bytes=options.max_artifact_bytes,
         capture_payload=capture_private_audit,
+        activity_reporter=activity,
     )
     negative_bytes, negative_size, negative_sha256 = _canonical_jsonl_artifact(
         normalized_negative,
         max_bytes=options.max_artifact_bytes,
         capture_payload=capture_private_audit,
+        activity_reporter=activity,
     )
     if positive_size and negative_size and positive_sha256 == negative_sha256:
         raise EnronConformanceError("Positive and negative case artifacts must be distinct.")
@@ -302,6 +348,7 @@ def _evaluate(
 
     if not active_patterns or not normalized_positive or not normalized_negative:
         aggregate = _unevaluated_aggregate()
+        activity.boundary()
         return _Evaluation(
             public=_public_result(compiled, aggregate, fingerprints),
             positive_bytes=positive_bytes,
@@ -316,6 +363,7 @@ def _evaluate(
     supported_patterns: set[tuple[str, str, str]] = set()
     positive_details: list[dict[str, Any]] = []
     for case in normalized_positive:
+        activity.worked()
         records = _scan_case(compiled, str(case["text"]), options)
         expected = cast(list[dict[str, Any]], case["expected"])
         statuses = _classify_expected(expected, records)
@@ -349,6 +397,7 @@ def _evaluate(
     unexpected_negative_matches = 0
     negative_details: list[dict[str, Any]] = []
     for case in normalized_negative:
+        activity.worked()
         records = _scan_case(compiled, str(case["text"]), options)
         unexpected = bool(records)
         unexpected_negative_matches += int(unexpected)
@@ -401,6 +450,7 @@ def _evaluate(
     diagnostic_codes = {str(item["code"]) for item in contract_validation["diagnostics"]}
     if diagnostic_codes - {"contract.incomplete_pattern_support"}:
         raise EnronConformanceError("Conformance output failed standalone contract validation.")
+    activity.boundary()
     return _Evaluation(
         public=_public_result(compiled, aggregate, fingerprints),
         positive_bytes=positive_bytes,
@@ -480,9 +530,13 @@ def _normalize_positive_cases(
     cases: Sequence[Mapping[str, Any]],
     catalog: Mapping[tuple[str, str, str], _ActivePattern],
     options: EnronConformanceOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for index, raw in enumerate(cases):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         case = _require_case_mapping(raw, _POSITIVE_FIELDS, "Positive", index)
         if case["schema_version"] != POSITIVE_CASE_SCHEMA_VERSION:
             raise EnronConformanceError(f"Positive conformance case {index} has an unsupported schema version.")
@@ -516,10 +570,15 @@ def _normalize_positive_cases(
 
 
 def _normalize_negative_cases(
-    cases: Sequence[Mapping[str, Any]], options: EnronConformanceOptions
+    cases: Sequence[Mapping[str, Any]],
+    options: EnronConformanceOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for index, raw in enumerate(cases):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         case = _require_case_mapping(raw, _NEGATIVE_FIELDS, "Negative", index)
         if case["schema_version"] != NEGATIVE_CASE_SCHEMA_VERSION:
             raise EnronConformanceError(f"Negative conformance case {index} has an unsupported schema version.")
@@ -829,11 +888,14 @@ def _canonical_jsonl_artifact(
     *,
     max_bytes: int,
     capture_payload: bool,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> tuple[bytes | None, int, str]:
     digest = hashlib.sha256()
     payload = bytearray() if capture_payload else None
     size = 0
     for record in records:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         line = _canonical_json_bytes(record) + b"\n"
         size += len(line)
         if size > max_bytes:

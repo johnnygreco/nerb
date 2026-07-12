@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from collections import defaultdict
@@ -67,6 +68,35 @@ def _prepare(input_jsonl: Path, output_dir: Path, **overrides: Any) -> tuple[Map
     return result, _discover_run(output_dir)
 
 
+def _verification_scratch(parent: Path, name: str = "verification-scratch") -> Path:
+    scratch = parent / name
+    scratch.mkdir(mode=0o700, exist_ok=True)
+    return scratch
+
+
+def _assert_payload_empty_private_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        info = path.lstat()
+        assert not stat.S_ISLNK(info.st_mode)
+        assert info.st_uid == os.geteuid()
+        if stat.S_ISDIR(info.st_mode):
+            assert stat.S_IMODE(info.st_mode) == 0o700
+        else:
+            assert stat.S_ISREG(info.st_mode)
+            assert stat.S_IMODE(info.st_mode) == 0o600
+            assert info.st_size == 0
+
+
+def _assert_cleanup_tombstones(root: Path, *, count: int) -> None:
+    entries = sorted(root.iterdir())
+    assert len(entries) == count
+    for entry in entries:
+        assert re.fullmatch(r"\.nerb-cleanup-[0-9a-f]{48}", entry.name)
+        assert entry.is_dir()
+        assert stat.S_IMODE(entry.stat().st_mode) == 0o700
+        _assert_payload_empty_private_tree(entry)
+
+
 def _discover_run(output_dir: Path) -> RunArtifacts:
     assert output_dir.is_dir()
     jsonl_candidates: list[tuple[Path, tuple[JsonObject, ...]]] = []
@@ -119,6 +149,476 @@ def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> Path:
     )
     path.write_text(payload, encoding="utf-8")
     return path
+
+
+def test_preparation_progress_comes_from_ingested_rows_and_reports_the_final_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "message_id": "<progress@fixture.invalid>",
+        "subject": "Progress",
+        "from": "progress@fixture.invalid",
+        "to": [],
+        "cc": [],
+        "bcc": [],
+        "date": "2001-01-01T00:00:00Z",
+        "body": "Visible body",
+        "file_name": "fixture/progress",
+    }
+    source = _write_jsonl(tmp_path / "source.jsonl", [row] * 5)
+    checkpoints: list[int] = []
+    monkeypatch.setattr(enron_preparation, "PROGRESS_RECORD_INTERVAL", 2)
+
+    result = prepare_enron_source(_options(source, tmp_path / "run", progress_callback=checkpoints.append))
+
+    assert result["source_records"] == 5
+    assert checkpoints == [2, 4, 5]
+
+
+def test_preparation_progress_failure_rolls_back_private_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "message_id": "<progress-failure@fixture.invalid>",
+        "subject": "Progress",
+        "from": "progress@fixture.invalid",
+        "to": [],
+        "cc": [],
+        "bcc": [],
+        "date": "2001-01-01T00:00:00Z",
+        "body": "Visible body",
+        "file_name": "fixture/progress",
+    }
+    source = _write_jsonl(tmp_path / "source.jsonl", [row] * 3)
+    output = tmp_path / "run"
+    monkeypatch.setattr(enron_preparation, "PROGRESS_RECORD_INTERVAL", 2)
+
+    def interrupt(_completed: int) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        prepare_enron_source(_options(source, output, progress_callback=interrupt))
+
+    assert not output.exists()
+    assert not list(tmp_path.glob(".run.stage-*"))
+
+
+def test_preparation_activity_is_observational_and_failure_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = {
+        "message_id": "<activity@fixture.invalid>",
+        "subject": "Activity",
+        "from": "activity@fixture.invalid",
+        "to": [],
+        "cc": [],
+        "bcc": [],
+        "date": "2001-01-01T00:00:00Z",
+        "body": "Visible body",
+        "file_name": "fixture/activity",
+    }
+    source = _write_jsonl(tmp_path / "source.jsonl", [row] * 5)
+    progress: list[int] = []
+    activity = 0
+    monkeypatch.setattr(enron_preparation, "PROGRESS_RECORD_INTERVAL", 2)
+
+    def heartbeat() -> None:
+        nonlocal activity
+        activity += 1
+
+    prepare_enron_source(
+        _options(
+            source,
+            tmp_path / "activity-run",
+            progress_callback=progress.append,
+            activity_callback=heartbeat,
+        )
+    )
+    assert progress == [2, 4, 5]
+    assert activity > 0
+
+    output = tmp_path / "activity-fail"
+    private_marker = str(tmp_path / "private-activity-marker")
+
+    def fail_after_prepared_write() -> None:
+        stages = tuple(tmp_path.glob(".activity-fail.stage-*"))
+        if stages and (stages[0] / "prepared.jsonl").exists():
+            raise RuntimeError(private_marker)
+
+    with pytest.raises(ValueError, match="activity callback failed") as captured:
+        prepare_enron_source(
+            _options(
+                source,
+                output,
+                activity_callback=fail_after_prepared_write,
+            )
+        )
+    assert private_marker not in str(captured.value)
+    assert not output.exists()
+    assert not list(tmp_path.glob(".activity-fail.stage-*"))
+
+
+def test_preparation_verification_uses_and_cleans_caller_owned_scratch(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    observed: list[Path] = []
+    real_open = enron_preparation._open_duplicate_verification_spool
+
+    def recording_open(path: Path, **kwargs: Any) -> Any:
+        observed.append(path)
+        connection = real_open(path, **kwargs)
+        assert connection.execute("PRAGMA temp_store").fetchone()[0] == 2
+        sidecar = path.with_name(path.name + "-wal")
+        sidecar.write_bytes(b"synthetic sidecar")
+        sidecar.chmod(0o600)
+        return connection
+
+    monkeypatch.setattr(enron_preparation, "_open_duplicate_verification_spool", recording_open)
+
+    assert load_enron_preparation_run(run.root, scratch_dir=scratch)["valid"] is True
+    assert observed and observed[0].is_relative_to(scratch)
+    _assert_cleanup_tombstones(scratch, count=1)
+
+
+def test_preparation_verification_rejects_non_private_scratch(
+    tmp_path: Path,
+    test_data_path: Path,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o755)
+
+    with pytest.raises(ValueError, match=r"(?i)(scratch|safe|owned|owner-only|private)"):
+        load_enron_preparation_run(run.root, scratch_dir=scratch)
+
+
+def test_preparation_verification_rejects_symlinked_scratch_ancestor(
+    tmp_path: Path,
+    test_data_path: Path,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    actual_parent = tmp_path / "actual-parent"
+    scratch = actual_parent / "scratch"
+    scratch.mkdir(parents=True, mode=0o700)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(actual_parent, target_is_directory=True)
+
+    with pytest.raises(ValueError, match=r"(?i)(scratch|private|safe|owned)"):
+        load_enron_preparation_run(run.root, scratch_dir=linked_parent / "scratch")
+
+    assert list(scratch.iterdir()) == []
+
+
+def test_preparation_verification_rejects_scratch_substitution_and_cleans_pinned_child(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    scratch = _verification_scratch(tmp_path)
+    parked = tmp_path / "parked-scratch"
+    actual_open = enron_preparation._open_duplicate_verification_spool
+    private_marker = str(scratch)
+
+    def substitute_after_open(path: Path, **kwargs: Any) -> Any:
+        connection = actual_open(path, **kwargs)
+        scratch.rename(parked)
+        scratch.mkdir(mode=0o700)
+        return connection
+
+    monkeypatch.setattr(enron_preparation, "_open_duplicate_verification_spool", substitute_after_open)
+
+    with pytest.raises(ValueError, match=r"(?i)(scratch|changed|clean)") as error:
+        load_enron_preparation_run(run.root, scratch_dir=scratch)
+
+    assert private_marker not in str(error.value)
+    parked_entries = list(parked.iterdir())
+    assert len(parked_entries) == 1
+    assert re.fullmatch(r"\.nerb-enron-verify-[0-9a-f]{24}", parked_entries[0].name)
+    _assert_payload_empty_private_tree(parked_entries[0])
+    assert list(scratch.iterdir()) == []
+
+
+def test_preparation_verification_hardlink_substitution_wipes_every_link_before_failing(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    scratch = _verification_scratch(tmp_path)
+    actual_open = enron_preparation._open_duplicate_verification_spool
+    linked_paths: list[tuple[Path, Path]] = []
+
+    def hardlink_after_open(path: Path, **kwargs: Any) -> Any:
+        connection = actual_open(path, **kwargs)
+        linked = path.with_name("duplicates-hardlink.sqlite3")
+        os.link(path, linked)
+        linked_paths.append((path, linked))
+        return connection
+
+    monkeypatch.setattr(enron_preparation, "_open_duplicate_verification_spool", hardlink_after_open)
+
+    with pytest.raises(ValueError, match=r"(?i)(scratch|clean)"):
+        load_enron_preparation_run(run.root, scratch_dir=scratch)
+
+    assert len(linked_paths) == 1
+    original, linked = linked_paths[0]
+    assert original.read_bytes() == b""
+    assert linked.read_bytes() == b""
+    assert original.stat().st_ino == linked.stat().st_ino
+    _assert_payload_empty_private_tree(scratch)
+
+
+def test_preparation_verification_cleanup_failure_supersedes_body_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = _verification_scratch(tmp_path)
+    real_cleanup = enron_preparation._cleanup_verification_scratch
+
+    def cleanup_then_fail(**kwargs: Any) -> None:
+        real_cleanup(**kwargs)
+        raise enron_preparation.EnronPreparationError("injected verification cleanup failure")
+
+    monkeypatch.setattr(enron_preparation, "_cleanup_verification_scratch", cleanup_then_fail)
+
+    with pytest.raises(enron_preparation.EnronPreparationError, match="injected verification cleanup") as caught:
+        with enron_preparation._verification_scratch_directory(scratch):
+            raise RuntimeError("injected verification body failure")
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    _assert_cleanup_tombstones(scratch, count=1)
+
+
+def test_duplicate_verification_spool_close_failure_supersedes_setup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = _verification_scratch(tmp_path)
+
+    class FailingSetupAndCloseConnection:
+        def execute(self, _statement: str) -> None:
+            raise enron_preparation.sqlite3.OperationalError("injected setup failure")
+
+        def close(self) -> None:
+            raise enron_preparation.sqlite3.OperationalError("injected close failure")
+
+    monkeypatch.setattr(
+        enron_preparation.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: FailingSetupAndCloseConnection(),
+    )
+
+    with enron_preparation._verification_scratch_directory(scratch) as private_file:
+        with pytest.raises(enron_preparation.EnronPreparationError, match="could not be closed") as caught:
+            enron_preparation._open_duplicate_verification_spool(
+                private_file.path,
+                expected_identity=private_file.identity,
+                proof_fd=private_file.descriptor,
+            )
+
+    assert isinstance(caught.value.__cause__, enron_preparation.sqlite3.OperationalError)
+    _assert_cleanup_tombstones(scratch, count=1)
+
+
+def test_preparation_construction_spool_move_out_wipes_original_and_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "private-temp"
+    temp_root.mkdir(mode=0o700)
+    monkeypatch.setattr(enron_preparation.tempfile, "tempdir", os.fspath(temp_root))
+    actual_open = enron_preparation._open_spool
+    parked = tmp_path / "parked-preparation.sqlite3"
+
+    def substitute_after_open(path: Path, **kwargs: Any) -> Any:
+        connection = actual_open(path, **kwargs)
+        path.replace(parked)
+        path.write_bytes(b"replacement private preparation payload")
+        path.chmod(0o600)
+        return connection
+
+    monkeypatch.setattr(enron_preparation, "_open_spool", substitute_after_open)
+
+    with enron_preparation._private_preparation_spool() as connection:
+        connection.execute("INSERT INTO source_items VALUES (?, ?)", ("private-source-digest", 1))
+        connection.commit()
+
+    assert parked.read_bytes() == b""
+    _assert_cleanup_tombstones(temp_root, count=1)
+    assert all(path.read_bytes() == b"" for path in temp_root.rglob("records.sqlite3"))
+
+
+def test_preparation_spool_close_failure_supersedes_body_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "private-temp"
+    temp_root.mkdir(mode=0o700)
+    monkeypatch.setattr(enron_preparation.tempfile, "tempdir", os.fspath(temp_root))
+
+    class FailingCloseConnection:
+        def close(self) -> None:
+            raise enron_preparation.sqlite3.OperationalError("injected close failure")
+
+    monkeypatch.setattr(enron_preparation, "_open_spool", lambda *_args, **_kwargs: FailingCloseConnection())
+
+    with pytest.raises(enron_preparation.EnronPreparationError, match="could not be closed") as caught:
+        with enron_preparation._private_preparation_spool():
+            raise RuntimeError("injected preparation body failure")
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    _assert_cleanup_tombstones(temp_root, count=1)
+
+
+@pytest.mark.parametrize(
+    "artifact_name",
+    ["COMMITTED", "manifest.json", "prepared.jsonl", "profile.json", "rejections.jsonl", "transport-receipt.json"],
+)
+def test_preparation_verifier_pins_every_committed_artifact(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+) -> None:
+    summary, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    manifest_path = run.root / "manifest.json"
+    assert summary["manifest_sha256"] == "sha256:" + hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    artifact_path = run.root / artifact_name
+    parked = tmp_path / f"{artifact_name}.original"
+    replacement = tmp_path / f"{artifact_name}.replacement"
+    replacement.write_bytes(artifact_path.read_bytes())
+    replacement.chmod(0o600)
+    actual_open = enron_preparation.open_private_binary_input_at
+    substituted = False
+
+    def substitute_after_descriptor_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        nonlocal substituted
+        opened = actual_open(directory_fd, name, **kwargs)
+        if name == artifact_name and not substituted:
+            artifact_path.replace(parked)
+            replacement.replace(artifact_path)
+            substituted = True
+        return opened
+
+    monkeypatch.setattr(enron_preparation, "open_private_binary_input_at", substitute_after_descriptor_open)
+    try:
+        with pytest.raises(ValueError, match=r"(?i)(changed|artifact)"):
+            load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
+    finally:
+        if artifact_path.exists():
+            artifact_path.replace(replacement)
+        if parked.exists():
+            parked.replace(artifact_path)
+    assert substituted is True
+
+
+def test_preparation_verifier_pins_committed_root(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    parked = tmp_path / "run-original"
+    actual_open = enron_preparation.open_private_binary_input_at
+    substituted = False
+
+    def substitute_root_after_first_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        nonlocal substituted
+        opened = actual_open(directory_fd, name, **kwargs)
+        if not substituted:
+            run.root.replace(parked)
+            run.root.mkdir(mode=0o700)
+            substituted = True
+        return opened
+
+    monkeypatch.setattr(enron_preparation, "open_private_binary_input_at", substitute_root_after_first_open)
+    try:
+        with pytest.raises(ValueError, match=r"(?i)(changed|inventory|artifact|verified safely)"):
+            load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
+    finally:
+        if run.root.exists():
+            run.root.rmdir()
+        if parked.exists():
+            parked.replace(run.root)
+    assert substituted is True
+
+
+def test_preparation_verification_sanitizes_nonwritable_scratch_failure(
+    tmp_path: Path,
+    test_data_path: Path,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    scratch = _verification_scratch(tmp_path)
+    scratch.chmod(0o500)
+    try:
+        with pytest.raises(ValueError, match=r"(?i)(scratch|safe)") as error:
+            load_enron_preparation_run(run.root, scratch_dir=scratch)
+    finally:
+        scratch.chmod(0o700)
+
+    assert str(scratch) not in str(error.value)
+    assert list(scratch.iterdir()) == []
+
+
+def test_preparation_verification_progress_is_fixed_interval_final_and_failure_safe(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    scratch = _verification_scratch(tmp_path)
+    observed: list[int] = []
+    monkeypatch.setattr(enron_preparation, "PROGRESS_RECORD_INTERVAL", 2)
+
+    assert (
+        load_enron_preparation_run(
+            run.root,
+            scratch_dir=scratch,
+            progress_callback=observed.append,
+        )["valid"]
+        is True
+    )
+    expected = list(range(2, len(run.records) + 1, 2))
+    if len(run.records) % 2:
+        expected.append(len(run.records))
+    assert observed == expected
+    _assert_cleanup_tombstones(scratch, count=1)
+
+    private_marker = str(tmp_path / "private-callback-path")
+
+    def fail_progress(_completed: int) -> None:
+        raise OSError(private_marker)
+
+    with pytest.raises(ValueError, match="Verification progress callback failed") as error:
+        load_enron_preparation_run(
+            run.root,
+            scratch_dir=scratch,
+            progress_callback=fail_progress,
+        )
+    assert private_marker not in str(error.value)
+    _assert_cleanup_tombstones(scratch, count=2)
+
+    def fail_activity_with_open_spool() -> None:
+        if any(path.stat().st_size > 0 for path in scratch.rglob("*.sqlite3")):
+            raise RuntimeError(private_marker)
+
+    with pytest.raises(ValueError, match="activity callback failed") as activity_error:
+        load_enron_preparation_run(
+            run.root,
+            scratch_dir=scratch,
+            activity_callback=fail_activity_with_open_spool,
+        )
+    assert private_marker not in str(activity_error.value)
+    _assert_cleanup_tombstones(scratch, count=3)
 
 
 def _normalized_path(parts: Sequence[str]) -> str:
@@ -286,6 +786,29 @@ def test_row_limited_local_receipt_labels_prefix_hash_as_incomplete(tmp_path: Pa
     assert receipt["transport_sha256"] is None
     assert SHA256_RE.fullmatch(receipt["transport_prefix_sha256"])
     assert receipt["transport_bytes"] < source.stat().st_size
+
+
+@pytest.mark.parametrize("mutation", ["unknown_field", "source_kind", "hash_state", "negative_elapsed"])
+def test_loader_semantically_validates_pinned_transport_receipt(
+    tmp_path: Path,
+    test_data_path: Path,
+    mutation: str,
+) -> None:
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
+    receipt_path = run.root / "transport-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    if mutation == "unknown_field":
+        receipt["unexpected"] = 0
+    elif mutation == "source_kind":
+        receipt["source_kind"] = "huggingface_streaming"
+    elif mutation == "hash_state":
+        receipt["transport_prefix_sha256"] = receipt["transport_sha256"]
+    else:
+        receipt["elapsed_seconds"] = -1
+    _write_json(receipt_path, receipt)
+
+    with pytest.raises(ValueError, match=r"(?i)transport receipt"):
+        load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_exact_duplicate_rows_collapse_but_distinct_mailbox_copies_remain_grouped(
@@ -683,9 +1206,13 @@ def test_huggingface_source_is_pinned_streaming_and_records_package_provenance(
 
     setattr(datasets_module, "load_dataset", load_dataset)
     monkeypatch.setitem(sys.modules, "datasets", datasets_module)
+    cache_dir = tmp_path / "huggingface-cache"
+    cache_dir.mkdir(mode=0o700)
     options = _options(
         None,
         tmp_path / "run",
+        huggingface_cache_dir=cache_dir,
+        huggingface_anonymous=True,
         dataset_id="corbt/enron-emails",
         dataset_revision="cfc06c758093d90993abce1a43668fb7357258a6",
         dataset_split="train",
@@ -703,6 +1230,8 @@ def test_huggingface_source_is_pinned_streaming_and_records_package_provenance(
                 "split": "train",
                 "streaming": True,
                 "revision": "cfc06c758093d90993abce1a43668fb7357258a6",
+                "cache_dir": cache_dir,
+                "token": False,
             },
         )
     ]
@@ -711,6 +1240,8 @@ def test_huggingface_source_is_pinned_streaming_and_records_package_provenance(
     assert "corbt/enron-emails" in aggregate
     assert "cfc06c758093d90993abce1a43668fb7357258a6" in aggregate
     assert "99.1.0-fixture" in aggregate
+    assert str(cache_dir) not in aggregate
+    assert "huggingface_anonymous" not in aggregate
     assert "HF-PRIVATE-BODY-MARKER" not in aggregate
     assert "hf@fixture.invalid" not in aggregate
 
@@ -848,7 +1379,7 @@ def test_promotion_failure_cleans_staging_and_preserves_an_existing_valid_run(
 def test_loader_verifies_artifact_hashes_and_rejects_tampering(tmp_path: Path, test_data_path: Path) -> None:
     _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
 
-    loaded = load_enron_preparation_run(tmp_path / "run")
+    loaded = load_enron_preparation_run(tmp_path / "run", scratch_dir=_verification_scratch(tmp_path))
     assert isinstance(loaded, Mapping)
     bound_hashes = {value for value in _strings(loaded) if SHA256_RE.fullmatch(value)}
     assert _sha256_file(run.records_path) in bound_hashes
@@ -857,7 +1388,7 @@ def test_loader_verifies_artifact_hashes_and_rejects_tampering(tmp_path: Path, t
     with run.records_path.open("ab") as file:
         file.write(b" ")
     with pytest.raises((OSError, ValueError), match="(?i)hash|artifact|invalid|mismatch"):
-        load_enron_preparation_run(tmp_path / "run")
+        load_enron_preparation_run(tmp_path / "run", scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_recomputes_conservation_instead_of_trusting_rebound_aggregate(
@@ -881,7 +1412,7 @@ def test_loader_recomputes_conservation_instead_of_trusting_rebound_aggregate(
     )
 
     with pytest.raises(ValueError, match="(?i)count|conservation|invalid"):
-        load_enron_preparation_run(tmp_path / "run")
+        load_enron_preparation_run(tmp_path / "run", scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_recomputes_duplicate_aggregates_after_full_rebinding(tmp_path: Path, test_data_path: Path) -> None:
@@ -892,7 +1423,7 @@ def test_loader_recomputes_duplicate_aggregates_after_full_rebinding(tmp_path: P
     _rebind_run(run, profile, manifest)
 
     with pytest.raises(ValueError, match="(?i)duplicate|private records"):
-        load_enron_preparation_run(run.root)
+        load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_cross_checks_rejection_reasons_against_ingestion_counters(tmp_path: Path, test_data_path: Path) -> None:
@@ -910,7 +1441,7 @@ def test_loader_cross_checks_rejection_reasons_against_ingestion_counters(tmp_pa
     _rebind_run(run, profile, manifest)
 
     with pytest.raises(ValueError, match="(?i)ingestion counters|private artifacts"):
-        load_enron_preparation_run(run.root)
+        load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_rejects_fabricated_source_provenance_and_row_limits(tmp_path: Path, test_data_path: Path) -> None:
@@ -928,7 +1459,7 @@ def test_loader_rejects_fabricated_source_provenance_and_row_limits(tmp_path: Pa
         _rebind_run(run, profile, manifest)
 
         with pytest.raises(ValueError, match="(?i)source|row limit|provenance"):
-            load_enron_preparation_run(run.root)
+            load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_rejects_fabricated_nerb_version_provenance(tmp_path: Path, test_data_path: Path) -> None:
@@ -939,7 +1470,7 @@ def test_loader_rejects_fabricated_nerb_version_provenance(tmp_path: Path, test_
     _rebind_run(run, profile, manifest)
 
     with pytest.raises(ValueError, match="(?i)software|provenance"):
-        load_enron_preparation_run(run.root)
+        load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_aggregate_privacy_validation_checks_mapping_keys() -> None:
@@ -952,14 +1483,14 @@ def test_loader_rejects_invalid_commit_marker_and_profile_descriptor(tmp_path: P
     _, marker_run = _prepare(source, tmp_path / "marker-run")
     (marker_run.root / "COMMITTED").write_text("fabricated\n", encoding="utf-8")
     with pytest.raises(ValueError, match="(?i)commit marker"):
-        load_enron_preparation_run(marker_run.root)
+        load_enron_preparation_run(marker_run.root, scratch_dir=_verification_scratch(tmp_path))
 
     _, descriptor_run = _prepare(source, tmp_path / "descriptor-run")
     manifest = json.loads(descriptor_run.manifest_path.read_text(encoding="utf-8"))
     manifest["artifacts"]["profile"]["id"] = "fabricated"
     _write_json(descriptor_run.manifest_path, manifest)
     with pytest.raises(ValueError, match="(?i)descriptor|artifact"):
-        load_enron_preparation_run(descriptor_run.root)
+        load_enron_preparation_run(descriptor_run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_rejects_unknown_aggregate_and_prepared_answer_fields(tmp_path: Path, test_data_path: Path) -> None:
@@ -970,14 +1501,14 @@ def test_loader_rejects_unknown_aggregate_and_prepared_answer_fields(tmp_path: P
     profile["raw_phone"] = "+1 555 0100"
     _rebind_run(profile_run, profile, manifest)
     with pytest.raises(ValueError, match="(?i)schema|closed"):
-        load_enron_preparation_run(profile_run.root)
+        load_enron_preparation_run(profile_run.root, scratch_dir=_verification_scratch(tmp_path))
 
     _, manifest_run = _prepare(source, tmp_path / "manifest-run")
     manifest = json.loads(manifest_run.manifest_path.read_text(encoding="utf-8"))
     manifest["raw_name"] = "Private Person"
     _write_json(manifest_run.manifest_path, manifest)
     with pytest.raises(ValueError, match="(?i)schema|closed"):
-        load_enron_preparation_run(manifest_run.root)
+        load_enron_preparation_run(manifest_run.root, scratch_dir=_verification_scratch(tmp_path))
 
     _, prepared_run = _prepare(source, tmp_path / "prepared-run")
     profile = json.loads(prepared_run.profile_path.read_text(encoding="utf-8"))
@@ -987,7 +1518,7 @@ def test_loader_rejects_unknown_aggregate_and_prepared_answer_fields(tmp_path: P
     _write_jsonl(prepared_run.records_path, records)
     _rebind_run(prepared_run, profile, manifest)
     with pytest.raises(ValueError, match="(?i)headers|views|schema"):
-        load_enron_preparation_run(prepared_run.root)
+        load_enron_preparation_run(prepared_run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_rejects_unknown_transform_counter_keys_even_when_aggregates_match(
@@ -1004,7 +1535,7 @@ def test_loader_rejects_unknown_transform_counter_keys_even_when_aggregates_matc
     _rebind_run(run, profile, manifest)
 
     with pytest.raises(ValueError, match="(?i)counter name|cleaning"):
-        load_enron_preparation_run(run.root)
+        load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_loader_binds_view_truncation_metadata_to_cleaning_audit(tmp_path: Path, test_data_path: Path) -> None:
@@ -1025,7 +1556,7 @@ def test_loader_binds_view_truncation_metadata_to_cleaning_audit(tmp_path: Path,
     _rebind_run(run, profile, manifest)
 
     with pytest.raises(ValueError, match="(?i)view metadata|truncat"):
-        load_enron_preparation_run(run.root)
+        load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))
 
 
 def test_blank_lines_are_explicit_rejected_source_occurrences(tmp_path: Path) -> None:
@@ -1048,7 +1579,7 @@ def test_blank_lines_are_explicit_rejected_source_occurrences(tmp_path: Path) ->
     assert run.profile["records"]["input_records"] == 2
     assert run.profile["records"]["rejected_records"] == 1
     assert run.profile["records"]["ingestion_errors"]["blank_line"] == 1
-    assert load_enron_preparation_run(run.root)["valid"] is True
+    assert load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))["valid"] is True
 
 
 def test_malformed_rfc2047_headers_fall_back_without_aborting_preparation(tmp_path: Path) -> None:
@@ -1069,7 +1600,7 @@ def test_malformed_rfc2047_headers_fall_back_without_aborting_preparation(tmp_pa
 
     assert run.records[0]["headers"]["subject"] == "=?utf-8?b?A?="
     assert run.profile["cleaning"]["header_decode_errors"] >= 1
-    assert load_enron_preparation_run(run.root)["valid"] is True
+    assert load_enron_preparation_run(run.root, scratch_dir=_verification_scratch(tmp_path))["valid"] is True
 
 
 def test_date_policy_boundaries_and_ambiguous_timezone_are_frozen() -> None:

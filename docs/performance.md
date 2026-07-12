@@ -1,6 +1,6 @@
 # Performance And Scale Evidence
 
-This page summarizes the current Rust-backed performance posture, the decision-grade Enron development result, and the
+This page summarizes the current Rust-backed performance posture, the decision-grade Enron benchmark standard, and the
 reproducible gate commands.
 
 Rust engine conformance, benchmark, dense-memory, mode-strategy, and distribution gate evidence is recorded in
@@ -27,12 +27,15 @@ development and bank-build runs; there is deliberately no preparation-source or 
 restricted to the verified development-train artifact used by the builder. Use ignored directories
 for both outputs because the prepared run contains the evaluated bank, selected validation documents, generated scale
 fixtures, inventories, and private source locations.
+The required owner-only scratch root keeps the preparation-time bank replay inside caller-accounted storage.
 
 ```shell
+install -d -m 700 .nerb/enron-scratch
 uv run nerb prepare-enron-performance \
   --bank-build-run .nerb/enron/bank-build \
   --development-run .nerb/enron/development \
-  --output-dir .nerb/enron/performance-plan
+  --output-dir .nerb/enron/performance-plan \
+  --scratch-root .nerb/enron-scratch
 
 # Five samples per cell: useful for correctness and workflow smoke only.
 uv run nerb run-enron-performance \
@@ -101,71 +104,56 @@ heterogeneous per-document timings is never compared with a whole-input average.
 shared declared scenario—not a measured model invocation, token, hosted-service, or dollar cost—and cannot manufacture
 the crossing.
 
-## Decision-Grade Development Result
+## Decision-Grade Performance Benchmark Standard
 
-Here, *decision-grade* means the workload and thresholds were frozen before measurement; exact paths prove the same
-mapped outputs; repeated isolated blocks quantify tails, session variation, and memory; software, hardware, and artifact
-lineage are recorded; and the aggregate result passes privacy and integrity verification. That is sufficient to choose
-the compile-once/scan-many runtime path. It is not a recall claim or final publication approval: quality, full-source
-capacity, and the one-shot sealed evaluation retain their own gates.
+A *decision-grade performance benchmark* is evidence strong enough to support a specific runtime-architecture decision,
+not merely a timing that looks favorable. Here, the decision is whether compile-once/scan-many can meet the frozen
+latency, throughput, memory, and stability requirements on the frozen benchmark bank and workload. It is not a claim
+that the sampled workload is a production request trace.
 
-The recorded decision profile passed the frozen exact-block plan on Apple M4 arm64 hardware with 10 logical CPUs,
-16 GiB RAM, macOS, and Python 3.13.12. The run used package and native engine 0.0.11 at clean commit
-`7dd1128d3b2f7ade7caf86b7fc5d9cb633e05f0b`, passed its aggregate privacy scan with zero violations, and recorded
-`sealed_test_accessed: false`. Its frozen plan is
-`sha256:5ac7496f85867ef71ed91305db2c87ca38a9092abef5c58a331fefa07f165650`, its performance manifest is
-`sha256:b5dfb33fb2ab351a9fb95d4f14a6bf1224b3aee1715e9a344880d4b7c2c290f0`, and the deep-verified run is
-`sha256:99ed7abddd34c9edf4c3dc2f43868885c5af768fae7eb9e3b57e973fb075f53c`.
+The result is decision-grade only when the decision question, workload identities, sample counts, comparison design,
+and pass/fail thresholds are frozen before measurement. Every exact path must prove identical mapped output, so speed is
+not purchased by silently doing less work. Repeated isolated blocks must measure tails, process/session variation,
+ordering effects, and peak RSS. The run must bind the selected bank, evaluator, validation aggregate, source split,
+implementation, software, hardware, and environment with verified hashes.
 
-This is development evidence over the frozen 50,000-row train/validation build, not the final public full-source claim.
-The mandatory full 517,401-row streaming/resource proof and one-shot sealed evaluation remain separate gates. The real
-performance input contains 100 validation documents, 35,837 UTF-8 bytes, and 1,314 expected mapped records. The evaluated
-bank has two semantic classes, 628 active patterns, 127 aliases, 8,783,376 canonical JSON bytes, 1,266,398 native-source
-bytes, and a 13,293,272-byte private bank artifact.
+The full production-capacity workflow must also pass its separate progress, scratch-space, free-space, and resource
+gates. Public evidence must be aggregate-only, pass privacy scanning, record `sealed_test_accessed: false`, and report
+every required cell—including failures and inconclusive stability outcomes—without post-hoc workload or threshold
+changes.
+
+That standard can justify a runtime architecture choice. It cannot establish PII recall, low leakage, or release
+readiness: quality evaluation, full-source capacity, and the one-shot sealed evaluation remain independent gates. The
+final evidence contract uses `decision_grade` for the broader *release decision*, which passes only when those independent
+quality, privacy, capacity, lineage, and performance requirements all pass. Smoke runs are useful for correctness and
+harness checks, but their small sample counts are not decision-grade performance evidence.
+
+The repository currently publishes the workflow and frozen gates, not a current production-capacity result. A fresh run
+must regenerate and deep-verify all aggregate commitments after any bank policy, evaluator, or workload change before a
+measured value is cited.
 
 ### Frozen promotion gates
 
-| Gate | Frozen threshold | Measured result | Status |
-| --- | ---: | ---: | --- |
-| Real document p99 | at most 50 ms | 0.259 ms | passed |
-| Real whole-input documents/s | at least 100 | 128,994 | passed |
-| Real whole-input MiB/s | at least 1 | 44.09 | passed |
-| 100k-pattern MiB/s | at least 1 | 99.69 | passed |
-| Peak RSS | at most 8 GiB | 555.6 MiB maximum measured cell | passed |
-| Exact-twin symmetric gap | at most 5% | 2.14% maximum across 20 comparisons | passed |
-| Cross-path paired-ratio MAD noise floor | at most 25% | 5.32% maximum across 12 comparisons | passed |
+| Gate | Frozen threshold | Evidence required |
+| --- | ---: | --- |
+| Real document p99 | at most 50 ms | Fresh decision-profile run |
+| Real whole-input documents/s | at least 100 | Fresh decision-profile run |
+| Real whole-input MiB/s | at least 1 | Fresh decision-profile run |
+| 100k-pattern MiB/s | at least 1 | Fresh decision-profile run |
+| Peak RSS | at most 8 GiB | Maximum over every required cell |
+| Exact-twin symmetric gap | at most 5% | Every required same-path comparison |
+| Cross-path paired-ratio MAD noise floor | at most 25% | Every required directional comparison |
 
-### Lifecycle and cache value
+### Frozen measurement design
 
 Setup stability uses the median of 20 fresh-process samples, slow cache-path stability uses the median of 100 samples,
 and direct/document p99 stability uses 1,000 pooled samples. The separate direct comparison-support proxy uses 100
 samples and median stability. All candidate/exact-twin pairs are acquired in ten frozen paired blocks.
 
-| Path | Median | Tail | Throughput | Peak RSS |
-| --- | ---: | ---: | ---: | ---: |
-| Train-source profile | 2.680 s | p95 2.692 s | one-time setup | 38.5 MiB |
-| Intelligence-bank build, including private snapshot setup | 45.382 s | p95 45.798 s | one-time setup | 555.6 MiB |
-| Cold compile | 3.188 s | p95 3.246 s | one-time setup | 130.8 MiB |
-| Direct compiled `Bank`, one document | 0.0062 ms | p99 0.259 ms | document sample | 122.3 MiB |
-| Direct compiled `Bank`, 100 documents | 0.775 ms | p99 0.831 ms | 128,994 docs/s; 44.09 MiB/s; 1.69M records/s | 122.3 MiB |
-| Helper cache hit | 3.117 s | p99 3.198 s | 32.1 docs/s; 0.0110 MiB/s | 155.7 MiB |
-| Helper cache miss | 3.241 s | p99 3.313 s | 30.9 docs/s; 0.0105 MiB/s | 123.5 MiB |
-| End to end | 3.293 s | p99 3.346 s | 30.4 docs/s; 0.0104 MiB/s | 143.4 MiB |
-
-The promoted break-even model's measured per-request inputs differ by about 4,181×: 0.000775 seconds for direct reuse
-versus 3.241025 seconds for the exact helper-cache-miss path. This ratio is a model-input summary, not the paired
-directional estimator or a generic speed promise. Helper paths include JSON-bank validation, canonicalization, hashing,
-and adapter work that a caller avoids by retaining the compiled `Bank`. After shared profiling, curation, and bank-build
-costs cancel, the direct path pays 3.188219 seconds to compile plus its 0.000775-second first frozen whole-input request.
-It is already ahead by about 52.0 ms at the model's minimum of one complete 100-document request; the result must not be
-translated into a per-document crossing.
-
-The exploratory generic email regex reached 78.05 MiB/s and happened to emit the same aggregate record count, but it
-cannot map a mention to a known canonical identity or implement the full bank semantics. The Python literal baseline
-reached 2.72 MiB/s and emitted only 631 records, so neither is a semantically exact correctness baseline. All 20
-same-path comparisons—including every true decision cell and the support proxy—were `within_tolerance`. Of the 12
-cross-path outcomes, nine were `improved` and three were `equivalent_within_noise`; none regressed or exceeded the
-unconditional noise ceiling.
+The measured lifecycle must include source profiling, bank construction, cold compilation, direct compiled-bank reuse,
+helper-cache hit and miss paths, and end-to-end extraction. The break-even model may compare only the same complete
+whole-input request. Generic regex and Python literal baselines remain exploratory because they do not implement exact
+bank semantics or canonical identity mapping.
 
 ### Matcher scale
 
@@ -174,17 +162,9 @@ evaluated bank's contact/person and alias proportions while reporting active pat
 contact shard includes a nonempty residual regex, so these are mixed literal/regex banks rather than literal-only
 exact-match fixtures.
 
-| Active patterns | Native shards | Aliases | Canonical JSON | Native source | Median / 100 docs | p99 | MiB/s | Peak RSS |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 4 | 202 | 226,280 B | 138,016 B | 0.172 ms | 0.187 ms | 5,669.45 | 40.9 MiB |
-| 10,000 | 32 | 2,022 | 2,261,206 B | 1,380,158 B | 1.021 ms | 1.059 ms | 956.63 | 80.2 MiB |
-| 25,000 | 80 | 5,056 | 5,652,792 B | 3,450,400 B | 2.492 ms | 2.567 ms | 391.95 | 143.8 MiB |
-| 100,000 | 318 | 20,223 | 22,610,648 B | 13,801,592 B | 9.796 ms | 10.148 ms | 99.69 | 485.9 MiB |
-
-Four-thread scanning of the tiny 1k negative cell was slower than single-thread scanning because coordination and Python
-projection overhead dominate sub-millisecond work. Concurrency is deterministic and bounded, but this cell does not
-support a parallel-speedup claim. NERB does not expose an exact compiled-object-size API, so the report uses physical
-artifact bytes, canonical/native source bytes, and process peak RSS as distinct size proxies.
+Fresh evidence must report the active-pattern count, native shard count, alias count, canonical and native-source bytes,
+latency, throughput, and peak RSS for every scale row. NERB does not expose an exact compiled-object-size API, so the
+report keeps physical artifact bytes, canonical/native source bytes, and process peak RSS as distinct size proxies.
 
 ## Reproducible Gate
 
@@ -253,7 +233,8 @@ PY
 | `eval_refs` warning above 1,000 refs | Enforced as `eval_refs.large` warning in schema validation. |
 | Metadata warning above 16 KiB | Enforced as `metadata.large` warning in schema validation. |
 | Metadata error above 1 MiB | Enforced as `metadata.too_large` error in schema validation. |
-| Single extraction text 10 MiB | Enforced by default extraction options. |
+| Single inline or path scan 10 MiB | Enforced by the native boundary before mapped-haystack allocation; extraction options may set a lower limit. |
+| Concurrent scans per compiled bank 8 | Enforced by the native per-bank scan limiter and used for regex-cache accounting. |
 | Batch 100 documents / 25 MiB combined text | Enforced by default extraction options. |
 | Eval JSONL 100 MiB | Enforced by default eval options. |
 | Runtime regex probes standard 5 / deep 25 | Enforced by runtime validation probe limits. |

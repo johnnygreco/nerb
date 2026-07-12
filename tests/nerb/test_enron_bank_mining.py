@@ -3,11 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import nerb.enron_bank_builder as bank_builder_module
 from nerb.engines import compile_bank
 from nerb.enron_bank_builder import (
     ITERATION_POLICIES,
     CandidateEvidence,
     CandidatePool,
+    EnronBankBuildError,
     EnronBankPolicy,
     curate_enron_iteration,
     mine_enron_candidates,
@@ -150,6 +154,102 @@ def test_candidate_mining_is_row_order_independent(tmp_path: Path) -> None:
     )
 
     assert first == second
+
+
+def test_candidate_mining_uses_only_the_bounded_main_spool_file(tmp_path: Path) -> None:
+    rows = [
+        _sender_record(
+            1,
+            address="alice.alpha@example.invalid",
+            current_body="First source record.\nAlice Alpha",
+        ),
+        _sender_record(
+            2,
+            address="alice.alpha@example.invalid",
+            current_body="Second source record.\nAlice Alpha",
+        ),
+    ]
+    spool = tmp_path / "bounded.sqlite3"
+    spool.touch()
+    checkpoints: list[tuple[str, ...]] = []
+
+    def checkpoint() -> None:
+        names = tuple(sorted(path.name for path in tmp_path.iterdir()))
+        checkpoints.append(names)
+        assert names == (spool.name,)
+        assert spool.stat().st_size <= 1024 * 1024
+
+    mine_enron_candidates(
+        rows,
+        sqlite_path=spool,
+        train_artifact_sha256="sha256:" + "c" * 64,
+        policy=EnronBankPolicy(),
+        max_spool_bytes=1024 * 1024,
+        resource_checkpoint=checkpoint,
+    )
+
+    assert len(checkpoints) >= 3
+    assert tuple(tmp_path.glob("bounded.sqlite3-*")) == ()
+
+
+def test_candidate_mining_heartbeats_through_every_post_ingest_pass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bank_builder_module, "_BUILDER_ACTIVITY_INTERVAL", 1)
+    rows = [
+        _sender_record(
+            index,
+            address=f"person.{index}@example.invalid",
+            current_body=f"Synthetic source record {index}.\nPerson {index}",
+        )
+        for index in (1, 2)
+    ]
+    spool = tmp_path / "heartbeat.sqlite3"
+    spool.touch()
+    checkpoints = 0
+
+    def checkpoint() -> None:
+        nonlocal checkpoints
+        checkpoints += 1
+
+    mine_enron_candidates(
+        rows,
+        sqlite_path=spool,
+        train_artifact_sha256="sha256:" + "e" * 64,
+        policy=EnronBankPolicy(),
+        resource_checkpoint=checkpoint,
+    )
+
+    # The callback fires during evidence materialization, source hashing,
+    # candidate-ledger hashing, and class grouping, not only around ingestion.
+    assert checkpoints >= 12
+
+
+def test_candidate_mining_hard_page_cap_fails_before_main_spool_exceeds_budget(tmp_path: Path) -> None:
+    rows = [
+        _sender_record(
+            index,
+            address=f"person.{index}@example.invalid",
+            current_body=f"Synthetic source record {index}.",
+        )
+        for index in range(1, 401)
+    ]
+    spool = tmp_path / "hard-cap.sqlite3"
+    spool.touch()
+    budget = 64 * 1024
+
+    with pytest.raises(EnronBankBuildError, match="Candidate mining failed safely"):
+        mine_enron_candidates(
+            rows,
+            sqlite_path=spool,
+            train_artifact_sha256="sha256:" + "d" * 64,
+            policy=EnronBankPolicy(),
+            max_spool_bytes=budget,
+        )
+
+    assert spool.stat().st_size <= budget
+    assert tuple(tmp_path.glob("hard-cap.sqlite3-*")) == ()
 
 
 def test_same_initial_names_at_one_address_do_not_share_an_active_identity(tmp_path: Path) -> None:
@@ -418,14 +518,14 @@ def test_default_policy_bounds_large_contact_pool_and_keeps_selected_bank_compil
             unknown_date_documents=0,
             evidence_sha256=f"sha256:{index:064x}",
         )
-        for index in range(5_000)
+        for index in range(13_000)
     )
     pool = CandidatePool(
         contacts=contacts,
         person_aliases=(),
         organization_domains=(),
-        train_records=10_000,
-        observations=10_000,
+        train_records=26_000,
+        observations=26_000,
         source_sha256="sha256:" + "2" * 64,
         ledger_sha256="sha256:" + "3" * 64,
     )
@@ -438,9 +538,9 @@ def test_default_policy_bounds_large_contact_pool_and_keeps_selected_bank_compil
     )
 
     contacts_funnel = curated.funnel["by_type"]["contact"]
-    assert contacts_funnel == {"total": 5_000, "active": 500, "draft": 2_000, "rejected": 2_500}
+    assert contacts_funnel == {"total": 13_000, "active": 12_000, "draft": 1_000, "rejected": 0}
     structural = validate_bank(curated.bank, level="deep", strict=True, check_engine_compile=True)
-    assert structural["valid"] is True
+    assert structural["valid"] is True, [item["message"] for item in structural["diagnostics"]]
     assert structural["engine_compatibility"]["compatible"] is True
 
     aggregate_only = curate_enron_iteration(

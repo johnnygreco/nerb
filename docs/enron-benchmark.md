@@ -1,17 +1,19 @@
 # Enron Benchmark Charter
 
 > **Status: contract, private preparation, immutable splitting, train-only bank construction, independent quality
-> execution, catalog conformance, and decision-grade development performance implemented.**
+> execution, catalog conformance, and the decision-grade performance workflow implemented.**
 > The manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
 > [group-aware split and sealing workflow](enron-splits.md), and [privacy evaluation workflow](enron-evaluation.md) are
 > implemented alongside the [train-only bank workflow](enron-bank-building.md) and
-> [deep-verified performance workflow](performance.md#decision-grade-development-result). Development bank cards remain
-> non-promotable until the mandatory full-source streaming/resource proof, one-shot sealed evaluation, final privacy
-> verification, and append-only lineage evidence are complete.
+> [deep-verified performance workflow](performance.md#decision-grade-performance-benchmark-standard). A fresh production-capacity
+> result is required, and bank cards remain non-promotable until the mandatory full-source streaming/resource proof,
+> one-shot sealed evaluation, final privacy verification, and append-only lineage evidence are complete.
 
-NERB's Enron benchmark demonstrates a privacy-first intelligence-cache workflow: a capable agent turns a large private
-organizational source into a reviewed entity bank once; an application compiles that bank once and reuses it for fast,
-deterministic scans. The benchmark must show both sides of that proposition without conflating them:
+NERB's Enron benchmark is designed to demonstrate a privacy-first intelligence-cache workflow: a capable agent turns a
+large private organizational source into a reviewed entity bank once; an application compiles that bank once and reuses
+it for fast, deterministic scans. The implemented workflow does not become demonstration evidence until the frozen
+production-capacity and one-shot quality runs pass. The benchmark must show both sides of the proposition without
+conflating them:
 
 1. how much sensitive information the construction process learned; and
 2. whether NERB reliably and efficiently recognizes the approved knowledge it was given.
@@ -106,7 +108,7 @@ Every promoted name or pattern must retain inspectable, privacy-safe metadata or
 
 Stable aliases should normally be literals. Regexes are appropriate for genuinely structured forms, not for hiding an
 unreviewed inventory. A collision that cannot be mapped unambiguously must be resolved by context-independent policy or
-kept inactive. Test observations never become candidates for the same benchmark version.
+kept inactive. Test observations never become candidates for the evaluated release candidate.
 
 ## Evidence Strength
 
@@ -142,9 +144,9 @@ Independent person-name evidence may use the published
 [CMU Enron Meetings XML archive](https://www.cs.cmu.edu/~einat/EnronMeetings-XML.zip), pinned by SHA-256
 `e7d8dbd9e066eddd6d706a041e379ca93daf9e441a73009646ead41e94a60202`. Its published split and annotation scope must be
 preserved and reported; its labels do not prove quality for email addresses, domains, or other classes. The large email
-source remains [`corbt/enron-emails`](https://huggingface.co/datasets/corbt/enron-emails) at revision
-`cfc06c758093d90993abce1a43668fb7357258a6` unless a future benchmark version deliberately changes it. Source identity
-alone is not sufficient: downloaded content hashes are mandatory.
+source is [`corbt/enron-emails`](https://huggingface.co/datasets/corbt/enron-emails) at revision
+`cfc06c758093d90993abce1a43668fb7357258a6`. Changing that pin creates a distinct source lineage and requires a new
+preregistered run. Source identity alone is not sufficient: downloaded content hashes are mandatory.
 
 ## Sealed Train, Validation, And Test Policy
 
@@ -170,9 +172,9 @@ Bank-building and policy-tuning processes may read train and validation artifact
 text, labels, per-document metrics, failure examples, or a scalar derived from final-test quality. The final test is run
 once for the frozen release candidate; it is never an optimization objective. Every access and its privacy-safe aggregate
 outcome, including a failed or aborted run, enters an append-only public benchmark lineage. A failure may be followed by
-a new benchmark version and newly sealed test, but the successor must link the failed version and disclose the changes
-and decisions informed by its outcome; it never replaces or hides that result. Repeatedly tuning against the same final
-test or selectively surfacing only successful benchmark versions invalidates promotion.
+a newly preregistered release candidate and newly sealed test, but that run must link the failed run and disclose the
+changes and decisions informed by its outcome; it never replaces or hides that result. Repeatedly tuning against the same
+final test or selectively surfacing only successful runs invalidates promotion.
 
 Before access, the manifest designates exactly one prepared primary natural-content view and binds its artifact and
 content policy. A promoted quality run must attest that this view contains no answer-bearing fields. The manifest also
@@ -186,7 +188,7 @@ The conformance plan separately freezes content-addressed positive and negative/
 counts, the exhaustive synthetic label artifact, and the conformance policy hash. It requires positive support for every
 active pattern. The final-test frozen target and every lineage entry bind the manifest hash alongside the bank,
 evaluator, split, exact final-test artifact, thresholds, performance plan, source commit, and freeze time. Reusing that
-test artifact under another benchmark version invalidates the lineage.
+test artifact for another release candidate invalidates the lineage.
 
 ## Quality Metrics
 
@@ -434,10 +436,10 @@ separate exact gates.
 Structured public claims are not selected from convenient diagnostics. Promotion requires the full quality metric set
 for every gate-designated slice, a passing catalog-conformance claim, and performance claims tied to the exact promoted
 document-latency and whole-input-throughput workloads. Each claim repeats its exact slice or workload, scope, label
-strength/completeness, bank, evaluator, source revision, benchmark version, and environment provenance.
+strength/completeness, bank, evaluator, source revision, benchmark identity, and environment provenance.
 
 A failed final gate is evidence, not permission to tune on the test. Claims must name the corpus revision, benchmark
-version, bank and evaluator hashes, label strength, class/cohort scope, and machine context for performance. “No known
+identity, bank and evaluator hashes, label strength, class/cohort scope, and machine context for performance. “No known
 cataloged miss in this frozen evaluation” is supportable when true; “NERB catches all PII” is not.
 
 Failed or aborted aggregate outcomes remain publishable in the append-only lineage when promotion and verifier success

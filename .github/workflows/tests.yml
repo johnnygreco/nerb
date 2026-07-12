@@ -19,6 +19,91 @@ env:
   MATURIN_VERSION: v1.11.5
 
 jobs:
+  enron-capacity-reader:
+    name: Locked Enron capacity reader (Python 3.13)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        # actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.13"
+
+      - name: Set up uv
+        # astral-sh/setup-uv@v8.1.0
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Rust
+        # dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - name: Install exact locked capacity reader environment
+        run: >-
+          uv sync --locked --no-default-groups --group enron-capacity --python 3.13
+          --reinstall-package nerb
+
+      - name: Verify reader distribution provenance
+        run: |
+          uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 python - <<'PY'
+          import sys
+
+          from nerb.enron_capacity import _READER_MODULE_PREFIXES, _reader_environment_identity
+
+          def loaded_reader_modules():
+              return [
+                  name
+                  for name in sys.modules
+                  if any(name == prefix or name.startswith(prefix + ".") for prefix in _READER_MODULE_PREFIXES)
+              ]
+
+          assert loaded_reader_modules() == []
+          first = _reader_environment_identity()
+          second = _reader_environment_identity()
+          assert first == second
+          assert loaded_reader_modules() == []
+          assert first["datasets_version"] == "5.0.0"
+          assert first["datasets_file_count"] > 0
+          assert first["datasets_total_bytes"] > 0
+          assert first["installed_distribution_count"] > 0
+          assert first["datasets_distribution_sha256"].startswith("sha256:")
+          assert first["critical_reader_distribution_count"] == 4
+          assert first["critical_reader_file_count"] > 0
+          assert first["critical_reader_total_bytes"] > 0
+          assert first["critical_reader_versions"] == {
+              "datasets": "5.0.0",
+              "huggingface-hub": "1.23.0",
+              "fsspec": "2026.4.0",
+              "pyarrow": "25.0.0",
+          }
+          assert first["critical_reader_distribution_sha256"].startswith("sha256:")
+          PY
+
+      - name: Smoke-test capacity-only CLI startup
+        run: |
+          uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 nerb --version
+          uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 nerb --help > /dev/null
+          uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+            python -I -S -B scripts/run_enron_capacity.py run-enron-capacity --help > /dev/null
+
+      - name: Add locked test dependencies
+        run: >-
+          uv sync --locked --no-default-groups --group dev --group enron-capacity --python 3.13
+          --reinstall-package nerb
+
+      - name: Exercise phase-owned reader isolation
+        run: >-
+          uv run --locked --no-default-groups --group dev --group enron-capacity --no-sync --python 3.13
+          pytest -q tests/nerb/test_enron_capacity.py::test_reader_provenance_stays_unloaded_until_phase_owned_isolation
+
   checks:
     name: Checks (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -32,6 +117,10 @@ jobs:
       - name: Checkout
         # actions/checkout@v6
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          # Aggregate benchmark evidence verifies source blobs from the
+          # measured ancestor commit, which must remain locally reachable.
+          fetch-depth: 0
 
       - name: Set up Python
         # actions/setup-python@v6
@@ -251,6 +340,12 @@ jobs:
           assert records[0]["string"] == "Alpha"
           assert records[0]["offset_unit"] == "byte"
           PY
+
+      - name: Smoke-test CLI startup
+        shell: bash
+        run: |
+          nerb --version
+          nerb --help > /dev/null
 
   build:
     name: Build package

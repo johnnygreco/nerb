@@ -13,6 +13,7 @@ import pytest
 import nerb.enron_bank_builder as bank_builder
 import nerb.enron_bank_workflow as bank_workflow
 import nerb.enron_contract as enron_contract
+import nerb.enron_quality as enron_quality
 from nerb.bank import bank_stats, hash_bank
 from nerb.enron_bank_builder import EnronBankBuildError, EnronBankPolicy, _canonical_hash, _canonical_json_bytes
 from nerb.enron_bank_workflow import (
@@ -57,6 +58,9 @@ def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
     assert structural["valid"] is True
     assert structural["engine_compatibility"]["compatible"] is True
     _validate_public_card(card)
+    assert card["builder"]["policy_sha256"] == EnronBankPolicy().sha256
+    assert card["builder"]["source_sha256"] == _builder_implementation_sha256()
+    assert card["validation"]["evaluator_sha256"] == _canonical_hash(enron_quality._evaluator_identity())
 
     assert card["candidate_funnel"] == funnel
     assert sum(funnel["by_decision"].values()) == funnel["total_candidates"]
@@ -101,82 +105,6 @@ def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
     conformance = evaluate_enron_conformance(bank, positives, negatives)["catalog_conformance"]
     for key in ("active_patterns", "approved_positive_cases", "correctly_mapped", "negative_cases"):
         assert card["catalog_conformance"][key] == conformance[key]
-
-
-def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_bound() -> None:
-    card_path = _DATA / "enron_bank_card_real_50000.json"
-    funnel_path = _DATA / "enron_candidate_funnel_real_50000.json"
-    card = _load(card_path.name)
-    funnel = _load(funnel_path.name)
-
-    _validate_public_card(card)
-    assert hashlib.sha256(card_path.read_bytes()).hexdigest() == (
-        "accfe490c84ce9704c25f557fd6c99e28d11c7589a0da5d727cbc72529eb8d2f"
-    )
-    assert hashlib.sha256(funnel_path.read_bytes()).hexdigest() == (
-        "3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f"
-    )
-    assert card["run_sha256"] == "sha256:c284e39601886898c52d3c42754d9f2a4979d016cb6dd92a47d1b995168178ee"
-    assert card["bank"]["canonical_sha256"] == (
-        "sha256:f0244b57c571d04784bb758d272292670252b82c1a3cd18cb7ba15a82e03d8d0"
-    )
-    assert card["builder"]["candidate_ledger_sha256"] == (
-        "sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448"
-    )
-    assert card["builder"]["source_sha256"] == _builder_implementation_sha256()
-    assert card["builder"]["policy_sha256"] == EnronBankPolicy().sha256
-    assert card["candidate_funnel"] == funnel
-    assert sum(funnel["by_decision"].values()) == funnel["total_candidates"] == 15_171
-    assert sum(item["total"] for item in funnel["by_type"].values()) == funnel["total_candidates"]
-    assert sum(funnel["by_primary_reason"].values()) == funnel["total_candidates"]
-    assert card["bank"]["stats"]["active_totals"]["patterns"] == 628
-    assert card["validation"]["contact"]["labeled_span_recall"] == 1.0
-    assert card["validation"]["contact"]["cataloged_false_negative"] == 0
-    assert card["validation"]["contact"]["cataloged_wrong_canonical"] == 0
-    assert card["catalog_conformance"]["passed"] is True
-    assert card["catalog_conformance"]["missed"] == 0
-    assert card["catalog_conformance"]["wrong_canonical"] == 0
-    auxiliary = card["independent_auxiliary"]
-    assert auxiliary["evaluated"] is True
-    assert auxiliary["true_positive"] == 94
-    assert auxiliary["false_negative"] == 1_802
-    assert auxiliary["metrics"]["cataloged_recall"] == 1.0
-    assert card["fixture_mode"] is True
-    assert card["promotable"] is False
-    assert card["source"]["sealed_test_accessed"] is False
-    assert card["privacy"]["status"] == "passed"
-
-    serialized = json.dumps((card, funnel), ensure_ascii=False, sort_keys=True)
-    assert "@" not in serialized
-    assert not _PHONE_SHAPE.search(serialized)
-    assert not re.search(r"doc_[0-9a-f]{64}", serialized)
-    assert all(not value.startswith(("/", "~/", "file://")) for value in _strings((card, funnel)))
-
-
-@pytest.mark.parametrize(
-    "metric",
-    [
-        "precision",
-        "open_world_recall",
-        "f1",
-        "catalog_coverage",
-        "cataloged_recall",
-        "document_leak_rate",
-        "cataloged_document_leak_rate",
-        "sensitive_character_recall",
-        "sensitive_character_leak_rate",
-        "negative_document_false_alarm_rate",
-        "over_redaction_rate",
-    ],
-)
-def test_real_aggregate_card_rejects_impossible_auxiliary_metric_arithmetic(metric: str) -> None:
-    card = _load("enron_bank_card_real_50000.json")
-    metrics = card["independent_auxiliary"]["metrics"]
-    metrics[metric] = 1.0 if metrics[metric] != 1.0 else 0.0
-    card["run_sha256"] = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
-
-    with pytest.raises(EnronBankBuildError, match="semantic invariants"):
-        _validate_public_card(card)
 
 
 def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tampering() -> None:

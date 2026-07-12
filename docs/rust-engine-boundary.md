@@ -1,8 +1,7 @@
 # Rust Engine PyO3 Boundary
 
 This document records the native boundary that backs the current Python `Bank` wrapper and the CLI/MCP extraction
-surfaces. Historical issues #50, #51, #52, #53, and #54 introduced the boundary, the first Rust scanning path, the
-measured `all_overlaps` prototype, the internal `global_leftmost` throughput baseline, and the first public wrapper.
+surfaces, including the production matcher and the two internal measurement modes.
 
 ## Native Bank Constructors
 
@@ -21,6 +20,7 @@ assert round_tripped.metadata()["bank_hash"] == bank.metadata()["bank_hash"]
 ```json
 {
   "engine": "nerb_engine",
+  "build_source_sha256": "sha256:...",
   "schema": 1,
   "bank_hash": "sha256:...",
   "entity_count": 1,
@@ -42,6 +42,35 @@ assert round_tripped.metadata()["bank_hash"] == bank.metadata()["bank_hash"]
     "internal_only": false,
     "semantic_notes": "reports cross-entity overlap with leftmost-first matching within each entity"
   },
+  "scan_limits": {
+    "maximum_input_bytes": 10485760,
+    "maximum_concurrent_scans_per_bank": 8
+  },
+  "regex_resources": {
+    "scope": "entity_independent_shards",
+    "physical_regex_layers": 0,
+    "maximum_regex_layers_per_entity": 0,
+    "compiled_regex_static_bytes": 0,
+    "eager_cache_bytes_per_scan": 0,
+    "pikevm_cache_projection_bytes_per_scan": 0,
+    "pikevm_stack_growth_allowance_bytes_per_scan": 0,
+    "lazy_dfa_growth_allowance_bytes_per_scan": 0,
+    "regex_cache_allowance_bytes": 0,
+    "size_limit_bisections": 0,
+    "resource_limit_bisections": 0,
+    "accounted_bytes": 0,
+    "cache_concurrency_budget": 8,
+    "explicit_regex_cache_slots": 8,
+    "internal_meta_cache_pool_used": false,
+    "per_lazy_dfa_cache_capacity_bytes": 32768,
+    "maximum_lazy_dfa_caches_per_regex": 3,
+    "pikevm_stack_nfa_memory_multiplier": 16,
+    "onepass_enabled": false,
+    "bounded_backtracker_enabled": false,
+    "maximum_layers_per_entity": 128,
+    "maximum_patterns_per_regex_layer": 128,
+    "maximum_accounted_bytes": 805306368
+  },
   "detectors": [
     {
       "detector_index": 0,
@@ -54,6 +83,11 @@ assert round_tripped.metadata()["bank_hash"] == bank.metadata()["bank_hash"]
   ]
 }
 ```
+
+The module-level `_engine.BUILD_SOURCE_SHA256` equals each bank's `build_source_sha256`. The build hashes a closed,
+sorted inventory containing `Cargo.toml`, `Cargo.lock`, `build.rs`, and every Rust source file after LF normalization;
+the build fails if that inventory changes without an explicit update. Only production `entity_independent` metadata
+contains `regex_resources`, because its accounting does not describe the internal modes' additional matchers.
 
 ## MatchBuffer
 
@@ -86,13 +120,50 @@ allocation paths. Later dense-hit measurement may revisit this logical limit.
 
 ## Scanning
 
-`Bank.scan_bytes` implements the production-default `entity_independent` mode: one `regex-automata` meta matcher per
-entity with leftmost-first semantics inside each entity and cross-entity overlap preserved. It validates UTF-8 input,
+`Bank.scan_bytes` implements the production-default `entity_independent` mode: one logical matcher per entity with
+leftmost-first semantics inside each entity and cross-entity overlap preserved. A logical matcher may contain bounded
+exact-literal Aho-Corasick layers, mapped Aho-Corasick layers for supported normalized-whitespace and simple-fold
+literals, and one or more residual `regex-automata` layers. Global arbitration by start offset and original pattern order
+reconstructs the entity's leftmost-first result. It validates UTF-8 input,
 releases the GIL during the Rust scan, returns raw `(detector_index, start_byte, end_byte)` matches sorted by byte offsets
 and detector index, and optionally fills a caller-provided `MatchBuffer`.
 
-Matcher construction applies bounded `regex-automata` NFA, one-pass, hybrid-cache, and DFA limits. Unsupported syntax and
-compile-bomb shapes fail during bank construction with `ValueError`.
+Matcher construction disables one-pass and bounded-backtracker strategies and applies bounded `regex-automata` NFA,
+hybrid-cache, and DFA limits. Size-limit failures
+for advancing residual patterns are deterministically bisected, with explicit per-entity layer and aggregate
+static/cache-memory ceilings. Unsupported syntax, singleton size failures, or aggregate resource exhaustion fail during
+bank construction before the bank is returned; syntax/shape failures raise `ValueError`, while aggregate memory-budget
+exhaustion raises `MemoryError`. Production metadata reports the realized layer, memory, and bisection profile.
+Cache accounting includes every physical regex, including the first or only regex in an entity. NERB does not use the
+meta regex's internal sharded cache pool: each physical regex owns exactly eight explicit cache slots selected by the
+bank's scan permit. For one scan slot, the allowance sums the eager meta-cache heap, a checked projection of the
+equivalent PikeVM fallback's fixed cache, a conservative PikeVM epsilon-stack growth bound, and three 32 KiB lazy-DFA
+capacities (forward, reverse, and reverse-inner). `regex_cache_allowance_bytes` multiplies that per-scan sum by eight, and
+`accounted_bytes` adds compiled static bytes. One-pass and bounded-backtracker strategies are disabled so no unmeasured
+lazy strategy cache can appear.
+
+An initial physical regex layer contains at most 128 patterns. This named envelope bounds the PikeVM's
+implicit-capture state/slot product before compilation while retaining deterministic pattern order. A layer that still
+exceeds a compile-size or accounted-resource limit is bisected deterministically; metadata reports size-limit and
+resource-limit bisections separately. More than 128 physical layers in one entity or more than 768 MiB of aggregate
+static-plus-eight-slot cache allowance fails before the layer is committed.
+
+The PikeVM stack bound is 16 times the compiled implicit-capture NFA's reported memory. In pinned `regex-automata`
+0.4.14, every epsilon-stack push is backed by an NFA state or stored Union alternate; the largest private frame is under
+four machine words. The multiplier covers the worst frame-to-`StateID` ratio and geometric `Vec` retained capacity.
+The fixed-cache projection uses checked arithmetic for the four NFA-state ID vectors and two capture-slot tables that
+`regex-automata` creates. Production accounting therefore rejects arithmetic overflow without first allocating a
+potentially quadratic table. Safe-size regressions compare the projection with an actual PikeVM cache, including a
+complex cache larger than 32 KiB, and exercise overflow failure directly.
+
+Every compiled bank admits at most eight scans at once. A per-bank permit covers every native scan mode and is released
+on success, validation/allocation failure, or panic unwinding; additional callers wait without reducing the first eight
+to a serial lane. This enforced scan ceiling is the same concurrency value used by regex-cache accounting.
+
+All inline scan variants reject inputs larger than 10 MiB before releasing the GIL or allocating mapped-haystack
+projections. Exactly 10 MiB is accepted. `scan_text` inherits this byte limit after UTF-8 encoding, so a Unicode string's
+encoded length—not its Python character count—is authoritative. Reused `MatchBuffer` objects are cleared on an
+over-limit error, just as they are for other scan failures.
 
 `IGNORECASE`, `MULTILINE`, `DOTALL`, and `VERBOSE` are applied through per-pattern syntax configuration. The `ASCII` flag
 lowers ASCII-sensitive escapes and boundaries such as `\w`, `\d`, `\s`, and `\b` while leaving the rest of the detector
@@ -196,7 +267,8 @@ assert [global_raw[i] for i in range(len(global_raw))] == [(0, 0, 3)]
 Native `_engine.Bank.scan_path` reads one explicit file path in Rust, validates the bytes through the same UTF-8 scanner,
 and returns raw matches in a `MatchBuffer`. It does not allocate Python match records. The public Python
 `nerb.Bank.scan_path` wrapper uses the native path scan variant that returns the scanned byte snapshot with the raw
-matches, then projects that same snapshot into public records.
+matches, then projects that same snapshot into public records. Path scans use the same 10 MiB ceiling and bound the read
+before passing bytes to the scanner.
 
 ## Error Boundary
 
@@ -245,8 +317,8 @@ limits.
 JSON with `defaults.word_boundaries: true`, wraps whole detector regexes once during canonicalization, and includes that
 policy in pattern stable IDs and the bank hash.
 
-CLI `nerb extract` and the config-backed MCP extraction tools now use this wrapper. Their records no longer include the
-old Python `name` field; use `canonical_name` and `surface_name` instead.
+CLI `nerb extract` and the config-backed MCP extraction tools use this wrapper. Their records expose
+`canonical_name` and `surface_name`.
 
 ```shell
 uv run nerb extract --all --text "Rush played rock." \
