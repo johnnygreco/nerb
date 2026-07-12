@@ -206,8 +206,8 @@
     "over_redacted_characters": 218,
     "predicted_characters": 1298,
     "predicted_spans": 119,
-    "protocol_sha256": "sha256:b5d00759f6245037c33aee914a70a72c7de9e34c0ca2e536e95a2f2d22224b4d",
-    "run_sha256": "sha256:f50aa45a59d93d046fed2c6f33c546dfd78a9c840562621c094f4d14295c16e5",
+    "protocol_sha256": "sha256:2ef668b95f804f48fc74b5e15c2f42858fed6a47848ae1c11c9a4147ac842eef",
+    "run_sha256": "sha256:16538cb1f32e18f70f8bf05ce37113781c88c4440fa0ec8ddba8c8277448d69c",
     "scope": "cmu_meetings_person_train_auxiliary_nonpromotable",
     "sensitive_gold_characters": 20028,
     "true_positive": 94
@@ -233,11 +233,11 @@
       "person_cataloged_wrong_canonical": null,
       "person_labeled_spans": null,
       "policy_sha256": "sha256:61524cefcc30f0fc273721ccd85e6cd9443527c8931ac6abc7661ccc611deced",
-      "quality_run_sha256": "sha256:d5fdde6e9a4dd26cca3dbfc55f9437ac28de869ca6878744ce152865c6a44a36",
+      "quality_run_sha256": "sha256:2aaad1cacd5ef6cdf494097f08e03c0e3f9c10dcf1df203370dd9814d95eef13",
       "schema_version": "nerb.enron_bank_build_iteration.v2",
       "selected": false,
       "utility_metrics_supported": false,
-      "validation_protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0"
+      "validation_protocol_sha256": "sha256:f272727119d5df41fcbbd5f77b523bc150dca1d36ce613e58a530a26312fde3e"
     },
     {
       "active_patterns": 628,
@@ -259,11 +259,11 @@
       "person_cataloged_wrong_canonical": null,
       "person_labeled_spans": null,
       "policy_sha256": "sha256:547e0864dfef037c62ef0bc562bea4ca9d4f23a3be15d65d4056b0dcaccf41bf",
-      "quality_run_sha256": "sha256:5896f621fe88acf4dfb7fdbb33fcc86e9ebda719c054e2b8e3f2316001995c93",
+      "quality_run_sha256": "sha256:b107e8657e67cd2d08168aced51540f20858d02e371067d8a7d2534186071abb",
       "schema_version": "nerb.enron_bank_build_iteration.v2",
       "selected": true,
       "utility_metrics_supported": false,
-      "validation_protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0"
+      "validation_protocol_sha256": "sha256:f272727119d5df41fcbbd5f77b523bc150dca1d36ce613e58a530a26312fde3e"
     },
     {
       "active_patterns": 629,
@@ -285,11 +285,11 @@
       "person_cataloged_wrong_canonical": null,
       "person_labeled_spans": null,
       "policy_sha256": "sha256:6d88cd838413cb49b90ab325b6e0bc620789272d0f08776c20afc0070c05fd14",
-      "quality_run_sha256": "sha256:69560249e2db355632d90ffcabadbc0643849139c868ff75bf5a52e381a38f98",
+      "quality_run_sha256": "sha256:27f0d175d3893a7475beb2715d014b1e1cc716746f1b2f0320f6cf13f8760d2b",
       "schema_version": "nerb.enron_bank_build_iteration.v2",
       "selected": false,
       "utility_metrics_supported": false,
-      "validation_protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0"
+      "validation_protocol_sha256": "sha256:f272727119d5df41fcbbd5f77b523bc150dca1d36ce613e58a530a26312fde3e"
     }
   ],
   "nonpromotable_reasons": [
@@ -309,7 +309,7 @@
     "violation_count": 0
   },
   "promotable": false,
-  "run_sha256": "sha256:08a76ada9561912861757b91c9b8e53e94fab18b6a0777080df7d86de9a5a012",
+  "run_sha256": "sha256:ebe1bbb4337e748f7f8dd1c491460017966a75c4feb346910377e22c690d1169",
   "schema_version": "nerb.enron_bank_card.v2",
   "source": {
     "dataset_id": "corbt/enron-emails",
@@ -369,8 +369,8 @@
       "reason_code": "zero_labeled_person_spans",
       "true_positive": 0
     },
-    "protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0",
-    "quality_run_sha256": "sha256:5896f621fe88acf4dfb7fdbb33fcc86e9ebda719c054e2b8e3f2316001995c93",
+    "protocol_sha256": "sha256:f272727119d5df41fcbbd5f77b523bc150dca1d36ce613e58a530a26312fde3e",
+    "quality_run_sha256": "sha256:b107e8657e67cd2d08168aced51540f20858d02e371067d8a7d2534186071abb",
     "unsupported_reason_code": "independent_exhaustive_validation_labels_unavailable",
     "utility_metrics_supported": false
   }

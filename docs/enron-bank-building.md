@@ -272,7 +272,7 @@ cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.7
 over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
 hidden by the catalog guarantee.
 
-On an Apple M4 with 16 GiB RAM, the fresh transactional rebuild took 44.43 seconds and 458,129,408 bytes peak RSS. Deep
+On an Apple M4 with 16 GiB RAM, the fresh transactional rebuild took 43.56 seconds and 461,553,664 bytes peak RSS. Deep
 verification passed. The repeated setup and steady-state measurements are reported separately in the
 [decision-grade performance result](performance.md#decision-grade-development-result); a single construction timing is
 not a latency claim.
@@ -286,8 +286,8 @@ Key commitments are:
 - privacy scanner implementation: `sha256:1f40d710da53f78e76f2731606ba83d70a3659ca8e994d733b86485d54a3f798`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
 - canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:08a76ada9561912861757b91c9b8e53e94fab18b6a0777080df7d86de9a5a012`;
-- committed bank-card file: `sha256:50e28331458a6e98c9ed8205f1ab01fafee008950fcccc3b75a0affd15936024`; and
+- bank-card run: `sha256:ebe1bbb4337e748f7f8dd1c491460017966a75c4feb346910377e22c690d1169`;
+- committed bank-card file: `sha256:eed2900f7406f8ad602525f5762a2f1cde017136365f45c57f9e24c89f935617`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
 The exact invocations remain bound inside the private run. Their privacy-safe CLI shape is:
