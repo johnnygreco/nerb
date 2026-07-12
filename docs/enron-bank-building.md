@@ -279,7 +279,7 @@ not a latency claim.
 
 The only selected-bank scalar changed from the preceding reviewed artifact is
 `metadata.builder_implementation_sha256`; removing that provenance field from both canonical JSON objects produces the
-same semantic SHA-256, `a90c58857074a371de31866209a22cf93fb6995d513f9fa66b7e462648d8d1f8`.
+same semantic SHA-256, `1e4dd99cdb621700fe71b8562b90dadacb93af6dedfc8a2f72cee3c4cfb8514c`.
 
 Key commitments are:
 
