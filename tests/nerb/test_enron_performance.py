@@ -1046,7 +1046,7 @@ def test_source_build_parent_resolves_symlinked_system_temp_root(
 
 
 def test_evaluated_descriptor_keeps_real_catalog_aliases_truthful(test_data_path: Path) -> None:
-    bank = json.loads((test_data_path / "enron_bank_v2_fake.json").read_text(encoding="utf-8"))
+    bank = json.loads((test_data_path / "enron_bank_fake.json").read_text(encoding="utf-8"))
     payload = _canonical(bank)
     artifact = performance_module._artifact_from_bytes("evaluated_bank_artifact", "banks/evaluated.json", payload)
     descriptor = performance_module._evaluated_bank_descriptor(bank, artifact, native_source_bytes=321)
@@ -1073,7 +1073,7 @@ def _prepare_run(
 ) -> Path:
     bank_run = tmp_path / f"{name}-bank-build"
     bank_run.mkdir()
-    bank = json.loads((test_data_path / "enron_bank_v2_fake.json").read_text(encoding="utf-8"))
+    bank = json.loads((test_data_path / "enron_bank_fake.json").read_text(encoding="utf-8"))
     bank_payload = _canonical(bank)
     development_run = tmp_path / f"{name}-development"
     development_run.mkdir(mode=0o700)

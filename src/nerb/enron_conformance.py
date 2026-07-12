@@ -1,4 +1,4 @@
-"""Privacy-safe catalog conformance evaluation for the Enron-v2 benchmark.
+"""Privacy-safe catalog conformance evaluation for the Enron benchmark.
 
 The evaluator scans synthetic, privately held case text with the complete active
 bank.  Public results contain only aggregate counts and content fingerprints;

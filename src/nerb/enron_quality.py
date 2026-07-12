@@ -1,4 +1,4 @@
-"""Privacy-safe, provenance-aware quality aggregation for Enron benchmark v2.
+"""Privacy-safe, provenance-aware quality aggregation for the Enron benchmark.
 
 The core executor is intentionally in-memory and has no sealed-test capability.
 An explicit file helper reads bounded private JSONL through the shared no-follow
@@ -223,7 +223,7 @@ def evaluate_enron_quality(
     slice_specs: Sequence[Mapping[str, Any]],
     unsupported_slice_specs: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    """Evaluate one bank and return aggregate-only Enron-v2 quality evidence.
+    """Evaluate one bank and return aggregate-only Enron quality evidence.
 
     ``catalog_identity`` on every gold span is required and is either ``None``
     (the occurrence was not cataloged by the frozen plan) or an exact

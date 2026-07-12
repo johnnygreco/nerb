@@ -21,8 +21,8 @@ path, and choose a new output directory: the transactional writer does not repla
 
 ```shell
 uv run nerb build-enron-bank \
-  --development-run .nerb/enron-splits/enron-v2-development \
-  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --development-run .nerb/enron-splits/development \
+  --output-dir .nerb/enron-bank-builds/run \
   --benchmark-version enron-v2
 ```
 
@@ -32,10 +32,10 @@ exactly covers the bundle's training labels. It remains auxiliary and non-promot
 
 ```shell
 uv run nerb build-enron-bank \
-  --development-run .nerb/enron-splits/enron-v2-development \
-  --annotation-run .nerb/enron-annotations/cmu-v2 \
-  --cmu-catalog-bindings .nerb/enron-annotations/cmu-v2-reviewed-catalog-bindings.jsonl \
-  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --development-run .nerb/enron-splits/development \
+  --annotation-run .nerb/enron-annotations/cmu-meetings \
+  --cmu-catalog-bindings .nerb/enron-annotations/cmu-reviewed-catalog-bindings.jsonl \
+  --output-dir .nerb/enron-bank-builds/run \
   --benchmark-version enron-v2
 ```
 
@@ -46,8 +46,8 @@ only checking its stored commitment.
 
 ```shell
 uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/enron-bank-builds/enron-v2 \
-  --annotation-run .nerb/enron-annotations/cmu-v2
+  --run-dir .nerb/enron-bank-builds/run \
+  --annotation-run .nerb/enron-annotations/cmu-meetings
 ```
 
 Omit both `--annotation-run` and `--cmu-catalog-bindings` from the build when no auxiliary bundle is available; supplying
@@ -254,8 +254,8 @@ access if that development-stage proof has not landed; a higher numeric limit al
 
 ## Reviewed 50k development evidence
 
-The committed aggregate-only evidence files `tests/data/enron_bank_card_v2_real_50000.json` and
-`tests/data/enron_candidate_funnel_v2_real_50000.json` come from a frozen 50,000-row real-source development fixture.
+The committed aggregate-only evidence files `tests/data/enron_bank_card_real_50000.json` and
+`tests/data/enron_candidate_funnel_real_50000.json` come from a frozen 50,000-row real-source development fixture.
 The fixture is deliberately marked `fixture_mode: true` and non-promotable; it contains 40,007 train and 4,995
 validation records, and the sealed test remained unopened.
 
@@ -272,22 +272,27 @@ cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.7
 over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
 hidden by the catalog guarantee.
 
-On an Apple M4 with 16 GiB RAM, the fresh transactional rebuild took 44.21 seconds and 458,276,864 bytes peak RSS. Deep
+On an Apple M4 with 16 GiB RAM, the fresh transactional rebuild took 43.32 seconds and 457,457,664 bytes peak RSS. Deep
 verification passed. The repeated setup and steady-state measurements are reported separately in the
 [decision-grade performance result](performance.md#decision-grade-development-result); a single construction timing is
 not a latency claim.
 
+The only selected-bank scalar changed from the preceding reviewed artifact is
+`metadata.builder_implementation_sha256`; removing that provenance field from both canonical JSON objects produces the
+same semantic SHA-256, `1e4dd99cdb621700fe71b8562b90dadacb93af6dedfc8a2f72cee3c4cfb8514c`.
+
 Key commitments are:
 
-- selected bank: `sha256:670f180d3ca8173d4a4269e0deb963566aeca68f3cb8ad893d69baa4e99f2f6d`;
-- bank artifact: `sha256:7c2a408f5c5167d35b953eae32f72a1f6aaa8bdaf1daeb4fc412f66db4df313e`;
+- selected bank: `sha256:f0244b57c571d04784bb758d272292670252b82c1a3cd18cb7ba15a82e03d8d0`;
+- bank artifact: `sha256:f2d60ac98fa7d4aa218fe73f02eed0798f565ece6a28718b1b726f6aeab366cb`;
+- candidate source: `sha256:f2242a8d6d81799f5dca0c118059a3fdf95bfb7be565debc2ecc9c765f93323d`;
 - candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
-- builder implementation: `sha256:ccf3619150ee309a96004002c376b583b2b5233287f76e209be0636d7ee968e2`;
-- privacy scanner implementation: `sha256:6c1d428a567dc9d14a064fb6fde6cfaf7645122517cefd8ab134340b1340ddf2`;
+- builder implementation: `sha256:c40abc903d8340830d9540f4a6befde6df01ff09b6e4931330279b21124968d6`;
+- privacy scanner implementation: `sha256:4fd3b726cc8a26eb8462ce7c0cdab772fcdfb024c5cc2d5aa97a51d8ab4009f8`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
 - canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:d3ad40dd72768b5840e031dd758e3c6ad83d3ab7e6871240efefd3bb9756b4bf`;
-- committed bank-card file: `sha256:6353d3ba91f52eb24309b02817870539ad63f7ffca1ba0a3535c9c3faf673f1f`; and
+- bank-card run: `sha256:c284e39601886898c52d3c42754d9f2a4979d016cb6dd92a47d1b995168178ee`;
+- committed bank-card file: `sha256:accfe490c84ce9704c25f557fd6c99e28d11c7589a0da5d727cbc72529eb8d2f`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
 The exact invocations remain bound inside the private run. Their privacy-safe CLI shape is:

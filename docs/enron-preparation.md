@@ -13,20 +13,20 @@ uv run --python 3.13 --with datasets==5.0.0 nerb prepare-enron \
   --dataset corbt/enron-emails \
   --dataset-split train \
   --dataset-revision cfc06c758093d90993abce1a43668fb7357258a6 \
-  --output-dir .nerb/enron-preparation/enron-v2
+  --output-dir .nerb/enron-preparation/run
 ```
 
 For the committed synthetic fixture:
 
 ```shell
 uv run nerb prepare-enron \
-  --input-jsonl tests/data/enron_preparation_v2.jsonl \
+  --input-jsonl tests/data/enron_preparation.jsonl \
   --dataset synthetic/enron-preparation \
   --dataset-revision fixture-v2 \
-  --output-dir .nerb/enron-preparation/fixture-v2
+  --output-dir .nerb/enron-preparation/fixture
 
 uv run nerb verify-enron-preparation \
-  --run-dir .nerb/enron-preparation/fixture-v2
+  --run-dir .nerb/enron-preparation/fixture
 ```
 
 The command streams its source once into a private disk-backed spool. Canonical export order, source commitments, and

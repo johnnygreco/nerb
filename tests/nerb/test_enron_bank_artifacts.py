@@ -48,10 +48,10 @@ def _strings(value: Any) -> Iterator[str]:
 
 
 def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
-    bank_path = _DATA / "enron_bank_v2_fake.json"
+    bank_path = _DATA / "enron_bank_fake.json"
     bank = _load(bank_path.name)
-    card = _load("enron_bank_card_v2_fake.json")
-    funnel = _load("enron_candidate_funnel_v2_fake.json")
+    card = _load("enron_bank_card_fake.json")
+    funnel = _load("enron_candidate_funnel_fake.json")
 
     structural = validate_bank(bank, level="deep", strict=True, check_engine_compile=True)
     assert structural["valid"] is True
@@ -104,21 +104,21 @@ def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
 
 
 def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_bound() -> None:
-    card_path = _DATA / "enron_bank_card_v2_real_50000.json"
-    funnel_path = _DATA / "enron_candidate_funnel_v2_real_50000.json"
+    card_path = _DATA / "enron_bank_card_real_50000.json"
+    funnel_path = _DATA / "enron_candidate_funnel_real_50000.json"
     card = _load(card_path.name)
     funnel = _load(funnel_path.name)
 
     _validate_public_card(card)
     assert hashlib.sha256(card_path.read_bytes()).hexdigest() == (
-        "6353d3ba91f52eb24309b02817870539ad63f7ffca1ba0a3535c9c3faf673f1f"
+        "accfe490c84ce9704c25f557fd6c99e28d11c7589a0da5d727cbc72529eb8d2f"
     )
     assert hashlib.sha256(funnel_path.read_bytes()).hexdigest() == (
         "3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f"
     )
-    assert card["run_sha256"] == "sha256:d3ad40dd72768b5840e031dd758e3c6ad83d3ab7e6871240efefd3bb9756b4bf"
+    assert card["run_sha256"] == "sha256:c284e39601886898c52d3c42754d9f2a4979d016cb6dd92a47d1b995168178ee"
     assert card["bank"]["canonical_sha256"] == (
-        "sha256:670f180d3ca8173d4a4269e0deb963566aeca68f3cb8ad893d69baa4e99f2f6d"
+        "sha256:f0244b57c571d04784bb758d272292670252b82c1a3cd18cb7ba15a82e03d8d0"
     )
     assert card["builder"]["candidate_ledger_sha256"] == (
         "sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448"
@@ -170,7 +170,7 @@ def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_boun
     ],
 )
 def test_real_aggregate_card_rejects_impossible_auxiliary_metric_arithmetic(metric: str) -> None:
-    card = _load("enron_bank_card_v2_real_50000.json")
+    card = _load("enron_bank_card_real_50000.json")
     metrics = card["independent_auxiliary"]["metrics"]
     metrics[metric] = 1.0 if metrics[metric] != 1.0 else 0.0
     card["run_sha256"] = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
@@ -180,7 +180,7 @@ def test_real_aggregate_card_rejects_impossible_auxiliary_metric_arithmetic(metr
 
 
 def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tampering() -> None:
-    card = _load("enron_bank_card_v2_fake.json")
+    card = _load("enron_bank_card_fake.json")
     missing_iteration_field = copy.deepcopy(card)
     del missing_iteration_field["iterations"][0]["policy_sha256"]
     missing_iteration_field["run_sha256"] = _canonical_hash(
@@ -199,9 +199,9 @@ def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tamper
 
 
 def test_committed_fake_artifacts_contain_only_fictitious_identifier_shapes() -> None:
-    bank = _load("enron_bank_v2_fake.json")
-    card = _load("enron_bank_card_v2_fake.json")
-    funnel = _load("enron_candidate_funnel_v2_fake.json")
+    bank = _load("enron_bank_fake.json")
+    card = _load("enron_bank_card_fake.json")
+    funnel = _load("enron_candidate_funnel_fake.json")
     serialized = json.dumps((bank, card, funnel), ensure_ascii=False, sort_keys=True)
 
     assert bank["metadata"]["privacy"] == "fictitious_values_only"
@@ -235,7 +235,7 @@ def test_public_card_scanner_commitment_binds_wrapper_and_canonical_scanner() ->
 
 
 def test_generated_conformance_cases_exercise_case_whitespace_and_boundaries() -> None:
-    bank = _load("enron_bank_v2_fake.json")
+    bank = _load("enron_bank_fake.json")
     positives, negatives = _conformance_cases(bank)
     result = evaluate_enron_conformance(bank, positives, negatives)
     assert result["catalog_conformance"]["passed"] is True

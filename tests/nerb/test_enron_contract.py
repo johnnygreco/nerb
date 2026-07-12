@@ -65,12 +65,12 @@ class _ExplodingMapping(Mapping[str, Any]):
 
 @pytest.fixture
 def manifest(test_data_path: Path) -> JsonObject:
-    return json.loads((test_data_path / "enron_manifest_v2.json").read_text(encoding="utf-8"))
+    return json.loads((test_data_path / "enron_manifest.json").read_text(encoding="utf-8"))
 
 
 @pytest.fixture
 def evidence(test_data_path: Path) -> JsonObject:
-    return json.loads((test_data_path / "enron_evidence_v2.json").read_text(encoding="utf-8"))
+    return json.loads((test_data_path / "enron_evidence.json").read_text(encoding="utf-8"))
 
 
 def _codes(result: JsonObject) -> set[str]:
@@ -5556,8 +5556,8 @@ def test_referenced_input_inventory_collection_limit_fails_closed(evidence: Json
 
 
 def test_contract_loaders_accept_bound_sanitized_fixtures(test_data_path: Path) -> None:
-    manifest = load_enron_manifest(test_data_path / "enron_manifest_v2.json")
-    evidence = load_enron_evidence(test_data_path / "enron_evidence_v2.json", manifest=manifest)
+    manifest = load_enron_manifest(test_data_path / "enron_manifest.json")
+    evidence = load_enron_evidence(test_data_path / "enron_evidence.json", manifest=manifest)
 
     assert manifest["artifact_kind"] == "synthetic_fixture"
     assert evidence["manifest_sha256"] == hash_enron_manifest(manifest)
@@ -5565,7 +5565,7 @@ def test_contract_loaders_accept_bound_sanitized_fixtures(test_data_path: Path) 
 
 def test_contract_loaders_reject_symlinks(tmp_path: Path, test_data_path: Path) -> None:
     link = tmp_path / "manifest-link.json"
-    link.symlink_to(test_data_path / "enron_manifest_v2.json")
+    link.symlink_to(test_data_path / "enron_manifest.json")
 
     with pytest.raises(ValueError, match="regular non-symlink"):
         load_enron_manifest(link)
@@ -5591,7 +5591,7 @@ def test_contract_loader_uses_nofollow_and_rejects_lstat_fstat_identity_change(
     monkeypatch.setattr(enron_contract.os, "fstat", changed_fstat)
 
     with pytest.raises(ValueError):
-        load_enron_manifest(test_data_path / "enron_manifest_v2.json")
+        load_enron_manifest(test_data_path / "enron_manifest.json")
 
     assert opened_flags
     nofollow = getattr(enron_contract.os, "O_NOFOLLOW", 0)
@@ -5671,9 +5671,9 @@ def test_contract_loaders_reject_structurally_invalid_contracts(tmp_path: Path) 
     invalid = tmp_path / "invalid.json"
     invalid.write_text("{}", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Invalid Enron v2 manifest"):
+    with pytest.raises(ValueError, match="Invalid Enron manifest"):
         load_enron_manifest(invalid)
-    with pytest.raises(ValueError, match="Invalid Enron v2 evidence"):
+    with pytest.raises(ValueError, match="Invalid Enron evidence"):
         load_enron_evidence(invalid)
 
 

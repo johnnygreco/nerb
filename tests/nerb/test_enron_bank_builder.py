@@ -831,10 +831,10 @@ def test_mining_replay_rejects_sparse_oversized_cells_before_private_cell_fetch(
         )
 
 
-def test_mining_sqlite_length_limit_reports_legacy_api_unavailable() -> None:
-    legacy_connection: Any = object()
+def test_mining_sqlite_length_limit_handles_missing_setlimit_api() -> None:
+    connection_without_setlimit: Any = object()
 
-    assert bank_workflow._set_mining_sqlite_length_limit(legacy_connection) is False
+    assert bank_workflow._set_mining_sqlite_length_limit(connection_without_setlimit) is False
 
 
 def test_mining_replay_preflights_schema_text_without_connection_limit(

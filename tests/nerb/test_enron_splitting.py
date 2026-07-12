@@ -1085,7 +1085,7 @@ def test_development_loader_validates_every_descriptor_before_hashing_large_arti
     assert snapshots == []
 
 
-def test_steward_projection_matches_the_closed_v2_split_contract(tmp_path: Path) -> None:
+def test_steward_projection_matches_the_closed_split_contract(tmp_path: Path) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="contract"))
     run = _split(tmp_path, preparation)
 

@@ -34,15 +34,7 @@ The banks are intentionally small but domain-specific:
 - `revenue_ops.json`: accounts, products, commercial artifacts, regions, and account health.
 - `compliance_ops.json`: audit frameworks, controls, evidence artifacts, systems, and data boundaries.
 
-Additional committed assets under `artifacts/hero-images/` need careful interpretation. The unmarked Enron quality and
-held-out-F1 autoresearch PNGs were removed; retained corresponding measurements are explicitly marked historical v1.
-They do not satisfy the privacy-first Enron v2 contract and must not support current public claims. The existing
-benchmark-hero generator is v1-only, requires explicit historical opt-in, and watermarks those panels; rerunning it does
-not produce v2 evidence. See the [figure evidence policy](../docs/hero-images.md) and [Enron v2
-charter](../docs/enron-benchmark.md).
-
 The scale figures are generated from deterministic synthetic JSON banks rather than committed large fixtures. They show
 how compile time, warm extraction, and process-local bank caching behave on a mostly-literal synthetic workload as an
-agent cache grows from 1,000 to 100,000 active patterns. The hero scale scan uses a capped generated target document, so
-the numbers are local illustrative measurements for comparing runs on the same machine rather than portable package-wide
-performance claims or Enron v2 evidence.
+agent cache grows from 1,000 to 10,000 active patterns. The numbers are local illustrative measurements for comparing
+runs on the same machine rather than portable package-wide performance claims.

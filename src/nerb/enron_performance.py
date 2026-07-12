@@ -736,7 +736,7 @@ def _active_bank_composition(bank: Mapping[str, Any]) -> dict[str, Any]:
             regex_patterns += sum(pattern.get("kind") == "regex" for pattern in name_patterns)
         if literal_patterns + regex_patterns == 0:
             continue
-        # In the v2 charter, active person-name catalog entries are address-anchored aliases;
+        # Under the benchmark charter, active person-name catalog entries are address-anchored aliases;
         # contact identities (including the bounded generic fallback) are canonical names.
         aliases = active_names if entity_class == "person" else 0
         taxonomy.append(

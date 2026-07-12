@@ -1,4 +1,4 @@
-"""Executable, privacy-safe contracts for the Enron benchmark-v2 evidence boundary.
+"""Executable, privacy-safe contracts for the Enron benchmark evidence boundary.
 
 The schemas close every object and the semantic verifier recomputes aggregate claims without reading private corpus
 text. A promoted or verifier-passed bundle must be checked with its exact manifest, the previously published final-test
@@ -460,7 +460,7 @@ _CONFORMANCE_PLAN = _closed_object(
 ENRON_MANIFEST_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://nerb.dev/schemas/enron-manifest.v2.schema.json",
-    "title": "NERB Enron benchmark v2 manifest",
+    "title": "NERB Enron benchmark manifest",
     **_closed_object(
         (
             "schema_version",
@@ -1149,7 +1149,7 @@ _PERFORMANCE_OUTPUT = _closed_object(
 ENRON_PERFORMANCE_OUTPUT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://nerb.dev/schemas/enron-performance-output.v2.schema.json",
-    "title": "NERB Enron benchmark v2 standalone performance output",
+    "title": "NERB Enron benchmark standalone performance output",
     **_PERFORMANCE_OUTPUT,
 }
 _FROZEN_TARGET = _closed_object(
@@ -1327,7 +1327,7 @@ _VERIFIER_RESULT = _closed_object(
 ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://nerb.dev/schemas/enron-evidence.v2.schema.json",
-    "title": "NERB Enron benchmark v2 evidence",
+    "title": "NERB Enron benchmark evidence",
     **_closed_object(
         (
             "schema_version",
@@ -2146,11 +2146,11 @@ def _is_external_resolver(value: Any) -> bool:
 
 
 def load_enron_manifest(path: str | Path) -> dict[str, Any]:
-    """Securely load and validate one benchmark-v2 manifest JSON object."""
+    """Securely load and validate one benchmark manifest JSON object."""
     value = _load_contract_json(path)
     result = validate_enron_manifest(value)
     if not result["valid"]:
-        raise ValueError(f"Invalid Enron v2 manifest: {result['diagnostics'][0]['message']}")
+        raise ValueError(f"Invalid Enron manifest: {result['diagnostics'][0]['message']}")
     return value
 
 
@@ -2162,7 +2162,7 @@ def load_enron_evidence(
     referenced_samples: Mapping[str, Sequence[float]] | None = None,
     referenced_input_inventories: Mapping[str, Sequence[Mapping[str, int]]] | None = None,
 ) -> dict[str, Any]:
-    """Securely load and semantically validate one benchmark-v2 evidence JSON object."""
+    """Securely load and semantically validate one benchmark evidence JSON object."""
     value = _load_contract_json(path)
     result = validate_enron_evidence(
         value,
@@ -2172,7 +2172,7 @@ def load_enron_evidence(
         referenced_input_inventories=referenced_input_inventories,
     )
     if not result["valid"]:
-        raise ValueError(f"Invalid Enron v2 evidence: {result['diagnostics'][0]['message']}")
+        raise ValueError(f"Invalid Enron evidence: {result['diagnostics'][0]['message']}")
     return value
 
 
@@ -3410,7 +3410,7 @@ def _test_access_diagnostics(
             _error(
                 "contract.test_access_count",
                 "/test_access/current_version_access_count",
-                "Current-version access count must equal its lineage entry count.",
+                "Active benchmark access count must equal its lineage entry count.",
             )
         )
     if has_test_aggregate and count != 1:
@@ -3418,7 +3418,7 @@ def _test_access_diagnostics(
             _error(
                 "contract.test_aggregate_without_access",
                 "/test_access/current_version_access_count",
-                "Every current-version final-test aggregate requires exactly one recorded sealed-test access.",
+                "Every active benchmark final-test aggregate requires exactly one recorded sealed-test access.",
             )
         )
     if count == 1 and len(current_entries) == 1:
@@ -4458,7 +4458,7 @@ def _performance_comparison_diagnostics(
                 _error(
                     "contract.unstable_performance_comparison",
                     path,
-                    "Decision-grade comparison noise exceeds the benchmark-v2 stability ceiling.",
+                    "Decision-grade comparison noise exceeds the benchmark stability ceiling.",
                 )
             )
         if any(not _same_scalar(comparison[field], value) for field, value in expected.items()):
@@ -5683,7 +5683,7 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
                         _error(
                             "contract.quality_threshold_policy",
                             "/promotion/checks",
-                            "Privacy thresholds may tighten but cannot weaken the benchmark-v2 policy bounds.",
+                            "Privacy thresholds may tighten but cannot weaken the benchmark policy bounds.",
                         )
                     )
         elif target.startswith("/performance/workloads/") and exact_threshold is None:

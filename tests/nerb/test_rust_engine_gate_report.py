@@ -82,12 +82,18 @@ def _expected_mode_metadata() -> dict[str, dict[str, Any]]:
     }
 
 
-def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shape():
+def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shape_with_nonbinding_rss():
     gate_report = _load_gate_report_module()
 
-    report = gate_report.gate_report(iterations=1, target_bytes=10_000, dense_bytes=128)
+    report = gate_report.gate_report(
+        iterations=1,
+        target_bytes=10_000,
+        dense_bytes=128,
+        memory_budget_kib=gate_report.MAX_PROTOCOL_INTEGER,
+        memory_absolute_budget_kib=gate_report.MAX_PROTOCOL_INTEGER,
+    )
 
-    assert report["overall"]["passed"] is True
+    assert report["overall"]["passed"] is True, json.dumps(report, sort_keys=True)
     assert report["overall"]["correctness_passed"] is True
     assert report["overall"]["timing_eligible"] is False
     assert report["overall"]["timing_status"] == "informational_insufficient_samples"
@@ -113,6 +119,8 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["mode_strategy"]["timing_eligible"] is False
     assert report["mode_strategy"]["timing_passed"] is None
     assert report["memory"]["passed"] is True
+    assert report["memory"]["memory_budget_kib"] == gate_report.MAX_PROTOCOL_INTEGER
+    assert report["memory"]["memory_absolute_budget_kib"] == gate_report.MAX_PROTOCOL_INTEGER
     assert report["distribution"]["passed"] is None
     assert report["distribution"]["included_in_overall"] is False
     assert report["distribution"]["checked_by"] == "make build and GitHub Actions wheel matrix external validation"

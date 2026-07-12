@@ -10,9 +10,9 @@ For a production split, keep the steward output outside the builder's access bou
 
 ```shell
 uv run nerb split-enron \
-  --preparation-run .nerb/enron-preparation/enron-v2 \
-  --development-output-dir .nerb/enron-splits/enron-v2-development \
-  --sealed-output-dir /authorized/steward/enron-v2-test \
+  --preparation-run .nerb/enron-preparation/run \
+  --development-output-dir .nerb/enron-splits/development \
+  --sealed-output-dir /authorized/steward/enron-test \
   --benchmark-version enron-v2 \
   --seed nerb-enron-v2-split-v1
 ```
@@ -21,8 +21,8 @@ Verify both committed bundles from the steward environment:
 
 ```shell
 uv run nerb verify-enron-splits \
-  --development-dir .nerb/enron-splits/enron-v2-development \
-  --sealed-dir /authorized/steward/enron-v2-test \
+  --development-dir .nerb/enron-splits/development \
+  --sealed-dir /authorized/steward/enron-test \
   --seed nerb-enron-v2-split-v1
 ```
 
