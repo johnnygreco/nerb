@@ -1,9 +1,9 @@
 {
   "artifact_kind": "aggregate_private_bank_build",
   "bank": {
-    "artifact_sha256": "sha256:403a8e760e22166dba42e8381bbdbe781e1e4613281b14e2d55d6b0147f59037",
+    "artifact_sha256": "sha256:7c2a408f5c5167d35b953eae32f72a1f6aaa8bdaf1daeb4fc412f66db4df313e",
     "canonical_json_bytes": 8783376,
-    "canonical_sha256": "sha256:a38ea885243ab00c9f90d2a8024fb6cf2e4cb3fbcdd7f4c837de58630deb95a4",
+    "canonical_sha256": "sha256:670f180d3ca8173d4a4269e0deb963566aeca68f3cb8ad893d69baa4e99f2f6d",
     "id": "enron_intelligence_v2",
     "stats": {
       "active_totals": {
@@ -53,7 +53,7 @@
     "observations": 721302,
     "policy_sha256": "sha256:23e6e54da792bca831183bb8992289e657df70d187e39840230480cb0e02f187",
     "selected_iteration_id": "iteration_02_email_recall",
-    "source_sha256": "sha256:802671dd6d4775f7e22ce8e4565d74cb261bbacbd5632f077c111a628007d82e",
+    "source_sha256": "sha256:ccf3619150ee309a96004002c376b583b2b5233287f76e209be0636d7ee968e2",
     "train_records": 40007
   },
   "candidate_funnel": {
@@ -120,7 +120,7 @@
     "negative_cases_artifact": {
       "bytes": 25434,
       "id": "enron_catalog_conformance_negative_cases",
-      "sha256": "sha256:ebc96b098635521ceb8b6cf630476bb5862f33f1fcbf69c164164ec8c03f26a5"
+      "sha256": "sha256:a727e817f8f5cf6ab254297f49e9fe5d70bdf524660c49968efc473e5efec818"
     },
     "passed": true,
     "patterns_with_positive_cases": 628,
@@ -128,7 +128,7 @@
     "positive_cases_artifact": {
       "bytes": 713258,
       "id": "enron_catalog_conformance_positive_cases",
-      "sha256": "sha256:93601afca8f2da274cba8862bad9088121d2b2e525e7fe4565dcbf25cdb91f4d"
+      "sha256": "sha256:e799f70986060f1675e4ebec40335c33666b16d78d2995a9b94875fb00f1c4fd"
     },
     "recall": 1.0,
     "unexpected_negative_matches": 0,
@@ -206,8 +206,8 @@
     "over_redacted_characters": 218,
     "predicted_characters": 1298,
     "predicted_spans": 119,
-    "protocol_sha256": "sha256:50f18380878ff1be3d321b8ff3af281b0250bfc6ea8e60a1b0bd824d83d9e926",
-    "run_sha256": "sha256:3a91da0c7453c970d9d2850f8a6ccc823a5208f6a3b91ca88c91e67ced9cab22",
+    "protocol_sha256": "sha256:b5d00759f6245037c33aee914a70a72c7de9e34c0ca2e536e95a2f2d22224b4d",
+    "run_sha256": "sha256:f50aa45a59d93d046fed2c6f33c546dfd78a9c840562621c094f4d14295c16e5",
     "scope": "cmu_meetings_person_train_auxiliary_nonpromotable",
     "sensitive_gold_characters": 20028,
     "true_positive": 94
@@ -215,9 +215,9 @@
   "iterations": [
     {
       "active_patterns": 627,
-      "bank_sha256": "sha256:f6f449ce99f33bcd0f854e8235f5eae33ef60e734b87ec8ea7bab877c66aef2c",
+      "bank_sha256": "sha256:660df5dbb45057ab5ca80ab6cc9f99cd8026d0c072d7e9db72d0832adcf30380",
       "canonical_json_bytes": 8783373,
-      "catalog_binding_sha256": "sha256:1b16e9af2fd2a06d2a00f17922183e7fa561e0fce72b070fa2d8000c31bec6b6",
+      "catalog_binding_sha256": "sha256:5d786e5241635efb72a77253074e272bf10157e0dee339d8f58f73fe3996da78",
       "contact_cataloged_false_negative": 0,
       "contact_cataloged_wrong_canonical": 0,
       "contact_labeled_false_negative": 33092,
@@ -233,17 +233,17 @@
       "person_cataloged_wrong_canonical": null,
       "person_labeled_spans": null,
       "policy_sha256": "sha256:61524cefcc30f0fc273721ccd85e6cd9443527c8931ac6abc7661ccc611deced",
-      "quality_run_sha256": "sha256:9632ba867c0f41bd6f6dd5cb0e35014e1b34928979ce480ab6881cd5f7c5e0f4",
+      "quality_run_sha256": "sha256:d5fdde6e9a4dd26cca3dbfc55f9437ac28de869ca6878744ce152865c6a44a36",
       "schema_version": "nerb.enron_bank_build_iteration.v2",
       "selected": false,
       "utility_metrics_supported": false,
-      "validation_protocol_sha256": "sha256:c42a21734865f244651f6e51cc85b2cb521b66f27d2a58c507df3874c1ebc424"
+      "validation_protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0"
     },
     {
       "active_patterns": 628,
-      "bank_sha256": "sha256:a38ea885243ab00c9f90d2a8024fb6cf2e4cb3fbcdd7f4c837de58630deb95a4",
+      "bank_sha256": "sha256:670f180d3ca8173d4a4269e0deb963566aeca68f3cb8ad893d69baa4e99f2f6d",
       "canonical_json_bytes": 8783376,
-      "catalog_binding_sha256": "sha256:774043a085ce4869d0a364101a072de8afda044ae79866b9d1414f2740f90912",
+      "catalog_binding_sha256": "sha256:78cdfa21e00d63176cc02c52e8dd9ea787fd033d2d13c05ae331ac2031742fb7",
       "contact_cataloged_false_negative": 0,
       "contact_cataloged_wrong_canonical": 0,
       "contact_labeled_false_negative": 0,
@@ -259,17 +259,17 @@
       "person_cataloged_wrong_canonical": null,
       "person_labeled_spans": null,
       "policy_sha256": "sha256:547e0864dfef037c62ef0bc562bea4ca9d4f23a3be15d65d4056b0dcaccf41bf",
-      "quality_run_sha256": "sha256:ec83afe87f0e22ef0e7e3eda58b63b9d1d9c1ce9d3dab273039adffcf1a79b42",
+      "quality_run_sha256": "sha256:5896f621fe88acf4dfb7fdbb33fcc86e9ebda719c054e2b8e3f2316001995c93",
       "schema_version": "nerb.enron_bank_build_iteration.v2",
       "selected": true,
       "utility_metrics_supported": false,
-      "validation_protocol_sha256": "sha256:c42a21734865f244651f6e51cc85b2cb521b66f27d2a58c507df3874c1ebc424"
+      "validation_protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0"
     },
     {
       "active_patterns": 629,
-      "bank_sha256": "sha256:fc506d5a2e23dcc0e19a4fd1a684cde504e53da6f0ee91c74923c548f6831878",
+      "bank_sha256": "sha256:abec4d8b9cd729c3999c466a449c2bfd8649bdaa2d0158d4b698fb3bfd56bc81",
       "canonical_json_bytes": 8783395,
-      "catalog_binding_sha256": "sha256:b5d1bcf82f9eac5af13a1ff63980ff47e92c4a10bd5b24efdc170fe942c0a023",
+      "catalog_binding_sha256": "sha256:1b5de3926a26cc0d8e6b7b4c3ed4ca7ae4617a6d01d0797629c8ec247d99c35e",
       "contact_cataloged_false_negative": 0,
       "contact_cataloged_wrong_canonical": 0,
       "contact_labeled_false_negative": 0,
@@ -285,11 +285,11 @@
       "person_cataloged_wrong_canonical": null,
       "person_labeled_spans": null,
       "policy_sha256": "sha256:6d88cd838413cb49b90ab325b6e0bc620789272d0f08776c20afc0070c05fd14",
-      "quality_run_sha256": "sha256:3a037e87579359d435024baa66eddbbdd96f0368853326effde56feb7afce433",
+      "quality_run_sha256": "sha256:69560249e2db355632d90ffcabadbc0643849139c868ff75bf5a52e381a38f98",
       "schema_version": "nerb.enron_bank_build_iteration.v2",
       "selected": false,
       "utility_metrics_supported": false,
-      "validation_protocol_sha256": "sha256:c42a21734865f244651f6e51cc85b2cb521b66f27d2a58c507df3874c1ebc424"
+      "validation_protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0"
     }
   ],
   "nonpromotable_reasons": [
@@ -302,14 +302,14 @@
     "direct_identifiers_included": false,
     "private_paths_included": false,
     "raw_text_included": false,
-    "report_sha256": "sha256:158669e8ffe45625b373b6e9be6b2e78872ec5ab3a734e3ac26cfa1be48ce8d7",
+    "report_sha256": "sha256:f6f916eedef81bc38a8278a66db305531f4a91198b31a30ab81a473e019e6009",
     "scanner": "nerb.enron_bank_workflow.public_card_scan.v2",
-    "scanner_source_sha256": "sha256:1a1bfe706e2efc2c243bf0758e96f34dbb572a4f3e2cd9006b0776d166347cd0",
+    "scanner_source_sha256": "sha256:1f40d710da53f78e76f2731606ba83d70a3659ca8e994d733b86485d54a3f798",
     "status": "passed",
     "violation_count": 0
   },
   "promotable": false,
-  "run_sha256": "sha256:bd599da34fdeec3fa8113190c92c8ed37e0053f22b5bd9b0e58d140e3c78266c",
+  "run_sha256": "sha256:08a76ada9561912861757b91c9b8e53e94fab18b6a0777080df7d86de9a5a012",
   "schema_version": "nerb.enron_bank_card.v2",
   "source": {
     "dataset_id": "corbt/enron-emails",
@@ -369,8 +369,8 @@
       "reason_code": "zero_labeled_person_spans",
       "true_positive": 0
     },
-    "protocol_sha256": "sha256:c42a21734865f244651f6e51cc85b2cb521b66f27d2a58c507df3874c1ebc424",
-    "quality_run_sha256": "sha256:ec83afe87f0e22ef0e7e3eda58b63b9d1d9c1ce9d3dab273039adffcf1a79b42",
+    "protocol_sha256": "sha256:0d5178b162c7ad0a2e1f2564b026d70d8b64126789912ef6e27ffd05f12c2cd0",
+    "quality_run_sha256": "sha256:5896f621fe88acf4dfb7fdbb33fcc86e9ebda719c054e2b8e3f2316001995c93",
     "unsupported_reason_code": "independent_exhaustive_validation_labels_unavailable",
     "utility_metrics_supported": false
   }
