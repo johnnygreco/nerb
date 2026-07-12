@@ -57,6 +57,7 @@ from .enron_contract import EnronContractValidator, _public_serialization_diagno
 from .enron_private_io import (
     EnronPrivateIOError,
     PrivateRun,
+    is_owner_only_private_mode,
     iter_strict_jsonl,
     open_private_binary_input,
 )
@@ -555,6 +556,21 @@ class _PrivateFileFingerprint:
     identity: _PrivateEntryIdentity
     sha256: str
     records: int | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _VerifiedEnronBankBuildSnapshot:
+    """Race-safe private inputs captured inside one completed deep verification."""
+
+    summary: dict[str, Any]
+    card: dict[str, Any]
+    bank: dict[str, Any]
+    bank_payload: bytes
+    validation_documents: tuple[dict[str, Any], ...]
+    build_created_at: str
+    private_tree: Mapping[str, _PrivateEntryIdentity] | None = None
+    artifact_fingerprints: Mapping[str, _PrivateFileFingerprint] | None = None
+    annotation_tree: Mapping[str, _PrivateEntryIdentity] | None = None
 
 
 def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, Any]:
@@ -2368,15 +2384,24 @@ def _validate_build_commitments(
     return False
 
 
-def verify_enron_bank_build(
+def _verify_enron_bank_build_snapshot(
     run_dir: Path,
     *,
     annotation_run: Path | None = None,
-) -> dict[str, Any]:
-    """Deep-verify a committed private build and return aggregate-only evidence."""
+) -> _VerifiedEnronBankBuildSnapshot:
+    """Deep-verify a committed private build and capture its consumed inputs."""
 
     root = _assert_private_run(Path(run_dir))
     initial_tree = _snapshot_private_tree(root)
+    annotation_root: Path | None = None
+    annotation_tree: Mapping[str, _PrivateEntryIdentity] | None = None
+    if annotation_run is not None:
+        annotation_root = Path(annotation_run).expanduser()
+        if any(part == os.pardir for part in annotation_root.parts):
+            raise EnronBankBuildError("Auxiliary annotation path must not contain parent traversal.")
+        if not annotation_root.is_absolute():
+            annotation_root = Path.cwd() / annotation_root
+        annotation_tree = _snapshot_private_tree(annotation_root)
     initial_marker = _fingerprint_private_artifact(
         root / "COMMITTED",
         max_bytes=_MAX_PRIVATE_COMMIT_MARKER_BYTES,
@@ -2433,6 +2458,12 @@ def verify_enron_bank_build(
     )
     if not isinstance(bank, Mapping):
         raise EnronBankBuildError("Selected private bank is invalid.")
+    bank_payload = _read_verified_private_bytes(
+        root / "bank.json",
+        expected_fingerprint=artifact_fingerprints["selected_bank"],
+        max_bytes=_MAX_PRIVATE_JSON_BYTES,
+        description="selected bank",
+    )
     structural = validate_bank(bank, level="deep", strict=True, check_engine_compile=True)
     if structural["valid"] is not True or structural["engine_compatibility"]["compatible"] is not True:
         raise EnronBankBuildError("Selected private bank failed deep verification.")
@@ -2681,8 +2712,10 @@ def verify_enron_bank_build(
     )
     if final_tree != initial_tree or final_marker != initial_marker or final_manifest != initial_manifest:
         raise EnronBankBuildError("Private bank-build tree changed during verification.")
+    if annotation_root is not None and _snapshot_private_tree(annotation_root) != annotation_tree:
+        raise EnronBankBuildError("Auxiliary annotation tree changed during verification.")
 
-    return {
+    verification = {
         "schema_version": "nerb.enron_bank_build_verification.v2",
         "valid": True,
         "benchmark_version": manifest["benchmark_version"],
@@ -2699,6 +2732,27 @@ def verify_enron_bank_build(
         "sealed_test_accessed": sealed_test_accessed,
         "privacy": card["privacy"],
     }
+    return _VerifiedEnronBankBuildSnapshot(
+        summary=verification,
+        card=cast(dict[str, Any], card),
+        bank=cast(dict[str, Any], bank),
+        bank_payload=bank_payload,
+        validation_documents=documents,
+        build_created_at=cast(str, manifest["created_at"]),
+        private_tree=dict(initial_tree),
+        artifact_fingerprints=dict(artifact_fingerprints),
+        annotation_tree=None if annotation_tree is None else dict(annotation_tree),
+    )
+
+
+def verify_enron_bank_build(
+    run_dir: Path,
+    *,
+    annotation_run: Path | None = None,
+) -> dict[str, Any]:
+    """Deep-verify a committed private build and return aggregate-only evidence."""
+
+    return _verify_enron_bank_build_snapshot(run_dir, annotation_run=annotation_run).summary
 
 
 _MINING_SQLITE_SCHEMA = {
@@ -3451,7 +3505,7 @@ def _private_entry_identity(info: os.stat_result, *, kind: str) -> _PrivateEntry
 
 
 def _require_private_entry(identity: _PrivateEntryIdentity) -> None:
-    if identity.mode & 0o077:
+    if not is_owner_only_private_mode(identity.mode):
         raise EnronBankBuildError("Private bank-build tree contains a non-private entry.")
     if identity.kind == "file" and identity.link_count != 1:
         raise EnronBankBuildError("Private bank-build files must not have multiple hard links.")

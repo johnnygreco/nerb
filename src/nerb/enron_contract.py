@@ -15,7 +15,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from fractions import Fraction
 from hashlib import sha256
-from heapq import nsmallest
+from heapq import nlargest, nsmallest
 from html import unescape as unescape_html
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from stat import S_ISREG
@@ -35,7 +35,7 @@ ENRON_MANIFEST_SCHEMA_VERSION = "nerb.enron_manifest.v2"
 ENRON_EVIDENCE_SCHEMA_VERSION = "nerb.enron_evidence.v2"
 ENRON_CHARTER_VERSION = "2"
 ENRON_VERIFIER_ID = "nerb-enron-contract"
-ENRON_VERIFIER_VERSION = "2.0.0"
+ENRON_VERIFIER_VERSION = "2.2.0"
 MAX_CONTRACT_BYTES = 16 * 1024 * 1024
 MAX_CONTRACT_DEPTH = 100
 MAX_CONTRACT_NODES = 250_000
@@ -93,6 +93,7 @@ PERFORMANCE_PHASE_PROCESS_MODELS = {
     "direct_bank_scan": "reused_process",
     "end_to_end": "fresh_process_per_sample",
 }
+PERFORMANCE_SETUP_PHASES = frozenset({"source_profile", "source_build", "cold_compile"})
 PERFORMANCE_GATE_STAT_FIELDS = {
     "sample_count",
     "median_seconds",
@@ -104,9 +105,12 @@ PERFORMANCE_GATE_STAT_FIELDS = {
     "records_per_second",
     "seconds_per_document",
 }
-PERFORMANCE_SCALE_ALIASES = (1_000, 10_000, 25_000, 100_000)
-MIN_DECISION_GRADE_SAMPLES = 100
+PERFORMANCE_SCALE_PATTERNS = (1_000, 10_000, 25_000, 100_000)
+MIN_DECISION_GRADE_SETUP_SAMPLES = 20
+MIN_DECISION_GRADE_SCAN_SAMPLES = 100
+MIN_DECISION_GRADE_P99_STABILITY_SAMPLES = 1_000
 MIN_DECISION_GRADE_WARMUPS = 3
+_CROSS_PATH_DIRECT_PROXY_SAMPLES = 100
 MAX_COMPARISON_NOISE_FLOOR = 0.25
 MAX_HEADLINE_DOCUMENT_P99_SECONDS = 0.05
 MIN_HEADLINE_DOCUMENTS_PER_SECOND = 100.0
@@ -287,6 +291,7 @@ _BANK = _closed_object(
         "id",
         "canonical_hash",
         "artifact_sha256",
+        "artifact_bytes",
         "active_entities",
         "active_names",
         "active_aliases",
@@ -298,6 +303,7 @@ _BANK = _closed_object(
         "id": {"type": "string", "minLength": 1},
         "canonical_hash": _HASH,
         "artifact_sha256": _HASH,
+        "artifact_bytes": _POSITIVE_INTEGER,
         "active_entities": _POSITIVE_INTEGER,
         "active_names": _POSITIVE_INTEGER,
         "active_aliases": _NONNEGATIVE_INTEGER,
@@ -859,6 +865,7 @@ _PERFORMANCE_WORKLOAD = _closed_object(
         "samples_seconds",
         "samples_ref",
         "stats",
+        "records_per_sample",
         "rss_samples_bytes",
         "peak_rss_bytes",
     ),
@@ -892,6 +899,7 @@ _PERFORMANCE_WORKLOAD = _closed_object(
         },
         "samples_ref": _OPTIONAL_ARTIFACT_REF,
         "stats": _PERFORMANCE_STATS,
+        "records_per_sample": {"anyOf": [_NONNEGATIVE_INTEGER, {"type": "null"}]},
         "rss_samples_bytes": {"type": "array", "items": _POSITIVE_INTEGER},
         "peak_rss_bytes": {"anyOf": [_POSITIVE_INTEGER, {"type": "null"}]},
     },
@@ -926,17 +934,84 @@ _PERFORMANCE_BASELINE = _closed_object(
         "descriptor_sha256": _HASH,
     },
 )
-_PERFORMANCE_COMPARISON = _closed_object(
+_PERFORMANCE_COMPARISON_METRIC = {
+    "type": "string",
+    "enum": [
+        "median_seconds",
+        "p95_seconds",
+        "p99_seconds",
+        "documents_per_second",
+        "mib_per_second",
+        "records_per_second",
+        "seconds_per_document",
+    ],
+}
+_PERFORMANCE_SAME_PATH_COMPARISON = _closed_object(
     (
         "id",
         "candidate_workload_id",
         "baseline_workload_id",
+        "comparison_kind",
+        "metric",
+        "direction",
+        "candidate_value",
+        "baseline_value",
+        "noise_method",
+        "block_count",
+        "samples_per_block",
+        "block_assignment",
+        "absolute_log_ratio",
+        "absolute_relative_gap",
+        "permutation_p_value",
+        "significance_level",
+        "stability_tolerance",
+        "result",
+        "comparison_plan_sha256",
+    ),
+    {
+        "id": {"type": "string", "minLength": 1},
+        "candidate_workload_id": {"type": "string", "minLength": 1},
+        "baseline_workload_id": {"type": "string", "minLength": 1},
+        "comparison_kind": {"const": "same_path_stability"},
+        "metric": _PERFORMANCE_COMPARISON_METRIC,
+        "direction": {"const": "symmetric"},
+        "candidate_value": _POSITIVE_NUMBER,
+        "baseline_value": _POSITIVE_NUMBER,
+        "noise_method": {"const": "exact_block_swap"},
+        "block_count": {"const": 10},
+        "samples_per_block": _POSITIVE_INTEGER,
+        "block_assignment": {
+            "type": "array",
+            "minItems": 10,
+            "maxItems": 10,
+            "items": {"type": "string", "enum": ["candidate_first", "control_first"]},
+            "allOf": [
+                {"contains": {"const": "candidate_first"}, "minContains": 5, "maxContains": 5},
+                {"contains": {"const": "control_first"}, "minContains": 5, "maxContains": 5},
+            ],
+        },
+        "absolute_log_ratio": _NONNEGATIVE_NUMBER,
+        "absolute_relative_gap": _NONNEGATIVE_NUMBER,
+        "permutation_p_value": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "significance_level": {"const": 0.05},
+        "stability_tolerance": {"const": 0.05},
+        "result": {"type": "string", "enum": ["within_tolerance", "unstable", "inconclusive"]},
+        "comparison_plan_sha256": _HASH,
+    },
+)
+_PERFORMANCE_CROSS_PATH_COMPARISON = _closed_object(
+    (
+        "id",
+        "candidate_workload_id",
+        "baseline_workload_id",
+        "comparison_kind",
         "metric",
         "direction",
         "candidate_value",
         "baseline_value",
         "relative_degradation",
         "noise_multiplier",
+        "noise_method",
         "noise_floor",
         "regression_tolerance",
         "result",
@@ -946,29 +1021,24 @@ _PERFORMANCE_COMPARISON = _closed_object(
         "id": {"type": "string", "minLength": 1},
         "candidate_workload_id": {"type": "string", "minLength": 1},
         "baseline_workload_id": {"type": "string", "minLength": 1},
-        "metric": {
-            "type": "string",
-            "enum": [
-                "median_seconds",
-                "p95_seconds",
-                "p99_seconds",
-                "documents_per_second",
-                "mib_per_second",
-                "records_per_second",
-                "seconds_per_document",
-            ],
-        },
+        "comparison_kind": {"const": "cross_path_value"},
+        "metric": _PERFORMANCE_COMPARISON_METRIC,
         "direction": {"type": "string", "enum": ["lower_is_better", "higher_is_better"]},
         "candidate_value": _NONNEGATIVE_NUMBER,
         "baseline_value": _POSITIVE_NUMBER,
         "relative_degradation": _FINITE_NUMBER,
         "noise_multiplier": {"type": "number", "minimum": 1, "maximum": 5},
+        "noise_method": {
+            "type": "string",
+            "enum": ["independent_mad", "paired_relative_mad", "paired_block_ratio_mad"],
+        },
         "noise_floor": _NONNEGATIVE_NUMBER,
         "regression_tolerance": {"type": "number", "minimum": 0, "maximum": 0.1},
         "result": {"type": "string", "enum": ["improved", "equivalent_within_noise", "regressed"]},
         "comparison_plan_sha256": _HASH,
     },
 )
+_PERFORMANCE_COMPARISON = {"oneOf": [_PERFORMANCE_SAME_PATH_COMPARISON, _PERFORMANCE_CROSS_PATH_COMPARISON]}
 _PERFORMANCE_VALUE_COMPONENT = _closed_object(
     (
         "id",
@@ -1004,6 +1074,7 @@ _PERFORMANCE_VALUE_COMPONENT = _closed_object(
             "enum": [
                 "workload_median_seconds",
                 "workload_seconds_per_document",
+                "workload_seconds_per_request",
                 "workload_seconds_per_scan",
                 "workload_seconds_per_mib",
                 "workload_seconds_per_record",
@@ -1036,7 +1107,7 @@ _PERFORMANCE_BREAKEVEN = _closed_object(
     {
         "id": {"type": "string", "minLength": 1},
         "parameter_name": {"type": "string", "minLength": 1},
-        "parameter_unit": {"type": "string", "enum": ["document", "scan", "mib", "record"]},
+        "parameter_unit": {"type": "string", "enum": ["document", "request", "scan", "mib", "record"]},
         "value_unit": {"type": "string", "enum": ["seconds", "usd"]},
         "minimum_units": _NONNEGATIVE_INTEGER,
         "maximum_units": _POSITIVE_INTEGER,
@@ -1053,6 +1124,34 @@ _PERFORMANCE_BREAKEVEN = _closed_object(
         "model_plan_sha256": _HASH,
     },
 )
+_PERFORMANCE_OUTPUT = _closed_object(
+    (
+        "evaluated",
+        "banks",
+        "inputs",
+        "harnesses",
+        "workloads",
+        "baselines",
+        "comparisons",
+        "breakeven_models",
+    ),
+    {
+        "evaluated": {"type": "boolean"},
+        "banks": {"type": "array", "items": _PERFORMANCE_BANK},
+        "inputs": {"type": "array", "items": _PERFORMANCE_INPUT},
+        "harnesses": {"type": "array", "items": _PERFORMANCE_HARNESS},
+        "workloads": {"type": "array", "items": _PERFORMANCE_WORKLOAD},
+        "baselines": {"type": "array", "items": _PERFORMANCE_BASELINE},
+        "comparisons": {"type": "array", "items": _PERFORMANCE_COMPARISON},
+        "breakeven_models": {"type": "array", "items": _PERFORMANCE_BREAKEVEN},
+    },
+)
+ENRON_PERFORMANCE_OUTPUT_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://nerb.dev/schemas/enron-performance-output.v2.schema.json",
+    "title": "NERB Enron benchmark v2 standalone performance output",
+    **_PERFORMANCE_OUTPUT,
+}
 _FROZEN_TARGET = _closed_object(
     (
         "frozen_at",
@@ -1280,28 +1379,7 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             ),
             "catalog_conformance": _CONFORMANCE,
             "test_access": _TEST_ACCESS,
-            "performance": _closed_object(
-                (
-                    "evaluated",
-                    "banks",
-                    "inputs",
-                    "harnesses",
-                    "workloads",
-                    "baselines",
-                    "comparisons",
-                    "breakeven_models",
-                ),
-                {
-                    "evaluated": {"type": "boolean"},
-                    "banks": {"type": "array", "items": _PERFORMANCE_BANK},
-                    "inputs": {"type": "array", "items": _PERFORMANCE_INPUT},
-                    "harnesses": {"type": "array", "items": _PERFORMANCE_HARNESS},
-                    "workloads": {"type": "array", "items": _PERFORMANCE_WORKLOAD},
-                    "baselines": {"type": "array", "items": _PERFORMANCE_BASELINE},
-                    "comparisons": {"type": "array", "items": _PERFORMANCE_COMPARISON},
-                    "breakeven_models": {"type": "array", "items": _PERFORMANCE_BREAKEVEN},
-                },
-            ),
+            "performance": _PERFORMANCE_OUTPUT,
             "performance_manifest_sha256": _HASH,
             "thresholds_sha256": _HASH,
             "promotion": _closed_object(
@@ -1352,15 +1430,18 @@ _apply_schema_resource_limits(ENRON_MANIFEST_SCHEMA)
 _apply_schema_resource_limits(ENRON_EVIDENCE_SCHEMA)
 _apply_schema_resource_limits(ENRON_QUALITY_OUTPUT_SCHEMA)
 _apply_schema_resource_limits(ENRON_CONFORMANCE_OUTPUT_SCHEMA)
+_apply_schema_resource_limits(ENRON_PERFORMANCE_OUTPUT_SCHEMA)
 
 MANIFEST_VALIDATOR = EnronContractValidator(ENRON_MANIFEST_SCHEMA)
 EVIDENCE_VALIDATOR = EnronContractValidator(ENRON_EVIDENCE_SCHEMA)
 QUALITY_OUTPUT_VALIDATOR = EnronContractValidator(ENRON_QUALITY_OUTPUT_SCHEMA)
 CONFORMANCE_OUTPUT_VALIDATOR = EnronContractValidator(ENRON_CONFORMANCE_OUTPUT_SCHEMA)
+PERFORMANCE_OUTPUT_VALIDATOR = EnronContractValidator(ENRON_PERFORMANCE_OUTPUT_SCHEMA)
 Draft202012Validator.check_schema(ENRON_MANIFEST_SCHEMA)
 Draft202012Validator.check_schema(ENRON_EVIDENCE_SCHEMA)
 Draft202012Validator.check_schema(ENRON_QUALITY_OUTPUT_SCHEMA)
 Draft202012Validator.check_schema(ENRON_CONFORMANCE_OUTPUT_SCHEMA)
+Draft202012Validator.check_schema(ENRON_PERFORMANCE_OUTPUT_SCHEMA)
 
 
 def _canonical_payload(value: Any) -> bytes:
@@ -1395,6 +1476,375 @@ def hash_enron_performance_inventory(inventory: Sequence[Mapping[str, int]]) -> 
     return _canonical_hash(normalized)
 
 
+def summarize_enron_performance_inventory(inventory: Sequence[Mapping[str, int]]) -> dict[str, Any]:
+    """Return the canonical privacy-safe denominators and distributions for an input inventory."""
+    normalized = _normalize_performance_inventory(inventory)
+    if normalized is None:
+        raise ValueError("Enron performance inventory rows require bounded nonnegative integer bytes and records.")
+    return _performance_inventory_summary(normalized)
+
+
+def calculate_enron_performance_statistics(
+    samples: Sequence[float],
+    input_descriptor: Mapping[str, Any] | None,
+    *,
+    phase: str,
+    sample_unit: str,
+    work_per_sample: int,
+    records_per_sample: int | None = None,
+) -> dict[str, float | int | None]:
+    """Calculate workload statistics with the exact verifier percentile policy for a performance phase."""
+    normalized = _normalize_samples(samples)
+    if normalized is None or len(normalized) < 5:
+        raise ValueError("Enron performance statistics require at least five finite, positive, bounded samples.")
+    if phase not in PERFORMANCE_PHASES:
+        raise ValueError(f"Unsupported Enron performance phase: {phase!r}.")
+    if sample_unit not in {"operation", "whole_input", "document"}:
+        raise ValueError(f"Unsupported Enron performance sample unit: {sample_unit!r}.")
+    if type(work_per_sample) is not int or work_per_sample < 1:
+        raise ValueError("Enron performance work_per_sample must be a positive integer.")
+    if records_per_sample is not None and (type(records_per_sample) is not int or records_per_sample < 0):
+        raise ValueError("Enron performance records_per_sample must be a nonnegative integer or null.")
+    return _sample_statistics(
+        normalized,
+        input_descriptor,
+        phase,
+        sample_unit,
+        work_per_sample,
+        records_per_sample=records_per_sample,
+    )
+
+
+def calculate_enron_performance_comparison(
+    candidate_statistics: Mapping[str, Any],
+    baseline_statistics: Mapping[str, Any],
+    *,
+    metric: str,
+    noise_method: str,
+    candidate_samples: Sequence[float] | None = None,
+    baseline_samples: Sequence[float] | None = None,
+    block_count: int | None = None,
+    samples_per_block: int | None = None,
+    block_assignment: Sequence[str] | None = None,
+    significance_level: float | None = None,
+    stability_tolerance: float | None = None,
+    noise_multiplier: float | None = None,
+    regression_tolerance: float | None = None,
+) -> dict[str, Any]:
+    """Calculate the verifier's noise-aware comparison outputs from two raw-sample statistic sets."""
+    lower_is_better = {"median_seconds", "p95_seconds", "p99_seconds", "seconds_per_document"}
+    supported_metrics = lower_is_better | {"documents_per_second", "mib_per_second", "records_per_second"}
+    if metric not in supported_metrics:
+        raise ValueError(f"Unsupported Enron performance comparison metric: {metric!r}.")
+
+    if noise_method == "exact_block_swap":
+        if noise_multiplier is not None or regression_tolerance is not None:
+            raise ValueError("Exact block-swap stability does not accept directional noise policy values.")
+        if type(block_count) is not int or block_count != 10:
+            raise ValueError("Exact block-swap stability requires the frozen ten-block policy.")
+        if type(samples_per_block) is not int or samples_per_block < 1:
+            raise ValueError("Exact block-swap stability requires the frozen ten-block policy.")
+        if not isinstance(block_assignment, (list, tuple)) or (
+            len(block_assignment) != block_count
+            or block_assignment.count("candidate_first") != block_count // 2
+            or block_assignment.count("control_first") != block_count // 2
+            or any(item not in {"candidate_first", "control_first"} for item in block_assignment)
+        ):
+            raise ValueError("Exact block-swap stability requires the frozen ten-block policy.")
+        if (
+            isinstance(significance_level, bool)
+            or not isinstance(significance_level, (int, float))
+            or float(significance_level) != 0.05
+        ):
+            raise ValueError("Exact block-swap stability requires the frozen ten-block policy.")
+        if (
+            isinstance(stability_tolerance, bool)
+            or not isinstance(stability_tolerance, (int, float))
+            or float(stability_tolerance) != 0.05
+        ):
+            raise ValueError("Exact block-swap stability requires the frozen ten-block policy.")
+        resolved_significance_level = float(significance_level)
+        resolved_stability_tolerance = float(stability_tolerance)
+        normalized_candidate = _normalize_samples(candidate_samples) if candidate_samples is not None else None
+        normalized_baseline = _normalize_samples(baseline_samples) if baseline_samples is not None else None
+        sample_count = block_count * samples_per_block
+        if (
+            normalized_candidate is None
+            or normalized_baseline is None
+            or len(normalized_candidate) != sample_count
+            or len(normalized_baseline) != sample_count
+        ):
+            raise ValueError("Exact block-swap stability requires complete aligned block samples.")
+        raw_candidate_value = candidate_statistics.get(metric)
+        raw_baseline_value = baseline_statistics.get(metric)
+        if isinstance(raw_candidate_value, bool) or not isinstance(raw_candidate_value, (int, float)):
+            raise ValueError("Exact block-swap stability requires finite positive metric values.")
+        if isinstance(raw_baseline_value, bool) or not isinstance(raw_baseline_value, (int, float)):
+            raise ValueError("Exact block-swap stability requires finite positive metric values.")
+        candidate_value = float(raw_candidate_value)
+        baseline_value = float(raw_baseline_value)
+        if (
+            not math.isfinite(candidate_value)
+            or not math.isfinite(baseline_value)
+            or not 0 < candidate_value <= MAX_FINITE_CONTRACT_NUMBER
+            or not 0 < baseline_value <= MAX_FINITE_CONTRACT_NUMBER
+        ):
+            raise ValueError("Exact block-swap stability requires finite positive metric values.")
+
+        def timing_value(samples: Sequence[float]) -> float:
+            if metric == "p95_seconds":
+                if len(samples) < 20:
+                    raise ValueError("Exact block-swap p95 stability requires at least twenty samples.")
+                return _nearest_rank(sorted(samples), 0.95)
+            if metric == "p99_seconds":
+                if len(samples) < MIN_DECISION_GRADE_P99_STABILITY_SAMPLES:
+                    raise ValueError("Exact block-swap p99 stability requires at least one thousand samples.")
+                tail_count = len(samples) - math.ceil(0.99 * len(samples)) + 1
+                return nlargest(tail_count, samples)[-1]
+            return float(median(samples))
+
+        def absolute_ratio(left: float, right: float) -> tuple[float, float]:
+            ratio = max(left, right) / min(left, right)
+            return math.log(ratio), ratio - 1.0
+
+        absolute_log_ratio, absolute_relative_gap = absolute_ratio(candidate_value, baseline_value)
+        minimum_value = min(candidate_value, baseline_value)
+        maximum_value = max(candidate_value, baseline_value)
+        within_tolerance = maximum_value <= minimum_value * (1.0 + resolved_stability_tolerance)
+        observed_timing_log_ratio, _observed_timing_gap = absolute_ratio(
+            timing_value(normalized_candidate), timing_value(normalized_baseline)
+        )
+        candidate_blocks = [
+            normalized_candidate[index : index + samples_per_block]
+            for index in range(0, sample_count, samples_per_block)
+        ]
+        baseline_blocks = [
+            normalized_baseline[index : index + samples_per_block]
+            for index in range(0, sample_count, samples_per_block)
+        ]
+        permutation_candidate_blocks = candidate_blocks
+        permutation_baseline_blocks = baseline_blocks
+        permutation_tail_count = sample_count - math.ceil(0.99 * sample_count) + 1 if metric == "p99_seconds" else None
+        if permutation_tail_count is not None:
+            permutation_candidate_blocks = [nlargest(permutation_tail_count, block) for block in candidate_blocks]
+            permutation_baseline_blocks = [nlargest(permutation_tail_count, block) for block in baseline_blocks]
+
+        def pooled_permutation_value(blocks: Sequence[Sequence[float]]) -> float:
+            pooled = [value for block in blocks for value in block]
+            if permutation_tail_count is not None:
+                return nlargest(permutation_tail_count, pooled)[-1]
+            return timing_value(pooled)
+
+        extreme_permutations = 0
+        permutation_count = 1 << block_count
+        for swap_mask in range(permutation_count):
+            permuted_candidate_blocks: list[Sequence[float]] = []
+            permuted_baseline_blocks: list[Sequence[float]] = []
+            for block_index, (candidate_block, baseline_block) in enumerate(
+                zip(permutation_candidate_blocks, permutation_baseline_blocks, strict=True)
+            ):
+                if swap_mask & (1 << block_index):
+                    permuted_candidate_blocks.append(baseline_block)
+                    permuted_baseline_blocks.append(candidate_block)
+                else:
+                    permuted_candidate_blocks.append(candidate_block)
+                    permuted_baseline_blocks.append(baseline_block)
+            permuted_log_ratio, _permuted_gap = absolute_ratio(
+                pooled_permutation_value(permuted_candidate_blocks),
+                pooled_permutation_value(permuted_baseline_blocks),
+            )
+            if permuted_log_ratio >= observed_timing_log_ratio:
+                extreme_permutations += 1
+        permutation_p_value = extreme_permutations / permutation_count
+        result = (
+            "within_tolerance"
+            if within_tolerance
+            else "unstable"
+            if permutation_p_value <= resolved_significance_level
+            else "inconclusive"
+        )
+        return {
+            "direction": "symmetric",
+            "candidate_value": candidate_value,
+            "baseline_value": baseline_value,
+            "block_count": block_count,
+            "samples_per_block": samples_per_block,
+            "block_assignment": list(block_assignment),
+            "absolute_log_ratio": absolute_log_ratio,
+            "absolute_relative_gap": absolute_relative_gap,
+            "permutation_p_value": permutation_p_value,
+            "result": result,
+        }
+
+    if (
+        block_count is not None
+        or samples_per_block is not None
+        or block_assignment is not None
+        or significance_level is not None
+        or stability_tolerance is not None
+    ):
+        raise ValueError("Directional performance comparisons do not accept exact block-swap policy values.")
+    numeric_values = {
+        "candidate_value": candidate_statistics.get(metric),
+        "baseline_value": baseline_statistics.get(metric),
+        "candidate_median": candidate_statistics.get("median_seconds"),
+        "baseline_median": baseline_statistics.get("median_seconds"),
+        "candidate_mad": candidate_statistics.get("mad_seconds"),
+        "baseline_mad": baseline_statistics.get("mad_seconds"),
+        "noise_multiplier": noise_multiplier,
+        "regression_tolerance": regression_tolerance,
+    }
+    parsed_values: dict[str, float] = {}
+    for name, value in numeric_values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("Enron performance comparisons require finite numeric statistics and policy values.")
+        try:
+            parsed = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "Enron performance comparisons require finite numeric statistics and policy values."
+            ) from exc
+        if not math.isfinite(parsed) or abs(parsed) > MAX_FINITE_CONTRACT_NUMBER:
+            raise ValueError("Enron performance comparisons require finite numeric statistics and policy values.")
+        parsed_values[name] = parsed
+    candidate_value = parsed_values["candidate_value"]
+    baseline_value = parsed_values["baseline_value"]
+    candidate_median = parsed_values["candidate_median"]
+    baseline_median = parsed_values["baseline_median"]
+    candidate_mad = parsed_values["candidate_mad"]
+    baseline_mad = parsed_values["baseline_mad"]
+    if (
+        candidate_value < 0
+        or baseline_value <= 0
+        or candidate_median <= 0
+        or baseline_median <= 0
+        or candidate_mad < 0
+        or baseline_mad < 0
+        or not 1 <= parsed_values["noise_multiplier"] <= 5
+        or not 0 <= parsed_values["regression_tolerance"] <= 0.1
+    ):
+        raise ValueError("Enron performance comparison statistics or policy values are outside supported bounds.")
+    direction = "lower_is_better" if metric in lower_is_better else "higher_is_better"
+    relative_degradation = (
+        (candidate_value - baseline_value) / baseline_value
+        if direction == "lower_is_better"
+        else (baseline_value - candidate_value) / baseline_value
+    )
+    if noise_method == "independent_mad":
+        if candidate_samples is not None or baseline_samples is not None:
+            raise ValueError("Independent-MAD comparisons do not accept paired raw samples.")
+        noise_floor = (
+            max(candidate_mad / candidate_median, baseline_mad / baseline_median) * parsed_values["noise_multiplier"]
+        )
+    elif noise_method == "paired_relative_mad":
+        normalized_candidate = _normalize_samples(candidate_samples) if candidate_samples is not None else None
+        normalized_baseline = _normalize_samples(baseline_samples) if baseline_samples is not None else None
+        if (
+            metric not in lower_is_better
+            or normalized_candidate is None
+            or normalized_baseline is None
+            or len(normalized_candidate) < 5
+            or len(normalized_candidate) != len(normalized_baseline)
+        ):
+            raise ValueError("Paired-relative-MAD comparisons require aligned positive timing samples.")
+        paired_relative = [
+            (candidate - baseline) / baseline
+            for candidate, baseline in zip(normalized_candidate, normalized_baseline, strict=True)
+        ]
+        paired_center = float(median(paired_relative))
+        paired_mad = float(median(abs(value - paired_center) for value in paired_relative))
+        noise_floor = paired_mad * parsed_values["noise_multiplier"]
+    elif noise_method == "paired_block_ratio_mad":
+        normalized_candidate = _normalize_samples(candidate_samples) if candidate_samples is not None else None
+        normalized_baseline = _normalize_samples(baseline_samples) if baseline_samples is not None else None
+        if (
+            normalized_candidate is None
+            or normalized_baseline is None
+            or len(normalized_candidate) < 5
+            or len(normalized_candidate) != len(normalized_baseline)
+        ):
+            raise ValueError("Paired-block-ratio-MAD comparisons require aligned positive timing samples.")
+        paired_ratios = [
+            candidate / baseline for candidate, baseline in zip(normalized_candidate, normalized_baseline, strict=True)
+        ]
+        paired_center = float(median(paired_ratios))
+        paired_mad = float(median(abs(value - paired_center) for value in paired_ratios))
+        noise_floor = (paired_mad / paired_center) * parsed_values["noise_multiplier"]
+        if not math.isfinite(noise_floor) or noise_floor > MAX_FINITE_CONTRACT_NUMBER:
+            raise ValueError("Paired-block-ratio-MAD comparison dispersion is outside supported bounds.")
+    else:
+        raise ValueError("Unsupported Enron performance comparison noise method.")
+    boundary = noise_floor + parsed_values["regression_tolerance"]
+    result = (
+        "regressed"
+        if relative_degradation > boundary
+        else "improved"
+        if relative_degradation < -boundary
+        else "equivalent_within_noise"
+    )
+    return {
+        "direction": direction,
+        "candidate_value": candidate_value,
+        "baseline_value": baseline_value,
+        "relative_degradation": relative_degradation,
+        "noise_floor": noise_floor,
+        "result": result,
+    }
+
+
+def calculate_enron_breakeven(
+    candidate_fixed_value: float,
+    baseline_fixed_value: float,
+    candidate_value_per_unit: float,
+    baseline_value_per_unit: float,
+    *,
+    minimum_units: int,
+    maximum_units: int,
+) -> dict[str, int | str | None]:
+    """Calculate the verifier's bounded additive breakeven result."""
+    values = (
+        candidate_fixed_value,
+        baseline_fixed_value,
+        candidate_value_per_unit,
+        baseline_value_per_unit,
+    )
+    normalized_values: list[float] = []
+    for value in values:
+        if type(value) not in (int, float):
+            raise ValueError("Enron breakeven inputs must be finite, nonnegative, and bounded.")
+        try:
+            normalized = float(value)
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError("Enron breakeven inputs must be finite, nonnegative, and bounded.") from exc
+        if not math.isfinite(normalized) or normalized < 0 or normalized > MAX_FINITE_CONTRACT_NUMBER:
+            raise ValueError("Enron breakeven inputs must be finite, nonnegative, and bounded.")
+        normalized_values.append(normalized)
+    if (
+        type(minimum_units) is not int
+        or type(maximum_units) is not int
+        or minimum_units < 0
+        or maximum_units < 1
+        or minimum_units > maximum_units
+        or maximum_units > MAX_SAFE_INTEGER
+    ):
+        raise ValueError("Enron breakeven unit bounds must be ordered nonnegative integers.")
+    normalized_candidate_fixed, normalized_baseline_fixed, normalized_candidate_unit, normalized_baseline_unit = (
+        normalized_values
+    )
+    result = _breakeven_result(
+        normalized_candidate_fixed,
+        normalized_baseline_fixed,
+        normalized_candidate_unit,
+        normalized_baseline_unit,
+        minimum_units,
+        maximum_units,
+    )
+    if result is None:
+        raise ValueError("Enron breakeven inputs must be finite, nonnegative, and bounded.")
+    outcome, units = result
+    return {"result": outcome, "breakeven_units": units}
+
+
 def hash_enron_performance_bank(bank: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in bank.items() if key != "descriptor_sha256"})
 
@@ -1412,15 +1862,21 @@ def hash_enron_performance_baseline(baseline: Mapping[str, Any]) -> str:
 
 
 def hash_enron_performance_comparison_plan(comparison: Mapping[str, Any]) -> str:
-    plan_fields = (
+    common_fields = (
         "id",
         "candidate_workload_id",
         "baseline_workload_id",
+        "comparison_kind",
         "metric",
         "direction",
-        "noise_multiplier",
-        "regression_tolerance",
+        "noise_method",
     )
+    policy_fields = (
+        ("block_count", "samples_per_block", "block_assignment", "significance_level", "stability_tolerance")
+        if comparison["comparison_kind"] == "same_path_stability"
+        else ("noise_multiplier", "regression_tolerance")
+    )
+    plan_fields = common_fields + policy_fields
     return _canonical_hash({field: comparison[field] for field in plan_fields})
 
 
@@ -1534,6 +1990,15 @@ def hash_enron_thresholds(checks: Sequence[Mapping[str, Any]]) -> str:
 
 def hash_enron_test_lineage_entry(entry: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in entry.items() if key != "entry_sha256"})
+
+
+def validate_enron_performance_output(performance: Any) -> dict[str, Any]:
+    """Validate the closed standalone performance shape without evidence-context semantic bindings."""
+
+    diagnostics = _structure_diagnostics(performance)
+    if diagnostics:
+        return _result(diagnostics)
+    return _result(_schema_diagnostics(PERFORMANCE_OUTPUT_VALIDATOR, performance))
 
 
 def validate_enron_quality_output(quality: Any) -> dict[str, Any]:
@@ -3155,7 +3620,7 @@ def _performance_diagnostics(
             "native_source_bytes": bank["native_source_bytes"],
             "artifact": {
                 "sha256": bank["artifact_sha256"],
-                "bytes": bank["canonical_json_bytes"],
+                "bytes": bank["artifact_bytes"],
             },
         }
         if any(
@@ -3256,12 +3721,12 @@ def _performance_diagnostics(
                     "other phases do not.",
                 )
             )
-        elif phase == "source_profile" and source_artifact["sha256"] != source["content_sha256"]:
+        elif phase == "source_profile" and source_artifact != splits["roles"]["train"]["artifact"]:
             diagnostics.append(
                 _error(
                     "contract.performance_harness_source_binding",
                     f"{path}/source_artifact",
-                    "Source profiling must bind the exact declared corpus content hash.",
+                    "Source profiling must bind the exact frozen train-split artifact.",
                 )
             )
         elif phase == "source_build" and source_artifact != splits["roles"]["train"]["artifact"]:
@@ -3274,6 +3739,7 @@ def _performance_diagnostics(
             )
     sample_cache: dict[str, tuple[list[float], int, str] | None] = {}
     sample_budget_exceeded: set[str] = set()
+    resolved_samples_by_workload: dict[str, list[float]] = {}
     for index, workload in enumerate(workloads):
         path = f"/performance/workloads/{index}"
         harness = harness_by_id.get(str(workload["harness_id"]))
@@ -3438,6 +3904,7 @@ def _performance_diagnostics(
                 )
             )
             continue
+        resolved_samples_by_workload[str(workload["id"])] = normalized_samples
         if not samples and (
             workload["samples_ref"]["bytes"] != resolved_sample_bytes
             or resolved_sample_sha256 != workload["samples_ref"]["sha256"]
@@ -3474,11 +3941,34 @@ def _performance_diagnostics(
                 )
             )
         stats = workload["stats"]
+        records_per_sample = workload["records_per_sample"]
+        expected_inventory_records = (
+            None
+            if input_descriptor is None or workload["sample_unit"] != "whole_input"
+            else input_descriptor["records"] * workload["work_per_sample"]
+        )
+        baseline = None if workload["baseline_id"] is None else baseline_by_id.get(str(workload["baseline_id"]))
+        records_must_match_inventory = baseline is None or baseline["semantic_equivalence"] == "exact"
+        if (workload["sample_unit"] == "whole_input") != (records_per_sample is not None) or (
+            records_per_sample is not None
+            and records_must_match_inventory
+            and records_per_sample != expected_inventory_records
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.performance_record_denominator",
+                    f"{path}/records_per_sample",
+                    "Whole-input record throughput must use the observed stable count; exact NERB paths must match the "
+                    "bound input inventory.",
+                )
+            )
         expected = _sample_statistics(
             normalized_samples,
             input_descriptor,
+            str(workload["phase"]),
             workload["sample_unit"],
             workload["work_per_sample"],
+            records_per_sample=records_per_sample,
         )
         recomputed_statistics[str(workload["id"])] = expected
         for field, value in expected.items():
@@ -3491,11 +3981,12 @@ def _performance_diagnostics(
                     )
                 )
         warm_path = workload["process_model"] == "reused_process"
+        minimum_samples = _required_decision_grade_sample_count(workload)
         if workload["decision_grade"] and (
             workload["baseline_id"] is not None
             or (warm_path and workload["warmups"] < MIN_DECISION_GRADE_WARMUPS)
             or (not warm_path and workload["warmups"] != 0)
-            or len(normalized_samples) < MIN_DECISION_GRADE_SAMPLES
+            or len(normalized_samples) < minimum_samples
             or workload["work_per_sample"] != 1
             or workload["peak_rss_bytes"] is None
         ):
@@ -3503,7 +3994,8 @@ def _performance_diagnostics(
                 _error(
                     "contract.invalid_decision_grade_workload",
                     f"{path}/decision_grade",
-                    "Decision-grade cells require one-unit work, phase-correct warmups, 100 samples, and peak RSS.",
+                    "Decision-grade cells require one-unit work, phase-correct warmups, phase-specific sample support "
+                    "including 1,000 samples for direct p99 evidence, and peak RSS.",
                 )
             )
         if workload["promotion_gate"] and (
@@ -3581,6 +4073,7 @@ def _performance_diagnostics(
             baseline_by_id,
             harness_by_id,
             recomputed_statistics,
+            resolved_samples_by_workload,
         )
     )
     diagnostics.extend(_performance_breakeven_diagnostics(breakeven_models, workloads, recomputed_statistics))
@@ -3604,14 +4097,6 @@ def _performance_bank_diagnostics(descriptor: Mapping[str, Any], path: str) -> l
                 "contract.performance_bank_generator",
                 f"{path}/generator",
                 "Synthetic scale banks require a versioned generator; evaluated banks bind their real artifact.",
-            )
-        )
-    if descriptor["artifact"]["bytes"] != descriptor["canonical_json_bytes"]:
-        diagnostics.append(
-            _error(
-                "contract.performance_bank_artifact",
-                f"{path}/artifact/bytes",
-                "Bank artifact byte count must equal the canonical JSON bank size.",
             )
         )
     taxonomy = descriptor["composition"]["taxonomy"]
@@ -3776,23 +4261,54 @@ def _performance_inventory_diagnostics(
     return []
 
 
+def _required_same_path_stability_metric(workload: Mapping[str, Any]) -> str:
+    if workload["phase"] == "direct_bank_scan" and workload["decision_grade"] is True:
+        return "p99_seconds"
+    return "median_seconds"
+
+
+def _required_decision_grade_sample_count(workload: Mapping[str, Any]) -> int:
+    if workload["phase"] in PERFORMANCE_SETUP_PHASES:
+        return MIN_DECISION_GRADE_SETUP_SAMPLES
+    if workload["phase"] == "direct_bank_scan":
+        return MIN_DECISION_GRADE_P99_STABILITY_SAMPLES
+    return MIN_DECISION_GRADE_SCAN_SAMPLES
+
+
+def _is_cross_path_direct_proxy(workload: Mapping[str, Any]) -> bool:
+    return (
+        workload["phase"] == "direct_bank_scan"
+        and workload["decision_grade"] is False
+        and workload["promotion_gate"] is False
+        and workload["baseline_id"] is None
+        and workload["sample_unit"] == "whole_input"
+        and workload["work_per_sample"] == 1
+        and workload["process_model"] == "reused_process"
+        and workload["warmups"] >= MIN_DECISION_GRADE_WARMUPS
+        and workload["stats"]["sample_count"] == _CROSS_PATH_DIRECT_PROXY_SAMPLES
+    )
+
+
 def _performance_comparison_diagnostics(
     comparisons: Sequence[Mapping[str, Any]],
     workloads: Sequence[Mapping[str, Any]],
     baseline_by_id: Mapping[str, Mapping[str, Any]],
     harness_by_id: Mapping[str, Mapping[str, Any]],
     recomputed_statistics: Mapping[str, Mapping[str, Any]],
+    resolved_samples_by_workload: Mapping[str, Sequence[float]],
 ) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     workload_by_id = {str(item["id"]): item for item in workloads}
-    lower_is_better = {"median_seconds", "p95_seconds", "p99_seconds", "seconds_per_document"}
-    comparison_keys = [(str(item["candidate_workload_id"]), str(item["metric"])) for item in comparisons]
+    comparison_keys = [
+        (str(item["candidate_workload_id"]), str(item["baseline_workload_id"]), str(item["metric"]))
+        for item in comparisons
+    ]
     if len(comparison_keys) != len(set(comparison_keys)):
         diagnostics.append(
             _error(
                 "contract.duplicate_performance_comparison_metric",
                 "/performance/comparisons",
-                "A candidate workload may declare at most one comparison for each metric.",
+                "A candidate/baseline workload pair may declare at most one comparison for each metric.",
             )
         )
     for index, comparison in enumerate(comparisons):
@@ -3824,36 +4340,111 @@ def _performance_comparison_diagnostics(
             "median_method",
             "percentile_method",
         )
-        if (
-            candidate is None
-            or baseline is None
-            or candidate["baseline_id"] is not None
-            or baseline["baseline_id"] is None
-            or baseline_identity is None
-            or baseline_identity["semantic_equivalence"] != "exact"
-            or candidate_harness is None
-            or baseline_harness is None
-            or candidate_harness["operation_spec_sha256"] != baseline_harness["operation_spec_sha256"]
-            or candidate_harness["source_artifact"] != baseline_harness["source_artifact"]
-            or candidate["stats"]["sample_count"] != baseline["stats"]["sample_count"]
-            or any(candidate[field] != baseline[field] for field in comparable_fields)
-        ):
+        comparison_kind = str(comparison["comparison_kind"])
+        same_path_valid = (
+            comparison_kind == "same_path_stability"
+            and candidate is not None
+            and baseline is not None
+            and candidate["baseline_id"] is None
+            and baseline["baseline_id"] is not None
+            and baseline_identity is not None
+            and baseline_identity["semantic_equivalence"] == "exact"
+            and candidate_harness is not None
+            and baseline_harness is not None
+            and candidate_harness["operation_spec_sha256"] == baseline_harness["operation_spec_sha256"]
+            and candidate_harness["source_artifact"] == baseline_harness["source_artifact"]
+            and candidate["stats"]["sample_count"] == baseline["stats"]["sample_count"]
+            and all(candidate[field] == baseline[field] for field in comparable_fields)
+            and comparison["direction"] == "symmetric"
+            and comparison["noise_method"] == "exact_block_swap"
+            and comparison["block_count"] == 10
+            and comparison["samples_per_block"] * comparison["block_count"] == candidate["stats"]["sample_count"]
+            and comparison["block_assignment"].count("candidate_first") == comparison["block_count"] // 2
+            and comparison["block_assignment"].count("control_first") == comparison["block_count"] // 2
+        )
+        cross_fields = (
+            "bank_id",
+            "bank_hash",
+            "input_id",
+            "input_sha256",
+            "sample_unit",
+            "work_per_sample",
+            "concurrency",
+            "median_method",
+            "percentile_method",
+        )
+        allowed_cross_phases = {
+            ("direct_bank_scan", "helper_cache_miss"),
+            ("direct_bank_scan", "helper_cache_hit"),
+            ("direct_bank_scan", "end_to_end"),
+            ("helper_cache_hit", "helper_cache_miss"),
+        }
+        cross_candidate_valid = candidate is not None and (
+            candidate["decision_grade"] is True or _is_cross_path_direct_proxy(candidate)
+        )
+        cross_path_valid = (
+            comparison_kind == "cross_path_value"
+            and candidate is not None
+            and baseline is not None
+            and candidate["baseline_id"] is None
+            and baseline["baseline_id"] is None
+            and cross_candidate_valid
+            and baseline["decision_grade"] is True
+            and candidate["sample_unit"] == "whole_input"
+            and candidate["stats"]["sample_count"] == baseline["stats"]["sample_count"]
+            and (candidate["phase"], baseline["phase"]) in allowed_cross_phases
+            and all(candidate[field] == baseline[field] for field in cross_fields)
+            and comparison["noise_method"] == "paired_block_ratio_mad"
+        )
+        if not same_path_valid and not cross_path_valid:
             diagnostics.append(
                 _error(
                     "contract.incomparable_performance_baseline",
                     path,
-                    "Baseline comparison requires identical operation/source artifacts, bank, input, sampling, "
-                    "and phase.",
+                    "Comparison must be either an identical exact same-path stability control or an allowed exact-"
+                    "semantics whole-input cache-value pair.",
                 )
             )
             continue
+        assert candidate is not None and baseline is not None
         metric = str(comparison["metric"])
         candidate_stats = recomputed_statistics.get(str(candidate["id"]), candidate["stats"])
         baseline_stats = recomputed_statistics.get(str(baseline["id"]), baseline["stats"])
-        candidate_value = candidate_stats[metric]
-        baseline_value = baseline_stats[metric]
-        direction = "lower_is_better" if metric in lower_is_better else "higher_is_better"
-        if candidate_value is None or baseline_value is None or not baseline_value:
+        try:
+            if comparison_kind == "same_path_stability":
+                expected = calculate_enron_performance_comparison(
+                    candidate_stats,
+                    baseline_stats,
+                    metric=metric,
+                    noise_method=str(comparison["noise_method"]),
+                    candidate_samples=resolved_samples_by_workload.get(str(candidate["id"])),
+                    baseline_samples=resolved_samples_by_workload.get(str(baseline["id"])),
+                    block_count=int(comparison["block_count"]),
+                    samples_per_block=int(comparison["samples_per_block"]),
+                    block_assignment=comparison["block_assignment"],
+                    significance_level=float(comparison["significance_level"]),
+                    stability_tolerance=float(comparison["stability_tolerance"]),
+                )
+            else:
+                expected = calculate_enron_performance_comparison(
+                    candidate_stats,
+                    baseline_stats,
+                    metric=metric,
+                    noise_multiplier=float(comparison["noise_multiplier"]),
+                    regression_tolerance=float(comparison["regression_tolerance"]),
+                    noise_method=str(comparison["noise_method"]),
+                    candidate_samples=(
+                        resolved_samples_by_workload.get(str(candidate["id"]))
+                        if comparison["noise_method"] == "paired_block_ratio_mad"
+                        else None
+                    ),
+                    baseline_samples=(
+                        resolved_samples_by_workload.get(str(baseline["id"]))
+                        if comparison["noise_method"] == "paired_block_ratio_mad"
+                        else None
+                    ),
+                )
+        except ValueError:
             diagnostics.append(
                 _error(
                     "contract.unsupported_performance_comparison",
@@ -3862,19 +4453,7 @@ def _performance_comparison_diagnostics(
                 )
             )
             continue
-        relative_degradation = (
-            (candidate_value - baseline_value) / baseline_value
-            if direction == "lower_is_better"
-            else (baseline_value - candidate_value) / baseline_value
-        )
-        noise_floor = (
-            max(
-                candidate_stats["mad_seconds"] / candidate_stats["median_seconds"],
-                baseline_stats["mad_seconds"] / baseline_stats["median_seconds"],
-            )
-            * comparison["noise_multiplier"]
-        )
-        if noise_floor > MAX_COMPARISON_NOISE_FLOOR:
+        if comparison_kind == "cross_path_value" and float(expected["noise_floor"]) > MAX_COMPARISON_NOISE_FLOOR:
             diagnostics.append(
                 _error(
                     "contract.unstable_performance_comparison",
@@ -3882,21 +4461,6 @@ def _performance_comparison_diagnostics(
                     "Decision-grade comparison noise exceeds the benchmark-v2 stability ceiling.",
                 )
             )
-        boundary = noise_floor + comparison["regression_tolerance"]
-        if relative_degradation > boundary:
-            result = "regressed"
-        elif relative_degradation < -boundary:
-            result = "improved"
-        else:
-            result = "equivalent_within_noise"
-        expected = {
-            "direction": direction,
-            "candidate_value": candidate_value,
-            "baseline_value": baseline_value,
-            "relative_degradation": relative_degradation,
-            "noise_floor": noise_floor,
-            "result": result,
-        }
         if any(not _same_scalar(comparison[field], value) for field, value in expected.items()):
             diagnostics.append(
                 _error(
@@ -3998,15 +4562,16 @@ def _performance_breakeven_diagnostics(
                 )
             )
             continue
-        breakeven = _breakeven_result(
-            totals[("candidate", "fixed")],
-            totals[("baseline", "fixed")],
-            totals[("candidate", "per_unit")],
-            totals[("baseline", "per_unit")],
-            model["minimum_units"],
-            model["maximum_units"],
-        )
-        if breakeven is None:
+        try:
+            breakeven = calculate_enron_breakeven(
+                totals[("candidate", "fixed")],
+                totals[("baseline", "fixed")],
+                totals[("candidate", "per_unit")],
+                totals[("baseline", "per_unit")],
+                minimum_units=int(model["minimum_units"]),
+                maximum_units=int(model["maximum_units"]),
+            )
+        except ValueError:
             diagnostics.append(
                 _error(
                     "contract.breakeven_numeric_bounds",
@@ -4015,14 +4580,12 @@ def _performance_breakeven_diagnostics(
                 )
             )
             continue
-        result, units = breakeven
         expected = {
             "candidate_fixed_value": totals[("candidate", "fixed")],
             "baseline_fixed_value": totals[("baseline", "fixed")],
             "candidate_value_per_unit": totals[("candidate", "per_unit")],
             "baseline_value_per_unit": totals[("baseline", "per_unit")],
-            "result": result,
-            "breakeven_units": units,
+            **breakeven,
         }
         if any(not _same_scalar(model[field], value) for field, value in expected.items()):
             diagnostics.append(
@@ -4066,7 +4629,23 @@ def _breakeven_component_value(
         return None
     workload_statistics = recomputed_statistics.get(str(workload["id"]), workload["stats"])
     candidate_side = component["side"] == "candidate"
-    if candidate_side != (workload["baseline_id"] is None):
+    baseline_scan_alternative = (
+        not candidate_side
+        and category == "scan"
+        and workload["baseline_id"] is None
+        and workload["phase"] in {"helper_cache_miss", "end_to_end"}
+    )
+    shared_acquisition_cost = (
+        not candidate_side
+        and component["application"] == "fixed"
+        and category in {"source_profiling", "bank_build"}
+        and workload["baseline_id"] is None
+    )
+    if (
+        not baseline_scan_alternative
+        and not shared_acquisition_cost
+        and candidate_side != (workload["baseline_id"] is None)
+    ):
         return None
     if source == "workload_median_seconds":
         expected_phase = {
@@ -4077,10 +4656,12 @@ def _breakeven_component_value(
         if component["application"] != "fixed" or expected_phase is None or workload["phase"] != expected_phase:
             return None
         return float(workload_statistics["median_seconds"])
-    if component["application"] != "per_unit" or category != "scan" or workload["phase"] != "direct_bank_scan":
+    allowed_scan_phases = {"direct_bank_scan"} if candidate_side else {"helper_cache_miss", "end_to_end"}
+    if component["application"] != "per_unit" or category != "scan" or workload["phase"] not in allowed_scan_phases:
         return None
     metric_by_source = {
         "workload_seconds_per_document": ("document", "seconds_per_document"),
+        "workload_seconds_per_request": ("request", "median_seconds"),
         "workload_seconds_per_scan": ("scan", "median_seconds"),
         "workload_seconds_per_mib": ("mib", "mib_per_second"),
         "workload_seconds_per_record": ("record", "records_per_second"),
@@ -4088,12 +4669,14 @@ def _breakeven_component_value(
     expected_unit, metric = metric_by_source[source]
     if model["parameter_unit"] != expected_unit:
         return None
+    if source == "workload_seconds_per_request" and workload["sample_unit"] != "whole_input":
+        return None
     metric_value = workload_statistics[metric]
     if metric_value is None or metric_value <= 0:
         return None
     if source in {"workload_seconds_per_mib", "workload_seconds_per_record"}:
         return 1.0 / float(metric_value)
-    if source == "workload_seconds_per_scan":
+    if source in {"workload_seconds_per_request", "workload_seconds_per_scan"}:
         return float(metric_value) / int(workload["work_per_sample"])
     return float(metric_value)
 
@@ -4198,14 +4781,15 @@ def _performance_promotion_diagnostics(
             or item["baseline_id"] is not None
             or not item["decision_grade"]
             or item["warmups"] < MIN_DECISION_GRADE_WARMUPS
-            or item["stats"]["sample_count"] < MIN_DECISION_GRADE_SAMPLES
+            or item["stats"]["sample_count"] < MIN_DECISION_GRADE_P99_STABILITY_SAMPLES
             or item["peak_rss_bytes"] is None
         ):
             diagnostics.append(
                 _error(
                     "contract.invalid_performance_headline",
                     f"/performance/workloads/{index}",
-                    "Headline performance must be a decision-grade direct scan of one real evaluated-bank input.",
+                    "Headline performance must be a 1,000-sample decision-grade direct p99 scan of one real evaluated-"
+                    "bank input.",
                 )
             )
     if (
@@ -4229,10 +4813,13 @@ def _performance_promotion_diagnostics(
             {
                 f"{path}/stats/median_seconds": ("lte", None),
                 f"{path}/stats/p95_seconds": ("lte", None),
-                f"{path}/stats/p99_seconds": ("lte", None),
                 f"{path}/peak_rss_bytes": ("lte", None),
             }
         )
+        if item["phase"] in PERFORMANCE_SETUP_PHASES:
+            required_gate_specs[f"{path}/stats/mad_seconds"] = ("lte", None)
+        else:
+            required_gate_specs[f"{path}/stats/p99_seconds"] = ("lte", None)
         if item["sample_unit"] == "document":
             required_gate_specs[f"{path}/stats/seconds_per_document"] = ("lte", None)
         elif item["sample_unit"] == "whole_input":
@@ -4269,15 +4856,15 @@ def _performance_promotion_diagnostics(
     required_scale_descriptors: list[Mapping[str, Any]] = []
     for item in banks:
         if item["kind"] == "synthetic_scale":
-            scale_banks.setdefault(int(item["active_aliases"]), []).append(item)
-    for alias_count in PERFORMANCE_SCALE_ALIASES:
-        descriptors = scale_banks.get(alias_count, [])
+            scale_banks.setdefault(int(item["active_patterns"]), []).append(item)
+    for pattern_count in PERFORMANCE_SCALE_PATTERNS:
+        descriptors = scale_banks.get(pattern_count, [])
         if len(descriptors) != 1:
             diagnostics.append(
                 _error(
                     "contract.missing_scale_shape",
                     "/performance/banks",
-                    "Promotion requires exactly one content-addressed bank for every required scale.",
+                    "Promotion requires exactly one content-addressed bank for every required matcher-pattern scale.",
                 )
             )
             continue
@@ -4288,7 +4875,8 @@ def _performance_promotion_diagnostics(
                 _error(
                     "contract.unrealistic_scale_bank",
                     "/performance/banks",
-                    "Synthetic scale composition must preserve the evaluated taxonomy and alias/regex proportions.",
+                    "Synthetic matcher-pattern scale composition must preserve the evaluated taxonomy and "
+                    "name/alias/literal/regex proportions.",
                 )
             )
         cells = [
@@ -4310,7 +4898,7 @@ def _performance_promotion_diagnostics(
                     "Every required scale bank needs a direct decision-grade workload cell.",
                 )
             )
-    if len(required_scale_descriptors) == len(PERFORMANCE_SCALE_ALIASES) and all(
+    if len(required_scale_descriptors) == len(PERFORMANCE_SCALE_PATTERNS) and all(
         descriptor["generator"] is not None for descriptor in required_scale_descriptors
     ):
         generator_families = {
@@ -4338,8 +4926,8 @@ def _performance_promotion_diagnostics(
         and item["phase"] == "direct_bank_scan"
         and str(item["input_id"]) in inputs
     ]
-    scale_aliases_by_bank_id = {
-        str(item["id"]): int(item["active_aliases"]) for item in banks if item["kind"] == "synthetic_scale"
+    scale_patterns_by_bank_id = {
+        str(item["id"]): int(item["active_patterns"]) for item in banks if item["kind"] == "synthetic_scale"
     }
     scale_families: dict[tuple[Any, ...], set[int]] = {}
     concurrency_families: dict[tuple[Any, ...], set[int]] = {}
@@ -4360,9 +4948,9 @@ def _performance_promotion_diagnostics(
             int(item["warmups"]),
             int(item["stats"]["sample_count"]),
         )
-        scale_alias_count = scale_aliases_by_bank_id.get(str(item["bank_id"]))
+        scale_pattern_count = scale_patterns_by_bank_id.get(str(item["bank_id"]))
         if (
-            scale_alias_count is not None
+            scale_pattern_count is not None
             and input_descriptor["kind"] == "synthetic_input"
             and input_descriptor["hit_density"] == "negative"
             and input_descriptor["size_cohort"] == "medium"
@@ -4387,7 +4975,7 @@ def _performance_promotion_diagnostics(
                 }
             )
             scale_families.setdefault((input_shape, int(item["concurrency"]), *sample_shape), set()).add(
-                scale_alias_count
+                scale_pattern_count
             )
         concurrency_key = (
             item["bank_id"],
@@ -4423,12 +5011,13 @@ def _performance_promotion_diagnostics(
             )
             size_families.setdefault(size_key, set()).add(str(input_descriptor["size_cohort"]))
 
-    if not any(set(PERFORMANCE_SCALE_ALIASES) <= values for values in scale_families.values()):
+    if not any(set(PERFORMANCE_SCALE_PATTERNS) <= values for values in scale_families.values()):
         diagnostics.append(
             _error(
                 "contract.uncontrolled_scale_sweep",
                 "/performance/workloads",
-                "Scale evidence must hold one canonical negative, medium, serial whole-input workload shape constant.",
+                "Matcher-pattern scale evidence must hold one canonical negative, medium, serial whole-input workload "
+                "shape constant.",
             )
         )
     if not any(1 in values and any(value > 1 for value in values) for values in concurrency_families.values()):
@@ -4509,18 +5098,22 @@ def _performance_promotion_diagnostics(
     comparisons = performance["comparisons"]
     for index in decision_indices:
         candidate = workloads[index]
-        required_metrics = {"p99_seconds"}
-        if candidate["sample_unit"] == "whole_input":
-            required_metrics.add("mib_per_second")
-        candidate_comparisons = [item for item in comparisons if item["candidate_workload_id"] == candidate["id"]]
+        stability_metric = _required_same_path_stability_metric(candidate)
+        required_metrics = {stability_metric}
+        candidate_comparisons = [
+            item
+            for item in comparisons
+            if item["candidate_workload_id"] == candidate["id"] and item["comparison_kind"] == "same_path_stability"
+        ]
         observed_metrics = {str(item["metric"]) for item in candidate_comparisons}
         baseline_cells = [workload_by_id.get(str(item["baseline_workload_id"])) for item in candidate_comparisons]
         if (
-            not required_metrics <= observed_metrics
-            or any(item["result"] == "regressed" for item in candidate_comparisons)
+            observed_metrics != required_metrics
+            or len(candidate_comparisons) != 1
+            or any(item["result"] != "within_tolerance" for item in candidate_comparisons)
             or any(
                 cell is None
-                or cell["stats"]["sample_count"] < MIN_DECISION_GRADE_SAMPLES
+                or cell["stats"]["sample_count"] < _required_decision_grade_sample_count(candidate)
                 or cell["baseline_id"] not in baseline_by_id
                 or baseline_by_id[str(cell["baseline_id"])]["semantic_equivalence"] != "exact"
                 for cell in baseline_cells
@@ -4528,9 +5121,10 @@ def _performance_promotion_diagnostics(
         ):
             diagnostics.append(
                 _error(
-                    "contract.performance_regression_coverage",
+                    "contract.performance_stability_coverage",
                     f"/performance/workloads/{index}",
-                    "Every decision cell requires supported non-regressed same-machine exact-baseline comparisons.",
+                    "Every decision cell requires exactly one phase-appropriate, within-tolerance, same-machine exact-"
+                    "twin stability comparison; decision-grade direct scans require 1,000 samples and p99 stability.",
                 )
             )
 
@@ -4541,6 +5135,9 @@ def _performance_promotion_diagnostics(
         ("candidate", "fixed", "bank_build"),
         ("candidate", "fixed", "cold_compile"),
         ("candidate", "per_unit", "scan"),
+        ("baseline", "fixed", "source_curation"),
+        ("baseline", "fixed", "source_profiling"),
+        ("baseline", "fixed", "bank_build"),
         ("baseline", "per_unit", "scan"),
     }
     acceptable_value_model = False
@@ -4551,44 +5148,71 @@ def _performance_promotion_diagnostics(
             role = (str(component["side"]), str(component["application"]), str(component["category"]))
             components_by_role.setdefault(role, []).append(component)
         required_components = {role: components_by_role.get(role, []) for role in required_component_roles}
-        if any(len(items) != 1 for items in required_components.values()):
+        if set(components_by_role) != required_component_roles or any(
+            len(items) != 1 for items in required_components.values()
+        ):
             continue
         curation = required_components[("candidate", "fixed", "source_curation")][0]
         source_profiling = required_components[("candidate", "fixed", "source_profiling")][0]
         bank_build = required_components[("candidate", "fixed", "bank_build")][0]
         cold_compile = required_components[("candidate", "fixed", "cold_compile")][0]
         candidate_scan = required_components[("candidate", "per_unit", "scan")][0]
+        baseline_curation = required_components[("baseline", "fixed", "source_curation")][0]
+        baseline_source_profiling = required_components[("baseline", "fixed", "source_profiling")][0]
+        baseline_bank_build = required_components[("baseline", "fixed", "bank_build")][0]
         baseline_scan = required_components[("baseline", "per_unit", "scan")][0]
         source_profiling_workload = workload_by_id.get(str(source_profiling["workload_id"]))
         bank_build_workload = workload_by_id.get(str(bank_build["workload_id"]))
         cold_compile_workload = workload_by_id.get(str(cold_compile["workload_id"]))
         candidate_scan_workload = workload_by_id.get(str(candidate_scan["workload_id"]))
         baseline_scan_workload = workload_by_id.get(str(baseline_scan["workload_id"]))
-        scan_pair_fields = (
+        value_pair_fields = (
             "bank_id",
             "bank_hash",
             "input_id",
             "input_sha256",
-            "sample_unit",
             "work_per_sample",
             "concurrency",
         )
-        scan_pair_comparisons = (
+        candidate_control_comparisons = (
             []
-            if candidate_scan_workload is None or baseline_scan_workload is None
+            if candidate_scan_workload is None
             else [
                 item
                 for item in comparisons
                 if item["candidate_workload_id"] == candidate_scan_workload["id"]
-                and item["baseline_workload_id"] == baseline_scan_workload["id"]
-                and item["metric"] == "p99_seconds"
+                and item["metric"] == _required_same_path_stability_metric(candidate_scan_workload)
+                and item["comparison_kind"] == "same_path_stability"
             ]
         )
-        has_scan_pair_comparison = (
-            candidate_scan_workload is not None
-            and baseline_scan_workload is not None
-            and len(scan_pair_comparisons) == 1
-            and scan_pair_comparisons[0]["result"] != "regressed"
+        baseline_control_comparisons = (
+            []
+            if baseline_scan_workload is None
+            else [
+                item
+                for item in comparisons
+                if item["candidate_workload_id"] == baseline_scan_workload["id"]
+                and item["metric"] == _required_same_path_stability_metric(baseline_scan_workload)
+                and item["comparison_kind"] == "same_path_stability"
+            ]
+        )
+        has_same_path_controls = (
+            len(candidate_control_comparisons) == 1
+            and candidate_control_comparisons[0]["result"] == "within_tolerance"
+            and workload_by_id[str(candidate_control_comparisons[0]["baseline_workload_id"])]["baseline_id"]
+            in baseline_by_id
+            and baseline_by_id[
+                str(workload_by_id[str(candidate_control_comparisons[0]["baseline_workload_id"])]["baseline_id"])
+            ]["semantic_equivalence"]
+            == "exact"
+            and len(baseline_control_comparisons) == 1
+            and baseline_control_comparisons[0]["result"] == "within_tolerance"
+            and workload_by_id[str(baseline_control_comparisons[0]["baseline_workload_id"])]["baseline_id"]
+            in baseline_by_id
+            and baseline_by_id[
+                str(workload_by_id[str(baseline_control_comparisons[0]["baseline_workload_id"])]["baseline_id"])
+            ]["semantic_equivalence"]
+            == "exact"
         )
         measured_workloads = [
             workload_by_id.get(str(component["workload_id"]))
@@ -4601,12 +5225,80 @@ def _performance_promotion_diagnostics(
             and item["bank_hash"] == evaluated_bank["bank_hash"]
             for item in measured_workloads
         )
-        promoted_latency_workload = workloads[latency_indices[0]] if len(latency_indices) == 1 else None
+        promoted_throughput_workload = workloads[throughput_indices[0]] if len(throughput_indices) == 1 else None
+        cache_value_direct_fields = (
+            "phase",
+            "harness_id",
+            "harness_sha256",
+            "bank_id",
+            "bank_hash",
+            "input_id",
+            "input_sha256",
+            "warmups",
+            "sample_unit",
+            "work_per_sample",
+            "concurrency",
+            "process_model",
+            "median_method",
+            "percentile_method",
+        )
+        cache_value_comparisons: list[Mapping[str, Any]] = []
+        cache_value_proxy_controls: list[Mapping[str, Any]] = []
+        if candidate_scan_workload is not None and baseline_scan_workload is not None:
+            for item in comparisons:
+                cache_value_proxy = workload_by_id.get(str(item["candidate_workload_id"]))
+                if (
+                    item["baseline_workload_id"] == baseline_scan_workload["id"]
+                    and item["comparison_kind"] == "cross_path_value"
+                    and item["metric"] == "p99_seconds"
+                    and cache_value_proxy is not None
+                    and cache_value_proxy["id"] != candidate_scan_workload["id"]
+                    and _is_cross_path_direct_proxy(cache_value_proxy)
+                    and baseline_scan_workload["stats"]["sample_count"] == _CROSS_PATH_DIRECT_PROXY_SAMPLES
+                    and all(
+                        cache_value_proxy[field] == candidate_scan_workload[field]
+                        for field in cache_value_direct_fields
+                    )
+                ):
+                    proxy_controls = [
+                        comparison
+                        for comparison in comparisons
+                        if comparison["candidate_workload_id"] == cache_value_proxy["id"]
+                        and comparison["comparison_kind"] == "same_path_stability"
+                        and comparison["metric"] == "median_seconds"
+                    ]
+                    if len(proxy_controls) != 1 or proxy_controls[0]["result"] != "within_tolerance":
+                        continue
+                    proxy_control = workload_by_id.get(str(proxy_controls[0]["baseline_workload_id"]))
+                    proxy_control_identity = (
+                        None if proxy_control is None else baseline_by_id.get(str(proxy_control["baseline_id"]))
+                    )
+                    if (
+                        proxy_control is None
+                        or proxy_control["stats"]["sample_count"] != _CROSS_PATH_DIRECT_PROXY_SAMPLES
+                        or proxy_control_identity is None
+                        or proxy_control_identity["semantic_equivalence"] != "exact"
+                    ):
+                        continue
+                    cache_value_comparisons.append(item)
+                    cache_value_proxy_controls.append(proxy_controls[0])
+        shared_acquisition_pairs = (
+            (curation, baseline_curation),
+            (source_profiling, baseline_source_profiling),
+            (bank_build, baseline_bank_build),
+        )
+        shared_acquisition_fields = ("category", "source", "workload_id", "assumption_sha256", "value")
+        shared_acquisition_cancels = all(
+            all(candidate_component[field] == baseline_component[field] for field in shared_acquisition_fields)
+            for candidate_component, baseline_component in shared_acquisition_pairs
+        )
         if (
-            model["parameter_unit"] == "document"
+            model["parameter_name"] == "whole_input_scan_requests"
+            and model["parameter_unit"] == "request"
             and model["value_unit"] == "seconds"
             and curation["source"] == "declared_assumption"
             and curation["value"] > 0
+            and shared_acquisition_cancels
             and source_profiling_workload is not None
             and str(source_profiling_workload["id"]) in decision_workload_ids
             and source_profiling_workload["phase"] == "source_profile"
@@ -4620,17 +5312,21 @@ def _performance_promotion_diagnostics(
             and candidate_scan_workload is not None
             and str(candidate_scan_workload["id"]) in decision_workload_ids
             and candidate_scan_workload["phase"] == "direct_bank_scan"
-            and candidate_scan_workload["sample_unit"] == "document"
-            and promoted_latency_workload is not None
-            and candidate_scan_workload["id"] == promoted_latency_workload["id"]
-            and candidate_scan["source"] == "workload_seconds_per_document"
+            and candidate_scan_workload["sample_unit"] == "whole_input"
+            and candidate_scan_workload["stats"]["sample_count"] >= MIN_DECISION_GRADE_P99_STABILITY_SAMPLES
+            and promoted_throughput_workload is not None
+            and candidate_scan_workload["id"] == promoted_throughput_workload["id"]
+            and candidate_scan["source"] == "workload_seconds_per_request"
             and baseline_scan_workload is not None
-            and baseline_scan_workload["phase"] == "direct_bank_scan"
-            and all(candidate_scan_workload[field] == baseline_scan_workload[field] for field in scan_pair_fields)
-            and baseline_scan_workload["baseline_id"] in baseline_by_id
-            and baseline_by_id[str(baseline_scan_workload["baseline_id"])]["semantic_equivalence"] == "exact"
-            and baseline_scan["source"] == "workload_seconds_per_document"
-            and has_scan_pair_comparison
+            and baseline_scan_workload["phase"] in {"helper_cache_miss", "end_to_end"}
+            and baseline_scan_workload["sample_unit"] == "whole_input"
+            and all(candidate_scan_workload[field] == baseline_scan_workload[field] for field in value_pair_fields)
+            and baseline_scan_workload["baseline_id"] is None
+            and baseline_scan["source"] == "workload_seconds_per_request"
+            and has_same_path_controls
+            and len(cache_value_comparisons) == 1
+            and len(cache_value_proxy_controls) == 1
+            and cache_value_comparisons[0]["result"] != "regressed"
             and all_measured_on_evaluated_bank
             and model["result"] in {"candidate_already_better", "finite_breakeven"}
         ):
@@ -4641,8 +5337,11 @@ def _performance_promotion_diagnostics(
             _error(
                 "contract.missing_breakeven_value_model",
                 "/performance/breakeven_models",
-                "Promotion requires an evaluated-bank document-value model separating curation, profiling, build, "
-                "compile, and the exact promoted scan pair.",
+                "Promotion requires an evaluated-bank whole-input request-value model that records identical shared "
+                "curation, profiling, and build costs on both cache paths, then separates one-time compile, promoted "
+                "1,000-sample direct reuse, and an exact NERB uncached or end-to-end alternative with independent "
+                "same-path controls. Its p99 cross-path comparison must use a distinct, semantically identical "
+                "100-sample direct proxy with a within-tolerance median exact-twin control.",
             )
         )
     return diagnostics, required_gate_specs
@@ -5922,8 +6621,11 @@ def _integer_nearest_rank(values: Sequence[int], probability: float) -> int:
 def _sample_statistics(
     samples: Sequence[float],
     input_descriptor: Mapping[str, Any] | None,
+    phase: str,
     sample_unit: str,
     work_per_sample: int,
+    *,
+    records_per_sample: int | None = None,
 ) -> dict[str, float | int | None]:
     ordered = sorted(float(item) for item in samples)
     median_seconds = float(median(ordered))
@@ -5941,10 +6643,12 @@ def _sample_statistics(
         whole_input_documents = int(input_descriptor["documents"]) * work_per_sample
         documents_per_sample = whole_input_documents
         bytes_per_sample = input_descriptor["bytes"] * work_per_sample
-        records_per_sample = input_descriptor["records"] * work_per_sample
+        resolved_records_per_sample = (
+            input_descriptor["records"] * work_per_sample if records_per_sample is None else records_per_sample
+        )
         documents_per_second = whole_input_documents / median_seconds
         mib_per_second = bytes_per_sample / (1024 * 1024) / median_seconds
-        records_per_second = records_per_sample / median_seconds
+        records_per_second = resolved_records_per_sample / median_seconds
     elif input_descriptor is not None:
         documents_per_sample = work_per_sample
         documents_per_second = None
@@ -5956,7 +6660,11 @@ def _sample_statistics(
         "sample_count": len(ordered),
         "median_seconds": median_seconds,
         "p95_seconds": _nearest_rank(ordered, 0.95) if len(ordered) >= 20 else None,
-        "p99_seconds": _nearest_rank(ordered, 0.99) if len(ordered) >= 100 else None,
+        "p99_seconds": (
+            _nearest_rank(ordered, 0.99)
+            if phase not in PERFORMANCE_SETUP_PHASES and len(ordered) >= MIN_DECISION_GRADE_SCAN_SAMPLES
+            else None
+        ),
         "mad_seconds": float(median(deviations)),
         "documents_per_second": documents_per_second,
         "mib_per_second": mib_per_second,
@@ -5979,18 +6687,29 @@ def _breakeven_result(
         candidate_value_per_unit,
         baseline_value_per_unit,
     )
-    if any(not math.isfinite(value) or value < 0 or value > MAX_FINITE_CONTRACT_NUMBER for value in values):
+    try:
+        if any(not math.isfinite(value) or value < 0 or value > MAX_FINITE_CONTRACT_NUMBER for value in values):
+            return None
+        candidate_at_minimum = candidate_fixed_value + minimum_units * candidate_value_per_unit
+        baseline_at_minimum = baseline_fixed_value + minimum_units * baseline_value_per_unit
+    except (OverflowError, TypeError, ValueError):
         return None
-    candidate_at_minimum = candidate_fixed_value + minimum_units * candidate_value_per_unit
-    baseline_at_minimum = baseline_fixed_value + minimum_units * baseline_value_per_unit
-    if not math.isfinite(candidate_at_minimum) or not math.isfinite(baseline_at_minimum):
+    if (
+        not math.isfinite(candidate_at_minimum)
+        or not math.isfinite(baseline_at_minimum)
+        or candidate_at_minimum > MAX_FINITE_CONTRACT_NUMBER
+        or baseline_at_minimum > MAX_FINITE_CONTRACT_NUMBER
+    ):
         return None
     if candidate_at_minimum <= baseline_at_minimum:
         return "candidate_already_better", minimum_units
     marginal_advantage = baseline_value_per_unit - candidate_value_per_unit
     if marginal_advantage <= 0:
         return "no_breakeven_within_range", None
-    crossing_value = (candidate_fixed_value - baseline_fixed_value) / marginal_advantage
+    try:
+        crossing_value = (candidate_fixed_value - baseline_fixed_value) / marginal_advantage
+    except (OverflowError, ZeroDivisionError):
+        return None
     if not math.isfinite(crossing_value):
         return None
     crossing = math.ceil(crossing_value)
@@ -6461,10 +7180,14 @@ __all__ = [
     "ENRON_EVIDENCE_SCHEMA_VERSION",
     "ENRON_MANIFEST_SCHEMA",
     "ENRON_MANIFEST_SCHEMA_VERSION",
+    "ENRON_PERFORMANCE_OUTPUT_SCHEMA",
     "ENRON_QUALITY_OUTPUT_SCHEMA",
     "ENRON_VERIFIER_ID",
     "ENRON_VERIFIER_VERSION",
     "MATCHING_SEMANTICS",
+    "calculate_enron_breakeven",
+    "calculate_enron_performance_comparison",
+    "calculate_enron_performance_statistics",
     "hash_enron_environment",
     "hash_enron_breakeven_plan",
     "hash_enron_manifest",
@@ -6481,8 +7204,10 @@ __all__ = [
     "hash_enron_workload",
     "load_enron_evidence",
     "load_enron_manifest",
+    "summarize_enron_performance_inventory",
     "validate_enron_evidence",
     "validate_enron_conformance_output",
     "validate_enron_manifest",
+    "validate_enron_performance_output",
     "validate_enron_quality_output",
 ]

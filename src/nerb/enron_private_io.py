@@ -49,6 +49,12 @@ class EnronPrivateIOError(RuntimeError):
     """Raised when private I/O cannot be completed without weakening safety."""
 
 
+def is_owner_only_private_mode(mode: int) -> bool:
+    """Return whether a permission mode grants no group or other access."""
+
+    return type(mode) is int and mode >= 0 and mode & 0o077 == 0
+
+
 def find_workspace_root(start: Path) -> Path | None:
     """Return the containing Git workspace root, if one can be identified."""
 
@@ -240,6 +246,32 @@ class PrivateRun:
             raise
         self._open_handles.append(handle)
         return handle
+
+    def ensure_directory(self, relative: Path | str) -> Path:
+        """Create or verify a private directory below the staging root."""
+
+        self._require_active()
+        if self._committed:
+            raise EnronPrivateIOError("Committed private runs cannot be modified.")
+        relative_path = _safe_relative_path(relative)
+        assert self._stage_fd is not None
+        assert self._stage_dir is not None
+        descriptor: int | None = None
+        try:
+            descriptor, path = _open_or_create_relative_directory(
+                self._stage_fd,
+                self._stage_dir,
+                relative_path.parts,
+            )
+            os.fchmod(descriptor, _DIRECTORY_MODE)
+            return path
+        except EnronPrivateIOError:
+            raise
+        except (OSError, ValueError):
+            raise EnronPrivateIOError("Private output directory could not be created safely.") from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
 
     def commit(self) -> Path:
         """Flush, mark, and atomically promote the complete private run."""
@@ -894,6 +926,7 @@ __all__ = [
     "PrivateRun",
     "ensure_private_output_allowed",
     "find_workspace_root",
+    "is_owner_only_private_mode",
     "iter_strict_jsonl",
     "open_private_binary_input",
 ]

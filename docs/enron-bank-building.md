@@ -1,11 +1,11 @@
 ---
 icon: lucide/database-zap
-description: "Train-only Enron v2 entity-bank construction, validation iterations, private artifacts, and verification."
+description: "Train-only Enron entity-bank construction, validation iterations, private artifacts, and verification."
 ---
 
-# Enron v2 Bank Construction
+# Enron Bank Construction
 
-The v2 bank builder turns one committed [development split](enron-splits.md) into a deterministic private entity bank.
+The bank builder turns one committed [development split](enron-splits.md) into a deterministic private entity bank.
 It mines candidates from **train only**, evaluates three frozen construction policies on validation, selects the bounded
 email-recall policy, and generates catalog-conformance evidence for every active pattern. It never accepts a sealed-test
 path or role.
@@ -78,7 +78,7 @@ commitments.
 
 ## Deferred candidate pools
 
-The v2 builder does not mine the following pools, including as draft patterns. Structured headers do not provide enough
+The builder does not mine the following pools, including as draft patterns. Structured headers do not provide enough
 independent semantic evidence for them, and opportunistic body-text mining would increase both false positives and the
 amount of private source material retained. Each pool needs a bounded train-only source plus independently reviewed
 validation before it can enter the lifecycle:
@@ -188,12 +188,12 @@ funnel, iteration decisions, supported validation summaries, explicit `null` met
 auxiliary totals, and privacy declarations. Before committing the private run, the builder rejects a card containing an
 email shape or `@`, a phone shape, a document ID, or a private path. The card remains non-promotable until the separate
 freeze, one-shot sealed-test, privacy-verification, performance, and lineage requirements in the
-[v2 charter](enron-benchmark.md) are satisfied.
+[charter](enron-benchmark.md) are satisfied.
 
 ## Scale and fail-closed caps
 
 The SQLite spool keeps raw candidate mining disk-backed and deterministic, while explicit ceilings prevent a malformed
-or unexpectedly large source from causing unbounded work. The default v2 policy uses these limits:
+or unexpectedly large source from causing unbounded work. The default policy uses these limits:
 
 | Resource | Limit |
 | --- | ---: |
@@ -248,7 +248,7 @@ The 150,000-span ceiling bounds retained weak-label and per-iteration gold objec
 preflight. A bank can produce matches outside labeled spans, so the evaluator independently enforces its frozen
 500,000-prediction runtime ceiling and still fails closed if scanning reaches it.
 
-Raising these limits for the full pinned source requires #152 to demonstrate a streaming/capacity design with peak-RSS
+Raising these limits for the full pinned source requires #163 to demonstrate a streaming/capacity design with peak-RSS
 and runtime evidence and to review any evaluator-capacity change separately. The #153 run must fail before any sealed-test
 access if that development-stage proof has not landed; a higher numeric limit alone is not evidence of acceptable scale.
 
@@ -272,36 +272,36 @@ cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.7
 over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
 hidden by the catalog guarantee.
 
-On an Apple M4 with 16 GiB RAM, the CMU-enabled build took 129.43 seconds and 1,181,171,712 bytes peak RSS. Deep replay
-took 119.04 seconds and 1,249,689,600 bytes peak RSS. These are one-time construction/audit costs, not steady-state scan
-latency claims; #152 owns runtime benchmarks.
+On an Apple M4 with 16 GiB RAM, the fresh transactional rebuild took 44.21 seconds and 458,276,864 bytes peak RSS. Deep
+verification passed. The repeated setup and steady-state measurements are reported separately in the
+[decision-grade performance result](performance.md#decision-grade-development-result); a single construction timing is
+not a latency claim.
 
 Key commitments are:
 
-- selected bank: `sha256:f8a08d0a1c4cfcd36aabe956f3024d749b9fed2f7b1ce59dd7baa8be53e79232`;
-- bank artifact: `sha256:19b32bce6bff90423f524305661b3f07e12756ec295e68ff676f5af81f245082`;
+- selected bank: `sha256:670f180d3ca8173d4a4269e0deb963566aeca68f3cb8ad893d69baa4e99f2f6d`;
+- bank artifact: `sha256:7c2a408f5c5167d35b953eae32f72a1f6aaa8bdaf1daeb4fc412f66db4df313e`;
 - candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
-- builder implementation: `sha256:f4dee1922eef085e2c73d83c3f97e46dea5426dbda981f7ff53d4fef1657b061`;
-- privacy scanner implementation: `sha256:2c41533f19b8619fc22214f9e0abbb194a486802f17a1ad9cbaefcdc80fa8457`;
+- builder implementation: `sha256:ccf3619150ee309a96004002c376b583b2b5233287f76e209be0636d7ee968e2`;
+- privacy scanner implementation: `sha256:6c1d428a567dc9d14a064fb6fde6cfaf7645122517cefd8ab134340b1340ddf2`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
 - canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:75c11e49db05c72ea6e14a4b5227f32b5297f93fa364aa6ea4461d2a29a50c9a`;
-- committed bank-card file: `sha256:28a36f27136826fe33f5ce9c853bd90961fe73aee4ccbd47f68f1216642a233f`; and
+- bank-card run: `sha256:d3ad40dd72768b5840e031dd758e3c6ad83d3ab7e6871240efefd3bb9756b4bf`;
+- committed bank-card file: `sha256:6353d3ba91f52eb24309b02817870539ad63f7ffca1ba0a3535c9c3faf673f1f`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
-The exact private commands were:
+The exact invocations remain bound inside the private run. Their privacy-safe CLI shape is:
 
 ```shell
 /usr/bin/time -l uv run nerb build-enron-bank \
-  --development-run .nerb/issue149-development-50000-v6 \
-  --output-dir .nerb/issue151-real-50000-v6-final \
-  --annotation-run .nerb/issue150-cmu/annotations-run-final4 \
-  --cmu-catalog-bindings .nerb/issue151-cmu-v4-proposal.jsonl \
-  --benchmark-version enron-v2-issue149-scale-50000
+  --development-run .nerb/enron/development \
+  --output-dir .nerb/enron/bank-build \
+  --annotation-run .nerb/enron/annotations \
+  --cmu-catalog-bindings .nerb/enron/cmu-catalog-bindings.jsonl
 
 /usr/bin/time -l uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/issue151-real-50000-v6-final \
-  --annotation-run .nerb/issue150-cmu/annotations-run-final4
+  --run-dir .nerb/enron/bank-build \
+  --annotation-run .nerb/enron/annotations
 ```
 
 ## Sealed-test boundary

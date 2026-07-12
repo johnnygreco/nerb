@@ -5,7 +5,6 @@ import json
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from statistics import median
 from typing import Any, cast
 
 import pytest
@@ -17,6 +16,10 @@ from nerb.enron_contract import (
     ENRON_EVIDENCE_SCHEMA_VERSION,
     ENRON_MANIFEST_SCHEMA,
     ENRON_MANIFEST_SCHEMA_VERSION,
+    ENRON_PERFORMANCE_OUTPUT_SCHEMA,
+    calculate_enron_breakeven,
+    calculate_enron_performance_comparison,
+    calculate_enron_performance_statistics,
     hash_enron_breakeven_plan,
     hash_enron_environment,
     hash_enron_manifest,
@@ -33,14 +36,20 @@ from nerb.enron_contract import (
     hash_enron_workload,
     load_enron_evidence,
     load_enron_manifest,
+    summarize_enron_performance_inventory,
     validate_enron_conformance_output,
     validate_enron_evidence,
     validate_enron_manifest,
+    validate_enron_performance_output,
     validate_enron_quality_output,
 )
 
 JsonObject = dict[str, Any]
 JsonPath = tuple[str | int, ...]
+_PROMOTABLE_FIXTURE_CACHE: dict[
+    str,
+    tuple[JsonObject, JsonObject, dict[str, list[JsonObject]]],
+] = {}
 
 
 class _ExplodingMapping(Mapping[str, Any]):
@@ -130,59 +139,8 @@ def _refresh_check_actuals(evidence: JsonObject, *, target_prefix: str) -> None:
         check["passed"] = refreshed["passed"]
 
 
-def _nearest_rank(values: Sequence[float], probability: float) -> float:
-    return sorted(values)[max(0, math.ceil(probability * len(values)) - 1)]
-
-
 def _inventory_summary(inventory: Sequence[Mapping[str, int]]) -> JsonObject:
-    byte_counts = sorted(int(row["bytes"]) for row in inventory)
-    record_counts = sorted(int(row["records"]) for row in inventory)
-    documents = len(inventory)
-    byte_count = sum(byte_counts)
-    records = sum(record_counts)
-    records_per_document = records / documents
-    if records == 0:
-        hit_density = "negative"
-    elif records_per_document < 0.1:
-        hit_density = "sparse"
-    elif records_per_document <= 2:
-        hit_density = "normal"
-    else:
-        hit_density = "dense"
-    mean_bytes = byte_count / documents
-    if mean_bytes < 1024:
-        size_cohort = "small"
-    elif mean_bytes < 16 * 1024:
-        size_cohort = "medium"
-    elif mean_bytes < 256 * 1024:
-        size_cohort = "large"
-    else:
-        size_cohort = "huge"
-    return {
-        "documents": documents,
-        "bytes": byte_count,
-        "records": records,
-        "hit_density": hit_density,
-        "size_cohort": size_cohort,
-        "document_length_distribution": {
-            "minimum_bytes": byte_counts[0],
-            "p50_bytes": int(_nearest_rank(byte_counts, 0.50)),
-            "p95_bytes": int(_nearest_rank(byte_counts, 0.95)),
-            "p99_bytes": int(_nearest_rank(byte_counts, 0.99)),
-            "maximum_bytes": byte_counts[-1],
-            "mean_bytes": byte_count / documents,
-        },
-        "hit_distribution": {
-            "negative_documents": sum(value == 0 for value in record_counts),
-            "documents_with_records": sum(value > 0 for value in record_counts),
-            "minimum_records": record_counts[0],
-            "p50_records": int(_nearest_rank(record_counts, 0.50)),
-            "p95_records": int(_nearest_rank(record_counts, 0.95)),
-            "p99_records": int(_nearest_rank(record_counts, 0.99)),
-            "maximum_records": record_counts[-1],
-            "mean_records": records / documents,
-        },
-    }
+    return summarize_enron_performance_inventory(inventory)
 
 
 def _inventory_payload_bytes(inventory: Sequence[Mapping[str, int]]) -> int:
@@ -191,39 +149,19 @@ def _inventory_payload_bytes(inventory: Sequence[Mapping[str, int]]) -> int:
 
 
 def _sample_stats(
-    samples: Sequence[float], input_descriptor: Mapping[str, Any] | None, sample_unit: str, work_per_sample: int
+    samples: Sequence[float],
+    input_descriptor: Mapping[str, Any] | None,
+    phase: str,
+    sample_unit: str,
+    work_per_sample: int,
 ) -> JsonObject:
-    ordered = sorted(float(value) for value in samples)
-    median_seconds = float(median(ordered))
-    deviations = [abs(value - median_seconds) for value in ordered]
-    if sample_unit == "operation":
-        documents_per_sample = None
-        documents_per_second = None
-        mib_per_second = None
-        records_per_second = None
-    elif sample_unit == "whole_input" and input_descriptor is not None:
-        documents_per_sample = input_descriptor["documents"] * work_per_sample
-        bytes_per_sample = input_descriptor["bytes"] * work_per_sample
-        records_per_sample = input_descriptor["records"] * work_per_sample
-        documents_per_second: float | None = documents_per_sample / median_seconds
-        mib_per_second: float | None = bytes_per_sample / (1024 * 1024) / median_seconds
-        records_per_second: float | None = records_per_sample / median_seconds
-    elif input_descriptor is not None:
-        documents_per_sample = work_per_sample
-        documents_per_second = None
-        mib_per_second = None
-        records_per_second = None
-    return {
-        "sample_count": len(ordered),
-        "median_seconds": median_seconds,
-        "p95_seconds": _nearest_rank(ordered, 0.95) if len(ordered) >= 20 else None,
-        "p99_seconds": _nearest_rank(ordered, 0.99) if len(ordered) >= 100 else None,
-        "mad_seconds": float(median(deviations)),
-        "documents_per_second": documents_per_second,
-        "mib_per_second": mib_per_second,
-        "records_per_second": records_per_second,
-        "seconds_per_document": None if documents_per_sample is None else median_seconds / documents_per_sample,
-    }
+    return calculate_enron_performance_statistics(
+        samples,
+        input_descriptor,
+        phase=phase,
+        sample_unit=sample_unit,
+        work_per_sample=work_per_sample,
+    )
 
 
 def _sample_payload_bytes(samples: Sequence[float]) -> int:
@@ -252,15 +190,58 @@ def _refresh_workload(evidence: JsonObject, workload: JsonObject, samples: Seque
         None,
     )
     workload["input_sha256"] = None if input_descriptor is None else input_descriptor["descriptor_sha256"]
+    workload["records_per_sample"] = (
+        input_descriptor["records"] * workload["work_per_sample"]
+        if input_descriptor is not None and workload["sample_unit"] == "whole_input"
+        else None
+    )
     workload["stats"] = _sample_stats(
         resolved,
         input_descriptor,
+        workload["phase"],
         workload["sample_unit"],
         workload["work_per_sample"],
     )
     peak_rss_bytes = workload["peak_rss_bytes"]
     workload["rss_samples_bytes"] = [] if peak_rss_bytes is None else [peak_rss_bytes] * len(resolved)
     workload["workload_sha256"] = hash_enron_workload(workload)
+
+
+def _refresh_same_path_comparison(evidence: JsonObject, comparison: JsonObject) -> None:
+    workloads = {item["id"]: item for item in evidence["performance"]["workloads"]}
+    candidate = workloads[comparison["candidate_workload_id"]]
+    baseline = workloads[comparison["baseline_workload_id"]]
+    outputs = calculate_enron_performance_comparison(
+        candidate["stats"],
+        baseline["stats"],
+        metric=comparison["metric"],
+        noise_method="exact_block_swap",
+        candidate_samples=candidate["samples_seconds"],
+        baseline_samples=baseline["samples_seconds"],
+        block_count=comparison["block_count"],
+        samples_per_block=comparison["samples_per_block"],
+        block_assignment=comparison["block_assignment"],
+        significance_level=comparison["significance_level"],
+        stability_tolerance=comparison["stability_tolerance"],
+    )
+    comparison.update(outputs)
+
+
+def _refresh_cross_path_comparison(evidence: JsonObject, comparison: JsonObject) -> None:
+    workloads = {item["id"]: item for item in evidence["performance"]["workloads"]}
+    candidate = workloads[comparison["candidate_workload_id"]]
+    baseline = workloads[comparison["baseline_workload_id"]]
+    outputs = calculate_enron_performance_comparison(
+        candidate["stats"],
+        baseline["stats"],
+        metric=comparison["metric"],
+        noise_method=comparison["noise_method"],
+        candidate_samples=candidate["samples_seconds"],
+        baseline_samples=baseline["samples_seconds"],
+        noise_multiplier=comparison["noise_multiplier"],
+        regression_tolerance=comparison["regression_tolerance"],
+    )
+    comparison.update(outputs)
 
 
 def _rehash_lineage(evidence: JsonObject) -> None:
@@ -466,17 +447,17 @@ def _make_performance_input(
     return descriptor, inventory
 
 
-def _make_scale_bank(active_aliases: int, *, number: int) -> JsonObject:
-    active_entities = active_aliases * 3
-    active_names = active_aliases * 4
-    active_patterns = active_aliases * 5
-    regex_patterns = active_aliases
+def _make_scale_bank(active_patterns: int, *, number: int) -> JsonObject:
+    active_entities = active_patterns * 3 // 5
+    active_names = active_patterns * 4 // 5
+    active_aliases = active_patterns // 5
+    regex_patterns = active_patterns // 5
     descriptor: JsonObject = {
-        "id": f"scale_{active_aliases}",
+        "id": f"scale_{active_patterns}",
         "kind": "synthetic_scale",
         "bank_hash": _sha256_number(number),
         "artifact": {
-            "id": f"scale_{active_aliases}_bank_artifact",
+            "id": f"scale_{active_patterns}_bank_artifact",
             "sha256": _sha256_number(number + 1),
             "bytes": active_patterns * 64,
         },
@@ -485,7 +466,7 @@ def _make_scale_bank(active_aliases: int, *, number: int) -> JsonObject:
             "version": "1.0.0",
             "source_sha256": _sha256_number(900),
             "spec_sha256": _sha256_number(901),
-            "seed": f"scale-{active_aliases}-seed",
+            "seed": f"scale-{active_patterns}-pattern-seed",
         },
         "composition": {
             "taxonomy": [
@@ -521,14 +502,8 @@ def _make_performance_harnesses(evidence: Mapping[str, Any]) -> list[JsonObject]
             "source_sha256": _sha256_number(680 + number),
             "operation_spec_sha256": _sha256_number(700 + number),
             "source_artifact": (
-                {
-                    "id": "synthetic_profile_source",
-                    "sha256": evidence["source"]["content_sha256"],
-                    "bytes": 4096,
-                }
-                if phase == "source_profile"
-                else copy.deepcopy(evidence["splits"]["roles"]["train"]["artifact"])
-                if phase == "source_build"
+                copy.deepcopy(evidence["splits"]["roles"]["train"]["artifact"])
+                if phase in {"source_profile", "source_build"}
                 else None
             ),
             "descriptor_sha256": _sha256_number(0),
@@ -558,6 +533,8 @@ def _make_decision_workload(
     sample_unit: str,
     promotion_gate: bool = False,
     concurrency: int = 1,
+    decision_grade: bool = True,
+    sample_count: int | None = None,
 ) -> JsonObject:
     process_model = {
         "source_profile": "fresh_process_per_sample",
@@ -571,6 +548,25 @@ def _make_decision_workload(
     setup_phase = phase in {"source_profile", "source_build", "cold_compile"}
     if setup_phase:
         sample_unit = "operation"
+    resolved_sample_count = (
+        sample_count
+        if sample_count is not None
+        else 20
+        if setup_phase
+        else 1_000
+        if phase == "direct_bank_scan" and decision_grade
+        else 100
+    )
+    sample_base = (
+        0.0001
+        if sample_unit == "document"
+        else 0.015
+        if phase == "helper_cache_miss"
+        else 0.02
+        if phase == "end_to_end"
+        else 0.01
+    )
+    sample_step = 0.00000001 if sample_unit == "document" else 0.000001
     harness = next(item for item in evidence["performance"]["harnesses"] if item["phase"] == phase)
     workload = copy.deepcopy(template)
     workload.update(
@@ -578,7 +574,7 @@ def _make_decision_workload(
             "id": identifier,
             "phase": phase,
             "promotion_gate": promotion_gate,
-            "decision_grade": True,
+            "decision_grade": decision_grade,
             "harness_id": harness["id"],
             "harness_sha256": harness["descriptor_sha256"],
             "bank_id": bank["id"],
@@ -591,7 +587,7 @@ def _make_decision_workload(
             "work_per_sample": 1,
             "concurrency": concurrency,
             "process_model": process_model,
-            "samples_seconds": [0.01 + index / 1_000_000 for index in range(100)],
+            "samples_seconds": [sample_base + index * sample_step for index in range(resolved_sample_count)],
             "samples_ref": None,
             "peak_rss_bytes": 1024 * 1024,
         }
@@ -631,53 +627,43 @@ def _add_baseline_comparisons_and_breakeven(
                 "promotion_gate": False,
                 "decision_grade": False,
                 "baseline_id": baseline["id"],
-                "samples_seconds": [0.015 + index / 1_000_000 for index in range(100)],
+                "samples_seconds": [float(value) * 1.01 for value in candidate["samples_seconds"]],
             }
         )
         _refresh_workload(evidence, reference)
         baseline_workloads.append(reference)
-        metrics = ["p99_seconds"]
-        if candidate["sample_unit"] == "whole_input":
-            metrics.append("mib_per_second")
+        metrics = [
+            "p99_seconds"
+            if candidate["phase"] == "direct_bank_scan" and candidate["stats"]["sample_count"] >= 1_000
+            else "median_seconds"
+        ]
         for metric in metrics:
-            candidate_value = candidate["stats"][metric]
-            baseline_value = reference["stats"][metric]
-            direction = "lower_is_better" if metric == "p99_seconds" else "higher_is_better"
-            relative_degradation = (
-                (candidate_value - baseline_value) / baseline_value
-                if direction == "lower_is_better"
-                else (baseline_value - candidate_value) / baseline_value
-            )
-            noise_multiplier = 2.0
-            noise_floor = (
-                max(
-                    candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
-                    reference["stats"]["mad_seconds"] / reference["stats"]["median_seconds"],
-                )
-                * noise_multiplier
-            )
-            regression_tolerance = 0.05
-            boundary = noise_floor + regression_tolerance
-            result = (
-                "regressed"
-                if relative_degradation > boundary
-                else "improved"
-                if relative_degradation < -boundary
-                else "equivalent_within_noise"
+            block_count = 10
+            samples_per_block = len(candidate["samples_seconds"]) // block_count
+            outputs = calculate_enron_performance_comparison(
+                candidate["stats"],
+                reference["stats"],
+                metric=metric,
+                noise_method="exact_block_swap",
+                candidate_samples=candidate["samples_seconds"],
+                baseline_samples=reference["samples_seconds"],
+                block_count=block_count,
+                samples_per_block=samples_per_block,
+                block_assignment=["candidate_first", "control_first"] * 5,
+                significance_level=0.05,
+                stability_tolerance=0.05,
             )
             comparison: JsonObject = {
                 "id": f"compare_{candidate['id']}_{metric}",
                 "candidate_workload_id": candidate["id"],
                 "baseline_workload_id": reference["id"],
+                "comparison_kind": "same_path_stability",
                 "metric": metric,
-                "direction": direction,
-                "candidate_value": candidate_value,
-                "baseline_value": baseline_value,
-                "relative_degradation": relative_degradation,
-                "noise_multiplier": noise_multiplier,
-                "noise_floor": noise_floor,
-                "regression_tolerance": regression_tolerance,
-                "result": result,
+                "noise_method": "exact_block_swap",
+                "block_assignment": ["candidate_first", "control_first"] * 5,
+                "significance_level": 0.05,
+                "stability_tolerance": 0.05,
+                **outputs,
                 "comparison_plan_sha256": _sha256_number(0),
             }
             comparison["comparison_plan_sha256"] = hash_enron_performance_comparison_plan(comparison)
@@ -687,10 +673,34 @@ def _add_baseline_comparisons_and_breakeven(
     candidate_profile = next(item for item in candidate_workloads if item["phase"] == "source_profile")
     candidate_setup = next(item for item in candidate_workloads if item["phase"] == "source_build")
     candidate_compile = next(item for item in candidate_workloads if item["phase"] == "cold_compile")
-    candidate_marginal = next(item for item in candidate_workloads if item["id"] == "direct_bank_latency")
-    baseline_by_candidate = {item["id"].removeprefix("baseline_"): item for item in baseline_workloads}
-    baseline_setup = baseline_by_candidate[candidate_setup["id"]]
-    baseline_marginal = baseline_by_candidate[candidate_marginal["id"]]
+    candidate_marginal = next(item for item in candidate_workloads if item["id"] == "direct_bank_throughput")
+    candidate_proxy = next(item for item in candidate_workloads if item["id"] == "direct_bank_cache_value_proxy")
+    baseline_marginal = next(item for item in candidate_workloads if item["id"] == "helper_cache_miss_fixture")
+    cross_outputs = calculate_enron_performance_comparison(
+        candidate_proxy["stats"],
+        baseline_marginal["stats"],
+        metric="p99_seconds",
+        noise_multiplier=2.0,
+        regression_tolerance=0.05,
+        noise_method="paired_block_ratio_mad",
+        candidate_samples=candidate_proxy["samples_seconds"],
+        baseline_samples=baseline_marginal["samples_seconds"],
+    )
+    cross_comparison: JsonObject = {
+        "id": "compare_direct_bank_cache_value_proxy_vs_helper_cache_miss_fixture_p99_seconds",
+        "candidate_workload_id": candidate_proxy["id"],
+        "baseline_workload_id": baseline_marginal["id"],
+        "comparison_kind": "cross_path_value",
+        "metric": "p99_seconds",
+        "noise_multiplier": 2.0,
+        "noise_method": "paired_block_ratio_mad",
+        "regression_tolerance": 0.05,
+        **cross_outputs,
+        "comparison_plan_sha256": _sha256_number(0),
+    }
+    cross_comparison["comparison_plan_sha256"] = hash_enron_performance_comparison_plan(cross_comparison)
+    comparisons.append(cross_comparison)
+    performance["comparisons"] = sorted(comparisons, key=lambda item: item["id"])
     components = [
         {
             "id": "baseline_fixed_build",
@@ -698,21 +708,43 @@ def _add_baseline_comparisons_and_breakeven(
             "application": "fixed",
             "category": "bank_build",
             "source": "workload_median_seconds",
-            "description": "Exact baseline source-build time.",
-            "workload_id": baseline_setup["id"],
+            "description": "Shared candidate source-build time.",
+            "workload_id": candidate_setup["id"],
             "assumption_sha256": None,
-            "value": baseline_setup["stats"]["median_seconds"],
+            "value": candidate_setup["stats"]["median_seconds"],
         },
         {
-            "id": "baseline_per_document_scan",
+            "id": "baseline_fixed_source_curation",
+            "side": "baseline",
+            "application": "fixed",
+            "category": "source_curation",
+            "source": "declared_assumption",
+            "description": "Shared frozen source-curation effort assumption.",
+            "workload_id": None,
+            "assumption_sha256": _sha256_number(970),
+            "value": 0.001,
+        },
+        {
+            "id": "baseline_fixed_source_profiling",
+            "side": "baseline",
+            "application": "fixed",
+            "category": "source_profiling",
+            "source": "workload_median_seconds",
+            "description": "Shared measured source-profiling time.",
+            "workload_id": candidate_profile["id"],
+            "assumption_sha256": None,
+            "value": candidate_profile["stats"]["median_seconds"],
+        },
+        {
+            "id": "baseline_per_request_scan",
             "side": "baseline",
             "application": "per_unit",
             "category": "scan",
-            "source": "workload_seconds_per_document",
-            "description": "Exact baseline marginal scan time per document.",
+            "source": "workload_seconds_per_request",
+            "description": "Exact NERB helper-cache-miss time per frozen whole-input request.",
             "workload_id": baseline_marginal["id"],
             "assumption_sha256": None,
-            "value": baseline_marginal["stats"]["seconds_per_document"],
+            "value": baseline_marginal["stats"]["median_seconds"],
         },
         {
             "id": "candidate_fixed_build",
@@ -759,15 +791,15 @@ def _add_baseline_comparisons_and_breakeven(
             "value": candidate_profile["stats"]["median_seconds"],
         },
         {
-            "id": "candidate_per_document_scan",
+            "id": "candidate_per_request_scan",
             "side": "candidate",
             "application": "per_unit",
             "category": "scan",
-            "source": "workload_seconds_per_document",
-            "description": "Candidate marginal scan time per document.",
+            "source": "workload_seconds_per_request",
+            "description": "Candidate scan time per frozen whole-input request.",
             "workload_id": candidate_marginal["id"],
             "assumption_sha256": None,
-            "value": candidate_marginal["stats"]["seconds_per_document"],
+            "value": candidate_marginal["stats"]["median_seconds"],
         },
     ]
     candidate_fixed_value = sum(
@@ -778,16 +810,27 @@ def _add_baseline_comparisons_and_breakeven(
             0.001,
         )
     )
-    baseline_fixed_value = baseline_setup["stats"]["median_seconds"]
-    candidate_value_per_unit = candidate_marginal["stats"]["seconds_per_document"]
-    baseline_value_per_unit = baseline_marginal["stats"]["seconds_per_document"]
-    crossing = math.ceil(
-        (candidate_fixed_value - baseline_fixed_value) / (baseline_value_per_unit - candidate_value_per_unit)
+    baseline_fixed_value = sum(
+        (
+            candidate_profile["stats"]["median_seconds"],
+            candidate_setup["stats"]["median_seconds"],
+            0.001,
+        )
+    )
+    candidate_value_per_unit = candidate_marginal["stats"]["median_seconds"]
+    baseline_value_per_unit = baseline_marginal["stats"]["median_seconds"]
+    breakeven = calculate_enron_breakeven(
+        candidate_fixed_value,
+        baseline_fixed_value,
+        candidate_value_per_unit,
+        baseline_value_per_unit,
+        minimum_units=1,
+        maximum_units=1_000_000,
     )
     model: JsonObject = {
         "id": "fixture_build_scan_breakeven",
-        "parameter_name": "scanned_documents",
-        "parameter_unit": "document",
+        "parameter_name": "whole_input_scan_requests",
+        "parameter_unit": "request",
         "value_unit": "seconds",
         "minimum_units": 1,
         "maximum_units": 1_000_000,
@@ -796,8 +839,7 @@ def _add_baseline_comparisons_and_breakeven(
         "baseline_fixed_value": baseline_fixed_value,
         "candidate_value_per_unit": candidate_value_per_unit,
         "baseline_value_per_unit": baseline_value_per_unit,
-        "result": "finite_breakeven",
-        "breakeven_units": crossing,
+        **breakeven,
         "model_plan_sha256": _sha256_number(0),
     }
     model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
@@ -815,24 +857,21 @@ def _refresh_breakeven_outputs(model: JsonObject) -> None:
         for side in ("candidate", "baseline")
         for application in ("fixed", "per_unit")
     }
-    result = enron_contract._breakeven_result(
+    result = calculate_enron_breakeven(
         totals[("candidate", "fixed")],
         totals[("baseline", "fixed")],
         totals[("candidate", "per_unit")],
         totals[("baseline", "per_unit")],
-        model["minimum_units"],
-        model["maximum_units"],
+        minimum_units=model["minimum_units"],
+        maximum_units=model["maximum_units"],
     )
-    assert result is not None
-    outcome, units = result
     model.update(
         {
             "candidate_fixed_value": totals[("candidate", "fixed")],
             "baseline_fixed_value": totals[("baseline", "fixed")],
             "candidate_value_per_unit": totals[("candidate", "per_unit")],
             "baseline_value_per_unit": totals[("baseline", "per_unit")],
-            "result": outcome,
-            "breakeven_units": units,
+            **result,
         }
     )
     model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
@@ -874,6 +913,17 @@ def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[Jso
             sample_unit="whole_input",
             promotion_gate=True,
         ),
+        _make_decision_workload(
+            evidence,
+            template,
+            identifier="direct_bank_cache_value_proxy",
+            bank=evaluated_bank,
+            input_descriptor=real_input,
+            phase="direct_bank_scan",
+            sample_unit="whole_input",
+            decision_grade=False,
+            sample_count=100,
+        ),
     ]
     for phase in (
         "source_profile",
@@ -897,9 +947,9 @@ def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[Jso
         )
 
     scale_banks: dict[int, JsonObject] = {}
-    for index, active_aliases in enumerate((1_000, 10_000, 25_000, 100_000), start=1):
-        bank = _make_scale_bank(active_aliases, number=800 + index * 10)
-        scale_banks[active_aliases] = bank
+    for index, active_patterns in enumerate(enron_contract.PERFORMANCE_SCALE_PATTERNS, start=1):
+        bank = _make_scale_bank(active_patterns, number=800 + index * 10)
+        scale_banks[active_patterns] = bank
         performance["banks"].append(bank)
 
     scale_anchor, scale_inventory = _make_performance_input(
@@ -920,25 +970,25 @@ def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[Jso
     _refresh_input_descriptor(scale_anchor)
     scale_inputs = {1_000: scale_anchor}
     inventories[scale_anchor["inventory_ref"]["id"]] = scale_inventory
-    for active_aliases in (10_000, 25_000, 100_000):
+    for active_patterns in (10_000, 25_000, 100_000):
         input_descriptor = copy.deepcopy(scale_anchor)
         input_descriptor.update(
             {
-                "id": f"scale_{active_aliases}_input",
-                "bank_id": scale_banks[active_aliases]["id"],
-                "bank_hash": scale_banks[active_aliases]["bank_hash"],
+                "id": f"scale_{active_patterns}_input",
+                "bank_id": scale_banks[active_patterns]["id"],
+                "bank_hash": scale_banks[active_patterns]["bank_hash"],
             }
         )
         _refresh_input_descriptor(input_descriptor)
-        scale_inputs[active_aliases] = input_descriptor
-    for active_aliases, input_descriptor in scale_inputs.items():
+        scale_inputs[active_patterns] = input_descriptor
+    for active_patterns, input_descriptor in scale_inputs.items():
         performance["inputs"].append(input_descriptor)
         workloads.append(
             _make_decision_workload(
                 evidence,
                 template,
-                identifier=f"scale_{active_aliases}_scan",
-                bank=scale_banks[active_aliases],
+                identifier=f"scale_{active_patterns}_scan",
+                bank=scale_banks[active_patterns],
                 input_descriptor=input_descriptor,
                 phase="direct_bank_scan",
                 sample_unit="whole_input",
@@ -1034,6 +1084,16 @@ def _add_required_performance_matrix(evidence: JsonObject) -> dict[str, list[Jso
 def _promotable(
     manifest: JsonObject, evidence: JsonObject
 ) -> tuple[JsonObject, JsonObject, dict[str, list[JsonObject]]]:
+    cache_key = json.dumps(
+        [manifest, evidence],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    cached = _PROMOTABLE_FIXTURE_CACHE.get(cache_key)
+    if cached is not None:
+        return copy.deepcopy(cached)
     bound_manifest = copy.deepcopy(manifest)
     value = copy.deepcopy(evidence)
     bound_manifest["artifact_kind"] = "real_benchmark"
@@ -1179,9 +1239,12 @@ def _promotable(
         fields = {
             "median_seconds": ("lte", 1.0),
             "p95_seconds": ("lte", 1.0),
-            "p99_seconds": ("lte", 1.0),
             "peak_rss_bytes": ("lte", 2 * 1024 * 1024),
         }
+        if workload["phase"] in enron_contract.PERFORMANCE_SETUP_PHASES:
+            fields["mad_seconds"] = ("lte", 1.0)
+        else:
+            fields["p99_seconds"] = ("lte", 1.0)
         if workload["sample_unit"] == "document":
             fields["seconds_per_document"] = ("lte", 1.0)
             if workload["phase"] == "direct_bank_scan":
@@ -1265,7 +1328,9 @@ def _promotable(
     value["verifier"]["passed"] = True
     _refresh_frozen_contract(value)
     _sync_bound_manifest(bound_manifest, value)
-    return bound_manifest, value, inventories
+    result = (bound_manifest, value, inventories)
+    _PROMOTABLE_FIXTURE_CACHE[cache_key] = copy.deepcopy(result)
+    return result
 
 
 def _validate_promoted(
@@ -1375,10 +1440,13 @@ def _drop_performance_assertions(evidence: JsonObject) -> None:
 def test_schema_ids_meta_validation_and_json_serialization() -> None:
     assert ENRON_MANIFEST_SCHEMA["$id"] == "https://nerb.dev/schemas/enron-manifest.v2.schema.json"
     assert ENRON_EVIDENCE_SCHEMA["$id"] == "https://nerb.dev/schemas/enron-evidence.v2.schema.json"
+    assert ENRON_PERFORMANCE_OUTPUT_SCHEMA["$id"] == "https://nerb.dev/schemas/enron-performance-output.v2.schema.json"
     Draft202012Validator.check_schema(ENRON_MANIFEST_SCHEMA)
     Draft202012Validator.check_schema(ENRON_EVIDENCE_SCHEMA)
+    Draft202012Validator.check_schema(ENRON_PERFORMANCE_OUTPUT_SCHEMA)
     json.dumps(ENRON_MANIFEST_SCHEMA, allow_nan=False)
     json.dumps(ENRON_EVIDENCE_SCHEMA, allow_nan=False)
+    json.dumps(ENRON_PERFORMANCE_OUTPUT_SCHEMA, allow_nan=False)
 
 
 def test_schemas_close_root_and_nested_objects(manifest: JsonObject, evidence: JsonObject) -> None:
@@ -1388,6 +1456,17 @@ def test_schemas_close_root_and_nested_objects(manifest: JsonObject, evidence: J
 
     assert "contract.schema.additionalProperties" in _codes(validate_enron_manifest(manifest))
     assert "contract.schema.additionalProperties" in _codes(validate_enron_evidence(evidence))
+
+
+def test_standalone_performance_output_schema_is_closed_and_schema_only(evidence: JsonObject) -> None:
+    performance = copy.deepcopy(evidence["performance"])
+    assert validate_enron_performance_output(performance) == {"valid": True, "diagnostics": []}
+
+    performance["unexpected"] = True
+    _assert_code(validate_enron_performance_output(performance), "contract.schema.additionalProperties")
+    del performance["unexpected"]
+    del performance["workloads"][0]["phase"]
+    _assert_code(validate_enron_performance_output(performance), "contract.schema.required")
 
 
 @pytest.mark.parametrize(
@@ -2416,45 +2495,14 @@ def test_performance_gate_uses_raw_samples_at_lte_threshold(
     candidate = workloads["direct_bank_latency"]
     baseline = workloads["baseline_direct_bank_latency"]
     candidate["samples_seconds"] = sorted(candidate["samples_seconds"])
-    candidate["samples_seconds"][-2:] = [0.05000000002, 0.05000000003]
+    candidate["samples_seconds"][-11:] = [0.05000000002 + index / 1_000_000_000_000 for index in range(11)]
     baseline["samples_seconds"] = sorted(baseline["samples_seconds"])
-    baseline["samples_seconds"][-2:] = [0.06000000002, 0.06000000003]
+    baseline["samples_seconds"][-11:] = [0.06000000002 + index / 1_000_000_000_000 for index in range(11)]
     _refresh_workload(promoted, candidate)
     raw_p99 = candidate["stats"]["p99_seconds"]
     _refresh_workload(promoted, baseline)
     candidate["stats"]["p99_seconds"] = 0.05
 
-    comparison = next(
-        item
-        for item in promoted["performance"]["comparisons"]
-        if item["candidate_workload_id"] == candidate["id"] and item["metric"] == "p99_seconds"
-    )
-    candidate_value = candidate["stats"]["p99_seconds"]
-    baseline_value = baseline["stats"]["p99_seconds"]
-    relative_degradation = (candidate_value - baseline_value) / baseline_value
-    noise_floor = (
-        max(
-            candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
-            baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
-        )
-        * comparison["noise_multiplier"]
-    )
-    boundary = noise_floor + comparison["regression_tolerance"]
-    comparison.update(
-        {
-            "candidate_value": candidate_value,
-            "baseline_value": baseline_value,
-            "relative_degradation": relative_degradation,
-            "noise_floor": noise_floor,
-            "result": (
-                "regressed"
-                if relative_degradation > boundary
-                else "improved"
-                if relative_degradation < -boundary
-                else "equivalent_within_noise"
-            ),
-        }
-    )
     candidate_index = promoted["performance"]["workloads"].index(candidate)
     _refresh_check_actuals(promoted, target_prefix=f"/performance/workloads/{candidate_index}/")
     for claim in promoted["promotion"]["claims"]:
@@ -2606,8 +2654,8 @@ def test_slower_exact_baseline_cannot_authorize_impractical_scale_performance(
     workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
     candidate = workloads["scale_100000_scan"]
     baseline = workloads["baseline_scale_100000_scan"]
-    candidate["samples_seconds"] = [80_000.0 + index / 1_000_000 for index in range(100)]
-    baseline["samples_seconds"] = [85_000.0 + index / 1_000_000 for index in range(100)]
+    candidate["samples_seconds"] = [80_000.0 + index / 1_000_000 for index in range(1_000)]
+    baseline["samples_seconds"] = [85_000.0 + index / 1_000_000 for index in range(1_000)]
     _refresh_workload(promoted, candidate)
     _refresh_workload(promoted, baseline)
 
@@ -2628,30 +2676,7 @@ def test_slower_exact_baseline_cannot_authorize_impractical_scale_performance(
     for comparison in promoted["performance"]["comparisons"]:
         if comparison["candidate_workload_id"] != candidate["id"]:
             continue
-        metric = comparison["metric"]
-        candidate_value = candidate["stats"][metric]
-        baseline_value = baseline["stats"][metric]
-        relative_degradation = (
-            (candidate_value - baseline_value) / baseline_value
-            if comparison["direction"] == "lower_is_better"
-            else (baseline_value - candidate_value) / baseline_value
-        )
-        noise_floor = (
-            max(
-                candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
-                baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
-            )
-            * comparison["noise_multiplier"]
-        )
-        comparison.update(
-            {
-                "candidate_value": candidate_value,
-                "baseline_value": baseline_value,
-                "relative_degradation": relative_degradation,
-                "noise_floor": noise_floor,
-                "result": "improved",
-            }
-        )
+        _refresh_same_path_comparison(promoted, comparison)
 
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
@@ -2697,7 +2722,7 @@ def test_real_promotable_evidence_requires_and_accepts_manifest_and_trusted_line
     candidate_workloads = [item for item in promoted["performance"]["workloads"] if item["baseline_id"] is None]
     baseline_workloads = [item for item in promoted["performance"]["workloads"] if item["baseline_id"] is not None]
     assert len(promoted["performance"]["harnesses"]) == 7
-    assert len(candidate_workloads) == len(baseline_workloads) == 19
+    assert len(candidate_workloads) == len(baseline_workloads) == 20
 
     _assert_code(
         validate_enron_evidence(promoted, trusted_lineage_prefix=[]),
@@ -2776,11 +2801,11 @@ def test_promotion_requires_full_phase_scale_density_and_concurrency_matrix(
     if mutation == "phase":
         performance["workloads"] = [item for item in performance["workloads"] if item["phase"] != "end_to_end"]
     elif mutation == "scale":
-        removed_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_aliases"] == 1_000)
+        removed_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_patterns"] == 1_000)
         performance["banks"] = [item for item in performance["banks"] if item["bank_hash"] != removed_hash]
         performance["workloads"] = [item for item in performance["workloads"] if item["bank_hash"] != removed_hash]
     else:
-        unused_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_aliases"] == 100_000)
+        unused_hash = next(item["bank_hash"] for item in performance["banks"] if item["active_patterns"] == 100_000)
         performance["workloads"] = [item for item in performance["workloads"] if item["bank_hash"] != unused_hash]
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
@@ -2835,7 +2860,7 @@ def test_global_axis_coverage_cannot_hide_confounded_performance_sweeps(
     ]
     input_by_id = {item["id"]: item for item in performance["inputs"]}
     bank_by_id = {item["id"]: item for item in performance["banks"]}
-    assert {bank_by_id[item["bank_id"]]["active_aliases"] for item in direct_cells} >= {
+    assert {bank_by_id[item["bank_id"]]["active_patterns"] for item in direct_cells} >= {
         1_000,
         10_000,
         25_000,
@@ -2909,7 +2934,7 @@ def test_required_scale_banks_share_one_generator_family(
     scale_bank = next(
         item
         for item in promoted["performance"]["banks"]
-        if item["kind"] == "synthetic_scale" and item["active_aliases"] == 100_000
+        if item["kind"] == "synthetic_scale" and item["active_patterns"] == 100_000
     )
     scale_bank["generator"][field] = replacement
     _refresh_bank_descriptor(scale_bank)
@@ -2960,27 +2985,27 @@ def test_unrelated_real_inputs_cannot_masquerade_as_a_controlled_generated_sweep
     _assert_code(_validate_promoted(promoted, bound_manifest, inventories), code)
 
 
-def test_required_scale_axis_is_exact_active_alias_count_not_pattern_count(
+def test_required_scale_axis_is_exact_active_pattern_count_not_alias_count(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
-    bank = next(item for item in promoted["performance"]["banks"] if item["active_aliases"] == 1_000)
+    bank = next(item for item in promoted["performance"]["banks"] if item["active_patterns"] == 1_000)
     taxon = bank["composition"]["taxonomy"][0]
     taxon.update(
         {
-            "entities": 600,
-            "canonical_names": 600,
-            "aliases": 200,
-            "literal_patterns": 800,
-            "regex_patterns": 200,
+            "entities": 3_000,
+            "canonical_names": 3_000,
+            "aliases": 1_000,
+            "literal_patterns": 4_000,
+            "regex_patterns": 1_000,
         }
     )
     bank.update(
         {
-            "active_entities": 600,
-            "active_names": 800,
-            "active_aliases": 200,
-            "active_patterns": 1_000,
+            "active_entities": 3_000,
+            "active_names": 4_000,
+            "active_aliases": 1_000,
+            "active_patterns": 5_000,
         }
     )
     _refresh_bank_descriptor(bank)
@@ -3015,7 +3040,7 @@ def test_synthetic_scale_banks_require_realistic_mixed_composition(
     bank = next(
         item
         for item in promoted["performance"]["banks"]
-        if item["kind"] == "synthetic_scale" and item["active_aliases"] == 1_000
+        if item["kind"] == "synthetic_scale" and item["active_patterns"] == 1_000
     )
     taxonomy = bank["composition"]["taxonomy"]
     if mutation == "taxonomy":
@@ -3055,7 +3080,7 @@ def test_scale_descriptor_without_a_decision_workload_cannot_promote(
     )
 
 
-def test_every_decision_cell_requires_full_exact_baseline_regression_coverage(
+def test_every_decision_cell_requires_full_exact_twin_stability_coverage(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
@@ -3069,7 +3094,7 @@ def test_every_decision_cell_requires_full_exact_baseline_regression_coverage(
 
     _assert_code(
         _validate_promoted(promoted, bound_manifest, inventories),
-        "contract.performance_regression_coverage",
+        "contract.performance_stability_coverage",
     )
 
 
@@ -3126,46 +3151,21 @@ def test_exact_setup_baseline_requires_same_source_artifact(manifest: JsonObject
     )
 
 
-def test_regressed_exact_baseline_comparison_cannot_promote(manifest: JsonObject, evidence: JsonObject) -> None:
+def test_out_of_tolerance_exact_twin_comparison_cannot_promote(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     candidate = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_1000_scan")
-    candidate["samples_seconds"] = [0.02 + sample / 1_000_000 for sample in range(100)]
+    candidate["samples_seconds"] = [0.02 + sample / 1_000_000 for sample in range(1_000)]
     _refresh_workload(promoted, candidate)
     index = promoted["performance"]["workloads"].index(candidate)
     _refresh_check_actuals(promoted, target_prefix=f"/performance/workloads/{index}/")
-    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
     for comparison in promoted["performance"]["comparisons"]:
         if comparison["candidate_workload_id"] != candidate["id"]:
             continue
-        baseline = workloads[comparison["baseline_workload_id"]]
-        metric = comparison["metric"]
-        candidate_value = candidate["stats"][metric]
-        baseline_value = baseline["stats"][metric]
-        relative_degradation = (
-            (candidate_value - baseline_value) / baseline_value
-            if comparison["direction"] == "lower_is_better"
-            else (baseline_value - candidate_value) / baseline_value
-        )
-        noise_floor = (
-            max(
-                candidate["stats"]["mad_seconds"] / candidate["stats"]["median_seconds"],
-                baseline["stats"]["mad_seconds"] / baseline["stats"]["median_seconds"],
-            )
-            * comparison["noise_multiplier"]
-        )
-        comparison.update(
-            {
-                "candidate_value": candidate_value,
-                "baseline_value": baseline_value,
-                "relative_degradation": relative_degradation,
-                "noise_floor": noise_floor,
-                "result": "regressed",
-            }
-        )
+        _refresh_same_path_comparison(promoted, comparison)
 
     _assert_code(
         _validate_promoted(promoted, bound_manifest, inventories),
-        "contract.performance_regression_coverage",
+        "contract.performance_stability_coverage",
     )
 
 
@@ -3178,6 +3178,99 @@ def test_promotion_requires_a_finite_additive_breakeven_value_model(manifest: Js
     _assert_code(
         _validate_promoted(promoted, bound_manifest, inventories),
         "contract.missing_breakeven_value_model",
+    )
+
+
+def test_cross_path_proxy_cannot_replace_promoted_direct_breakeven_marginal(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    proxy = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_cache_value_proxy")
+    component = next(item for item in model["components"] if item["id"] == "candidate_per_request_scan")
+    component["workload_id"] = proxy["id"]
+    component["value"] = proxy["stats"]["median_seconds"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_cross_path_proxy_requires_its_own_within_tolerance_median_control(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    promoted["performance"]["comparisons"] = [
+        item
+        for item in promoted["performance"]["comparisons"]
+        if not (
+            item["candidate_workload_id"] == "direct_bank_cache_value_proxy"
+            and item["comparison_kind"] == "same_path_stability"
+            and item["metric"] == "median_seconds"
+        )
+    ]
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_promoted_breakeven_shared_acquisition_costs_cancel(manifest: JsonObject, evidence: JsonObject) -> None:
+    _bound_manifest, promoted, _inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    cold_compile = next(item for item in model["components"] if item["id"] == "candidate_fixed_cold_compile")
+
+    assert model["candidate_fixed_value"] - model["baseline_fixed_value"] == pytest.approx(cold_compile["value"])
+
+
+def test_promoted_breakeven_rejects_fractionalized_whole_input_helper_cost(
+    manifest: JsonObject,
+    evidence: JsonObject,
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
+    model["parameter_name"] = "scanned_documents"
+    model["parameter_unit"] = "document"
+    for component in model["components"]:
+        if component["category"] != "scan":
+            continue
+        component["source"] = "workload_seconds_per_document"
+        component["value"] = workloads[component["workload_id"]]["stats"]["seconds_per_document"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_request_breakeven_component_requires_a_whole_input_workload(
+    manifest: JsonObject,
+    evidence: JsonObject,
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    component = next(item for item in model["components"] if item["id"] == "candidate_per_request_scan")
+    latency = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
+    component["workload_id"] = latency["id"]
+    component["value"] = latency["stats"]["median_seconds"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.invalid_breakeven_component",
     )
 
 
@@ -3202,13 +3295,13 @@ def test_synthetic_scale_scan_pair_cannot_stand_in_for_evaluated_bank_value_mode
     model = promoted["performance"]["breakeven_models"][0]
     workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
     for component_id, workload_id in (
-        ("candidate_per_document_scan", "scale_1000_scan"),
-        ("baseline_per_document_scan", "baseline_scale_1000_scan"),
+        ("candidate_per_request_scan", "scale_1000_scan"),
+        ("baseline_per_request_scan", "baseline_scale_1000_scan"),
     ):
         component = next(item for item in model["components"] if item["id"] == component_id)
         workload = workloads[workload_id]
         component["workload_id"] = workload_id
-        component["value"] = workload["stats"]["seconds_per_document"]
+        component["value"] = workload["stats"]["median_seconds"]
     _refresh_breakeven_outputs(model)
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
@@ -3224,7 +3317,7 @@ def test_slow_decision_cell_fails_its_frozen_performance_thresholds(manifest: Js
         index for index, item in enumerate(promoted["performance"]["workloads"]) if item["id"] == "scale_1000_scan"
     )
     workload = promoted["performance"]["workloads"][index]
-    workload["samples_seconds"] = [2.0 + sample / 1_000_000 for sample in range(100)]
+    workload["samples_seconds"] = [2.0 + sample / 1_000_000 for sample in range(1_000)]
     _refresh_workload(promoted, workload)
     _refresh_check_actuals(promoted, target_prefix=f"/performance/workloads/{index}/")
 
@@ -3724,7 +3817,8 @@ def test_performance_result_schema_requires_complete_baseline_and_breakeven_shap
 ) -> None:
     evidence["performance"][collection].append({})
 
-    _assert_code(validate_enron_evidence(evidence), "contract.schema.required")
+    expected_code = "contract.schema.oneOf" if collection == "comparisons" else "contract.schema.required"
+    _assert_code(validate_enron_evidence(evidence), expected_code)
 
 
 @pytest.mark.parametrize(
@@ -3757,6 +3851,31 @@ def test_performance_bank_and_input_descriptors_are_recomputed(evidence: JsonObj
     _assert_code(validate_enron_evidence(evidence), code)
 
 
+def test_bank_provenance_distinguishes_physical_artifact_bytes_from_canonical_bytes(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    assert manifest["bank"]["artifact_bytes"] == evidence["bank"]["artifact_bytes"] == 3072
+    assert evidence["bank"]["canonical_json_bytes"] == 2048
+    assert evidence["performance"]["banks"][0]["artifact"]["bytes"] == 3072
+    assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
+    assert validate_enron_evidence(evidence) == {"valid": True, "diagnostics": []}
+
+
+def test_evaluated_performance_bank_binds_physical_artifact_size(evidence: JsonObject) -> None:
+    descriptor = evidence["performance"]["banks"][0]
+    descriptor["artifact"]["bytes"] = evidence["bank"]["canonical_json_bytes"]
+    _refresh_bank_descriptor(descriptor)
+    _refresh_frozen_contract(evidence)
+
+    _assert_code(validate_enron_evidence(evidence), "contract.performance_bank_mismatch")
+
+
+def test_bank_provenance_requires_physical_artifact_size(evidence: JsonObject) -> None:
+    del evidence["bank"]["artifact_bytes"]
+
+    _assert_code(validate_enron_evidence(evidence), "contract.schema.required")
+
+
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
@@ -3773,7 +3892,7 @@ def test_baseline_comparison_and_breakeven_plans_are_frozen_but_outputs_are_reco
     comparison = promoted["performance"]["comparisons"][0]
     model = promoted["performance"]["breakeven_models"][0]
     if mutation == "comparison_plan":
-        comparison["noise_multiplier"] += 1
+        comparison["samples_per_block"] += 1
     elif mutation == "comparison_output":
         comparison["candidate_value"] += 1
     elif mutation == "component_output":
@@ -3792,24 +3911,46 @@ def test_comparison_noise_policy_has_bounded_schema_parameters(
     manifest: JsonObject, evidence: JsonObject, field: str, value: float
 ) -> None:
     _, promoted, _ = _promotable(manifest, evidence)
-    promoted["performance"]["comparisons"][0][field] = value
+    comparison = next(
+        item for item in promoted["performance"]["comparisons"] if item["comparison_kind"] == "cross_path_value"
+    )
+    comparison[field] = value
 
-    _assert_code(validate_enron_evidence(promoted), "contract.schema.maximum")
+    _assert_code(validate_enron_evidence(promoted), "contract.schema.oneOf")
 
 
-def test_unstable_high_mad_samples_cannot_hide_performance_regressions(
-    manifest: JsonObject, evidence: JsonObject
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("block_count", 9),
+        ("block_assignment", ["candidate_first"] * 10),
+        ("significance_level", 0.04),
+        ("stability_tolerance", 0.04),
+    ],
+)
+def test_exact_block_swap_policy_is_frozen_by_schema(
+    manifest: JsonObject, evidence: JsonObject, field: str, value: Any
 ) -> None:
+    _, promoted, _ = _promotable(manifest, evidence)
+    comparison = next(
+        item for item in promoted["performance"]["comparisons"] if item["comparison_kind"] == "same_path_stability"
+    )
+    comparison[field] = value
+
+    _assert_code(validate_enron_evidence(promoted), "contract.schema.oneOf")
+
+
+def test_incomplete_exact_block_swap_samples_cannot_validate(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     candidate = next(item for item in promoted["performance"]["workloads"] if item["id"] == "scale_1000_scan")
-    candidate["samples_seconds"] = [value for _ in range(50) for value in (0.001, 0.1)]
+    candidate["samples_seconds"] = candidate["samples_seconds"][:-1]
     _refresh_workload(promoted, candidate)
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
 
     _assert_code(
         _validate_promoted(promoted, bound_manifest, inventories),
-        "contract.unstable_performance_comparison",
+        "contract.incomparable_performance_baseline",
     )
 
 
@@ -3849,10 +3990,10 @@ def test_breakeven_component_category_must_match_its_workload_phase(manifest: Js
     )
 
 
-def test_breakeven_scan_pair_must_use_the_exact_same_frozen_input(manifest: JsonObject, evidence: JsonObject) -> None:
+def test_breakeven_alternative_must_use_the_exact_same_frozen_input(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     model = promoted["performance"]["breakeven_models"][0]
-    baseline_component = next(item for item in model["components"] if item["id"] == "baseline_per_document_scan")
+    baseline_component = next(item for item in model["components"] if item["id"] == "baseline_per_request_scan")
     baseline_workload = next(
         item for item in promoted["performance"]["workloads"] if item["id"] == baseline_component["workload_id"]
     )
@@ -3869,41 +4010,121 @@ def test_breakeven_scan_pair_must_use_the_exact_same_frozen_input(manifest: Json
     )
 
 
+def test_direct_same_path_control_cannot_replace_uncached_breakeven_alternative(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    component = next(item for item in model["components"] if item["id"] == "baseline_per_request_scan")
+    direct_control = next(
+        item for item in promoted["performance"]["workloads"] if item["id"] == "baseline_direct_bank_latency"
+    )
+    component["workload_id"] = direct_control["id"]
+    component["value"] = direct_control["stats"]["median_seconds"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+    assert {"contract.invalid_breakeven_component", "contract.missing_breakeven_value_model"} <= _codes(result)
+
+
+def test_non_equivalent_baseline_cannot_satisfy_uncached_breakeven_alternative(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    baseline = promoted["performance"]["baselines"][0]
+    baseline["semantic_equivalence"] = "subset"
+    baseline["descriptor_sha256"] = hash_enron_performance_baseline(baseline)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+    assert {"contract.incomparable_performance_baseline", "contract.missing_breakeven_value_model"} <= _codes(result)
+
+
+def test_breakeven_paths_retain_independent_same_path_controls(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    component = next(item for item in model["components"] if item["id"] == "baseline_per_request_scan")
+    promoted["performance"]["comparisons"] = [
+        item
+        for item in promoted["performance"]["comparisons"]
+        if not (
+            item["candidate_workload_id"] == component["workload_id"]
+            and item["comparison_kind"] == "same_path_stability"
+            and item["metric"] == "median_seconds"
+        )
+    ]
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+    assert {"contract.performance_stability_coverage", "contract.missing_breakeven_value_model"} <= _codes(result)
+
+
 def test_zero_vacuous_breakeven_assumptions_cannot_satisfy_promotion(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     model = promoted["performance"]["breakeven_models"][0]
-    curation = next(item for item in model["components"] if item["id"] == "candidate_fixed_source_curation")
-    curation["value"] = 0.0
-    candidate_fixed = sum(
-        item["value"] for item in model["components"] if item["side"] == "candidate" and item["application"] == "fixed"
+    for component in model["components"]:
+        if component["category"] == "source_curation":
+            component["value"] = 0.0
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
     )
-    baseline_fixed = sum(
-        item["value"] for item in model["components"] if item["side"] == "baseline" and item["application"] == "fixed"
-    )
-    candidate_per_unit = next(
-        item["value"]
-        for item in model["components"]
-        if item["side"] == "candidate" and item["application"] == "per_unit"
-    )
-    baseline_per_unit = next(
-        item["value"]
-        for item in model["components"]
-        if item["side"] == "baseline" and item["application"] == "per_unit"
-    )
-    crossing = math.ceil((candidate_fixed - baseline_fixed) / (baseline_per_unit - candidate_per_unit))
-    model.update(
+
+
+def test_promoted_breakeven_rejects_extra_asymmetric_cost_components(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    model["components"].append(
         {
-            "candidate_fixed_value": candidate_fixed,
-            "baseline_fixed_value": baseline_fixed,
-            "candidate_value_per_unit": candidate_per_unit,
-            "baseline_value_per_unit": baseline_per_unit,
-            "result": "finite_breakeven",
-            "breakeven_units": crossing,
+            "id": "baseline_per_document_external_call",
+            "side": "baseline",
+            "application": "per_unit",
+            "category": "external_call",
+            "source": "declared_assumption",
+            "description": "Adversarial external-call assumption.",
+            "workload_id": None,
+            "assumption_sha256": _sha256_number(975),
+            "value": 0.5,
         }
     )
-    model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
+    model["components"].sort(key=lambda item: item["id"])
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+@pytest.mark.parametrize("mismatch", ["declared_value", "measured_workload"])
+def test_promoted_breakeven_requires_identical_shared_acquisition_components(
+    mismatch: str,
+    manifest: JsonObject,
+    evidence: JsonObject,
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    if mismatch == "declared_value":
+        component = next(item for item in model["components"] if item["id"] == "baseline_fixed_source_curation")
+        component["value"] += 0.001
+    else:
+        component = next(item for item in model["components"] if item["id"] == "baseline_fixed_source_profiling")
+        component["workload_id"] = "baseline_source_profile_fixture"
+    _refresh_breakeven_outputs(model)
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
 
@@ -4118,16 +4339,434 @@ def test_p95_and_p99_require_meaningful_sample_support(
     assert validate_enron_evidence(value) == {"valid": True, "diagnostics": []}
 
 
-def test_promoted_performance_requires_at_least_one_hundred_samples(manifest: JsonObject, evidence: JsonObject) -> None:
+def test_public_performance_arithmetic_helpers_share_verifier_semantics(evidence: JsonObject) -> None:
+    input_descriptor = evidence["performance"]["inputs"][0]
+    inventory = [{"bytes": 1024, "records": 0}, {"bytes": 2048, "records": 1}]
+    assert summarize_enron_performance_inventory(inventory)["documents"] == 2
+
+    setup = calculate_enron_performance_statistics(
+        [0.01 + index / 1_000_000 for index in range(100)],
+        None,
+        phase="source_build",
+        sample_unit="operation",
+        work_per_sample=1,
+    )
+    candidate = calculate_enron_performance_statistics(
+        [0.01] * 100,
+        input_descriptor,
+        phase="direct_bank_scan",
+        sample_unit="whole_input",
+        work_per_sample=1,
+    )
+    baseline = calculate_enron_performance_statistics(
+        [0.02] * 100,
+        input_descriptor,
+        phase="direct_bank_scan",
+        sample_unit="whole_input",
+        work_per_sample=1,
+    )
+    assert setup["p95_seconds"] is not None and setup["p99_seconds"] is None
+    comparison = calculate_enron_performance_comparison(
+        candidate,
+        baseline,
+        metric="p99_seconds",
+        noise_method="paired_block_ratio_mad",
+        candidate_samples=[0.01] * 100,
+        baseline_samples=[0.02] * 100,
+        noise_multiplier=2.0,
+        regression_tolerance=0.05,
+    )
+    assert comparison["direction"] == "lower_is_better"
+    assert comparison["result"] == "improved"
+    assert calculate_enron_breakeven(
+        10.0,
+        0.0,
+        0.001,
+        0.002,
+        minimum_units=1,
+        maximum_units=20_000,
+    ) == {"result": "finite_breakeven", "breakeven_units": 10_000}
+
+
+def _exact_block_swap_comparison(
+    evidence: JsonObject,
+    candidate_samples: Sequence[float],
+    baseline_samples: Sequence[float],
+) -> JsonObject:
+    input_descriptor = evidence["performance"]["inputs"][0]
+    candidate = calculate_enron_performance_statistics(
+        candidate_samples,
+        input_descriptor,
+        phase="direct_bank_scan",
+        sample_unit="whole_input",
+        work_per_sample=1,
+    )
+    baseline = calculate_enron_performance_statistics(
+        baseline_samples,
+        input_descriptor,
+        phase="direct_bank_scan",
+        sample_unit="whole_input",
+        work_per_sample=1,
+    )
+    return calculate_enron_performance_comparison(
+        candidate,
+        baseline,
+        metric="p99_seconds",
+        noise_method="exact_block_swap",
+        candidate_samples=candidate_samples,
+        baseline_samples=baseline_samples,
+        block_count=10,
+        samples_per_block=len(candidate_samples) // 10,
+        block_assignment=["candidate_first", "control_first"] * 5,
+        significance_level=0.05,
+        stability_tolerance=0.05,
+    )
+
+
+def test_exact_block_swap_is_label_invariant_and_marks_one_block_tail_inconclusive(evidence: JsonObject) -> None:
+    candidate_samples = [*([0.012] * 11), *([0.01] * 989)]
+    baseline_samples = [0.01] * 1_000
+
+    forward = _exact_block_swap_comparison(evidence, candidate_samples, baseline_samples)
+    reversed_labels = _exact_block_swap_comparison(evidence, baseline_samples, candidate_samples)
+
+    assert forward["candidate_value"] == reversed_labels["baseline_value"]
+    assert forward["baseline_value"] == reversed_labels["candidate_value"]
+    for field in (
+        "direction",
+        "block_count",
+        "samples_per_block",
+        "block_assignment",
+        "absolute_log_ratio",
+        "absolute_relative_gap",
+        "permutation_p_value",
+        "result",
+    ):
+        assert forward[field] == reversed_labels[field]
+    assert forward["permutation_p_value"] == 1.0
+    assert forward["result"] == "inconclusive"
+
+
+def test_exact_block_swap_p99_is_robust_to_a_few_isolated_tail_points(evidence: JsonObject) -> None:
+    candidate_samples = [0.02, 0.02, 0.02, *([0.01] * 997)]
+
+    comparison = _exact_block_swap_comparison(evidence, candidate_samples, [0.01] * 1_000)
+
+    assert comparison["candidate_value"] == comparison["baseline_value"] == 0.01
+    assert comparison["absolute_relative_gap"] == 0.0
+    assert comparison["result"] == "within_tolerance"
+
+
+@pytest.mark.parametrize(
+    ("candidate_seconds", "expected_result"),
+    [
+        (0.01049, "within_tolerance"),
+        (0.0105, "within_tolerance"),
+        (math.nextafter(0.0105, math.inf), "unstable"),
+    ],
+)
+def test_exact_block_swap_uses_a_boundary_safe_frozen_tolerance(
+    evidence: JsonObject, candidate_seconds: float, expected_result: str
+) -> None:
+    comparison = _exact_block_swap_comparison(evidence, [candidate_seconds] * 1_000, [0.01] * 1_000)
+
+    assert comparison["permutation_p_value"] == 2 / 1024
+    assert comparison["result"] == expected_result
+
+
+def test_exact_block_swap_plan_hash_binds_every_stability_policy_field() -> None:
+    comparison: JsonObject = {
+        "id": "same_path_fixture",
+        "candidate_workload_id": "candidate",
+        "baseline_workload_id": "control",
+        "comparison_kind": "same_path_stability",
+        "metric": "p99_seconds",
+        "direction": "symmetric",
+        "noise_method": "exact_block_swap",
+        "block_count": 10,
+        "samples_per_block": 10,
+        "block_assignment": ["candidate_first", "control_first"] * 5,
+        "significance_level": 0.05,
+        "stability_tolerance": 0.05,
+    }
+    original = hash_enron_performance_comparison_plan(comparison)
+
+    for field, value in (
+        ("direction", "lower_is_better"),
+        ("noise_method", "different"),
+        ("block_count", 9),
+        ("samples_per_block", 11),
+        ("block_assignment", ["candidate_first"] * 10),
+        ("significance_level", 0.04),
+        ("stability_tolerance", 0.04),
+    ):
+        mutated = {**comparison, field: value}
+        assert hash_enron_performance_comparison_plan(mutated) != original
+
+
+def test_paired_block_ratio_mad_removes_common_drift_for_latency_and_throughput(evidence: JsonObject) -> None:
+    input_descriptor = evidence["performance"]["inputs"][0]
+    candidate_samples = [0.01, 0.02, 0.03, 0.04, 0.05]
+    baseline_samples = [0.02, 0.04, 0.06, 0.08, 0.10]
+    candidate = calculate_enron_performance_statistics(
+        candidate_samples,
+        input_descriptor,
+        phase="direct_bank_scan",
+        sample_unit="whole_input",
+        work_per_sample=1,
+    )
+    baseline = calculate_enron_performance_statistics(
+        baseline_samples,
+        input_descriptor,
+        phase="helper_cache_miss",
+        sample_unit="whole_input",
+        work_per_sample=1,
+    )
+
+    for metric in ("median_seconds", "mib_per_second"):
+        comparison = calculate_enron_performance_comparison(
+            candidate,
+            baseline,
+            metric=metric,
+            noise_multiplier=2.0,
+            regression_tolerance=0.05,
+            noise_method="paired_block_ratio_mad",
+            candidate_samples=candidate_samples,
+            baseline_samples=baseline_samples,
+        )
+        assert comparison["noise_floor"] == 0.0
+        assert comparison["result"] == "improved"
+
+
+def _set_promoted_proxy_cross_path_ratios(evidence: JsonObject, ratios: Sequence[float]) -> JsonObject:
+    workloads = {item["id"]: item for item in evidence["performance"]["workloads"]}
+    comparison = next(
+        item for item in evidence["performance"]["comparisons"] if item["comparison_kind"] == "cross_path_value"
+    )
+    proxy = workloads[comparison["candidate_workload_id"]]
+    baseline = workloads[comparison["baseline_workload_id"]]
+    assert len(ratios) == len(proxy["samples_seconds"]) == len(baseline["samples_seconds"])
+    proxy["samples_seconds"] = [
+        baseline_sample * ratio for baseline_sample, ratio in zip(baseline["samples_seconds"], ratios, strict=True)
+    ]
+    _refresh_workload(evidence, proxy)
+
+    same_path = next(
+        item
+        for item in evidence["performance"]["comparisons"]
+        if item["candidate_workload_id"] == proxy["id"] and item["comparison_kind"] == "same_path_stability"
+    )
+    exact_twin = workloads[same_path["baseline_workload_id"]]
+    exact_twin["samples_seconds"] = [sample * 1.01 for sample in proxy["samples_seconds"]]
+    _refresh_workload(evidence, exact_twin)
+    _refresh_same_path_comparison(evidence, same_path)
+    _refresh_cross_path_comparison(evidence, comparison)
+    return comparison
+
+
+def test_cross_path_noise_floor_accepts_the_exact_directional_ceiling(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    comparison = _set_promoted_proxy_cross_path_ratios(promoted, [7 / 16] * 50 + [9 / 16] * 50)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    assert comparison["noise_floor"] == 0.25
+    assert comparison["result"] == "improved"
+    assert _validate_promoted(promoted, bound_manifest, inventories) == {"valid": True, "diagnostics": []}
+
+
+def test_cross_path_noise_floor_rejects_the_next_float_even_when_direction_improves(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    next_upper_ratio = math.nextafter(9 / 16, math.inf)
+    comparison = _set_promoted_proxy_cross_path_ratios(promoted, [7 / 16] * 50 + [next_upper_ratio] * 50)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    assert comparison["noise_floor"] == math.nextafter(0.25, math.inf)
+    assert comparison["result"] == "improved"
+    comparison_path = f"/performance/comparisons/{promoted['performance']['comparisons'].index(comparison)}"
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+    assert [(item["code"], item["path"]) for item in result["diagnostics"]] == [
+        ("contract.unstable_performance_comparison", comparison_path),
+        ("contract.forged_promotion", "/promotion/passed"),
+        ("contract.forged_verifier", "/verifier/passed"),
+    ]
+
+
+def test_regressed_directional_cross_path_result_prevents_promotion(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    comparison = _set_promoted_proxy_cross_path_ratios(promoted, [2.0] * 100)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    assert comparison["noise_floor"] == 0.0
+    assert comparison["result"] == "regressed"
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+    assert [(item["code"], item["path"]) for item in result["diagnostics"]] == [
+        ("contract.missing_breakeven_value_model", "/performance/breakeven_models"),
+        ("contract.forged_promotion", "/promotion/passed"),
+        ("contract.forged_verifier", "/verifier/passed"),
+    ]
+
+
+def test_public_performance_arithmetic_helpers_reject_invalid_inputs(evidence: JsonObject) -> None:
+    with pytest.raises(ValueError, match="at least five"):
+        calculate_enron_performance_statistics(
+            [0.01, float("nan"), 0.02, 0.03, 0.04],
+            evidence["performance"]["inputs"][0],
+            phase="direct_bank_scan",
+            sample_unit="whole_input",
+            work_per_sample=1,
+        )
+    with pytest.raises(ValueError, match="Unsupported"):
+        calculate_enron_performance_comparison(
+            evidence["performance"]["workloads"][0]["stats"],
+            evidence["performance"]["workloads"][0]["stats"],
+            metric="sample_count",
+            noise_method="paired_block_ratio_mad",
+            noise_multiplier=2.0,
+            regression_tolerance=0.05,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        calculate_enron_breakeven(
+            True,
+            0.0,
+            0.001,
+            0.002,
+            minimum_units=1,
+            maximum_units=20_000,
+        )
+    with pytest.raises(ValueError, match="finite"):
+        calculate_enron_breakeven(
+            10**300,
+            0,
+            10**300,
+            10**300,
+            minimum_units=2**63 - 1,
+            maximum_units=2**63 - 1,
+        )
+    with pytest.raises(ValueError, match="ordered"):
+        calculate_enron_breakeven(
+            1.0,
+            0.0,
+            0.001,
+            0.002,
+            minimum_units=1,
+            maximum_units=2**63,
+        )
+
+
+def test_decision_grade_direct_performance_requires_one_thousand_samples(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
-    workload["samples_seconds"] = workload["samples_seconds"][:99]
+    workload["samples_seconds"] = workload["samples_seconds"][:999]
     _refresh_workload(promoted, workload)
 
     _assert_code(
         _validate_promoted(promoted, bound_manifest, inventories),
         "contract.invalid_decision_grade_workload",
     )
+
+
+def test_promotable_performance_separates_direct_p99_evidence_from_cross_path_proxy(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    _bound_manifest, promoted, _inventories = _promotable(manifest, evidence)
+    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
+    comparisons = promoted["performance"]["comparisons"]
+    throughput = workloads["direct_bank_throughput"]
+    proxy = workloads["direct_bank_cache_value_proxy"]
+    model = promoted["performance"]["breakeven_models"][0]
+    candidate_marginal = next(item for item in model["components"] if item["id"] == "candidate_per_request_scan")
+
+    assert throughput["decision_grade"] is True
+    assert throughput["promotion_gate"] is True
+    assert throughput["stats"]["sample_count"] == 1_000
+    assert proxy["decision_grade"] is False
+    assert proxy["promotion_gate"] is False
+    assert proxy["stats"]["sample_count"] == 100
+    assert candidate_marginal["workload_id"] == throughput["id"]
+    assert any(
+        item["candidate_workload_id"] == throughput["id"]
+        and item["comparison_kind"] == "same_path_stability"
+        and item["metric"] == "p99_seconds"
+        and item["result"] == "within_tolerance"
+        for item in comparisons
+    )
+    assert any(
+        item["candidate_workload_id"] == proxy["id"]
+        and item["comparison_kind"] == "same_path_stability"
+        and item["metric"] == "median_seconds"
+        and item["result"] == "within_tolerance"
+        for item in comparisons
+    )
+    assert any(
+        item["candidate_workload_id"] == proxy["id"]
+        and item["comparison_kind"] == "cross_path_value"
+        and item["metric"] == "p99_seconds"
+        for item in comparisons
+    )
+
+
+def test_setup_decision_cells_use_twenty_samples_with_descriptive_p95_and_median_stability(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    _, promoted, _ = _promotable(manifest, evidence)
+    setup_ids = {"source_profile_fixture", "source_build_fixture", "cold_compile_fixture"}
+    setup_cells = [item for item in promoted["performance"]["workloads"] if item["id"] in setup_ids]
+
+    assert len(setup_cells) == 3
+    assert all(item["stats"]["sample_count"] == 20 for item in setup_cells)
+    assert all(
+        item["stats"]["p95_seconds"] is not None and item["stats"]["p99_seconds"] is None for item in setup_cells
+    )
+    comparisons = promoted["performance"]["comparisons"]
+    assert all(
+        {item["metric"] for item in comparisons if item["candidate_workload_id"] == workload["id"]}
+        == {"median_seconds"}
+        for workload in setup_cells
+    )
+
+
+def test_setup_decision_cells_require_twenty_samples(manifest: JsonObject, evidence: JsonObject) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "source_build_fixture")
+    workload["samples_seconds"] = workload["samples_seconds"][:19]
+    _refresh_workload(promoted, workload)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.invalid_decision_grade_workload",
+    )
+
+
+def test_setup_decision_cells_require_mad_gate_and_median_stability_comparison(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    workload = next(item for item in promoted["performance"]["workloads"] if item["id"] == "source_profile_fixture")
+    promoted["performance"]["comparisons"] = [
+        item
+        for item in promoted["performance"]["comparisons"]
+        if not (item["candidate_workload_id"] == workload["id"] and item["metric"] == "median_seconds")
+    ]
+    promoted["promotion"]["checks"] = [
+        item
+        for item in promoted["promotion"]["checks"]
+        if item["target"]
+        != f"/performance/workloads/{promoted['performance']['workloads'].index(workload)}/stats/mad_seconds"
+    ]
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    result = _validate_promoted(promoted, bound_manifest, inventories)
+    assert {"contract.performance_stability_coverage", "contract.missing_required_gate"} <= _codes(result)
 
 
 def test_referenced_samples_are_hash_verified_and_recomputed(evidence: JsonObject) -> None:

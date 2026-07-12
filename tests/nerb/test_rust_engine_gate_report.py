@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 
 def _load_gate_report_module():
     module_path = Path(__file__).parents[2] / "scripts" / "rust_engine_gate_report.py"
@@ -19,7 +21,42 @@ def _load_gate_report_module():
 
 
 def _measurement(*, count: int = 1, seconds: float = 0.01, stable: bool = True) -> dict[str, Any]:
-    return {"count": count, "count_stable": stable, "median_seconds": seconds, "min_seconds": seconds}
+    return {
+        "count": count,
+        "count_stable": stable,
+        "warmup_matches_measured": stable,
+        "median_seconds": seconds,
+        "min_seconds": seconds,
+    }
+
+
+def _memory_child_payload(*, iterations: int = 1, dense_bytes: int = 128, count: int = 128) -> dict[str, Any]:
+    samples = [0.001] * iterations
+    return {
+        "status": "measured",
+        "dense_probe_bytes": dense_bytes,
+        "iterations": iterations,
+        "all_overlaps_raw": {
+            "count": count,
+            "counts": [count] * iterations,
+            "count_stable": True,
+            "warmup_counts": [count],
+            "warmup_matches_measured": True,
+            "samples_seconds": samples,
+            "sample_count": iterations,
+            "warmup_iterations": 1,
+            "median_seconds": 0.001,
+            "min_seconds": 0.001,
+        },
+        "match_buffer_capacity_after_scan": count,
+        "max_rss_kib_process_start": 10_000,
+        "max_rss_kib_before_compile": 10_000,
+        "max_rss_kib_after_compile": 11_000,
+        "max_rss_kib_after_scan": 12_500,
+        "max_rss_kib_compile_delta": 1_000,
+        "max_rss_kib_scan_delta": 1_500,
+        "max_rss_kib_growth": 2_500,
+    }
 
 
 def _expected_mode_metadata() -> dict[str, dict[str, Any]]:
@@ -51,6 +88,10 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     report = gate_report.gate_report(iterations=1, target_bytes=10_000, dense_bytes=128)
 
     assert report["overall"]["passed"] is True
+    assert report["overall"]["correctness_passed"] is True
+    assert report["overall"]["timing_eligible"] is False
+    assert report["overall"]["timing_status"] == "informational_insufficient_samples"
+    assert report["overall"]["timing_passed"] is None
     assert report["overall"]["included_sections"] == {
         "performance": True,
         "memory": True,
@@ -64,7 +105,13 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["conformance"]["passed"] is None
     assert report["conformance"]["included_in_overall"] is False
     assert report["performance"]["passed"] is True
+    assert report["performance"]["correctness_passed"] is True
+    assert report["performance"]["timing_eligible"] is False
+    assert report["performance"]["timing_passed"] is None
     assert report["mode_strategy"]["passed"] is True
+    assert report["mode_strategy"]["correctness_passed"] is True
+    assert report["mode_strategy"]["timing_eligible"] is False
+    assert report["mode_strategy"]["timing_passed"] is None
     assert report["memory"]["passed"] is True
     assert report["distribution"]["passed"] is None
     assert report["distribution"]["included_in_overall"] is False
@@ -80,17 +127,19 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["mode_strategy"]["entity_cardinality_sweep"]["medium_bank_document_bytes_floor"] == 100_000
     assert report["mode_strategy"]["entity_cardinality_sweep"]["entity_counts"] == [2, 8, 32, 64, 1000]
     assert report["mode_strategy"]["entity_cardinality_sweep"]["routine_entity_counts"] == [2, 64, 1000]
-    assert report["mode_strategy"]["entity_cardinality_sweep"]["performance"]["criteria"] == {
-        "max_dense_entity_independent_scan_seconds_under_ceiling": True,
-        "dense_entity_independent_scaling_ratio_under_ceiling": True,
-        "routine_max_entity_independent_scan_seconds_under_ceiling": True,
-        "routine_max_to_2_entity_scan_seconds_ratio_under_ceiling": True,
-        "medium_bank_compile_seconds_under_ceiling": True,
-        "medium_bank_raw_scan_seconds_under_ceiling": True,
-        "medium_bank_scan_project_seconds_under_ceiling": True,
-        "medium_bank_scan_project_throughput_floor": True,
-        "medium_bank_to_routine_max_entity_scan_seconds_ratio_under_ceiling": True,
+    assert set(report["mode_strategy"]["entity_cardinality_sweep"]["performance"]["criteria"]) == {
+        "max_dense_entity_independent_scan_seconds_under_ceiling",
+        "dense_entity_independent_scaling_ratio_under_ceiling",
+        "routine_max_entity_independent_scan_seconds_under_ceiling",
+        "routine_max_to_2_entity_scan_seconds_ratio_under_ceiling",
+        "medium_bank_compile_seconds_under_ceiling",
+        "medium_bank_raw_scan_seconds_under_ceiling",
+        "medium_bank_scan_project_seconds_under_ceiling",
+        "medium_bank_scan_project_throughput_floor",
+        "medium_bank_to_routine_max_entity_scan_seconds_ratio_under_ceiling",
     }
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["timing_eligible"] is False
+    assert report["mode_strategy"]["entity_cardinality_sweep"]["timing_passed"] is None
     assert [case["entity_count"] for case in report["mode_strategy"]["entity_cardinality_sweep"]["dense_cases"]] == [
         2,
         8,
@@ -117,7 +166,12 @@ def test_rust_engine_gate_report_quick_mode_returns_passing_json_compatible_shap
     assert report["performance"]["corpus_size"]["passed"] is True
     assert "source_parse_jsonl" in report["performance"]["small_bank_floor"]["measurements"]
     assert report["performance"]["small_bank_floor"]["criteria"]["native_public_records_equal"] is True
-    assert report["performance"]["small_bank_floor"]["criteria"]["rust_scan_project_under_ceiling"] is True
+    assert report["performance"]["small_bank_floor"]["timing_eligible"] is False
+    assert report["performance"]["small_bank_floor"]["timing_passed"] is None
+    scan_measurement = report["performance"]["small_bank_floor"]["measurements"]["rust_entity_independent_scan_project"]
+    assert scan_measurement["sample_count"] == 1
+    assert scan_measurement["warmup_iterations"] == 1
+    assert scan_measurement["samples_seconds"] == [scan_measurement["median_seconds"]]
 
 
 def test_workload_pass_criteria_fail_on_rust_scan_project_regression():
@@ -144,6 +198,123 @@ def test_workload_pass_criteria_fail_on_rust_scan_project_regression():
     assert all(criteria.values()) is False
 
 
+def test_single_sample_timing_outlier_is_informational_but_correctness_still_gates():
+    gate_report = _load_gate_report_module()
+
+    timing_outlier = gate_report._gate_summary(
+        {
+            "native_public_records_equal": True,
+            "cache_hit_verified": True,
+            "mode_metadata_expected": True,
+        },
+        {"rust_scan_project_throughput_floor": False},
+        sample_count=1,
+    )
+
+    assert timing_outlier["timing_eligible"] is False
+    assert timing_outlier["timing_status"] == "informational_insufficient_samples"
+    assert timing_outlier["timing_observed_passed"] is False
+    assert timing_outlier["timing_passed"] is None
+    assert timing_outlier["passed"] is True
+
+    for failed_criterion in (
+        "native_public_records_equal",
+        "cache_hit_verified",
+        "mode_metadata_expected",
+    ):
+        correctness = {
+            "native_public_records_equal": True,
+            "cache_hit_verified": True,
+            "mode_metadata_expected": True,
+        }
+        correctness[failed_criterion] = False
+        failed = gate_report._gate_summary(correctness, {"timing": True}, sample_count=1)
+        assert failed["correctness_passed"] is False
+        assert failed["passed"] is False
+
+
+def test_five_samples_keep_existing_timing_thresholds_hard_gated():
+    gate_report = _load_gate_report_module()
+
+    failed = gate_report._gate_summary({"records_equal": True}, {"throughput_floor": False}, sample_count=5)
+
+    assert gate_report.MIN_TIMING_SAMPLES == 5
+    assert failed["timing_eligible"] is True
+    assert failed["timing_status"] == "failed"
+    assert failed["timing_passed"] is False
+    assert failed["passed"] is False
+
+
+def test_measurement_retains_raw_samples_and_median_resists_one_scheduler_outlier():
+    gate_report = _load_gate_report_module()
+    samples = [0.001_001, 0.001_002, 0.050_123, 0.001_003, 0.001_004]
+
+    measurement = gate_report._measurement(
+        samples,
+        [7, 7, 7, 7, 7],
+        warmup_counts=[7],
+        warmup_iterations=1,
+    )
+    gate = gate_report._gate_summary(
+        {"record_count_stable": measurement["count_stable"]},
+        {"under_ceiling": measurement["median_seconds"] < 0.002},
+        sample_count=measurement["sample_count"],
+    )
+
+    assert measurement["samples_seconds"] == samples
+    assert measurement["median_seconds"] == 0.001_003
+    assert measurement["min_seconds"] == 0.001_001
+    assert measurement["sample_count"] == 5
+    assert measurement["warmup_iterations"] == 1
+    assert gate["timing_eligible"] is True
+    assert gate["timing_passed"] is True
+    assert gate["passed"] is True
+
+
+def test_measure_runs_one_untimed_warmup():
+    gate_report = _load_gate_report_module()
+    calls = 0
+
+    def operation() -> list[int]:
+        nonlocal calls
+        calls += 1
+        return [1]
+
+    measurement = gate_report._measure(operation, iterations=2)
+
+    assert calls == 3
+    assert measurement["sample_count"] == 2
+    assert measurement["warmup_iterations"] == 1
+    assert measurement["warmup_counts"] == [1]
+    assert measurement["warmup_matches_measured"] is True
+
+
+def test_untimed_warmup_result_mismatch_fails_cold_correctness_even_with_stable_counts():
+    gate_report = _load_gate_report_module()
+    calls = 0
+
+    def operation() -> list[int]:
+        nonlocal calls
+        calls += 1
+        return [0] if calls == 1 else [1]
+
+    measurement = gate_report._measure(operation, iterations=1)
+    gate = gate_report._gate_summary(
+        {
+            "record_count_stable": measurement["count_stable"],
+            "warmup_matches_measured": measurement["warmup_matches_measured"],
+        },
+        {"timing": True},
+        sample_count=measurement["sample_count"],
+    )
+
+    assert measurement["count_stable"] is True
+    assert measurement["warmup_matches_measured"] is False
+    assert gate["timing_eligible"] is False
+    assert gate["correctness_passed"] is False
+    assert gate["passed"] is False
+
+
 def test_mode_pass_criteria_fail_on_reconstruction_tuple_mismatch():
     gate_report = _load_gate_report_module()
 
@@ -167,6 +338,7 @@ def test_entity_cardinality_sweep_fails_when_routine_case_fails(monkeypatch):
     def dense_case(entity_count: int, _iterations: int) -> dict[str, Any]:
         return {
             "entity_count": entity_count,
+            "correctness_passed": True,
             "passed": True,
             "entity_independent": _measurement(seconds=0.001),
         }
@@ -175,6 +347,7 @@ def test_entity_cardinality_sweep_fails_when_routine_case_fails(monkeypatch):
         return {
             "entity_count": entity_count,
             "document_bytes": target_bytes,
+            "correctness_passed": entity_count != 64,
             "passed": entity_count != 64,
             "entity_independent": _measurement(seconds=0.001),
         }
@@ -183,6 +356,7 @@ def test_entity_cardinality_sweep_fails_when_routine_case_fails(monkeypatch):
         return {
             "entity_count": entity_count,
             "document_bytes": target_bytes,
+            "correctness_passed": True,
             "passed": True,
             "rust_entity_independent_compile": _measurement(seconds=0.001),
             "entity_independent": _measurement(seconds=0.001),
@@ -210,25 +384,87 @@ def test_memory_report_from_child_fails_when_isolated_probe_exceeds_budget():
     gate_report = _load_gate_report_module()
 
     report = gate_report._memory_report_from_child(
-        {
-            "status": "measured",
-            "dense_probe_bytes": 128,
-            "iterations": 1,
-            "all_overlaps_raw": _measurement(count=128),
-            "match_buffer_capacity_after_scan": 128,
-            "max_rss_kib_process_start": 10_000,
-            "max_rss_kib_before_compile": 10_000,
-            "max_rss_kib_after_compile": 11_000,
-            "max_rss_kib_after_scan": 12_500,
-            "max_rss_kib_compile_delta": 1_000,
-            "max_rss_kib_scan_delta": 1_500,
-            "max_rss_kib_growth": 2_500,
-        },
+        _memory_child_payload(),
         memory_budget_kib=2_000,
     )
 
     assert report["passed"] is False
     assert report["criteria"]["max_rss_growth_within_budget"] is False
+
+
+def test_memory_child_failure_does_not_embed_subprocess_output(monkeypatch):
+    gate_report = _load_gate_report_module()
+    secret = "private-child-diagnostic"
+
+    def failed_run(*_args, **kwargs):
+        kwargs["stdout"].write(secret.encode("utf-8"))
+        kwargs["stderr"].write(secret.encode("utf-8"))
+        return subprocess.CompletedProcess(args=["memory-child"], returncode=2)
+
+    monkeypatch.setattr(gate_report.subprocess, "run", failed_run)
+
+    report = gate_report._run_memory_child(iterations=1, dense_bytes=128)
+
+    assert report == {
+        "status": "failed",
+        "returncode": 2,
+        "error": "memory child exited nonzero",
+        "stdout_bytes": len(secret),
+        "stderr_bytes": len(secret),
+        "diagnostic_output_included": False,
+    }
+    assert secret not in json.dumps(report)
+
+
+def test_memory_child_output_is_bounded_without_loading_or_returning_content(monkeypatch):
+    gate_report = _load_gate_report_module()
+
+    def oversized_run(*_args, **kwargs):
+        kwargs["stdout"].write(b"x" * (gate_report.MAX_MEMORY_CHILD_OUTPUT_BYTES + 1))
+        return subprocess.CompletedProcess(args=["memory-child"], returncode=0)
+
+    monkeypatch.setattr(gate_report.subprocess, "run", oversized_run)
+
+    report = gate_report._run_memory_child(iterations=1, dense_bytes=128)
+
+    assert report["status"] == "failed"
+    assert report["error"] == "memory child output exceeded the byte bound"
+    assert report["stdout_bytes"] == gate_report.MAX_MEMORY_CHILD_OUTPUT_BYTES + 1
+    assert report["diagnostic_output_included"] is False
+    assert "xxx" not in json.dumps(report)
+
+
+def test_memory_child_malformed_measured_payload_fails_closed(monkeypatch):
+    gate_report = _load_gate_report_module()
+
+    def malformed_run(*_args, **kwargs):
+        kwargs["stdout"].write(b'{"status":"measured"}')
+        return subprocess.CompletedProcess(args=["memory-child"], returncode=0)
+
+    monkeypatch.setattr(gate_report.subprocess, "run", malformed_run)
+
+    report = gate_report._run_memory_child(iterations=1, dense_bytes=128)
+    summarized = gate_report._memory_report_from_child(
+        {"status": "measured"},
+        memory_budget_kib=2_000,
+    )
+
+    assert report["status"] == "failed"
+    assert report["error"] == "memory child payload has an invalid object shape"
+    assert summarized["status"] == "failed"
+    assert summarized["passed"] is False
+    assert summarized["diagnostic_output_included"] is False
+
+
+def test_gate_report_rejects_unbounded_iteration_requests():
+    gate_report = _load_gate_report_module()
+
+    with pytest.raises(ValueError, match="between 1"):
+        gate_report.gate_report(
+            iterations=gate_report.MAX_GATE_ITERATIONS + 1,
+            target_bytes=10_000,
+            dense_bytes=128,
+        )
 
 
 def test_max_rss_kib_normalizes_darwin_bytes(monkeypatch):
@@ -262,6 +498,11 @@ def test_external_required_sections_are_excluded_from_overall_pass():
 
     assert report == {
         "passed": True,
+        "correctness_passed": True,
+        "timing_eligible": False,
+        "timing_status": "not_applicable",
+        "timing_passed": None,
+        "timing_observed_passed": None,
         "included_sections": {"performance": True, "memory": True, "mode_strategy": True},
         "external_required_sections": ["conformance", "distribution"],
     }

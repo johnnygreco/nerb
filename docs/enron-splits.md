@@ -1,4 +1,4 @@
-# Enron v2 Immutable Splits
+# Enron Immutable Splits
 
 The split stage turns one committed [Enron preparation run](enron-preparation.md) into two private, immutable bundles:
 a development bundle containing train and validation data, and a separately controlled steward bundle containing the
@@ -166,7 +166,7 @@ claim and pair receipt; it never opens the test artifact and cannot authorize a 
 
 Run `verify-enron-splits` before freezing the bank, evaluator, thresholds, claims, and workload for release. Once the
 frozen target has been bound and access is claimed, treat every result as final-test evidence rather than development
-feedback. See the [Enron v2 charter](enron-benchmark.md#sealed-train-validation-and-test-policy) for the quality and
+feedback. See the [Enron charter](enron-benchmark.md#sealed-train-validation-and-test-policy) for the quality and
 promotion rules that apply after splitting.
 
 Before any release freeze, a builder may pass only the development bundle to the

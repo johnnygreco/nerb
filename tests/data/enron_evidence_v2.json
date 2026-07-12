@@ -3,7 +3,7 @@
   "charter_version": "2",
   "artifact_kind": "synthetic_fixture",
   "created_at": "2026-07-10T00:03:00Z",
-  "manifest_sha256": "sha256:9a964aec320dcf79b32e7055602249575754030bec3a9138942da4c3d5253059",
+  "manifest_sha256": "sha256:b7d6597abe90691c760dd5d3e90775dc42039bed3596787a304310e6137bc258",
   "evaluator": {
     "id": "synthetic_privacy_eval",
     "version": "2.0.0",
@@ -79,6 +79,7 @@
     "id": "synthetic_intelligence_bank",
     "canonical_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
     "artifact_sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "artifact_bytes": 3072,
     "active_entities": 3,
     "active_names": 4,
     "active_aliases": 1,
@@ -211,13 +212,13 @@
     "current_version_accessed_at": "2026-07-10T00:02:00Z",
     "frozen_target": {
       "frozen_at": "2026-07-10T00:01:00Z",
-      "manifest_sha256": "sha256:9a964aec320dcf79b32e7055602249575754030bec3a9138942da4c3d5253059",
+      "manifest_sha256": "sha256:b7d6597abe90691c760dd5d3e90775dc42039bed3596787a304310e6137bc258",
       "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
       "test_artifact_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
-      "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
+      "performance_manifest_sha256": "sha256:b6b9d663887af95c9242dd027643748e4ec55d57f152425640a912784e95bfa6",
       "git_commit": "0000000000000000000000000000000000000000"
     },
     "lineage": [
@@ -233,22 +234,22 @@
         },
         "frozen_target": {
           "frozen_at": "2026-07-10T00:01:00Z",
-          "manifest_sha256": "sha256:9a964aec320dcf79b32e7055602249575754030bec3a9138942da4c3d5253059",
+          "manifest_sha256": "sha256:b7d6597abe90691c760dd5d3e90775dc42039bed3596787a304310e6137bc258",
           "bank_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
           "evaluator_source_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
           "split_manifest_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
           "test_artifact_sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
           "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
-          "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
+          "performance_manifest_sha256": "sha256:b6b9d663887af95c9242dd027643748e4ec55d57f152425640a912784e95bfa6",
           "git_commit": "0000000000000000000000000000000000000000"
         },
         "predecessor_benchmark_version": null,
         "changes_informed_by_predecessor": [],
         "previous_entry_sha256": null,
-        "entry_sha256": "sha256:fbfd4e9302f30c6bf24ecb32b561943f55362c6bf7270ac109941291c284f738"
+      "entry_sha256": "sha256:84175474a21f037cbcdda0d760ad279f7e7782449aa3186645e16cf8713c0ea2"
       }
     ],
-    "lineage_head_sha256": "sha256:fbfd4e9302f30c6bf24ecb32b561943f55362c6bf7270ac109941291c284f738"
+    "lineage_head_sha256": "sha256:84175474a21f037cbcdda0d760ad279f7e7782449aa3186645e16cf8713c0ea2"
   },
   "performance": {
     "evaluated": true,
@@ -260,7 +261,7 @@
         "artifact": {
           "id": "synthetic_evaluated_bank_artifact",
           "sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-          "bytes": 2048
+          "bytes": 3072
         },
         "generator": null,
         "composition": {
@@ -275,7 +276,7 @@
             }
           ]
         },
-        "descriptor_sha256": "sha256:776e4f9b416a5c2c07f66faf8cf0ea3383daf3192bd45cc659f3b20f63a8f789",
+        "descriptor_sha256": "sha256:5afc3036cadad595e2456eefb5f76f02c03a9319921c330823b0db8d859a9d67",
         "active_entities": 3,
         "active_names": 4,
         "active_aliases": 1,
@@ -378,6 +379,7 @@
           "records_per_second": 4166.666666666667,
           "seconds_per_document": 0.00012
         },
+        "records_per_sample": 50,
         "rss_samples_bytes": [1048576, 1048576, 1048576, 1048576, 1048576],
         "peak_rss_bytes": 1048576
       }
@@ -386,7 +388,7 @@
     "comparisons": [],
     "breakeven_models": []
   },
-  "performance_manifest_sha256": "sha256:9adec69babfe6a9ef9dcff31102b666c375ae038620288ea2654d737d116e793",
+  "performance_manifest_sha256": "sha256:b6b9d663887af95c9242dd027643748e4ec55d57f152425640a912784e95bfa6",
   "thresholds_sha256": "sha256:3497188876fc52d49b4e215171bed07ff86a61408b6a4e7a3cb36f970ad92657",
   "promotion": {
     "passed": false,
@@ -441,7 +443,7 @@
   },
   "verifier": {
     "id": "nerb-enron-contract",
-    "version": "2.0.0",
+    "version": "2.2.0",
     "source_sha256": "sha256:abababababababababababababababababababababababababababababababab",
     "passed": false
   }

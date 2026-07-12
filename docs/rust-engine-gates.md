@@ -1,6 +1,6 @@
 # Rust Engine Gate Evidence
 
-Historical Rust engine gate evidence was recorded on 2026-06-05, then updated by the final gate follow-up after the
+Rust engine gate evidence was first recorded on 2026-06-05, then updated by the final gate follow-up after the
 Rust-backed `Bank` surface, wheel matrix, and record contract follow-ups merged. Use this file as recorded release-gate
 evidence for the current Rust-backed engine path.
 
@@ -18,6 +18,22 @@ memory, and mode strategy. Conformance and distribution are marked `external_req
 validation commands. Bank-owner cardinality is marked `external_required` unless the bank-owner entity-count flags are
 provided; with those flags, it is included in `overall.passed` as a recorded count/range signoff.
 
+Timing thresholds are eligible to gate only when an operation has at least five measured samples. The default
+`--iterations 5` command therefore remains fully timing-gated. Runs with fewer samples, including the one-iteration
+pytest smoke path, still hard-gate record equivalence, stable counts, cache behavior, mode semantics, and memory/resource
+invariants; their timing observations are explicitly marked `informational_insufficient_samples` and cannot change the
+exit status. Each operation receives one untimed warmup before measurement. Its duration is excluded, but its count and
+result are retained as cold-start correctness observations and must agree with the timed observations. Thus even a
+one-iteration smoke run checks cold versus repeated behavior instead of treating one count as vacuously stable. Reports
+retain every unrounded timing sample and use unrounded medians and derived values for gates; `correctness_passed`,
+`timing_eligible`, `timing_status`, and `timing_passed` make the distinction explicit at workload, section, and overall
+levels.
+
+Iteration requests are bounded at 1,000. The isolated memory child writes through bounded temporary output, may return
+at most 1 MiB across stdout and stderr, and must satisfy an exact request-bound result shape before the parent reads any
+measurement fields. Oversized, malformed, non-UTF-8, timed-out, or nonzero child results fail closed without embedding
+their diagnostic output in the report.
+
 Routine local target documents are 100 KB and exercise small-bank, literal-heavy, regex-heavy, mixed-bank,
 corpus-size, dense-overlap, memory, cache, projection, and output behavior.
 
@@ -27,7 +43,8 @@ Larger 1 MB evidence was recorded with:
 timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --target-bytes 1000000 --dense-bytes 512
 ```
 
-The single-iteration 1 MB report passed under the cap. A five-iteration 1 MB report is not a routine local gate.
+The single-iteration 1 MB report passed the hard correctness and resource gates, with timing recorded as informational.
+A five-iteration 1 MB report is not a routine local gate.
 
 For #73, the bank-owner target is a representative synthetic medium bank with 1,000 top-level entities. Record that
 target with:
@@ -89,18 +106,20 @@ Stage coverage:
 - `rust_entity_independent_scan_project`: Rust raw scan plus public wrapper record projection.
 - `json_output`: JSON serialization of already projected Rust records.
 
-Routine report, 5 iterations. `--target-bytes` applies to the literal-heavy, regex-heavy, mixed, and configured-size
-mixed corpus-size workloads; the small-bank floor and the corpus-size floor are intentionally fixed at 10 KB.
+Routine report, 5 iterations. All timing ceilings and floors above are hard gates at this sample count. `--target-bytes`
+applies to the literal-heavy, regex-heavy, mixed, and configured-size mixed corpus-size workloads; the small-bank floor
+and the corpus-size floor are intentionally fixed at 10 KB.
 
 The report emits one object per workload with `native_public_records_equal`, `measurements`, `criteria`, and
 `rust_scan_project_bytes_per_second`. The JSON report is the authority for exact timings.
 
-Larger 1 MB report, 1 iteration:
+Larger 1 MB report, 1 iteration (timing informational):
 
 The 1 MB report uses the same fields as the routine report.
 
-The literal-heavy, regex-heavy, and mixed gates pass independently. All preserve the public records, have stable counts,
-and stay inside the Rust timing and throughput thresholds. The small-bank floor also remains inside the checked-in floor.
+The literal-heavy, regex-heavy, and mixed cases preserve the public records and have stable counts. Their observed
+timings were inside the Rust timing and throughput thresholds, but a one-sample observation is not timing-gate evidence.
+The small-bank floor observation was also inside the checked-in floor.
 
 Routine 100 KB report, 5 iterations, final gate update:
 

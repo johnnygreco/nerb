@@ -76,6 +76,28 @@ For large corpora, treat bank construction as an evidence pipeline:
 - keep handoff artifacts reproducible and privacy-safe.
 
 The [Enron Benchmark](enron-benchmark.md), [private preparation workflow](enron-preparation.md),
-[train-only bank construction guide](enron-bank-building.md), [Autoresearch](autoresearch.md), and
+[train-only bank construction guide](enron-bank-building.md), [evaluation guide](enron-evaluation.md), and
 [large-source bank skill](https://github.com/johnnygreco/nerb/tree/main/.agents/skills/nerb-large-source-bank-building)
 document that deeper workflow.
+
+### Measure Enron cache value
+
+After a verified train/validation bank build, freeze and smoke-test the private workload before starting the long
+decision profile:
+
+```shell
+nerb prepare-enron-performance \
+  --bank-build-run .nerb/enron/bank-build \
+  --development-run .nerb/enron/development \
+  --output-dir .nerb/enron/performance-plan
+nerb run-enron-performance \
+  --prepared-run .nerb/enron/performance-plan \
+  --output-dir .nerb/enron/performance-smoke \
+  --profile smoke
+nerb verify-enron-performance --run-dir .nerb/enron/performance-smoke
+```
+
+The commands expose neither a preparation-source nor sealed-test path; profiling is confined to the verified train
+artifact. Outputs remain private and ignored; only privacy-scanned aggregate evidence is
+suitable for a later reviewed handoff. The smoke profile is non-promotable. See [Performance](performance.md#enron-intelligence-cache-workflow)
+for the decision command, measurement boundaries, scale semantics, and sample policy.

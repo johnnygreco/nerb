@@ -1,6 +1,6 @@
-# Enron v2 Privacy Evaluation
+# Enron Privacy Evaluation
 
-The v2 evaluator keeps three questions separate:
+The evaluator keeps three questions separate:
 
 1. **Catalog coverage:** how much independently labeled sensitive text the frozen bank knew.
 2. **Catalog conformance:** whether every approved active pattern is detected and mapped exactly as declared.
@@ -191,7 +191,7 @@ split role, text view, exhaustively negative documents, and any train-derived kn
 by the immutable split artifacts. CMU surface recurrence is not person-identity recurrence and must be labeled as a
 diagnostic if used. Missing identity or frequency linkage is reported as unsupported.
 
-The fixed benchmark is a finite population; v2 makes no independent-and-identically-distributed sampling claim and does
+The fixed benchmark is a finite population; it makes no independent-and-identically-distributed sampling claim and does
 not publish a binomial confidence interval. Raw support counts and promotion floors stay beside every rate.
 
 ## Catalog conformance

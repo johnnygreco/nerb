@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import platform
 import resource
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
@@ -17,6 +19,12 @@ from nerb import Bank, __version__, bank_cache_info, clear_bank_cache
 MEMORY_BUDGET_KIB = 64 * 1024
 MEMORY_ABSOLUTE_BUDGET_KIB = 256 * 1024
 MATCH_BUFFER_PRE_SCAN_CAP = 1_000_000
+MIN_TIMING_SAMPLES = 5
+UNTIMED_WARMUP_ITERATIONS = 1
+MEMORY_CHILD_TIMEOUT_SECONDS = 60
+MAX_GATE_ITERATIONS = 1_000
+MAX_MEMORY_CHILD_OUTPUT_BYTES = 1024 * 1024
+MAX_PROTOCOL_INTEGER = 2**63 - 1
 CARDINALITY_SCAN_SECONDS_CEILING = 0.01
 CARDINALITY_ROUTINE_SCAN_SECONDS_CEILING = 0.05
 DENSE_CARDINALITY_ENTITY_COUNT = 64
@@ -124,8 +132,8 @@ def gate_report(
     bank_owner_growth_entity_count: int | None = None,
     bank_owner_note: str | None = None,
 ) -> dict[str, Any]:
-    if iterations < 1:
-        raise ValueError("--iterations must be positive.")
+    if type(iterations) is not int or not 1 <= iterations <= MAX_GATE_ITERATIONS:
+        raise ValueError(f"--iterations must be between 1 and {MAX_GATE_ITERATIONS}.")
     if target_bytes < 10_000:
         raise ValueError("--target-bytes must be at least 10000.")
     if dense_bytes < 64:
@@ -203,6 +211,17 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
     mixed = _workload_report(_mixed_workload(), iterations, target_bytes)
     corpus_size = _corpus_size_report(_mixed_workload(), iterations, target_bytes)
     workloads = (small, literal, regex, mixed)
+    gate = _gate_summary(
+        {
+            **{workload["id"]: workload["correctness_passed"] for workload in workloads},
+            "corpus_size": corpus_size["correctness_passed"],
+        },
+        {
+            **{workload["id"]: workload["timing_observed_passed"] for workload in workloads},
+            "corpus_size": corpus_size["timing_observed_passed"],
+        },
+        iterations,
+    )
     return {
         "included_in_overall": True,
         "baseline_id": "rust-engine-final-gates-v1",
@@ -214,7 +233,7 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
         },
         "pass_criteria": {
             "native_public_records_equal": "Native raw-match projection and public Bank records must match exactly.",
-            "count_stable": "Repeated measured scan/project counts must be stable.",
+            "count_stable": "Untimed cold and repeated measured scan/project results and counts must be stable.",
             "cache_hit_verified": "Public Bank cache must miss cold and hit warm for the same source/options.",
             "rust_thresholds": (
                 "Each workload also enforces checked-in Rust raw-scan ceilings, Rust scan/project ceilings, and "
@@ -226,7 +245,7 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
         "regex_heavy": regex,
         "mixed": mixed,
         "corpus_size": corpus_size,
-        "passed": all(workload["passed"] for workload in workloads) and corpus_size["passed"],
+        **gate,
     }
 
 
@@ -279,6 +298,27 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
         rust_public_cache_lookup=rust_public_cache_lookup,
         thresholds=thresholds,
     )
+    gate = _gate_summary(
+        {
+            name: passed
+            for name, passed in criteria.items()
+            if name
+            not in {
+                "rust_scan_project_under_ceiling",
+                "rust_raw_scan_under_ceiling",
+                "rust_scan_project_throughput_floor",
+            }
+        },
+        {
+            name: criteria[name]
+            for name in (
+                "rust_scan_project_under_ceiling",
+                "rust_raw_scan_under_ceiling",
+                "rust_scan_project_throughput_floor",
+            )
+        },
+        iterations,
+    )
     return {
         "id": workload["id"],
         "pattern_count": _pattern_count(pattern_config),
@@ -317,7 +357,7 @@ def _workload_report(workload: dict[str, Any], iterations: int, target_bytes: in
             len(text_bytes),
             rust_entity_scan_project["median_seconds"],
         ),
-        "passed": all(criteria.values()),
+        **gate,
     }
 
 
@@ -339,13 +379,18 @@ def _corpus_size_report(workload: dict[str, Any], iterations: int, target_bytes:
         )
         for size in sizes
     ]
+    gate = _gate_summary(
+        {str(case["text_bytes"]): case["correctness_passed"] for case in cases},
+        {str(case["text_bytes"]): case["timing_observed_passed"] for case in cases},
+        iterations,
+    )
     return {
         "description": "Mixed-bank corpus-size scaling over the routine target document sizes.",
         "workload_id": workload["id"],
         "text_bytes": [case["text_bytes"] for case in cases],
         "thresholds": CORPUS_SIZE_THRESHOLDS,
         "cases": cases,
-        "passed": all(case["passed"] for case in cases),
+        **gate,
     }
 
 
@@ -364,18 +409,30 @@ def _corpus_size_case(
     bytes_per_second = _bytes_per_second(len(text_bytes), scan_project["median_seconds"])
     criteria = {
         "rust_raw_scan_count_stable": raw_scan["count_stable"] is True,
+        "rust_raw_scan_warmup_matches_measured": raw_scan["warmup_matches_measured"] is True,
         "rust_scan_project_count_stable": scan_project["count_stable"] is True,
+        "rust_scan_project_warmup_matches_measured": scan_project["warmup_matches_measured"] is True,
         "rust_scan_project_throughput_floor": (
             bytes_per_second >= CORPUS_SIZE_THRESHOLDS["rust_scan_project_bytes_per_second_floor"]
         ),
     }
+    gate = _gate_summary(
+        {
+            "rust_raw_scan_count_stable": criteria["rust_raw_scan_count_stable"],
+            "rust_raw_scan_warmup_matches_measured": criteria["rust_raw_scan_warmup_matches_measured"],
+            "rust_scan_project_count_stable": criteria["rust_scan_project_count_stable"],
+            "rust_scan_project_warmup_matches_measured": criteria["rust_scan_project_warmup_matches_measured"],
+        },
+        {"rust_scan_project_throughput_floor": criteria["rust_scan_project_throughput_floor"]},
+        iterations,
+    )
     return {
         "text_bytes": len(text_bytes),
         "rust_entity_independent_scan_raw": raw_scan,
         "rust_entity_independent_scan_project": scan_project,
         "rust_scan_project_bytes_per_second": bytes_per_second,
         "criteria": criteria,
-        "passed": all(criteria.values()),
+        **gate,
     }
 
 
@@ -415,6 +472,14 @@ def _mode_strategy_report(iterations: int, dense_bytes: int, target_bytes: int) 
         metadata=metadata,
     )
     cardinality_sweep = _entity_cardinality_sweep(iterations, target_bytes)
+    gate = _gate_summary(
+        {
+            **criteria,
+            "entity_cardinality_sweep": cardinality_sweep["correctness_passed"],
+        },
+        {"entity_cardinality_sweep": cardinality_sweep["timing_observed_passed"]},
+        iterations,
+    )
 
     return {
         "included_in_overall": True,
@@ -440,7 +505,7 @@ def _mode_strategy_report(iterations: int, dense_bytes: int, target_bytes: int) 
         "metadata": metadata,
         "entity_cardinality_sweep": cardinality_sweep,
         "criteria": criteria,
-        "passed": all(criteria.values()) and cardinality_sweep["passed"],
+        **gate,
     }
 
 
@@ -455,8 +520,8 @@ def _memory_report(
 
 
 def _memory_child_report(iterations: int, dense_bytes: int) -> dict[str, Any]:
-    if iterations < 1:
-        raise ValueError("--iterations must be positive.")
+    if type(iterations) is not int or not 1 <= iterations <= MAX_GATE_ITERATIONS:
+        raise ValueError(f"--iterations must be between 1 and {MAX_GATE_ITERATIONS}.")
     if dense_bytes < 64:
         raise ValueError("--dense-bytes must be at least 64.")
     process_start = _max_rss_kib()
@@ -492,17 +557,37 @@ def _memory_report_from_child(
     memory_budget_kib: int,
     memory_absolute_budget_kib: int = MEMORY_ABSOLUTE_BUDGET_KIB,
 ) -> dict[str, Any]:
-    if child.get("status") != "measured":
+    validation_error = None
+    if child.get("status") == "measured":
+        child_iterations = child.get("iterations")
+        child_dense_bytes = child.get("dense_probe_bytes")
+        if (
+            type(child_iterations) is not int
+            or not 0 <= child_iterations <= MAX_PROTOCOL_INTEGER
+            or type(child_dense_bytes) is not int
+            or not 0 <= child_dense_bytes <= MAX_PROTOCOL_INTEGER
+        ):
+            validation_error = "memory child payload contains invalid request metadata"
+        else:
+            validation_error = _memory_child_payload_error(
+                child,
+                iterations=child_iterations,
+                dense_bytes=child_dense_bytes,
+            )
+    if child.get("status") != "measured" or validation_error is not None:
         return {
             "included_in_overall": True,
-            "status": child.get("status", "failed"),
+            "status": "failed",
+            "error": validation_error or "memory child did not return a measured payload",
+            "correctness_passed": False,
             "passed": False,
             "memory_budget_kib": memory_budget_kib,
             "memory_absolute_budget_kib": memory_absolute_budget_kib,
-            "child": dict(child),
+            "diagnostic_output_included": False,
             "criteria": {
                 "child_probe_measured": False,
                 "raw_match_count_stable": False,
+                "raw_warmup_matches_measured": False,
                 "raw_match_count_under_cap": False,
                 "match_buffer_capacity_under_cap": False,
                 "max_rss_growth_within_budget": False,
@@ -514,11 +599,13 @@ def _memory_report_from_child(
     criteria = {
         "child_probe_measured": True,
         "raw_match_count_stable": raw["count_stable"] is True,
+        "raw_warmup_matches_measured": raw["warmup_matches_measured"] is True,
         "raw_match_count_under_cap": raw["count"] < MATCH_BUFFER_PRE_SCAN_CAP,
         "match_buffer_capacity_under_cap": child["match_buffer_capacity_after_scan"] <= MATCH_BUFFER_PRE_SCAN_CAP,
         "max_rss_growth_within_budget": child["max_rss_kib_growth"] <= memory_budget_kib,
         "max_rss_absolute_within_budget": child["max_rss_kib_after_scan"] <= memory_absolute_budget_kib,
     }
+    correctness_passed = all(criteria.values())
     return {
         "included_in_overall": True,
         "status": "measured",
@@ -538,7 +625,8 @@ def _memory_report_from_child(
         "max_rss_kib_scan_delta": child["max_rss_kib_scan_delta"],
         "max_rss_kib_growth": child["max_rss_kib_growth"],
         "criteria": criteria,
-        "passed": all(criteria.values()),
+        "correctness_passed": correctness_passed,
+        "passed": correctness_passed,
     }
 
 
@@ -692,10 +780,21 @@ def _workload_pass_criteria(
     return {
         "native_public_records_equal": native_public_records_equal,
         "rust_native_scan_project_count_stable": rust_native_scan_project["count_stable"] is True,
+        "rust_native_scan_project_warmup_matches_measured": (
+            rust_native_scan_project["warmup_matches_measured"] is True
+        ),
         "rust_entity_scan_raw_count_stable": rust_entity_scan["count_stable"] is True,
+        "rust_entity_scan_raw_warmup_matches_measured": rust_entity_scan["warmup_matches_measured"] is True,
         "rust_entity_scan_project_count_stable": rust_entity_scan_project["count_stable"] is True,
+        "rust_entity_scan_project_warmup_matches_measured": (
+            rust_entity_scan_project["warmup_matches_measured"] is True
+        ),
         "rust_all_overlaps_scan_raw_count_stable": rust_all_overlaps_scan["count_stable"] is True,
+        "rust_all_overlaps_scan_raw_warmup_matches_measured": (
+            rust_all_overlaps_scan["warmup_matches_measured"] is True
+        ),
         "rust_global_leftmost_scan_raw_count_stable": rust_global_scan["count_stable"] is True,
+        "rust_global_leftmost_scan_raw_warmup_matches_measured": (rust_global_scan["warmup_matches_measured"] is True),
         "cache_hit_verified": rust_public_cache_lookup["cache_hit_verified"] is True,
         "rust_scan_project_under_ceiling": (
             rust_entity_scan_project["median_seconds"] <= thresholds["rust_scan_project_seconds_ceiling"]
@@ -722,9 +821,13 @@ def _mode_pass_criteria(
 ) -> dict[str, bool]:
     return {
         "entity_count_stable": entity["count_stable"] is True,
+        "entity_warmup_matches_measured": entity["warmup_matches_measured"] is True,
         "all_overlaps_raw_count_stable": raw["count_stable"] is True,
+        "all_overlaps_raw_warmup_matches_measured": raw["warmup_matches_measured"] is True,
         "all_overlaps_reconstructed_count_stable": reconstructed["count_stable"] is True,
+        "all_overlaps_reconstructed_warmup_matches_measured": reconstructed["warmup_matches_measured"] is True,
         "global_leftmost_count_stable": global_leftmost["count_stable"] is True,
+        "global_leftmost_warmup_matches_measured": global_leftmost["warmup_matches_measured"] is True,
         "all_overlaps_raw_amplifies_entity_independent": raw["count"] > entity["count"],
         "all_overlaps_reconstructs_exact_default_tuples": reconstructed_tuples == entity_tuples,
         "global_leftmost_drops_cross_entity_matches": 0 < global_leftmost["count"] < entity["count"],
@@ -806,6 +909,13 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
             and medium_to_routine_max_seconds_ratio <= MEDIUM_BANK_TO_ROUTINE_MAX_RATIO_CEILING
         ),
     }
+    correctness_criteria = {
+        "dense_cases": all(case["correctness_passed"] for case in cases),
+        "routine_size_cases": all(case["correctness_passed"] for case in routine_cases),
+        "medium_bank_baseline_case": medium_bank_baseline_case["correctness_passed"],
+        "medium_bank_case": medium_bank_case["correctness_passed"],
+    }
+    gate = _gate_summary(correctness_criteria, performance_criteria, iterations)
     return {
         "description": (
             "Synthetic cardinality evidence. Dense cases use 8 prefix detectors per entity over 256 bytes through the "
@@ -836,13 +946,7 @@ def _entity_cardinality_sweep(iterations: int, target_bytes: int) -> dict[str, A
         "routine_size_cases": routine_cases,
         "medium_bank_baseline_case": medium_bank_baseline_case,
         "medium_bank_case": medium_bank_case,
-        "passed": (
-            all(case["passed"] for case in cases)
-            and all(case["passed"] for case in routine_cases)
-            and medium_bank_baseline_case["passed"]
-            and medium_bank_case["passed"]
-            and all(performance_criteria.values())
-        ),
+        **gate,
     }
 
 
@@ -880,6 +984,7 @@ def _entity_cardinality_case(entity_count: int, iterations: int) -> dict[str, An
         reconstructed_tuples=reconstructed_tuples,
         metadata=metadata,
     )
+    correctness_passed = all(criteria.values())
     return {
         "entity_count": entity_count,
         "workload": "dense_prefix",
@@ -892,7 +997,8 @@ def _entity_cardinality_case(entity_count: int, iterations: int) -> dict[str, An
         "raw_to_entity_count_ratio": _ratio(raw["count"], entity["count"]),
         "global_to_entity_count_ratio": _ratio(global_leftmost["count"], entity["count"]),
         "criteria": criteria,
-        "passed": all(criteria.values()),
+        "correctness_passed": correctness_passed,
+        "passed": correctness_passed,
     }
 
 
@@ -901,6 +1007,7 @@ def _entity_cardinality_routine_case(entity_count: int, iterations: int, target_
     native_engine = importlib.import_module("nerb._engine")
     default_bank = native_engine.Bank.from_source_bytes(source, format_hint="jsonl")
     entity = _measure_raw(lambda: default_bank.scan_bytes(haystack), iterations)
+    correctness_passed = entity["count_stable"] is True and entity["warmup_matches_measured"] is True
     return {
         "entity_count": entity_count,
         "workload": "routine_size_sparse_no_match",
@@ -908,9 +1015,10 @@ def _entity_cardinality_routine_case(entity_count: int, iterations: int, target_
         "document_bytes": len(haystack),
         "entity_independent": entity,
         "criteria": {
-            "entity_count_stable": entity["count_stable"] is True,
+            "entity_count_stable": correctness_passed,
         },
-        "passed": entity["count_stable"] is True,
+        "correctness_passed": correctness_passed,
+        "passed": correctness_passed,
     }
 
 
@@ -933,7 +1041,9 @@ def _medium_bank_cardinality_case(entity_count: int, iterations: int, target_byt
     bytes_per_second = _bytes_per_second(len(haystack), scan_project["median_seconds"])
     criteria = {
         "entity_count_stable": entity["count_stable"] is True,
+        "entity_warmup_matches_measured": entity["warmup_matches_measured"] is True,
         "scan_project_count_stable": scan_project["count_stable"] is True,
+        "scan_project_warmup_matches_measured": scan_project["warmup_matches_measured"] is True,
         "compile_seconds_under_ceiling": compile_seconds["median_seconds"]
         <= MEDIUM_BANK_THRESHOLDS["compile_seconds_ceiling"],
         "rust_raw_scan_seconds_under_ceiling": entity["median_seconds"]
@@ -944,6 +1054,24 @@ def _medium_bank_cardinality_case(entity_count: int, iterations: int, target_byt
             bytes_per_second >= MEDIUM_BANK_THRESHOLDS["rust_scan_project_bytes_per_second_floor"]
         ),
     }
+    gate = _gate_summary(
+        {
+            "entity_count_stable": criteria["entity_count_stable"],
+            "entity_warmup_matches_measured": criteria["entity_warmup_matches_measured"],
+            "scan_project_count_stable": criteria["scan_project_count_stable"],
+            "scan_project_warmup_matches_measured": criteria["scan_project_warmup_matches_measured"],
+        },
+        {
+            name: criteria[name]
+            for name in (
+                "compile_seconds_under_ceiling",
+                "rust_raw_scan_seconds_under_ceiling",
+                "rust_scan_project_seconds_under_ceiling",
+                "rust_scan_project_throughput_floor",
+            )
+        },
+        iterations,
+    )
     return {
         "entity_count": entity_count,
         "workload": "medium_bank_sparse_no_match",
@@ -957,7 +1085,7 @@ def _medium_bank_cardinality_case(entity_count: int, iterations: int, target_byt
         "rust_scan_project_bytes_per_second": bytes_per_second,
         "thresholds": MEDIUM_BANK_THRESHOLDS,
         "criteria": criteria,
-        "passed": all(criteria.values()),
+        **gate,
     }
 
 
@@ -970,10 +1098,14 @@ def _measure_public_bank_cache_lookup(source: bytes, iterations: int) -> dict[st
     warm = _measure_seconds(lambda: Bank.from_source_bytes(source, format_hint="jsonl", use_cache=True), iterations)
     info = bank_cache_info()
     return {
-        "cold_seconds": round(cold_seconds, 6),
+        "cold_seconds": cold_seconds,
         "warm_cache_lookup": warm,
         "cache_info": info,
-        "cache_hit_verified": cold_cache["hit"] is False and info["misses"] == 1 and info["hits"] >= iterations,
+        "cache_hit_verified": (
+            cold_cache["hit"] is False
+            and info["misses"] == 1
+            and info["hits"] >= iterations + UNTIMED_WARMUP_ITERATIONS
+        ),
     }
 
 
@@ -982,6 +1114,13 @@ def _parse_jsonl_source(source: bytes) -> list[dict[str, Any]]:
 
 
 def _run_memory_child(iterations: int, dense_bytes: int) -> dict[str, Any]:
+    if type(iterations) is not int or not 1 <= iterations <= MAX_GATE_ITERATIONS:
+        return _memory_child_failure(
+            returncode=None,
+            error="memory child request exceeds the iteration bound",
+            stdout_bytes=0,
+            stderr_bytes=0,
+        )
     command = [
         sys.executable,
         __file__,
@@ -991,65 +1130,251 @@ def _run_memory_child(iterations: int, dense_bytes: int) -> dict[str, Any]:
         "--dense-bytes",
         str(dense_bytes),
     ]
-    completed = subprocess.run(command, capture_output=True, check=False, text=True)
-    if completed.returncode != 0:
-        return {
-            "status": "failed",
-            "command": " ".join(command),
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-        }
     try:
-        parsed = json.loads(completed.stdout)
-    except json.JSONDecodeError as error:
+        with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(mode="w+b") as stderr_file:
+            completed = subprocess.run(
+                command,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                check=False,
+                timeout=MEMORY_CHILD_TIMEOUT_SECONDS,
+            )
+            stdout_bytes = stdout_file.tell()
+            stderr_bytes = stderr_file.tell()
+            if stdout_bytes + stderr_bytes > MAX_MEMORY_CHILD_OUTPUT_BYTES:
+                return _memory_child_failure(
+                    returncode=completed.returncode,
+                    error="memory child output exceeded the byte bound",
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
+                )
+            stdout_file.seek(0)
+            stdout_payload = stdout_file.read()
+    except subprocess.TimeoutExpired:
         return {
             "status": "failed",
-            "command": " ".join(command),
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "error": str(error),
+            "error": "memory child timed out",
+            "timeout_seconds": MEMORY_CHILD_TIMEOUT_SECONDS,
+            "diagnostic_output_included": False,
         }
-    if not isinstance(parsed, dict):
-        return {
-            "status": "failed",
-            "command": " ".join(command),
-            "returncode": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "error": "memory child did not emit a JSON object",
-        }
-    parsed["command"] = " ".join(command)
+    if completed.returncode != 0:
+        return _memory_child_failure(
+            returncode=completed.returncode,
+            error="memory child exited nonzero",
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+        )
+    try:
+        parsed = json.loads(stdout_payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _memory_child_failure(
+            returncode=completed.returncode,
+            error="memory child emitted invalid JSON",
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+        )
+    validation_error = _memory_child_payload_error(parsed, iterations=iterations, dense_bytes=dense_bytes)
+    if validation_error is not None:
+        return _memory_child_failure(
+            returncode=completed.returncode,
+            error=validation_error,
+            stdout_bytes=stdout_bytes,
+            stderr_bytes=stderr_bytes,
+        )
     return parsed
 
 
-def _overall_report(sections: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
-    included = {
-        name: section["passed"]
-        for name, section in sections.items()
-        if section.get("included_in_overall", True) is True
+def _memory_child_failure(
+    *,
+    returncode: int | None,
+    error: str,
+    stdout_bytes: int,
+    stderr_bytes: int,
+) -> dict[str, Any]:
+    return {
+        "status": "failed",
+        "returncode": returncode,
+        "error": error,
+        "stdout_bytes": stdout_bytes,
+        "stderr_bytes": stderr_bytes,
+        "diagnostic_output_included": False,
     }
+
+
+def _memory_child_payload_error(value: Any, *, iterations: int, dense_bytes: int) -> str | None:
+    expected_fields = {
+        "status",
+        "dense_probe_bytes",
+        "iterations",
+        "all_overlaps_raw",
+        "match_buffer_capacity_after_scan",
+        "max_rss_kib_process_start",
+        "max_rss_kib_before_compile",
+        "max_rss_kib_after_compile",
+        "max_rss_kib_after_scan",
+        "max_rss_kib_compile_delta",
+        "max_rss_kib_scan_delta",
+        "max_rss_kib_growth",
+    }
+    if type(value) is not dict or set(value) != expected_fields:
+        return "memory child payload has an invalid object shape"
+    if value["status"] != "measured" or value["iterations"] != iterations or value["dense_probe_bytes"] != dense_bytes:
+        return "memory child payload does not match its bounded request"
+    if not all(
+        _is_bounded_protocol_integer(value[field])
+        for field in expected_fields
+        - {
+            "status",
+            "all_overlaps_raw",
+        }
+    ):
+        return "memory child payload contains an invalid bounded integer"
+
+    measurement = value["all_overlaps_raw"]
+    expected_measurement_fields = {
+        "count",
+        "counts",
+        "count_stable",
+        "warmup_counts",
+        "warmup_matches_measured",
+        "samples_seconds",
+        "sample_count",
+        "warmup_iterations",
+        "median_seconds",
+        "min_seconds",
+    }
+    if type(measurement) is not dict or set(measurement) != expected_measurement_fields:
+        return "memory child measurement has an invalid object shape"
+    counts = measurement["counts"]
+    warmup_counts = measurement["warmup_counts"]
+    samples = measurement["samples_seconds"]
+    if (
+        type(counts) is not list
+        or len(counts) != iterations
+        or not all(_is_bounded_protocol_integer(item) for item in counts)
+        or type(warmup_counts) is not list
+        or len(warmup_counts) != UNTIMED_WARMUP_ITERATIONS
+        or not all(_is_bounded_protocol_integer(item) for item in warmup_counts)
+        or type(samples) is not list
+        or len(samples) != iterations
+        or not all(_is_bounded_protocol_seconds(item) for item in samples)
+    ):
+        return "memory child measurement contains invalid bounded samples"
+    if (
+        measurement["count"] != counts[0]
+        or type(measurement["count_stable"]) is not bool
+        or measurement["count_stable"] != (len(set([*warmup_counts, *counts])) == 1)
+        or type(measurement["warmup_matches_measured"]) is not bool
+        or measurement["sample_count"] != iterations
+        or measurement["warmup_iterations"] != UNTIMED_WARMUP_ITERATIONS
+        or not _same_protocol_float(measurement["median_seconds"], statistics.median(samples))
+        or not _same_protocol_float(measurement["min_seconds"], min(samples))
+    ):
+        return "memory child measurement statistics are inconsistent"
+
+    process_start = value["max_rss_kib_process_start"]
+    before_compile = value["max_rss_kib_before_compile"]
+    after_compile = value["max_rss_kib_after_compile"]
+    after_scan = value["max_rss_kib_after_scan"]
+    if not process_start <= before_compile <= after_compile <= after_scan:
+        return "memory child RSS samples are not monotonic"
+    if (
+        value["max_rss_kib_compile_delta"] != after_compile - before_compile
+        or value["max_rss_kib_scan_delta"] != after_scan - after_compile
+        or value["max_rss_kib_growth"] != after_scan - process_start
+    ):
+        return "memory child RSS deltas are inconsistent"
+    return None
+
+
+def _is_bounded_protocol_integer(value: Any) -> bool:
+    return type(value) is int and 0 <= value <= MAX_PROTOCOL_INTEGER
+
+
+def _is_bounded_protocol_seconds(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= MEMORY_CHILD_TIMEOUT_SECONDS
+
+
+def _same_protocol_float(actual: Any, expected: float) -> bool:
+    return _is_bounded_protocol_seconds(actual) and math.isclose(float(actual), expected, rel_tol=1e-12, abs_tol=1e-15)
+
+
+def _overall_report(sections: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    included_sections = {
+        name: section for name, section in sections.items() if section.get("included_in_overall", True) is True
+    }
+    included = {name: section["passed"] for name, section in included_sections.items()}
     external_required = [
         name for name, section in sections.items() if section.get("included_in_overall", True) is False
     ]
+    timing_sections = {name: section for name, section in included_sections.items() if "timing_eligible" in section}
+    correctness_passed = all(
+        section.get("correctness_passed", section["passed"]) is True for section in included_sections.values()
+    )
+    if not timing_sections:
+        timing_eligible = False
+        timing_status = "not_applicable"
+        timing_passed = None
+        timing_observed_passed = None
+    elif all(section["timing_eligible"] is True for section in timing_sections.values()):
+        timing_eligible = True
+        timing_passed = all(section["timing_passed"] is True for section in timing_sections.values())
+        timing_observed_passed = timing_passed
+        timing_status = "passed" if timing_passed else "failed"
+    else:
+        timing_eligible = False
+        timing_passed = None
+        timing_observed_passed = all(section["timing_observed_passed"] is True for section in timing_sections.values())
+        timing_status = "informational_insufficient_samples"
     return {
         "passed": all(passed is True for passed in included.values()),
+        "correctness_passed": correctness_passed,
+        "timing_eligible": timing_eligible,
+        "timing_status": timing_status,
+        "timing_passed": timing_passed,
+        "timing_observed_passed": timing_observed_passed,
         "included_sections": included,
         "external_required_sections": external_required,
+    }
+
+
+def _gate_summary(
+    correctness_criteria: Mapping[str, bool],
+    timing_criteria: Mapping[str, bool],
+    sample_count: int,
+) -> dict[str, Any]:
+    correctness_passed = all(passed is True for passed in correctness_criteria.values())
+    timing_observed_passed = all(passed is True for passed in timing_criteria.values())
+    timing_eligible = sample_count >= MIN_TIMING_SAMPLES
+    timing_passed = timing_observed_passed if timing_eligible else None
+    if timing_eligible:
+        timing_status = "passed" if timing_observed_passed else "failed"
+    else:
+        timing_status = "informational_insufficient_samples"
+    return {
+        "correctness_criteria": dict(correctness_criteria),
+        "timing_criteria": dict(timing_criteria),
+        "correctness_passed": correctness_passed,
+        "timing_sample_count": sample_count,
+        "minimum_timing_samples": MIN_TIMING_SAMPLES,
+        "timing_eligible": timing_eligible,
+        "timing_status": timing_status,
+        "timing_passed": timing_passed,
+        "timing_observed_passed": timing_observed_passed,
+        "passed": correctness_passed and (timing_observed_passed if timing_eligible else True),
     }
 
 
 def _ratio(numerator: float, denominator: float) -> float | None:
     if denominator == 0:
         return None
-    return round(numerator / denominator, 3)
+    return numerator / denominator
 
 
 def _bytes_per_second(byte_count: int, seconds: float) -> float:
     if seconds <= 0:
         return float("inf")
-    return round(byte_count / seconds, 3)
+    return byte_count / seconds
 
 
 def _repeat_to_size(seed: str, target_bytes: int) -> str:
@@ -1141,29 +1466,55 @@ def _sparse_cardinality_source(document_bytes: int, *, entity_count: int, patter
 
 
 def _measure(operation: Callable[[], Any], iterations: int) -> dict[str, Any]:
+    warmup_results = _warm_up(operation)
+    warmup_counts = [_result_count(result) for result in warmup_results]
+    reference_result = warmup_results[-1]
     seconds = []
     counts = []
+    warmup_matches_measured = True
     for _ in range(iterations):
         start = time.perf_counter()
         result = operation()
         seconds.append(time.perf_counter() - start)
-        counts.append(result if isinstance(result, int) else len(result))
-    return _measurement(seconds, counts)
+        counts.append(_result_count(result))
+        warmup_matches_measured = warmup_matches_measured and result == reference_result
+    return _measurement(
+        seconds,
+        counts,
+        warmup_counts=warmup_counts,
+        warmup_matches_measured=warmup_matches_measured,
+        warmup_iterations=UNTIMED_WARMUP_ITERATIONS,
+    )
 
 
 def _measure_with_result(operation: Callable[[], Any], iterations: int) -> tuple[dict[str, Any], Any]:
+    warmup_results = _warm_up(operation)
+    warmup_counts = [_result_count(result) for result in warmup_results]
+    reference_result = warmup_results[-1]
     seconds = []
     counts = []
     last_result = None
+    warmup_matches_measured = True
     for _ in range(iterations):
         start = time.perf_counter()
         last_result = operation()
         seconds.append(time.perf_counter() - start)
-        counts.append(last_result if isinstance(last_result, int) else len(last_result))
-    return _measurement(seconds, counts), last_result
+        counts.append(_result_count(last_result))
+        warmup_matches_measured = warmup_matches_measured and last_result == reference_result
+    return (
+        _measurement(
+            seconds,
+            counts,
+            warmup_counts=warmup_counts,
+            warmup_matches_measured=warmup_matches_measured,
+            warmup_iterations=UNTIMED_WARMUP_ITERATIONS,
+        ),
+        last_result,
+    )
 
 
 def _measure_seconds(operation: Callable[[], Any], iterations: int) -> dict[str, Any]:
+    _warm_up(operation)
     seconds = []
     for _ in range(iterations):
         start = time.perf_counter()
@@ -1171,42 +1522,93 @@ def _measure_seconds(operation: Callable[[], Any], iterations: int) -> dict[str,
         seconds.append(time.perf_counter() - start)
     second_values = list(seconds)
     return {
-        "median_seconds": round(statistics.median(second_values), 6),
-        "min_seconds": round(min(second_values), 6),
+        "samples_seconds": second_values,
+        "sample_count": len(second_values),
+        "warmup_iterations": UNTIMED_WARMUP_ITERATIONS,
+        "median_seconds": statistics.median(second_values),
+        "min_seconds": min(second_values),
     }
 
 
 def _measure_raw(operation: Callable[[], Any], iterations: int) -> dict[str, Any]:
+    warmup_buffers = _warm_up(operation)
+    warmup_counts = [len(buffer) for buffer in warmup_buffers]
+    reference_tuples = _raw_tuples(warmup_buffers[-1])
     seconds = []
     counts = []
+    warmup_matches_measured = True
     for _ in range(iterations):
         start = time.perf_counter()
         buffer = operation()
         seconds.append(time.perf_counter() - start)
         counts.append(len(buffer))
-    return _measurement(seconds, counts)
+        warmup_matches_measured = warmup_matches_measured and _raw_tuples(buffer) == reference_tuples
+    return _measurement(
+        seconds,
+        counts,
+        warmup_counts=warmup_counts,
+        warmup_matches_measured=warmup_matches_measured,
+        warmup_iterations=UNTIMED_WARMUP_ITERATIONS,
+    )
 
 
 def _measure_raw_with_capacity(operation: Callable[[], Any], iterations: int) -> tuple[dict[str, Any], int]:
+    warmup_buffers = _warm_up(operation)
+    warmup_counts = [len(buffer) for buffer in warmup_buffers]
+    reference_tuples = _raw_tuples(warmup_buffers[-1])
     seconds = []
     counts = []
-    last_capacity = 0
+    max_capacity = max(int(buffer.capacity()) for buffer in warmup_buffers)
+    warmup_matches_measured = True
     for _ in range(iterations):
         start = time.perf_counter()
         buffer = operation()
         seconds.append(time.perf_counter() - start)
         counts.append(len(buffer))
-        last_capacity = int(buffer.capacity())
-    return _measurement(seconds, counts), last_capacity
+        max_capacity = max(max_capacity, int(buffer.capacity()))
+        warmup_matches_measured = warmup_matches_measured and _raw_tuples(buffer) == reference_tuples
+    return (
+        _measurement(
+            seconds,
+            counts,
+            warmup_counts=warmup_counts,
+            warmup_matches_measured=warmup_matches_measured,
+            warmup_iterations=UNTIMED_WARMUP_ITERATIONS,
+        ),
+        max_capacity,
+    )
 
 
-def _measurement(seconds: Iterable[float], counts: list[int]) -> dict[str, Any]:
+def _warm_up(operation: Callable[[], Any]) -> list[Any]:
+    return [operation() for _ in range(UNTIMED_WARMUP_ITERATIONS)]
+
+
+def _result_count(result: Any) -> int:
+    return result if isinstance(result, int) else len(result)
+
+
+def _measurement(
+    seconds: Iterable[float],
+    counts: list[int],
+    *,
+    warmup_counts: Iterable[int] = (),
+    warmup_matches_measured: bool = True,
+    warmup_iterations: int = 0,
+) -> dict[str, Any]:
     second_values = list(seconds)
+    warmup_count_values = list(warmup_counts)
+    correctness_counts = [*warmup_count_values, *counts]
     return {
         "count": counts[0],
-        "count_stable": len(set(counts)) == 1,
-        "median_seconds": round(statistics.median(second_values), 6),
-        "min_seconds": round(min(second_values), 6),
+        "counts": list(counts),
+        "count_stable": len(set(correctness_counts)) == 1,
+        "warmup_counts": warmup_count_values,
+        "warmup_matches_measured": warmup_matches_measured,
+        "samples_seconds": second_values,
+        "sample_count": len(second_values),
+        "warmup_iterations": warmup_iterations,
+        "median_seconds": statistics.median(second_values),
+        "min_seconds": min(second_values),
     }
 
 

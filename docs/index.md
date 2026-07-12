@@ -24,11 +24,12 @@ nerb extract-text \
 [Quickstart](quickstart.md){ .md-button .md-button--primary }
 [Schema](schemas.md){ .md-button }
 [Performance](performance.md){ .md-button }
-[Enron v2 charter](enron-benchmark.md){ .md-button }
-[Prepare Enron v2](enron-preparation.md){ .md-button }
-[Split Enron v2](enron-splits.md){ .md-button }
-[Build an Enron v2 bank](enron-bank-building.md){ .md-button }
-[Evaluate Enron v2](enron-evaluation.md){ .md-button }
+[Enron charter](enron-benchmark.md){ .md-button }
+[Prepare Enron](enron-preparation.md){ .md-button }
+[Split Enron](enron-splits.md){ .md-button }
+[Build an Enron bank](enron-bank-building.md){ .md-button }
+[Evaluate Enron](enron-evaluation.md){ .md-button }
+[Measure Enron performance](performance.md#enron-intelligence-cache-workflow){ .md-button }
 </p>
 
 </div>
@@ -47,13 +48,12 @@ so privacy evidence must report open-world recall and misses separately from cat
 
 !!! warning "Enron evidence is not yet promotable"
 
-    The privacy-first Enron benchmark v2 contract, private preparation, immutable splits, independent quality executor,
-    train-only [bank construction](enron-bank-building.md), and catalog-conformance gate are implemented. A development
-    bank card remains non-promotable until the frozen one-shot sealed-test, privacy-verification, performance, and
-    lineage gates are completed. Historical v1 quality, autoresearch, and performance artifacts do not meet the v2
-    contract and do not support current public claims. See the [v2 charter](enron-benchmark.md),
-    [preparation guide](enron-preparation.md), [split guide](enron-splits.md), and
-    [evaluation guide](enron-evaluation.md).
+    The privacy-first Enron contract, private preparation, immutable splits, independent quality executor, train-only
+    [bank construction](enron-bank-building.md), catalog-conformance gate, and deep-verified
+    [decision performance result](performance.md#decision-grade-development-result) are implemented. The development
+    bank card remains non-promotable until the mandatory full-source streaming/resource proof, frozen one-shot sealed
+    evaluation, privacy verification, and final lineage gates are complete. See the [charter](enron-benchmark.md),
+    [preparation guide](enron-preparation.md), [split guide](enron-splits.md), and [evaluation guide](enron-evaluation.md).
 
 ## Why Teams Use NERB
 
@@ -185,7 +185,7 @@ NERB returns deterministic JSON records:
 : Read the JSON bank, extraction record, eval, replacement DB, and diagnostic contracts.
 
 [Performance](performance.md)
-: Reproduce the Rust-backed gate evidence and understand cache, compile, and scan behavior.
+: Reproduce Rust-backed gates and run the private Enron compile-once/cache-value workflow.
 </div>
 
 ## When NERB Fits

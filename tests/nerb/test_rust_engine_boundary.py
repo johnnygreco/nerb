@@ -72,6 +72,18 @@ def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
     )
 
 
+def test_native_bank_projects_one_detector_metadata_record_by_index(engine):
+    bank = engine.Bank.from_source_bytes(
+        b'{"CODE":{"Alpha":"A"},"ARTIST":{"Pink Floyd":"Pink\\\\s+Floyd"}}',
+        format_hint="json",
+    )
+
+    assert bank.detector_metadata(0) == ("ARTIST", "Pink Floyd", "Pink Floyd")
+    assert bank.detector_metadata(1) == ("CODE", "Alpha", "Alpha")
+    with pytest.raises(IndexError, match="detector index 2 out of range"):
+        bank.detector_metadata(2)
+
+
 def test_native_match_buffer_supports_capacity_len_indexing_and_clear(engine):
     buffer = importlib.import_module("nerb._engine").MatchBuffer(capacity=4)
 

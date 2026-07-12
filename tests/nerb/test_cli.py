@@ -199,6 +199,9 @@ def test_help_shows_command_structure():
         "verify-enron-annotations",
         "build-enron-bank",
         "verify-enron-bank-build",
+        "prepare-enron-performance",
+        "run-enron-performance",
+        "verify-enron-performance",
         "eval-enron-quality",
         "eval-enron-cmu-train",
         "eval-enron-conformance",
@@ -858,6 +861,212 @@ def test_enron_bank_build_cli_has_no_sealed_or_role_selector() -> None:
     assert "--cmu-catalog-bindings" in help_result.output
     assert "--sealed" not in help_result.output
     assert "--role" not in help_result.output
+
+
+def test_enron_performance_commands_map_private_options_and_emit_json(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def fake_prepare(options):
+        captured["prepare"] = options
+        return {"schema_version": "nerb.enron_performance_plan.v1", "sealed_test_accessed": False}
+
+    def fake_run(options):
+        captured["run"] = options
+        return {"schema_version": "nerb.enron_performance_run.v1", "profile": options.profile}
+
+    def fake_verify(run_dir):
+        captured["verify"] = run_dir
+        return {"valid": True, "sealed_test_accessed": False}
+
+    monkeypatch.setattr(cli_module, "prepare_enron_performance_manifest", fake_prepare)
+    monkeypatch.setattr(cli_module, "run_enron_performance", fake_run)
+    monkeypatch.setattr(cli_module, "verify_enron_performance_run", fake_verify)
+    bank_build = tmp_path / "bank-build"
+    development = tmp_path / "development"
+    annotations = tmp_path / "annotations"
+    prepared_output = tmp_path / "performance-plan"
+    measured_output = tmp_path / "performance-run"
+
+    prepare_result = runner.invoke(
+        app,
+        [
+            "prepare-enron-performance",
+            "--bank-build-run",
+            str(bank_build),
+            "--development-run",
+            str(development),
+            "--output-dir",
+            str(prepared_output),
+            "--annotation-run",
+            str(annotations),
+            "--benchmark-version",
+            "enron-v2-fixture",
+            "--real-input-documents",
+            "100",
+            "--concurrency",
+            "2",
+            "--source-curation-seconds",
+            "45.5",
+            "--allow-unignored-output",
+        ],
+    )
+
+    assert prepare_result.exit_code == 0, prepare_result.output
+    assert json.loads(prepare_result.output) == {
+        "schema_version": "nerb.enron_performance_plan.v1",
+        "sealed_test_accessed": False,
+    }
+    prepare_options = captured["prepare"]
+    assert prepare_options.bank_build_run == bank_build
+    assert prepare_options.development_run == development
+    assert prepare_options.output_dir == prepared_output
+    assert prepare_options.annotation_run == annotations
+    assert prepare_options.benchmark_version == "enron-v2-fixture"
+    assert prepare_options.real_input_documents == 100
+    assert prepare_options.concurrency == 2
+    assert prepare_options.source_curation_seconds == 45.5
+    assert prepare_options.allow_unignored_output is True
+
+    run_result = runner.invoke(
+        app,
+        [
+            "run-enron-performance",
+            "--prepared-run",
+            str(prepared_output),
+            "--output-dir",
+            str(measured_output),
+            "--profile",
+            "decision",
+            "--warmups",
+            "3",
+            "--smoke-samples",
+            "5",
+            "--setup-samples",
+            "20",
+            "--scan-samples",
+            "1000",
+            "--document-samples",
+            "1000",
+            "--worker-timeout-seconds",
+            "90.5",
+            "--source-build-timeout-seconds",
+            "700.5",
+            "--allow-unignored-output",
+        ],
+    )
+
+    assert run_result.exit_code == 0, run_result.output
+    assert json.loads(run_result.output) == {
+        "profile": "decision",
+        "schema_version": "nerb.enron_performance_run.v1",
+    }
+    run_options = captured["run"]
+    assert run_options.prepared_run == prepared_output
+    assert run_options.output_dir == measured_output
+    assert run_options.profile == "decision"
+    assert run_options.warmups == 3
+    assert run_options.smoke_samples == 5
+    assert run_options.setup_samples == 20
+    assert run_options.scan_samples == 1_000
+    assert run_options.document_samples == 1_000
+    assert run_options.worker_timeout_seconds == 90.5
+    assert run_options.source_build_timeout_seconds == 700.5
+    assert run_options.allow_unignored_output is True
+
+    verify_result = runner.invoke(app, ["verify-enron-performance", "--run-dir", str(measured_output)])
+    assert verify_result.exit_code == 0, verify_result.output
+    assert json.loads(verify_result.output) == {"sealed_test_accessed": False, "valid": True}
+    assert captured["verify"] == measured_output
+
+
+def test_enron_performance_cli_defaults_follow_public_option_defaults(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def fake_prepare(options):
+        captured["prepare"] = options
+        return {"committed": True}
+
+    def fake_run(options):
+        captured["run"] = options
+        return {"profile": options.profile}
+
+    monkeypatch.setattr(cli_module, "prepare_enron_performance_manifest", fake_prepare)
+    monkeypatch.setattr(cli_module, "run_enron_performance", fake_run)
+    bank_build = tmp_path / "bank-build"
+    development = tmp_path / "development"
+    prepared_output = tmp_path / "performance-plan"
+    measured_output = tmp_path / "performance-run"
+
+    prepare_result = runner.invoke(
+        app,
+        [
+            "prepare-enron-performance",
+            "--bank-build-run",
+            str(bank_build),
+            "--development-run",
+            str(development),
+            "--output-dir",
+            str(prepared_output),
+        ],
+    )
+    run_result = runner.invoke(
+        app,
+        [
+            "run-enron-performance",
+            "--prepared-run",
+            str(prepared_output),
+            "--output-dir",
+            str(measured_output),
+        ],
+    )
+
+    assert prepare_result.exit_code == 0, prepare_result.output
+    assert run_result.exit_code == 0, run_result.output
+    assert captured["prepare"] == cli_module.EnronPerformancePrepareOptions(
+        bank_build_run=bank_build,
+        development_run=development,
+        output_dir=prepared_output,
+    )
+    assert captured["run"] == cli_module.EnronPerformanceRunOptions(
+        prepared_run=prepared_output,
+        output_dir=measured_output,
+    )
+
+
+def test_enron_performance_commands_sanitize_helper_errors_and_exclude_sealed_inputs(monkeypatch, tmp_path) -> None:
+    message = "Private performance plan failed safely."
+    monkeypatch.setattr(
+        cli_module,
+        "prepare_enron_performance_manifest",
+        lambda _options: (_ for _ in ()).throw(cli_module.EnronPerformanceError(message)),
+    )
+    result = runner.invoke(
+        app,
+        [
+            "prepare-enron-performance",
+            "--bank-build-run",
+            str(tmp_path / "bank-build"),
+            "--development-run",
+            str(tmp_path / "development"),
+            "--output-dir",
+            str(tmp_path / "performance-plan"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert message in result.output
+    assert "Traceback" not in result.output
+    for command in ("prepare-enron-performance", "run-enron-performance", "verify-enron-performance"):
+        help_result = runner.invoke(app, [command, "--help"])
+        assert help_result.exit_code == 0
+        assert "sealed" in help_result.output.lower()
+        assert "--sealed" not in help_result.output
+        if command == "run-enron-performance":
+            normalized_help = " ".join(help_result.output.split()).lower()
+            assert "true direct decision cells; frozen at 1,000" in normalized_help
+            assert "helper, end-to-end, and support cells remain fixed at 100" in normalized_help
+            assert "ten complete balanced 100-document passes (1,000 samples)" in normalized_help
+            assert "five balanced passes" not in normalized_help
 
 
 def test_enron_quality_commands_route_private_inputs_and_fail_closed(monkeypatch, tmp_path):

@@ -130,6 +130,22 @@ impl PyBank {
         })
     }
 
+    fn detector_metadata(&self, detector_index: u32) -> PyResult<(String, String, String)> {
+        ffi_boundary(|| {
+            let index = usize::try_from(detector_index).map_err(|_| {
+                PyIndexError::new_err(format!("detector index {detector_index} out of range"))
+            })?;
+            let detector = self.inner.detectors().get(index).ok_or_else(|| {
+                PyIndexError::new_err(format!("detector index {detector_index} out of range"))
+            })?;
+            Ok((
+                detector.entity.clone(),
+                detector.canonical_name.clone(),
+                detector.surface_name.clone(),
+            ))
+        })
+    }
+
     #[pyo3(signature = (haystack, out=None))]
     fn scan_bytes(
         &self,

@@ -45,6 +45,16 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+@pytest.mark.parametrize("mode", [0o400, 0o500, 0o600, 0o700])
+def test_owner_only_private_mode_accepts_read_only_and_writable_owner_modes(mode: int) -> None:
+    assert enron_private_io.is_owner_only_private_mode(mode) is True
+
+
+@pytest.mark.parametrize("mode", [0o004, 0o040, 0o640, 0o750])
+def test_owner_only_private_mode_rejects_group_or_other_access(mode: int) -> None:
+    assert enron_private_io.is_owner_only_private_mode(mode) is False
+
+
 def test_find_workspace_root_from_nonexistent_descendant(tmp_path: Path) -> None:
     root = _git_workspace(tmp_path)
 
