@@ -505,7 +505,7 @@ def _native_jsonl_source(
             surface_name, is_alias = name_slots[pattern_index % len(name_slots)]
             match_text = f"NERB{taxon_index}{pattern_index:05d}"
             is_literal = pattern_index < taxon.literal_patterns
-            regex = match_text if is_literal else f"(?:{match_text})"
+            regex = match_text if is_literal else _residual_regex(match_text)
             canonical_name = f"NERB_PERF_T{taxon_index:03d}_ALIAS_TARGET" if is_alias else surface_name
             entity_index = pattern_index % taxon.entities
             row = {
@@ -523,6 +523,22 @@ def _native_jsonl_source(
     if row_count != active_patterns or len(hit_tokens) != 3:
         raise EnronPerformanceFixtureError("Synthetic native bank row allocation did not reconcile.")
     return bytes(output), pattern_bytes, tuple(hit_tokens)
+
+
+def _residual_regex(match_text: str) -> str:
+    """Return a nonempty multi-string regex that still matches ``match_text``.
+
+    Grouping an exact token is normalized to literal HIR by the native engine,
+    so it does not exercise the residual-regex layer.  Generalizing the final
+    decimal digit to a two-member class preserves every controlled hit while
+    guaranteeing that the parsed HIR contains a class rather than only literal
+    nodes.  The alternate is synthetic and cannot resemble corpus PII.
+    """
+
+    final = match_text[-1:]
+    if len(match_text) < 2 or final not in "0123456789":
+        raise EnronPerformanceFixtureError("Synthetic residual-regex token has an invalid shape.")
+    return f"{match_text[:-1]}[{final}X]"
 
 
 def _scale_bank_family(

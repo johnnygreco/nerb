@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Iterator
 from typing import Any
@@ -80,6 +81,10 @@ def _rows(fixture: EnronPerformanceBankFixture) -> Iterator[dict[str, Any]]:
         yield value
 
 
+def _residual_regex_rows(fixture: EnronPerformanceBankFixture) -> list[dict[str, Any]]:
+    return [row for row in _rows(fixture) if re.fullmatch(r"NERB\d+\[(\d)X\]", str(row["regex"]))]
+
+
 def test_1k_bank_fixture_is_deterministic_and_keeps_aliases_distinct_from_patterns(
     scale_family: tuple[EnronPerformanceBankFixture, ...],
 ) -> None:
@@ -89,9 +94,9 @@ def test_1k_bank_fixture_is_deterministic_and_keeps_aliases_distinct_from_patter
     assert first.source_bytes == repeated.source_bytes
     assert first.canonical_bytes == repeated.canonical_bytes
     assert first.descriptor_bytes == repeated.descriptor_bytes
-    assert first.source_sha256 == "sha256:a22d215f52c9c715f975be3cc74e78104940d8e7ddac77fb3cebcd875a973912"
-    assert first.bank_hash == "sha256:f77abc2c175af27123e073463e2cf7a9039e2598285894f89dc954b28b1e840b"
-    assert first.canonical_sha256 == "sha256:5b087680d1f1670edc25f2b3fd48385bc550fd9868836100aa838e3240f30944"
+    assert first.source_sha256 == "sha256:312eed9b7d8ad77ee7f2d5a4d05b4865560a797b62322e6cfb52508cb2493323"
+    assert first.bank_hash == "sha256:d1d4d221e1d2dc007dc512341ebf01fffeedf4b8601ae980545e483c9c9bd871"
+    assert first.canonical_sha256 == "sha256:73ee4e4790b10390f827d16539f284dafc3065b18451f9c9cae5d7ab1d9059a0"
     assert first.preflight_record_count == 3
 
     descriptor = first.descriptor
@@ -134,7 +139,8 @@ def test_1k_bank_fixture_is_deterministic_and_keeps_aliases_distinct_from_patter
     assert len({row["surface_name"] for row in rows}) == descriptor["active_names"]
     alias_surfaces = {row["surface_name"] for row in rows if row["surface_name"] != row["canonical_name"]}
     assert len(alias_surfaces) == descriptor["active_aliases"]
-    assert sum(str(row["regex"]).startswith("(?:") for row in rows) == 2
+    residual_rows = _residual_regex_rows(first)
+    assert len(residual_rows) == 2
     assert sum(len(str(row["regex"]).encode("utf-8")) for row in rows) < 10_000_000
     assert len(first.source_bytes) < 64 * 1024 * 1024
     assert b"NERB_PERF" not in first.descriptor_bytes
@@ -146,6 +152,41 @@ def test_1k_bank_fixture_is_deterministic_and_keeps_aliases_distinct_from_patter
     for fixture in scale_family:
         taxonomy = fixture.descriptor["composition"]["taxonomy"]
         assert taxonomy[0]["entities"] == taxonomy[1]["entities"]
+        expected_regexes = sum(item["regex_patterns"] for item in taxonomy)
+        assert len(_residual_regex_rows(fixture)) == expected_regexes
+
+
+def test_generated_regex_share_is_nonliteral_nonempty_and_uses_native_regex_semantics(
+    scale_family: tuple[EnronPerformanceBankFixture, ...],
+) -> None:
+    fixture = scale_family[0]
+    regex_rows = _residual_regex_rows(fixture)
+    expected_regexes = sum(item["regex_patterns"] for item in fixture.descriptor["composition"]["taxonomy"])
+    assert len(regex_rows) == expected_regexes == 2
+
+    for row in regex_rows:
+        pattern = str(row["regex"])
+        prefix, character_class = pattern.rsplit("[", 1)
+        original = prefix + character_class[0]
+        alternate = prefix + "X"
+        assert original != alternate
+        assert re.fullmatch(pattern, original) is not None
+        assert re.fullmatch(pattern, alternate) is not None
+        assert re.fullmatch(pattern, "") is None
+
+    # An exact HIR literal without case-insensitive flags can recognize only
+    # one byte string.  Compiling one generated row in isolation and matching
+    # both distinct alternatives proves that native compilation retained a
+    # nonliteral regex matcher instead of projecting this fixture as a literal.
+    representative = regex_rows[0]
+    pattern = str(representative["regex"])
+    prefix, character_class = pattern.rsplit("[", 1)
+    original = prefix + character_class[0]
+    alternate = prefix + "X"
+    source = json.dumps(representative, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    probe = Bank.from_source_bytes(source, format_hint="jsonl", use_cache=False)
+    records = probe.scan_text(f"{original} {alternate}")
+    assert [record["string"] for record in records] == [original, alternate]
 
 
 def test_100k_native_compile_scan_preflight_is_aggregate_only(
@@ -160,12 +201,15 @@ def test_100k_native_compile_scan_preflight_is_aggregate_only(
     assert descriptor["active_entities"] == 318
     assert len(descriptor["composition"]["taxonomy"]) == 2
     assert [item["entities"] for item in descriptor["composition"]["taxonomy"]] == [159, 159]
+    residual_rows = _residual_regex_rows(fixture)
+    assert len(residual_rows) == 159
+    assert len({str(row["entity"]) for row in residual_rows}) == 159
     assert fixture.preflight_record_count == 3
-    assert len(fixture.source_bytes) == descriptor["native_source_bytes"] == 13_801_751
-    assert len(fixture.canonical_bytes) == descriptor["canonical_json_bytes"] == 22_610_807
-    assert fixture.source_sha256 == "sha256:e1402abe44d9127f6c6b7c1a2a742c0ebb05267ea160484e98f33c60b9c41673"
-    assert fixture.bank_hash == "sha256:d4878822f61ecee7244230068c2e2ce604274ccfe774493a1f575211a9d86633"
-    assert fixture.canonical_sha256 == "sha256:8249046bb9e3d30a0d96f00909f10f576edf46bb5bff4e215cb36e3b456ee471"
+    assert len(fixture.source_bytes) == descriptor["native_source_bytes"] == 13_801_592
+    assert len(fixture.canonical_bytes) == descriptor["canonical_json_bytes"] == 22_610_648
+    assert fixture.source_sha256 == "sha256:79a5af2e18221866a2077328bd25da0af337f9473ad9ebe1fb7a935733c00067"
+    assert fixture.bank_hash == "sha256:f74de4bff5a070f85365c0e4d53a28bd4154e996066d09730dccb0a0966118af"
+    assert fixture.canonical_sha256 == "sha256:03bf4d6f1727b0d183c6f049baded6a306a14970314d6f0b6e7956503d9fdced"
     assert _sha256(fixture.source_bytes) == fixture.source_sha256
     assert _sha256(fixture.canonical_bytes) == fixture.canonical_sha256
     assert descriptor["descriptor_sha256"] == hash_enron_performance_bank(descriptor)
