@@ -36,7 +36,23 @@ def _sha256(value: bytes) -> str:
 
 def _artifact(path: Path, value: bytes) -> dict[str, Any]:
     path.write_bytes(value)
-    return {"path": str(path.resolve()), "sha256": _sha256(value), "bytes": len(value)}
+    path.chmod(0o600)
+    info = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "sha256": _sha256(value),
+        "bytes": len(value),
+        "identity": {
+            "kind": "file",
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "mode": 0o600,
+            "link_count": info.st_nlink,
+            "size": info.st_size,
+            "modified_ns": info.st_mtime_ns,
+            "changed_ns": info.st_ctime_ns,
+        },
+    }
 
 
 def _input_artifacts(
@@ -462,6 +478,58 @@ def test_source_profile_is_strict_bounded_and_deterministic(tmp_path: Path) -> N
     assert b"private-one" not in encode_worker_result(first)
 
 
+def test_source_profile_rejects_same_byte_inode_substitution_before_parsing(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "private-source.jsonl"
+    source_bytes = b'{"id":1,"value":"private-one"}\n'
+    source = _artifact(source_path, source_bytes)
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_bytes(source_bytes)
+    replacement.chmod(0o600)
+    replacement.replace(source_path)
+    request = _request(
+        "source_profile",
+        artifacts={"source": source},
+        parameters={"max_line_bytes": 1_024, "max_records": 10},
+        workload="profile-substitution",
+    )
+
+    result = _run(EnronPerformanceWorker(), request)
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "artifact_changed"
+
+
+def test_source_profile_accepts_owner_read_only_frozen_file(tmp_path: Path) -> None:
+    source_path = tmp_path / "read-only-source.jsonl"
+    source_bytes = b'{"id":1,"value":"private-one"}\n'
+    source = _artifact(source_path, source_bytes)
+    source_path.chmod(0o400)
+    info = source_path.stat()
+    source["identity"] = {
+        "kind": "file",
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": 0o400,
+        "link_count": info.st_nlink,
+        "size": info.st_size,
+        "modified_ns": info.st_mtime_ns,
+        "changed_ns": info.st_ctime_ns,
+    }
+    request = _request(
+        "source_profile",
+        artifacts={"source": source},
+        parameters={"max_line_bytes": 1_024, "max_records": 10},
+        workload="profile-read-only",
+    )
+
+    result = _run(EnronPerformanceWorker(), request)
+
+    assert result["status"] == "ok"
+    assert result["record_count"] == 1
+
+
 def test_source_build_is_explicitly_unsupported_in_narrow_worker() -> None:
     request = _request("source_build", artifacts={}, parameters={}, workload="source-build")
 
@@ -553,7 +621,7 @@ def test_inventory_and_artifact_bindings_fail_closed(tmp_path: Path, test_data_p
     changed_result = _run(worker, _direct_request(bank, mismatch, workload="changed"))
 
     assert invalid_result["error_code"] == "input_inventory_invalid"
-    assert changed_result["error_code"] == "artifact_changed"
+    assert changed_result["error_code"] == "request_shape"
 
 
 def test_malformed_inventory_values_return_inventory_error(tmp_path: Path, test_data_path: Path) -> None:
@@ -570,10 +638,9 @@ def test_malformed_inventory_values_return_inventory_error(tmp_path: Path, test_
 def test_symlink_artifact_is_rejected_without_echoing_path(tmp_path: Path, test_data_path: Path) -> None:
     source_path = tmp_path / "private-bank.json"
     source = _canonical(_json_bank(test_data_path))
-    source_path.write_bytes(source)
+    bank = _artifact(source_path, source)
     link = tmp_path / "private-bank-link.json"
     link.symlink_to(source_path)
-    bank = {"path": str(link.resolve(strict=False)), "sha256": _sha256(source), "bytes": len(source)}
     # Resolve the parent but preserve the final symlink component for the no-follow open.
     bank["path"] = str(link.parent.resolve() / link.name)
     inputs = _input_artifacts(tmp_path, [b"Acme Corp"], [1])
@@ -608,6 +675,16 @@ def test_operation_output_and_exception_payload_are_discarded(
         "path": str((tmp_path / "not-read.jsonl").resolve()),
         "sha256": _sha256(b""),
         "bytes": 0,
+        "identity": {
+            "kind": "file",
+            "device": 0,
+            "inode": 0,
+            "mode": 0o600,
+            "link_count": 1,
+            "size": 0,
+            "modified_ns": 0,
+            "changed_ns": 0,
+        },
     }
     request = _request(
         "source_profile",

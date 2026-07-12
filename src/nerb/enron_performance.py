@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from . import __version__
+from . import enron_bank_workflow as _bank_workflow
 from .bank import bank_stats, canonicalize_bank, hash_bank
 from .engines import compile_bank_with_report, extraction_execution_sha256
 from .enron_bank_builder import EnronBankPolicy
@@ -69,7 +70,12 @@ from .enron_performance_worker import (
     RESULT_SCHEMA_VERSION,
     normalize_peak_rss,
 )
-from .enron_private_io import EnronPrivateIOError, PrivateRun, open_private_binary_input
+from .enron_private_io import (
+    EnronPrivateIOError,
+    PrivateRun,
+    is_owner_only_private_mode,
+    open_private_binary_input,
+)
 from .enron_splitting import EnronSplitError, load_enron_development_split
 
 PERFORMANCE_PLAN_SCHEMA_VERSION = "nerb.enron_performance_plan.v1"
@@ -114,10 +120,14 @@ PERFORMANCE_DECISION_THRESHOLDS = {
 }
 MAX_WORKER_OUTPUT_BYTES = 64 * 1024
 MAX_PLAN_BYTES = 16 * 1024 * 1024
+MAX_PRIVATE_PATH_BYTES = 4 * 1024
+MAX_BENCHMARK_VERSION_BYTES = 256
+MAX_BUILD_TIMESTAMP_BYTES = 256
 MAX_PRIVATE_JSON_BYTES = 64 * 1024 * 1024
 MAX_INPUT_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
 MAX_SOURCE_PROFILE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_SOURCE_SNAPSHOT_BYTES = 16 * 1024 * 1024 * 1024
 MAX_SOURCE_BUILD_SECONDS = 24 * 60 * 60
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -187,6 +197,16 @@ class _PreparedPerformanceRun:
     manifest: Mapping[str, Any]
     plan: Mapping[str, Any]
     locations: Mapping[str, Any]
+    tree: Mapping[str, Any]
+    artifact_fingerprints: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceBuildInputSnapshot:
+    root: Path
+    development_run: Path
+    annotation_run: Path | None
+    cmu_catalog_bindings: Path | None
 
 
 def _canonical_json_bytes(value: Any) -> bytes:
@@ -254,6 +274,208 @@ def _write_artifact(run: PrivateRun, artifact: _Artifact, payload: bytes) -> Non
         raise EnronPerformanceError("Performance artifact changed before it was written.")
     with run.open_binary(artifact.relative_path) as file:
         file.write(payload)
+
+
+def _absolute_private_path(path: Path, *, description: str) -> Path:
+    try:
+        raw = os.fspath(path)
+        if (
+            not isinstance(raw, str)
+            or not raw
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw)
+            or len(raw.encode("utf-8")) > MAX_PRIVATE_PATH_BYTES
+        ):
+            raise ValueError
+        candidate = Path(path).expanduser()
+        if any(part == os.pardir for part in candidate.parts):
+            raise ValueError
+        return candidate if candidate.is_absolute() else Path.cwd() / candidate
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise EnronPerformanceError(f"{description} path is invalid.") from None
+
+
+def _bounded_private_string(value: Any, *, maximum_bytes: int, description: str) -> str:
+    if not isinstance(value, str):
+        raise EnronPerformanceError(f"{description} is invalid.")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeError:
+        raise EnronPerformanceError(f"{description} is invalid.") from None
+    if (
+        not value
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+        or len(encoded) > maximum_bytes
+    ):
+        raise EnronPerformanceError(f"{description} is invalid.")
+    return value
+
+
+def _validated_absolute_private_location(value: Any, *, description: str) -> Path:
+    raw = _bounded_private_string(value, maximum_bytes=MAX_PRIVATE_PATH_BYTES, description=description)
+    path = Path(raw)
+    if not path.is_absolute() or any(part == os.pardir for part in path.parts):
+        raise EnronPerformanceError(f"{description} is invalid.")
+    return path
+
+
+def _private_identity_payload(identity: Any) -> dict[str, Any]:
+    return {
+        "kind": identity.kind,
+        "device": identity.device,
+        "inode": identity.inode,
+        "mode": identity.mode,
+        "link_count": identity.link_count,
+        "size": identity.size,
+        "modified_ns": identity.modified_ns,
+        "changed_ns": identity.changed_ns,
+    }
+
+
+def _private_tree_payload(tree: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    return {name: _private_identity_payload(identity) for name, identity in sorted(tree.items())}
+
+
+def _validate_private_identity_payload(value: Any, *, expected_kind: str | None = None) -> dict[str, Any]:
+    expected_keys = {
+        "kind",
+        "device",
+        "inode",
+        "mode",
+        "link_count",
+        "size",
+        "modified_ns",
+        "changed_ns",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected_keys:
+        raise EnronPerformanceError("Frozen private file identity is invalid.")
+    kind = value.get("kind")
+    if kind not in {"file", "directory"} or (expected_kind is not None and kind != expected_kind):
+        raise EnronPerformanceError("Frozen private file identity kind is invalid.")
+    numeric = {key: value.get(key) for key in expected_keys - {"kind"}}
+    if any(type(item) is not int or item < 0 for item in numeric.values()):
+        raise EnronPerformanceError("Frozen private file identity values are invalid.")
+    mode = int(value["mode"])
+    link_count = int(value["link_count"])
+    if not is_owner_only_private_mode(mode) or link_count < 1 or (kind == "file" and link_count != 1):
+        raise EnronPerformanceError("Frozen private file identity is not private and single-linked.")
+    return dict(value)
+
+
+def _validate_private_tree_payload(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, Mapping) or not value or len(value) > 256 or "." not in value:
+        raise EnronPerformanceError("Frozen private tree identity is invalid.")
+    result: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_identity in value.items():
+        if not isinstance(raw_name, str):
+            raise EnronPerformanceError("Frozen private tree path is invalid.")
+        if raw_name == ".":
+            identity = _validate_private_identity_payload(raw_identity, expected_kind="directory")
+        else:
+            relative = Path(raw_name)
+            try:
+                path_bytes = raw_name.encode("utf-8")
+            except UnicodeError:
+                raise EnronPerformanceError("Frozen private tree path is invalid.") from None
+            if (
+                relative.is_absolute()
+                or not relative.parts
+                or len(relative.parts) > 9
+                or len(path_bytes) > MAX_PRIVATE_PATH_BYTES
+                or any(ord(character) < 0x20 or ord(character) == 0x7F for character in raw_name)
+                or relative.as_posix() != raw_name
+                or any(part in {"", os.curdir, os.pardir} for part in relative.parts)
+            ):
+                raise EnronPerformanceError("Frozen private tree path is invalid.")
+            identity = _validate_private_identity_payload(raw_identity)
+            for length in range(1, len(relative.parts)):
+                parent = Path(*relative.parts[:length]).as_posix()
+                parent_identity = value.get(parent)
+                if not isinstance(parent_identity, Mapping) or parent_identity.get("kind") != "directory":
+                    raise EnronPerformanceError("Frozen private tree parent identity is invalid.")
+        result[raw_name] = identity
+    return result
+
+
+def _snapshot_performance_private_tree(path: Path, *, description: str) -> tuple[Path, Mapping[str, Any]]:
+    root = _absolute_private_path(path, description=description)
+    try:
+        tree = _bank_workflow._snapshot_private_tree(root)
+        _validate_private_tree_payload(_private_tree_payload(tree))
+        return root, tree
+    except EnronBankBuildError:
+        raise EnronPerformanceError(f"{description} is not a stable private tree.") from None
+
+
+def _fingerprint_performance_private_file(
+    root: Path,
+    relative_path: str,
+    tree: Mapping[str, Any],
+    *,
+    maximum_bytes: int,
+    description: str,
+) -> Any:
+    expected_identity = tree.get(relative_path)
+    if expected_identity is None or expected_identity.kind != "file":
+        raise EnronPerformanceError(f"{description} is missing from its private tree.")
+    try:
+        fingerprint = _bank_workflow._fingerprint_private_artifact(
+            root / relative_path,
+            max_bytes=maximum_bytes,
+        )
+    except EnronBankBuildError:
+        raise EnronPerformanceError(f"{description} could not be fingerprinted safely.") from None
+    if fingerprint.identity != expected_identity:
+        raise EnronPerformanceError(f"{description} changed while its private tree was inspected.")
+    return fingerprint
+
+
+def _read_fingerprinted_private_bytes(
+    path: Path,
+    fingerprint: Any,
+    *,
+    maximum_bytes: int,
+    description: str,
+) -> bytes:
+    try:
+        return _bank_workflow._read_verified_private_bytes(
+            path,
+            expected_fingerprint=fingerprint,
+            max_bytes=maximum_bytes,
+            description=description,
+        )
+    except EnronBankBuildError:
+        raise EnronPerformanceError(f"{description} could not be read from its frozen inode.") from None
+
+
+def _verify_performance_tree_inventory(tree: Mapping[str, Any], relative_paths: Sequence[str]) -> None:
+    try:
+        _bank_workflow._verify_private_tree_inventory(
+            tree,
+            {str(index): name for index, name in enumerate(relative_paths)},
+        )
+    except EnronBankBuildError:
+        raise EnronPerformanceError("Performance private tree has an undeclared entry.") from None
+
+
+def _assert_performance_private_tree_current(
+    root: Path,
+    expected_tree: Mapping[str, Any],
+    *,
+    description: str,
+) -> None:
+    _current_root, current_tree = _snapshot_performance_private_tree(root, description=description)
+    if current_tree != expected_tree:
+        raise EnronPerformanceError(f"{description} changed after its immutable snapshot was captured.")
+
+
+def _strict_json_object_bytes(payload: bytes, *, description: str) -> dict[str, Any]:
+    try:
+        value = _strict_json_loads(payload)
+    except (json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
+        raise EnronPerformanceError(f"{description} is not strict finite JSON.") from None
+    if not isinstance(value, dict):
+        raise EnronPerformanceError(f"{description} must contain a JSON object.")
+    return value
 
 
 def _read_bounded_bytes(path: Path, *, maximum_bytes: int, description: str) -> bytes:
@@ -1412,7 +1634,11 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
         "Source curation scenario",
         maximum=MAX_SOURCE_BUILD_SECONDS,
     )
-    bank_root = Path(options.bank_build_run).expanduser()
+    bank_root = _absolute_private_path(options.bank_build_run, description="Bank-build run")
+    development_root, development_tree = _snapshot_performance_private_tree(
+        options.development_run,
+        description="Development source run",
+    )
     try:
         bank_snapshot = _verify_enron_bank_build_snapshot(
             options.bank_build_run,
@@ -1424,10 +1650,18 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
         bank_value = bank_snapshot.bank
         validation_documents = bank_snapshot.validation_documents
         build_created_at = bank_snapshot.build_created_at
+        bank_tree = getattr(bank_snapshot, "private_tree", None)
+        bank_artifact_fingerprints = getattr(bank_snapshot, "artifact_fingerprints", None)
+        annotation_tree = getattr(bank_snapshot, "annotation_tree", None)
         del bank_snapshot
-        development = load_enron_development_split(options.development_run)
+        development = load_enron_development_split(development_root)
     except (EnronBankBuildError, EnronPrivateIOError, EnronSplitError):
         raise EnronPerformanceError("Performance source runs did not pass deep verification.") from None
+    _assert_performance_private_tree_current(
+        development_root,
+        development_tree,
+        description="Development source run",
+    )
     if (
         verification.get("valid") is not True
         or card.get("run_sha256") != verification.get("bank_card_run_sha256")
@@ -1443,8 +1677,11 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
     benchmark_version = str(card.get("benchmark_version", ""))
     if options.benchmark_version is not None and options.benchmark_version != benchmark_version:
         raise EnronPerformanceError("Requested benchmark version does not match the verified bank build.")
-    if not benchmark_version or len(benchmark_version) > 256:
-        raise EnronPerformanceError("Verified benchmark version is invalid.")
+    _bounded_private_string(
+        benchmark_version,
+        maximum_bytes=MAX_BENCHMARK_VERSION_BYTES,
+        description="Verified benchmark version",
+    )
 
     bank_card = card.get("bank")
     if not isinstance(bank_card, Mapping):
@@ -1494,6 +1731,54 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
         or bank_source.get("train_records") != train_records
     ):
         raise EnronPerformanceError("Evaluated bank build does not bind the selected development train artifact.")
+    development_manifest_fingerprint = _fingerprint_performance_private_file(
+        development_root,
+        "manifest.json",
+        development_tree,
+        maximum_bytes=MAX_PLAN_BYTES,
+        description="Development manifest",
+    )
+    train_fingerprint = _fingerprint_performance_private_file(
+        development_root,
+        "train.jsonl",
+        development_tree,
+        maximum_bytes=MAX_SOURCE_PROFILE_BYTES,
+        description="Development train artifact",
+    )
+    if (
+        development_manifest_fingerprint.sha256 != development_manifest_sha256
+        or train_fingerprint.sha256 != train_ref["sha256"]
+        or train_fingerprint.identity.size != train_ref["bytes"]
+    ):
+        raise EnronPerformanceError("Frozen development source identities differ from their verified descriptors.")
+    annotation_root: Path | None = None
+    bindings_path: Path | None = None
+    bindings_identity: dict[str, Any] | None = None
+    annotation_tree_payload: dict[str, dict[str, Any]] | None = None
+    bank_tree_payload: dict[str, dict[str, Any]] | None = None
+    if options.annotation_run is not None:
+        annotation_root = _absolute_private_path(options.annotation_run, description="Annotation source run")
+        if annotation_tree is None or bank_tree is None or bank_artifact_fingerprints is None:
+            raise EnronPerformanceError("Verified bank build did not retain its auxiliary source identities.")
+        _validate_private_tree_payload(_private_tree_payload(annotation_tree))
+        _assert_performance_private_tree_current(
+            annotation_root,
+            annotation_tree,
+            description="Annotation source run",
+        )
+        _assert_performance_private_tree_current(
+            bank_root,
+            bank_tree,
+            description="Bank-build source run",
+        )
+        bindings_fingerprint = bank_artifact_fingerprints.get("cmu_catalog_bindings")
+        bindings_relative = "auxiliary/cmu-train-catalog-bindings.jsonl"
+        if bindings_fingerprint is None or bank_tree.get(bindings_relative) != bindings_fingerprint.identity:
+            raise EnronPerformanceError("Verified bank build did not retain its auxiliary binding identity.")
+        bindings_path = bank_root / bindings_relative
+        bindings_identity = _private_identity_payload(bindings_fingerprint.identity)
+        annotation_tree_payload = _private_tree_payload(annotation_tree)
+        bank_tree_payload = _private_tree_payload(bank_tree)
     plan = _performance_plan(
         benchmark_version=benchmark_version,
         source_profile_artifact=train_ref,
@@ -1511,19 +1796,23 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
 
     locations = {
         "schema_version": "nerb.enron_performance_locations.v1",
-        "profile_source": os.fspath(Path(options.development_run).expanduser().absolute() / "train.jsonl"),
-        "development_run": os.fspath(Path(options.development_run).expanduser().absolute()),
-        "annotation_run": (
-            None if options.annotation_run is None else os.fspath(Path(options.annotation_run).expanduser().absolute())
-        ),
-        "cmu_catalog_bindings": (
-            os.fspath(bank_root.absolute() / "auxiliary" / "cmu-train-catalog-bindings.jsonl")
-            if options.annotation_run is not None
-            else None
-        ),
+        "profile_source": os.fspath(development_root / "train.jsonl"),
+        "development_run": os.fspath(development_root),
+        "annotation_run": None if annotation_root is None else os.fspath(annotation_root),
+        "cmu_catalog_bindings": None if bindings_path is None else os.fspath(bindings_path),
+        "source_identities": {
+            "development_tree": _private_tree_payload(development_tree),
+            "development_manifest": _private_identity_payload(development_manifest_fingerprint.identity),
+            "profile_source": _private_identity_payload(train_fingerprint.identity),
+            "annotation_tree": annotation_tree_payload,
+            "bank_build_tree": bank_tree_payload,
+            "cmu_catalog_bindings": bindings_identity,
+        },
         "build_created_at": build_created_at,
         "source_build_projection_sha256": _canonical_hash(_source_build_projection(card)),
     }
+    _validate_performance_locations(locations, plan)
+    _validate_source_build_request_budget(plan, locations)
     plan_payload = _pretty_json_bytes(plan)
     locations_payload = _pretty_json_bytes(locations)
     artifacts_by_path: dict[str, tuple[_Artifact, bytes, str]] = {}
@@ -1597,6 +1886,17 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
             for artifact, _payload, kind in sorted(artifacts_by_path.values(), key=lambda item: item[0].relative_path)
         ],
     }
+    _assert_performance_private_tree_current(
+        development_root,
+        development_tree,
+        description="Development source run",
+    )
+    if annotation_root is not None and annotation_tree is not None:
+        _assert_performance_private_tree_current(
+            annotation_root,
+            annotation_tree,
+            description="Annotation source run",
+        )
     try:
         with PrivateRun(
             options.output_dir,
@@ -1626,13 +1926,39 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
 
 
 def _load_prepared_performance_run_impl(run_dir: Path) -> _PreparedPerformanceRun:
-    root = Path(run_dir).expanduser()
-    marker = _read_bounded_bytes(root / "COMMITTED", maximum_bytes=128, description="Performance commit marker")
+    root, initial_tree = _snapshot_performance_private_tree(
+        run_dir,
+        description="Performance preparation run",
+    )
+    marker_fingerprint = _fingerprint_performance_private_file(
+        root,
+        "COMMITTED",
+        initial_tree,
+        maximum_bytes=128,
+        description="Performance commit marker",
+    )
+    marker = _read_fingerprinted_private_bytes(
+        root / "COMMITTED",
+        marker_fingerprint,
+        maximum_bytes=128,
+        description="Performance commit marker",
+    )
     if marker != b"nerb.enron.private-run.v2\n":
         raise EnronPerformanceError("Performance preparation run is not committed.")
-    manifest = _read_json_object(
-        root / "manifest.json",
+    manifest_fingerprint = _fingerprint_performance_private_file(
+        root,
+        "manifest.json",
+        initial_tree,
         maximum_bytes=MAX_PLAN_BYTES,
+        description="Performance private manifest",
+    )
+    manifest = _strict_json_object_bytes(
+        _read_fingerprinted_private_bytes(
+            root / "manifest.json",
+            manifest_fingerprint,
+            maximum_bytes=MAX_PLAN_BYTES,
+            description="Performance private manifest",
+        ),
         description="Performance private manifest",
     )
     if (
@@ -1654,6 +1980,7 @@ def _load_prepared_performance_run_impl(run_dir: Path) -> _PreparedPerformanceRu
     identifiers: set[str] = set()
     paths: set[str] = set()
     artifact_by_id: dict[str, Mapping[str, Any]] = {}
+    artifact_fingerprints: dict[str, Any] = {}
     for item in raw_artifacts:
         if not isinstance(item, Mapping) or set(item) != {"id", "sha256", "bytes", "relative_path", "kind"}:
             raise EnronPerformanceError("Performance private artifact descriptor is invalid.")
@@ -1677,33 +2004,48 @@ def _load_prepared_performance_run_impl(run_dir: Path) -> _PreparedPerformanceRu
         relative = Path(relative_path)
         if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
             raise EnronPerformanceError("Performance private artifact path is unsafe.")
-        byte_count = _positive_int(
+        _positive_int(
             item.get("bytes"),
             "Performance artifact bytes",
             maximum=MAX_PRIVATE_JSON_BYTES,
         )
-        payload = _read_bounded_bytes(
-            root / relative,
-            maximum_bytes=max(byte_count, 1),
-            description="Performance private artifact",
-        )
-        if len(payload) != byte_count or _sha256_bytes(payload) != item.get("sha256"):
-            raise EnronPerformanceError("Performance private artifact changed after preparation.")
         identifiers.add(identifier)
         paths.add(relative_path)
         artifact_by_id[identifier] = item
+    _verify_performance_tree_inventory(initial_tree, ["COMMITTED", "manifest.json", *sorted(paths)])
+    for identifier, item in artifact_by_id.items():
+        byte_count = int(item["bytes"])
+        relative_path = str(item["relative_path"])
+        fingerprint = _fingerprint_performance_private_file(
+            root,
+            relative_path,
+            initial_tree,
+            maximum_bytes=max(byte_count, 1),
+            description="Performance private artifact",
+        )
+        if fingerprint.identity.size != byte_count or fingerprint.sha256 != item.get("sha256"):
+            raise EnronPerformanceError("Performance private artifact changed after preparation.")
+        artifact_fingerprints[identifier] = fingerprint
     if "performance_plan" not in artifact_by_id or "private_locations" not in artifact_by_id:
         raise EnronPerformanceError("Performance preparation is missing its plan or private locations.")
     plan_item = artifact_by_id["performance_plan"]
     locations_item = artifact_by_id["private_locations"]
-    plan = _read_json_object(
-        root / str(plan_item["relative_path"]),
-        maximum_bytes=MAX_PLAN_BYTES,
+    plan = _strict_json_object_bytes(
+        _read_fingerprinted_private_bytes(
+            root / str(plan_item["relative_path"]),
+            artifact_fingerprints["performance_plan"],
+            maximum_bytes=MAX_PLAN_BYTES,
+            description="Performance plan",
+        ),
         description="Performance plan",
     )
-    locations = _read_json_object(
-        root / str(locations_item["relative_path"]),
-        maximum_bytes=MAX_PLAN_BYTES,
+    locations = _strict_json_object_bytes(
+        _read_fingerprinted_private_bytes(
+            root / str(locations_item["relative_path"]),
+            artifact_fingerprints["private_locations"],
+            maximum_bytes=MAX_PLAN_BYTES,
+            description="Performance private locations",
+        ),
         description="Performance private locations",
     )
     _validate_performance_plan_shape(plan)
@@ -1730,9 +2072,21 @@ def _load_prepared_performance_run_impl(run_dir: Path) -> _PreparedPerformanceRu
             profile_plan["performance"]
         ):
             raise EnronPerformanceError("Performance profile manifest hash is invalid.")
-    if not isinstance(locations, Mapping) or locations.get("schema_version") != "nerb.enron_performance_locations.v1":
-        raise EnronPerformanceError("Performance private location binding is invalid.")
-    return _PreparedPerformanceRun(root=root, manifest=manifest, plan=plan, locations=locations)
+    _validate_performance_locations(locations, plan)
+    _validate_source_build_request_budget(plan, locations)
+    _assert_performance_private_tree_current(
+        root,
+        initial_tree,
+        description="Performance preparation run",
+    )
+    return _PreparedPerformanceRun(
+        root=root,
+        manifest=manifest,
+        plan=plan,
+        locations=locations,
+        tree=initial_tree,
+        artifact_fingerprints=artifact_fingerprints,
+    )
 
 
 def _prepared_artifact_contracts(plan: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
@@ -1773,6 +2127,114 @@ def _prepared_artifact_contracts(plan: Mapping[str, Any]) -> dict[str, tuple[str
     return contracts
 
 
+def _validate_performance_locations(locations: Mapping[str, Any], plan: Mapping[str, Any]) -> None:
+    if (
+        set(locations)
+        != {
+            "schema_version",
+            "profile_source",
+            "development_run",
+            "annotation_run",
+            "cmu_catalog_bindings",
+            "source_identities",
+            "build_created_at",
+            "source_build_projection_sha256",
+        }
+        or locations.get("schema_version") != "nerb.enron_performance_locations.v1"
+    ):
+        raise EnronPerformanceError("Performance private location binding is invalid.")
+    _bounded_private_string(
+        plan.get("benchmark_version"),
+        maximum_bytes=MAX_BENCHMARK_VERSION_BYTES,
+        description="Performance benchmark version",
+    )
+    development_value = locations.get("development_run")
+    profile_value = locations.get("profile_source")
+    development_path = _validated_absolute_private_location(
+        development_value,
+        description="Performance development run location",
+    )
+    profile_path = _validated_absolute_private_location(
+        profile_value,
+        description="Performance profile source location",
+    )
+    if profile_path != development_path / "train.jsonl":
+        raise EnronPerformanceError("Performance development source locations are invalid.")
+    identities = locations.get("source_identities")
+    if not isinstance(identities, Mapping) or set(identities) != {
+        "development_tree",
+        "development_manifest",
+        "profile_source",
+        "annotation_tree",
+        "bank_build_tree",
+        "cmu_catalog_bindings",
+    }:
+        raise EnronPerformanceError("Performance source identity binding is invalid.")
+    development_tree = _validate_private_tree_payload(identities.get("development_tree"))
+    manifest_identity = _validate_private_identity_payload(
+        identities.get("development_manifest"),
+        expected_kind="file",
+    )
+    profile_identity = _validate_private_identity_payload(
+        identities.get("profile_source"),
+        expected_kind="file",
+    )
+    if (
+        development_tree.get("manifest.json") != manifest_identity
+        or development_tree.get("train.jsonl") != profile_identity
+    ):
+        raise EnronPerformanceError("Performance development source identity binding is inconsistent.")
+    source_profile_ref = plan.get("source_profile_artifact")
+    source_build_ref = plan.get("source_build_artifact")
+    if (
+        not isinstance(source_profile_ref, Mapping)
+        or not isinstance(source_build_ref, Mapping)
+        or source_profile_ref != source_build_ref
+        or profile_identity["size"] != source_profile_ref.get("bytes")
+    ):
+        raise EnronPerformanceError("Performance train identity differs from its frozen plan descriptor.")
+    annotation_value = locations.get("annotation_run")
+    bindings_value = locations.get("cmu_catalog_bindings")
+    annotation_identities = identities.get("annotation_tree")
+    bank_build_identities = identities.get("bank_build_tree")
+    bindings_identity = identities.get("cmu_catalog_bindings")
+    optional_values = (
+        annotation_value,
+        bindings_value,
+        annotation_identities,
+        bank_build_identities,
+        bindings_identity,
+    )
+    if any(item is None for item in optional_values) and any(item is not None for item in optional_values):
+        raise EnronPerformanceError("Performance auxiliary source identity binding is incomplete.")
+    if annotation_value is not None:
+        _validated_absolute_private_location(
+            annotation_value,
+            description="Performance annotation run location",
+        )
+        bindings_path = _validated_absolute_private_location(
+            bindings_value,
+            description="Performance auxiliary binding location",
+        )
+        _validate_private_tree_payload(annotation_identities)
+        bank_build_tree = _validate_private_tree_payload(bank_build_identities)
+        frozen_bindings_identity = _validate_private_identity_payload(bindings_identity, expected_kind="file")
+        try:
+            bindings_relative = bindings_path.relative_to(bindings_path.parents[1]).as_posix()
+        except (IndexError, ValueError):
+            raise EnronPerformanceError("Performance auxiliary binding location is invalid.") from None
+        if bindings_relative != "auxiliary/cmu-train-catalog-bindings.jsonl" or (
+            bank_build_tree.get(bindings_relative) != frozen_bindings_identity
+        ):
+            raise EnronPerformanceError("Performance auxiliary binding identity is inconsistent.")
+    _bounded_private_string(
+        locations.get("build_created_at"),
+        maximum_bytes=MAX_BUILD_TIMESTAMP_BYTES,
+        description="Performance source-build timestamp",
+    )
+    _require_sha256(locations.get("source_build_projection_sha256"), "Performance source-build projection")
+
+
 def _load_prepared_performance_run(run_dir: Path) -> _PreparedPerformanceRun:
     try:
         return _load_prepared_performance_run_impl(run_dir)
@@ -1789,15 +2251,41 @@ def _prepared_artifact_paths(prepared: _PreparedPerformanceRun) -> dict[str, Pat
     return result
 
 
-def _worker_artifact(reference: Mapping[str, Any], paths: Mapping[str, Path]) -> dict[str, Any]:
+def _read_prepared_artifact(
+    prepared: _PreparedPerformanceRun,
+    identifier: str,
+    *,
+    maximum_bytes: int,
+    description: str,
+) -> bytes:
+    paths = _prepared_artifact_paths(prepared)
+    path = paths.get(identifier)
+    fingerprint = prepared.artifact_fingerprints.get(identifier)
+    if path is None or fingerprint is None:
+        raise EnronPerformanceError(f"{description} has no frozen private artifact binding.")
+    return _read_fingerprinted_private_bytes(
+        path,
+        fingerprint,
+        maximum_bytes=maximum_bytes,
+        description=description,
+    )
+
+
+def _worker_artifact(
+    reference: Mapping[str, Any],
+    paths: Mapping[str, Path],
+    prepared: _PreparedPerformanceRun,
+) -> dict[str, Any]:
     identifier = str(reference["id"])
     path = paths.get(identifier)
-    if path is None:
+    fingerprint = prepared.artifact_fingerprints.get(identifier)
+    if path is None or fingerprint is None:
         raise EnronPerformanceError("Frozen worker artifact has no private location binding.")
     return {
         "path": os.fspath(path.absolute()),
         "sha256": reference["sha256"],
         "bytes": reference["bytes"],
+        "identity": _private_identity_payload(fingerprint.identity),
     }
 
 
@@ -1825,12 +2313,13 @@ def _worker_request(
                 "path": str(prepared.locations["profile_source"]),
                 "sha256": source_ref["sha256"],
                 "bytes": source_ref["bytes"],
+                "identity": prepared.locations["source_identities"]["profile_source"],
             }
         }
         parameters = {"max_line_bytes": 16 * 1024 * 1024, "max_records": 750_000}
         operation = "source_profile"
     elif phase == "cold_compile":
-        artifacts = {"bank": _worker_artifact(bank["artifact"], paths)}
+        artifacts = {"bank": _worker_artifact(bank["artifact"], paths, prepared)}
         parameters = {
             "bank_format": "json_bank_active" if bank["kind"] == "evaluated_bank" else "native_json",
             "cache_mode": "miss",
@@ -1840,9 +2329,9 @@ def _worker_request(
         if input_descriptor is None:
             raise EnronPerformanceError("Scan-bearing helper workload is missing its input.")
         artifacts = {
-            "bank": _worker_artifact(bank["artifact"], paths),
-            "input": _worker_artifact(input_descriptor["artifact"], paths),
-            "inventory": _worker_artifact(input_descriptor["inventory_ref"], paths),
+            "bank": _worker_artifact(bank["artifact"], paths, prepared),
+            "input": _worker_artifact(input_descriptor["artifact"], paths, prepared),
+            "inventory": _worker_artifact(input_descriptor["inventory_ref"], paths, prepared),
         }
         parameters = {
             "cache_mode": "hit" if phase == "helper_cache_hit" else "miss",
@@ -1854,8 +2343,8 @@ def _worker_request(
         if input_descriptor is None:
             raise EnronPerformanceError("Direct scan workload is missing its input.")
         artifacts = {
-            "input": _worker_artifact(input_descriptor["artifact"], paths),
-            "inventory": _worker_artifact(input_descriptor["inventory_ref"], paths),
+            "input": _worker_artifact(input_descriptor["artifact"], paths, prepared),
+            "inventory": _worker_artifact(input_descriptor["inventory_ref"], paths, prepared),
         }
         if harness["id"] == "generic_regex_harness":
             parameters = {
@@ -1865,11 +2354,11 @@ def _worker_request(
             }
             operation = "generic_regex_scan"
         elif harness["id"] == "python_literal_harness":
-            artifacts["bank"] = _worker_artifact(bank["artifact"], paths)
+            artifacts["bank"] = _worker_artifact(bank["artifact"], paths, prepared)
             parameters = {"concurrency": workload["concurrency"], "max_records": 5_000_000}
             operation = "python_literal_scan"
         else:
-            artifacts["bank"] = _worker_artifact(bank["artifact"], paths)
+            artifacts["bank"] = _worker_artifact(bank["artifact"], paths, prepared)
             parameters = {
                 "bank_format": "json_bank_active" if bank["kind"] == "evaluated_bank" else "native_json",
                 "concurrency": workload["concurrency"],
@@ -2213,17 +2702,70 @@ class _WorkerSession:
 def _source_build_request(
     workload: Mapping[str, Any], prepared: _PreparedPerformanceRun, *, nonce: str
 ) -> dict[str, Any]:
+    return _source_build_request_from_bindings(
+        workload,
+        prepared.plan,
+        prepared.locations,
+        nonce=nonce,
+    )
+
+
+def _source_build_request_from_bindings(
+    workload: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    locations: Mapping[str, Any],
+    *,
+    nonce: str,
+) -> dict[str, Any]:
     return {
         "schema_version": "nerb.enron_performance_source_build_request.v1",
         "nonce": nonce,
         "workload_sha256": workload["workload_sha256"],
-        "development_run": prepared.locations["development_run"],
-        "annotation_run": prepared.locations["annotation_run"],
-        "cmu_catalog_bindings": prepared.locations["cmu_catalog_bindings"],
-        "benchmark_version": prepared.plan["benchmark_version"],
-        "created_at": prepared.locations["build_created_at"],
-        "expected_projection_sha256": prepared.locations["source_build_projection_sha256"],
+        "development_run": locations["development_run"],
+        "annotation_run": locations["annotation_run"],
+        "cmu_catalog_bindings": locations["cmu_catalog_bindings"],
+        "source_identities": locations["source_identities"],
+        "benchmark_version": plan["benchmark_version"],
+        "created_at": locations["build_created_at"],
+        "expected_projection_sha256": locations["source_build_projection_sha256"],
     }
+
+
+def _reserved_source_build_output_path() -> str:
+    suffix = "/build"
+    return "/" + "\\" * (MAX_PRIVATE_PATH_BYTES - len(suffix) - 1) + suffix
+
+
+def _validate_source_build_request_budget(plan: Mapping[str, Any], locations: Mapping[str, Any]) -> None:
+    profiles = plan.get("profiles")
+    if not isinstance(profiles, Mapping):
+        raise EnronPerformanceError("Performance source-build request plan is invalid.")
+    workloads: list[Mapping[str, Any]] = []
+    for profile in PERFORMANCE_PROFILE_IDS:
+        profile_value = profiles.get(profile)
+        performance = profile_value.get("performance") if isinstance(profile_value, Mapping) else None
+        raw_workloads = performance.get("workloads") if isinstance(performance, Mapping) else None
+        if not isinstance(raw_workloads, list):
+            raise EnronPerformanceError("Performance source-build request plan is invalid.")
+        workloads.extend(
+            workload
+            for workload in raw_workloads
+            if isinstance(workload, Mapping) and workload.get("phase") == "source_build"
+        )
+    if not workloads:
+        raise EnronPerformanceError("Performance source-build request plan has no source-build workload.")
+    for workload in workloads:
+        request = {
+            **_source_build_request_from_bindings(
+                workload,
+                plan,
+                locations,
+                nonce="N" * 128,
+            ),
+            "output_dir": _reserved_source_build_output_path(),
+        }
+        if len(_canonical_json_bytes(request)) > DEFAULT_MAX_REQUEST_BYTES:
+            raise EnronPerformanceError("Performance source-build request exceeds its complete worker budget.")
 
 
 def _run_source_build_once(request: Mapping[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
@@ -2754,6 +3296,11 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
         if profile == "decision"
         else {"passed": False, "failure_codes": ["smoke_profile_nonpromotable"]}
     )
+    _assert_performance_private_tree_current(
+        prepared.root,
+        prepared.tree,
+        description="Performance preparation run",
+    )
     ending_source_sha256 = _performance_harness_source_sha256()
     software = _software()
     if ending_source_sha256 != current_source_sha256 or software != starting_software:
@@ -2828,8 +3375,9 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
         inventory_path = prepared_paths.get(inventory_id)
         if inventory_path is None:
             raise EnronPerformanceError("Prepared performance inventory location is unavailable.")
-        inventory_payloads[inventory_id] = _read_bounded_bytes(
-            inventory_path,
+        inventory_payloads[inventory_id] = _read_prepared_artifact(
+            prepared,
+            inventory_id,
             maximum_bytes=int(inventory_ref["bytes"]),
             description="Performance inventory",
         )
@@ -2873,6 +3421,11 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
             for artifact, _payload, kind in sorted(run_artifacts, key=lambda item: item[0].relative_path)
         ],
     }
+    _assert_performance_private_tree_current(
+        prepared.root,
+        prepared.tree,
+        description="Performance preparation run",
+    )
     try:
         with PrivateRun(options.output_dir, allow_unignored_output=options.allow_unignored_output) as run:
             for artifact, payload, _kind in sorted(run_artifacts, key=lambda item: item[0].relative_path):
@@ -2896,11 +3449,304 @@ def run_enron_performance(options: EnronPerformanceRunOptions) -> dict[str, Any]
         raise EnronPerformanceError("Performance run failed closed structural verification.") from None
 
 
+def _open_frozen_private_input(path: Path, expected_identity: Mapping[str, Any], *, description: str) -> Any:
+    frozen = _validate_private_identity_payload(expected_identity, expected_kind="file")
+    handle = None
+    try:
+        handle = open_private_binary_input(path)
+        observed_identity = _bank_workflow._private_entry_identity(os.fstat(handle.fileno()), kind="file")
+        _bank_workflow._require_private_entry(observed_identity)
+        observed = _private_identity_payload(observed_identity)
+    except (EnronBankBuildError, EnronPrivateIOError, OSError):
+        if handle is not None:
+            handle.close()
+        raise EnronPerformanceError(f"{description} could not be opened from its frozen private inode.") from None
+    if observed != frozen:
+        handle.close()
+        raise EnronPerformanceError(f"{description} identity changed before use.")
+    return handle
+
+
+def _assert_pinned_private_input(handle: Any, expected_identity: Mapping[str, Any], *, description: str) -> None:
+    try:
+        observed_identity = _bank_workflow._private_entry_identity(os.fstat(handle.fileno()), kind="file")
+        _bank_workflow._require_private_entry(observed_identity)
+    except (EnronBankBuildError, OSError):
+        raise EnronPerformanceError(f"{description} changed during use.") from None
+    if _private_identity_payload(observed_identity) != dict(expected_identity):
+        raise EnronPerformanceError(f"{description} changed during use.")
+
+
+def _copy_frozen_private_input(
+    run: PrivateRun,
+    source: Path,
+    destination: Path,
+    expected_identity: Mapping[str, Any],
+    *,
+    description: str,
+) -> tuple[str, int]:
+    frozen = _validate_private_identity_payload(expected_identity, expected_kind="file")
+    expected_bytes = int(frozen["size"])
+    if expected_bytes > MAX_SOURCE_SNAPSHOT_BYTES:
+        raise EnronPerformanceError(f"{description} exceeds the private snapshot byte limit.")
+    digest = hashlib.sha256()
+    observed_bytes = 0
+    try:
+        with _open_frozen_private_input(source, frozen, description=description) as source_handle:
+            with run.open_binary(destination) as destination_handle:
+                while chunk := source_handle.read(min(1024 * 1024, expected_bytes - observed_bytes + 1)):
+                    observed_bytes += len(chunk)
+                    if observed_bytes > expected_bytes:
+                        raise EnronPerformanceError(f"{description} changed while it was snapshotted.")
+                    digest.update(chunk)
+                    destination_handle.write(chunk)
+            _assert_pinned_private_input(source_handle, frozen, description=description)
+    except EnronPerformanceError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError):
+        raise EnronPerformanceError(f"{description} could not be snapshotted safely.") from None
+    if observed_bytes != expected_bytes:
+        raise EnronPerformanceError(f"{description} changed while it was snapshotted.")
+    return "sha256:" + digest.hexdigest(), observed_bytes
+
+
+def _copy_frozen_private_tree(
+    run: PrivateRun,
+    source_root: Path,
+    destination_root: Path,
+    expected_tree_value: Mapping[str, Any],
+    *,
+    description: str,
+) -> tuple[dict[str, tuple[str, int]], set[str]]:
+    expected_tree = _validate_private_tree_payload(expected_tree_value)
+    _root, current_tree = _snapshot_performance_private_tree(source_root, description=description)
+    if _private_tree_payload(current_tree) != expected_tree:
+        raise EnronPerformanceError(f"{description} identity changed before snapshotting.")
+    total_bytes = sum(int(identity["size"]) for identity in expected_tree.values() if identity["kind"] == "file")
+    if total_bytes > MAX_SOURCE_SNAPSHOT_BYTES:
+        raise EnronPerformanceError(f"{description} exceeds the private snapshot byte limit.")
+    run.ensure_directory(destination_root)
+    destination_directories = {destination_root.as_posix()}
+    directories = sorted(
+        (name for name, identity in expected_tree.items() if name != "." and identity["kind"] == "directory"),
+        key=lambda name: (len(Path(name).parts), name),
+    )
+    for name in directories:
+        run.ensure_directory(destination_root / name)
+        destination_directories.add((destination_root / name).as_posix())
+    copied: dict[str, tuple[str, int]] = {}
+    for name, identity in sorted(expected_tree.items()):
+        if identity["kind"] != "file":
+            continue
+        target = destination_root / name
+        copied[target.as_posix()] = _copy_frozen_private_input(
+            run,
+            source_root / name,
+            target,
+            identity,
+            description=f"{description} file",
+        )
+    _root, final_tree = _snapshot_performance_private_tree(source_root, description=description)
+    if _private_tree_payload(final_tree) != expected_tree:
+        raise EnronPerformanceError(f"{description} changed while it was snapshotted.")
+    return copied, destination_directories
+
+
+def _verify_source_build_snapshot(
+    root: Path,
+    copied: Mapping[str, tuple[str, int]],
+    expected_directories: set[str],
+) -> Mapping[str, Any]:
+    snapshot_root, tree = _snapshot_performance_private_tree(root, description="Source-build private input snapshot")
+    expected_files = {"COMMITTED", "manifest.json", *copied}
+    for name in expected_files:
+        parts = Path(name).parts[:-1]
+        for length in range(1, len(parts) + 1):
+            expected_directories.add(Path(*parts[:length]).as_posix())
+    observed_files = {name for name, identity in tree.items() if identity.kind == "file"}
+    observed_directories = {name for name, identity in tree.items() if name != "." and identity.kind == "directory"}
+    if observed_files != expected_files or observed_directories != expected_directories:
+        raise EnronPerformanceError("Source-build private input snapshot inventory is invalid.")
+    for relative_path, (expected_sha256, expected_bytes) in copied.items():
+        fingerprint = _fingerprint_performance_private_file(
+            snapshot_root,
+            relative_path,
+            tree,
+            maximum_bytes=max(expected_bytes, 1),
+            description="Source-build private input snapshot file",
+        )
+        if fingerprint.sha256 != expected_sha256 or fingerprint.identity.size != expected_bytes:
+            raise EnronPerformanceError("Source-build private input snapshot differs from its copied source.")
+    return tree
+
+
+@contextlib.contextmanager
+def _source_build_input_boundary(request: Mapping[str, Any]):
+    identities = request.get("source_identities")
+    if not isinstance(identities, Mapping) or set(identities) != {
+        "development_tree",
+        "development_manifest",
+        "profile_source",
+        "annotation_tree",
+        "bank_build_tree",
+        "cmu_catalog_bindings",
+    }:
+        raise EnronPerformanceError("Source-build frozen identity request is invalid.")
+    development_tree = _validate_private_tree_payload(identities["development_tree"])
+    manifest_identity = _validate_private_identity_payload(
+        identities["development_manifest"],
+        expected_kind="file",
+    )
+    train_identity = _validate_private_identity_payload(identities["profile_source"], expected_kind="file")
+    if (
+        development_tree.get("manifest.json") != manifest_identity
+        or development_tree.get("train.jsonl") != train_identity
+    ):
+        raise EnronPerformanceError("Source-build development identities are inconsistent.")
+    development_root = _validated_absolute_private_location(
+        request.get("development_run"),
+        description="Source-build development run location",
+    )
+    annotation_value = request.get("annotation_run")
+    bindings_value = request.get("cmu_catalog_bindings")
+    annotation_tree_value = identities.get("annotation_tree")
+    bank_tree_value = identities.get("bank_build_tree")
+    bindings_identity_value = identities.get("cmu_catalog_bindings")
+    optional_values = (
+        annotation_value,
+        bindings_value,
+        annotation_tree_value,
+        bank_tree_value,
+        bindings_identity_value,
+    )
+    if any(value is None for value in optional_values) and any(value is not None for value in optional_values):
+        raise EnronPerformanceError("Source-build auxiliary identities are incomplete.")
+
+    annotation_root: Path | None = None
+    annotation_tree: dict[str, dict[str, Any]] | None = None
+    bank_root: Path | None = None
+    bank_tree: dict[str, dict[str, Any]] | None = None
+    bindings_path: Path | None = None
+    bindings_identity: dict[str, Any] | None = None
+    if annotation_value is not None:
+        annotation_root = _validated_absolute_private_location(
+            annotation_value,
+            description="Source-build annotation run location",
+        )
+        annotation_tree = _validate_private_tree_payload(annotation_tree_value)
+        bank_tree = _validate_private_tree_payload(bank_tree_value)
+        bindings_path = _validated_absolute_private_location(
+            bindings_value,
+            description="Source-build auxiliary binding location",
+        )
+        bank_root = bindings_path.parents[1]
+        bindings_identity = _validate_private_identity_payload(bindings_identity_value, expected_kind="file")
+    output_dir = _validated_absolute_private_location(
+        request.get("output_dir"),
+        description="Source-build output location",
+    )
+    declared_snapshot_bytes = sum(
+        int(identity["size"]) for identity in development_tree.values() if identity["kind"] == "file"
+    )
+    if annotation_tree is not None:
+        declared_snapshot_bytes += sum(
+            int(identity["size"]) for identity in annotation_tree.values() if identity["kind"] == "file"
+        )
+    if bindings_identity is not None:
+        declared_snapshot_bytes += int(bindings_identity["size"])
+    if declared_snapshot_bytes > MAX_SOURCE_SNAPSHOT_BYTES:
+        raise EnronPerformanceError("Source-build inputs exceed the private snapshot byte limit.")
+    snapshot_root = output_dir.parent / "inputs"
+    copied: dict[str, tuple[str, int]] = {}
+    snapshot_directories: set[str] = set()
+    try:
+        with PrivateRun(snapshot_root, allow_unignored_output=True) as run:
+            development_copied, development_directories = _copy_frozen_private_tree(
+                run,
+                development_root,
+                Path("development"),
+                development_tree,
+                description="Source-build development run",
+            )
+            copied.update(development_copied)
+            snapshot_directories.update(development_directories)
+            if (
+                annotation_root is not None
+                and annotation_tree is not None
+                and bank_root is not None
+                and bank_tree is not None
+                and bindings_path is not None
+                and bindings_identity is not None
+            ):
+                annotation_copied, annotation_directories = _copy_frozen_private_tree(
+                    run,
+                    annotation_root,
+                    Path("annotation"),
+                    annotation_tree,
+                    description="Source-build annotation run",
+                )
+                copied.update(annotation_copied)
+                snapshot_directories.update(annotation_directories)
+                _bank_root, current_bank_tree = _snapshot_performance_private_tree(
+                    bank_root,
+                    description="Source-build bank run",
+                )
+                if _private_tree_payload(current_bank_tree) != bank_tree:
+                    raise EnronPerformanceError("Source-build bank run identity changed before snapshotting.")
+                binding_target = Path("bindings/cmu-train-catalog-bindings.jsonl")
+                copied[binding_target.as_posix()] = _copy_frozen_private_input(
+                    run,
+                    bindings_path,
+                    binding_target,
+                    bindings_identity,
+                    description="Source-build auxiliary bindings",
+                )
+                _bank_root, final_bank_tree = _snapshot_performance_private_tree(
+                    bank_root,
+                    description="Source-build bank run",
+                )
+                if _private_tree_payload(final_bank_tree) != bank_tree:
+                    raise EnronPerformanceError("Source-build bank run changed while it was snapshotted.")
+            if sum(byte_count for _sha256, byte_count in copied.values()) > MAX_SOURCE_SNAPSHOT_BYTES:
+                raise EnronPerformanceError("Source-build inputs exceed the private snapshot byte limit.")
+            snapshot_manifest = {
+                "schema_version": "nerb.enron_performance_source_snapshot.v1",
+                "files": {
+                    name: {"sha256": sha256, "bytes": byte_count}
+                    for name, (sha256, byte_count) in sorted(copied.items())
+                },
+            }
+            with run.open_binary("manifest.json") as file:
+                file.write(_pretty_json_bytes(snapshot_manifest))
+            run.commit()
+    except EnronPerformanceError:
+        raise
+    except EnronPrivateIOError:
+        raise EnronPerformanceError("Source-build private input snapshot failed safely.") from None
+    snapshot_tree = _verify_source_build_snapshot(snapshot_root, copied, snapshot_directories)
+    snapshot = _SourceBuildInputSnapshot(
+        root=snapshot_root,
+        development_run=snapshot_root / "development",
+        annotation_run=None if annotation_root is None else snapshot_root / "annotation",
+        cmu_catalog_bindings=(
+            None if bindings_path is None else snapshot_root / "bindings" / "cmu-train-catalog-bindings.jsonl"
+        ),
+    )
+    try:
+        yield snapshot
+    finally:
+        _assert_performance_private_tree_current(
+            snapshot.root,
+            snapshot_tree,
+            description="Source-build private input snapshot",
+        )
+
+
 def _source_build_worker_result(raw: bytes) -> dict[str, Any]:
     nonce: str | None = None
     workload_sha256: str | None = None
     try:
-        if not raw or len(raw) > 64 * 1024:
+        if not raw or len(raw) > DEFAULT_MAX_REQUEST_BYTES:
             raise ValueError
         request = _strict_json_loads(raw)
         if not isinstance(request, dict) or set(request) != {
@@ -2910,6 +3756,7 @@ def _source_build_worker_result(raw: bytes) -> dict[str, Any]:
             "development_run",
             "annotation_run",
             "cmu_catalog_bindings",
+            "source_identities",
             "benchmark_version",
             "created_at",
             "expected_projection_sha256",
@@ -2928,18 +3775,28 @@ def _source_build_worker_result(raw: bytes) -> dict[str, Any]:
             request.get("schema_version") != "nerb.enron_performance_source_build_request.v1"
             or nonce is None
             or workload_sha256 is None
-            or not isinstance(request.get("development_run"), str)
-            or not Path(request["development_run"]).is_absolute()
-            or not isinstance(request.get("benchmark_version"), str)
-            or not request["benchmark_version"]
-            or not isinstance(request.get("created_at"), str)
-            or not request["created_at"]
             or not isinstance(request.get("expected_projection_sha256"), str)
             or _SHA256_RE.fullmatch(request["expected_projection_sha256"]) is None
-            or not isinstance(request.get("output_dir"), str)
         ):
             raise ValueError
-        output_dir = Path(request["output_dir"])
+        _validated_absolute_private_location(
+            request.get("development_run"),
+            description="Source-build development run location",
+        )
+        _bounded_private_string(
+            request.get("benchmark_version"),
+            maximum_bytes=MAX_BENCHMARK_VERSION_BYTES,
+            description="Source-build benchmark version",
+        )
+        _bounded_private_string(
+            request.get("created_at"),
+            maximum_bytes=MAX_BUILD_TIMESTAMP_BYTES,
+            description="Source-build timestamp",
+        )
+        output_dir = _validated_absolute_private_location(
+            request.get("output_dir"),
+            description="Source-build output location",
+        )
         temporary_root = output_dir.parent
         system_temporary_root = Path(tempfile.gettempdir()).resolve()
         if (
@@ -2955,30 +3812,58 @@ def _source_build_worker_result(raw: bytes) -> dict[str, Any]:
         bindings_value = request.get("cmu_catalog_bindings")
         if (annotation_value is None) != (bindings_value is None):
             raise ValueError
-        if annotation_value is not None and (
-            not isinstance(annotation_value, str)
-            or not Path(annotation_value).is_absolute()
-            or not isinstance(bindings_value, str)
-            or not Path(bindings_value).is_absolute()
-        ):
+        if annotation_value is not None:
+            _validated_absolute_private_location(
+                annotation_value,
+                description="Source-build annotation run location",
+            )
+            _validated_absolute_private_location(
+                bindings_value,
+                description="Source-build auxiliary binding location",
+            )
+        identities = request.get("source_identities")
+        if not isinstance(identities, Mapping) or set(identities) != {
+            "development_tree",
+            "development_manifest",
+            "profile_source",
+            "annotation_tree",
+            "bank_build_tree",
+            "cmu_catalog_bindings",
+        }:
             raise ValueError
-    except (json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
+        _validate_private_tree_payload(identities["development_tree"])
+        _validate_private_identity_payload(identities["development_manifest"], expected_kind="file")
+        _validate_private_identity_payload(identities["profile_source"], expected_kind="file")
+        optional_identities = (
+            identities["annotation_tree"],
+            identities["bank_build_tree"],
+            identities["cmu_catalog_bindings"],
+        )
+        if annotation_value is None:
+            if any(value is not None for value in optional_identities):
+                raise ValueError
+        else:
+            _validate_private_tree_payload(identities["annotation_tree"])
+            _validate_private_tree_payload(identities["bank_build_tree"])
+            _validate_private_identity_payload(identities["cmu_catalog_bindings"], expected_kind="file")
+    except (EnronPerformanceError, OSError, json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
         return _source_build_error_result(nonce, workload_sha256, "request_shape")
 
     try:
-        options = EnronBankBuildOptions(
-            development_run=Path(request["development_run"]),
-            output_dir=output_dir,
-            annotation_run=None if annotation_value is None else Path(annotation_value),
-            cmu_catalog_bindings_path=None if bindings_value is None else Path(bindings_value),
-            benchmark_version=request["benchmark_version"],
-            created_at=request["created_at"],
-            allow_unignored_output=True,
-        )
         started = time.perf_counter_ns()
-        with open(os.devnull, "w", encoding="utf-8") as sink:
-            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                card = build_enron_intelligence_bank(options)
+        with _source_build_input_boundary(request) as source_snapshot:
+            options = EnronBankBuildOptions(
+                development_run=source_snapshot.development_run,
+                output_dir=output_dir,
+                annotation_run=source_snapshot.annotation_run,
+                cmu_catalog_bindings_path=source_snapshot.cmu_catalog_bindings,
+                benchmark_version=request["benchmark_version"],
+                created_at=request["created_at"],
+                allow_unignored_output=True,
+            )
+            with open(os.devnull, "w", encoding="utf-8") as sink:
+                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                    card = build_enron_intelligence_bank(options)
         elapsed_ns = time.perf_counter_ns() - started
         projection_sha256 = _canonical_hash(_source_build_projection(card))
         if projection_sha256 != request["expected_projection_sha256"]:
@@ -3000,6 +3885,8 @@ def _source_build_worker_result(raw: bytes) -> dict[str, Any]:
             "record_count": active_patterns,
             "correctness_sha256": projection_sha256,
         }
+    except EnronPerformanceError:
+        return _source_build_error_result(nonce, workload_sha256, "source_identity_changed")
     except BaseException:
         return _source_build_error_result(nonce, workload_sha256, "operation_failed")
 
@@ -3036,11 +3923,16 @@ def _source_build_error_result(
     }
 
 
-def _read_run_artifacts(root: Path, manifest: Mapping[str, Any]) -> dict[str, bytes]:
+def _read_run_artifacts(
+    root: Path,
+    manifest: Mapping[str, Any],
+    tree: Mapping[str, Any],
+) -> dict[str, bytes]:
     raw_artifacts = manifest.get("artifacts")
     if not isinstance(raw_artifacts, list) or not raw_artifacts:
         raise EnronPerformanceError("Performance run manifest has no artifacts.")
     result: dict[str, bytes] = {}
+    descriptors: dict[str, Mapping[str, Any]] = {}
     paths: set[str] = set()
     for item in raw_artifacts:
         if not isinstance(item, Mapping) or set(item) != {"id", "sha256", "bytes", "relative_path", "kind"}:
@@ -3050,7 +3942,7 @@ def _read_run_artifacts(root: Path, manifest: Mapping[str, Any]) -> dict[str, by
         if (
             not isinstance(identifier, str)
             or not identifier
-            or identifier in result
+            or identifier in descriptors
             or not isinstance(relative_path, str)
             or not relative_path
             or relative_path in paths
@@ -3067,20 +3959,34 @@ def _read_run_artifacts(root: Path, manifest: Mapping[str, Any]) -> dict[str, by
         relative = Path(relative_path)
         if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
             raise EnronPerformanceError("Performance run artifact path is unsafe.")
-        byte_count = _positive_int(
+        _positive_int(
             item.get("bytes"),
             "Performance run artifact bytes",
             maximum=MAX_PRIVATE_JSON_BYTES,
         )
-        payload = _read_bounded_bytes(
-            root / relative,
-            maximum_bytes=byte_count,
+        descriptors[identifier] = item
+        paths.add(relative_path)
+    _verify_performance_tree_inventory(tree, ["COMMITTED", "manifest.json", *sorted(paths)])
+    for identifier, item in descriptors.items():
+        byte_count = int(item["bytes"])
+        relative_path = str(item["relative_path"])
+        relative = Path(relative_path)
+        fingerprint = _fingerprint_performance_private_file(
+            root,
+            relative_path,
+            tree,
+            maximum_bytes=max(byte_count, 1),
             description="Performance run artifact",
         )
-        if len(payload) != byte_count or _sha256_bytes(payload) != item.get("sha256"):
+        if fingerprint.identity.size != byte_count or fingerprint.sha256 != item.get("sha256"):
             raise EnronPerformanceError("Performance run artifact changed after commit.")
+        payload = _read_fingerprinted_private_bytes(
+            root / relative,
+            fingerprint,
+            maximum_bytes=max(byte_count, 1),
+            description="Performance run artifact",
+        )
         result[identifier] = payload
-        paths.add(relative_path)
     return result
 
 
@@ -3212,13 +4118,39 @@ def _verify_materialized_performance(
 def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
     """Verify a committed performance run without reading protected corpus text."""
 
-    root = Path(run_dir).expanduser()
-    marker = _read_bounded_bytes(root / "COMMITTED", maximum_bytes=128, description="Performance commit marker")
+    root, initial_tree = _snapshot_performance_private_tree(
+        run_dir,
+        description="Performance evidence run",
+    )
+    marker_fingerprint = _fingerprint_performance_private_file(
+        root,
+        "COMMITTED",
+        initial_tree,
+        maximum_bytes=128,
+        description="Performance commit marker",
+    )
+    marker = _read_fingerprinted_private_bytes(
+        root / "COMMITTED",
+        marker_fingerprint,
+        maximum_bytes=128,
+        description="Performance commit marker",
+    )
     if marker != b"nerb.enron.private-run.v2\n":
         raise EnronPerformanceError("Performance run is not committed.")
-    manifest = _read_json_object(
-        root / "manifest.json",
+    manifest_fingerprint = _fingerprint_performance_private_file(
+        root,
+        "manifest.json",
+        initial_tree,
         maximum_bytes=MAX_PLAN_BYTES,
+        description="Performance run manifest",
+    )
+    manifest = _strict_json_object_bytes(
+        _read_fingerprinted_private_bytes(
+            root / "manifest.json",
+            manifest_fingerprint,
+            maximum_bytes=MAX_PLAN_BYTES,
+            description="Performance run manifest",
+        ),
         description="Performance run manifest",
     )
     if (
@@ -3235,7 +4167,7 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
         or manifest.get("suite") != PERFORMANCE_SUITE_ID
     ):
         raise EnronPerformanceError("Performance run manifest shape is invalid.")
-    artifacts = _read_run_artifacts(root, manifest)
+    artifacts = _read_run_artifacts(root, manifest, initial_tree)
     if not {"performance_report", "performance_audit", "performance_plan"} <= set(artifacts):
         raise EnronPerformanceError("Performance run is missing required artifacts.")
     try:
@@ -3467,6 +4399,11 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
         reused_value_pids = [audit_rows[identifier]["samples"][0]["pid"] for identifier in reused_value_ids]
         if len(set(reused_value_pids)) != len(reused_value_pids):
             raise EnronPerformanceError("Performance cache-value reused-process isolation is invalid.")
+    _assert_performance_private_tree_current(
+        root,
+        initial_tree,
+        description="Performance evidence run",
+    )
     return {
         "valid": True,
         "schema_version": PERFORMANCE_RUN_SCHEMA_VERSION,

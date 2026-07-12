@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import time
 from collections import OrderedDict
@@ -36,7 +37,7 @@ from .bank import hash_bank
 from .config import PatternConfig, validate_pattern_config
 from .engine import Bank, clear_bank_cache
 from .engines import CompiledBank, compile_bank_with_report
-from .enron_private_io import EnronPrivateIOError, iter_strict_jsonl, open_private_binary_input
+from .enron_private_io import EnronPrivateIOError, is_owner_only_private_mode, open_private_binary_input
 
 try:  # pragma: no cover - import availability is platform-dependent.
     _resource: Any = importlib.import_module("resource")
@@ -145,11 +146,17 @@ class _ArtifactRef:
     path: Path
     sha256: str
     bytes: int
+    identity: Mapping[str, int | str]
 
     def semantic_descriptor(self) -> dict[str, Any]:
         # The digest is process-private, so binding the approved path cannot leak
         # it and prevents a reused state from reading a prior request's location.
-        return {"path": str(self.path), "sha256": self.sha256, "bytes": self.bytes}
+        return {
+            "path": str(self.path),
+            "sha256": self.sha256,
+            "bytes": self.bytes,
+            "identity": dict(self.identity),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,6 +369,34 @@ def _prepare_operation(request: _Request) -> _Operation:
     raise _WorkerError("operation_invalid")
 
 
+def _file_identity(info: os.stat_result) -> dict[str, int | str]:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or not is_owner_only_private_mode(stat.S_IMODE(info.st_mode))
+    ):
+        raise _WorkerError("artifact_changed")
+    return {
+        "kind": "file",
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": stat.S_IMODE(info.st_mode),
+        "link_count": info.st_nlink,
+        "size": info.st_size,
+        "modified_ns": info.st_mtime_ns,
+        "changed_ns": info.st_ctime_ns,
+    }
+
+
+def _require_artifact_identity(file: Any, reference: _ArtifactRef) -> None:
+    try:
+        observed = _file_identity(os.fstat(file.fileno()))
+    except OSError:
+        raise _WorkerError("artifact_invalid") from None
+    if observed != reference.identity:
+        raise _WorkerError("artifact_changed")
+
+
 def _prepare_source_profile(request: _Request) -> _Operation:
     source = request.artifacts["source"]
     max_line_bytes = cast(int, request.parameters["max_line_bytes"])
@@ -376,17 +411,28 @@ def _prepare_source_profile(request: _Request) -> _Operation:
         records = 0
         raw_sha = hashlib.sha256()
         try:
-            for _line_number, raw, value in iter_strict_jsonl(source.path, max_line_bytes):
-                records += 1
-                if records > max_records:
-                    raise _WorkerError("record_limit_exceeded")
-                total_bytes += len(raw)
-                if total_bytes > source.bytes:
-                    raise _WorkerError("artifact_changed")
-                raw_sha.update(raw)
-                canonical = _canonical_json_bytes(value)
-                _digest_frame(digest, canonical)
-        except EnronPrivateIOError:
+            with open_private_binary_input(source.path) as file:
+                _require_artifact_identity(file, source)
+                while raw := file.readline(max_line_bytes + 1):
+                    if len(raw) > max_line_bytes:
+                        raise _WorkerError("artifact_invalid")
+                    records += 1
+                    if records > max_records:
+                        raise _WorkerError("record_limit_exceeded")
+                    total_bytes += len(raw)
+                    if total_bytes > source.bytes:
+                        raise _WorkerError("artifact_changed")
+                    raw_sha.update(raw)
+                    try:
+                        value = _load_strict_json(raw)
+                    except (UnicodeDecodeError, _StrictJSONError):
+                        raise _WorkerError("artifact_invalid") from None
+                    if not isinstance(value, Mapping):
+                        raise _WorkerError("artifact_invalid")
+                    canonical = _canonical_json_bytes(value)
+                    _digest_frame(digest, canonical)
+                _require_artifact_identity(file, source)
+        except (EnronPrivateIOError, OSError, OverflowError):
             raise _WorkerError("artifact_invalid") from None
         if total_bytes != source.bytes or "sha256:" + raw_sha.hexdigest() != source.sha256:
             raise _WorkerError("artifact_changed")
@@ -925,7 +971,9 @@ def _read_bound_artifact(reference: _ArtifactRef, maximum_bytes: int) -> bytes:
         raise _WorkerError("artifact_too_large")
     try:
         with open_private_binary_input(reference.path) as file:
+            _require_artifact_identity(file, reference)
             data = file.read(reference.bytes + 1)
+            _require_artifact_identity(file, reference)
     except (EnronPrivateIOError, OSError, OverflowError):
         raise _WorkerError("artifact_invalid") from None
     if len(data) != reference.bytes:
@@ -1167,7 +1215,7 @@ def _operation_shape(operation: Operation) -> tuple[set[str], dict[str, Callable
 
 
 def _artifact_ref(value: Any) -> _ArtifactRef:
-    if not isinstance(value, Mapping) or set(value) != {"path", "sha256", "bytes"}:
+    if not isinstance(value, Mapping) or set(value) != {"path", "sha256", "bytes", "identity"}:
         raise _WorkerError("request_shape")
     raw_path = value.get("path")
     raw_sha256 = value.get("sha256")
@@ -1181,12 +1229,35 @@ def _artifact_ref(value: Any) -> _ArtifactRef:
         or "\0" in raw_path
         or len(path_bytes) > DEFAULT_MAX_PATH_BYTES
         or not Path(raw_path).is_absolute()
+        or any(part == os.pardir for part in Path(raw_path).parts)
         or not isinstance(raw_sha256, str)
         or _SHA256_RE.fullmatch(raw_sha256) is None
     ):
         raise _WorkerError("request_shape")
     byte_count = _bounded_int(value.get("bytes"), minimum=0, maximum=DEFAULT_MAX_PROFILE_BYTES)
-    return _ArtifactRef(Path(raw_path), raw_sha256, byte_count)
+    raw_identity = value.get("identity")
+    identity_keys = {
+        "kind",
+        "device",
+        "inode",
+        "mode",
+        "link_count",
+        "size",
+        "modified_ns",
+        "changed_ns",
+    }
+    if not isinstance(raw_identity, Mapping) or set(raw_identity) != identity_keys:
+        raise _WorkerError("request_shape")
+    numeric = {key: raw_identity.get(key) for key in identity_keys - {"kind"}}
+    if (
+        raw_identity.get("kind") != "file"
+        or any(type(item) is not int or item < 0 for item in numeric.values())
+        or not is_owner_only_private_mode(cast(int, raw_identity.get("mode")))
+        or raw_identity.get("link_count") != 1
+        or raw_identity.get("size") != byte_count
+    ):
+        raise _WorkerError("request_shape")
+    return _ArtifactRef(Path(raw_path), raw_sha256, byte_count, dict(raw_identity))
 
 
 def _request_spec_sha256(request: _Request) -> str:

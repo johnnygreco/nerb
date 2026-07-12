@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -565,6 +567,18 @@ def test_source_build_worker_never_echoes_exception_text_or_invalid_correlation_
         lambda _options: (_ for _ in ()).throw(RuntimeError("SAFE_PRIVATE_FIXTURE_TOKEN")),
     )
     monkeypatch.setattr(performance_module, "_source_build_peak_rss", lambda: (None, "resource_unavailable"))
+    monkeypatch.setattr(
+        performance_module,
+        "_source_build_input_boundary",
+        lambda _request: performance_module.contextlib.nullcontext(
+            performance_module._SourceBuildInputSnapshot(
+                root=tmp_path,
+                development_run=tmp_path,
+                annotation_run=None,
+                cmu_catalog_bindings=None,
+            )
+        ),
+    )
     monkeypatch.setattr(performance_module.tempfile, "gettempdir", lambda: str(tmp_path))
     temporary_root = tmp_path / "nerb-performance-build-test"
     temporary_root.mkdir()
@@ -575,6 +589,63 @@ def test_source_build_worker_never_echoes_exception_text_or_invalid_correlation_
         "development_run": str(tmp_path.resolve()),
         "annotation_run": None,
         "cmu_catalog_bindings": None,
+        "source_identities": {
+            "development_tree": {
+                ".": {
+                    "kind": "directory",
+                    "device": 1,
+                    "inode": 1,
+                    "mode": 0o700,
+                    "link_count": 1,
+                    "size": 0,
+                    "modified_ns": 1,
+                    "changed_ns": 1,
+                },
+                "manifest.json": {
+                    "kind": "file",
+                    "device": 1,
+                    "inode": 2,
+                    "mode": 0o600,
+                    "link_count": 1,
+                    "size": 0,
+                    "modified_ns": 1,
+                    "changed_ns": 1,
+                },
+                "train.jsonl": {
+                    "kind": "file",
+                    "device": 1,
+                    "inode": 3,
+                    "mode": 0o600,
+                    "link_count": 1,
+                    "size": 0,
+                    "modified_ns": 1,
+                    "changed_ns": 1,
+                },
+            },
+            "development_manifest": {
+                "kind": "file",
+                "device": 1,
+                "inode": 2,
+                "mode": 0o600,
+                "link_count": 1,
+                "size": 0,
+                "modified_ns": 1,
+                "changed_ns": 1,
+            },
+            "profile_source": {
+                "kind": "file",
+                "device": 1,
+                "inode": 3,
+                "mode": 0o600,
+                "link_count": 1,
+                "size": 0,
+                "modified_ns": 1,
+                "changed_ns": 1,
+            },
+            "annotation_tree": None,
+            "bank_build_tree": None,
+            "cmu_catalog_bindings": None,
+        },
         "benchmark_version": "safe-v2",
         "created_at": "2026-07-11T00:00:00Z",
         "expected_projection_sha256": _HASH_2,
@@ -592,6 +663,164 @@ def test_source_build_worker_never_echoes_exception_text_or_invalid_correlation_
     assert rejected["error_code"] == "request_shape"
     assert rejected["nonce"] is None
     assert "@" not in _canonical(rejected).decode("ascii")
+
+    request["nonce"] = "safe-nonce"
+    for field in ("development_run", "benchmark_version", "created_at", "output_dir"):
+        original = request[field]
+        request[field] = 1
+        malformed = performance_module._source_build_worker_result(_canonical(request))
+        assert malformed["status"] == "error"
+        assert malformed["error_code"] == "request_shape"
+        assert "@" not in _canonical(malformed).decode("ascii")
+        request[field] = original
+
+
+def test_source_build_worker_rejects_development_root_substitution_before_builder_use(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    development = tmp_path / "development"
+    development.mkdir(mode=0o700)
+    development.chmod(0o700)
+    for name, payload in (("manifest.json", b"{}\n"), ("train.jsonl", b'{"safe":true}\n')):
+        (development / name).write_bytes(payload)
+        (development / name).chmod(0o600)
+    _root, tree = performance_module._snapshot_performance_private_tree(
+        development,
+        description="Test development run",
+    )
+    tree_payload = performance_module._private_tree_payload(tree)
+    identities = {
+        "development_tree": tree_payload,
+        "development_manifest": tree_payload["manifest.json"],
+        "profile_source": tree_payload["train.jsonl"],
+        "annotation_tree": None,
+        "bank_build_tree": None,
+        "cmu_catalog_bindings": None,
+    }
+    original = tmp_path / "development-original"
+    development.rename(original)
+    development.mkdir(mode=0o700)
+    development.chmod(0o700)
+    for name in ("manifest.json", "train.jsonl"):
+        (development / name).write_bytes((original / name).read_bytes())
+        (development / name).chmod(0o600)
+    temporary_root = tmp_path / "nerb-performance-build-substitution"
+    temporary_root.mkdir()
+    monkeypatch.setattr(performance_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(
+        performance_module,
+        "build_enron_intelligence_bank",
+        lambda _options: pytest.fail("builder consumed a substituted development root"),
+    )
+    request = {
+        "schema_version": "nerb.enron_performance_source_build_request.v1",
+        "nonce": "safe-nonce",
+        "workload_sha256": _HASH_1,
+        "development_run": str(development.resolve()),
+        "annotation_run": None,
+        "cmu_catalog_bindings": None,
+        "source_identities": identities,
+        "benchmark_version": "safe-v2",
+        "created_at": "2026-07-11T00:00:00Z",
+        "expected_projection_sha256": _HASH_2,
+        "output_dir": str((temporary_root / "build").resolve()),
+    }
+
+    failed = performance_module._source_build_worker_result(_canonical(request))
+
+    assert failed["status"] == "error"
+    assert failed["error_code"] == "source_identity_changed"
+
+
+def test_source_build_worker_uses_complete_immutable_snapshot_during_source_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    development = tmp_path / "development-race"
+    development.mkdir(mode=0o700)
+    development.chmod(0o700)
+    payloads = {
+        "COMMITTED": b"nerb.enron.private-run.v2\n",
+        "manifest.json": b"{}\n",
+        "train.jsonl": b'{"source":"train-safe"}\n',
+        "validation.jsonl": b'{"source":"validation-safe"}\n',
+        "memberships.jsonl": b'{"source":"memberships-safe"}\n',
+        "samples.jsonl": b'{"source":"samples-safe"}\n',
+        "split-freeze-receipt.json": b"{}\n",
+    }
+    for name, payload in payloads.items():
+        (development / name).write_bytes(payload)
+        (development / name).chmod(0o600)
+    (development / "empty-support").mkdir(mode=0o700)
+    _root, tree = performance_module._snapshot_performance_private_tree(
+        development,
+        description="Test development race run",
+    )
+    tree_payload = performance_module._private_tree_payload(tree)
+    identities = {
+        "development_tree": tree_payload,
+        "development_manifest": tree_payload["manifest.json"],
+        "profile_source": tree_payload["train.jsonl"],
+        "annotation_tree": None,
+        "bank_build_tree": None,
+        "cmu_catalog_bindings": None,
+    }
+    temporary_root = tmp_path / "nerb-performance-build-race"
+    temporary_root.mkdir()
+    monkeypatch.setattr(performance_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    projection = {"safe": True}
+    monkeypatch.setattr(performance_module, "_source_build_projection", lambda _card: projection)
+    events: list[str] = []
+    real_clock = performance_module.time.perf_counter_ns
+    real_copy = performance_module._copy_frozen_private_tree
+
+    def observed_clock() -> int:
+        events.append("clock")
+        return real_clock()
+
+    def observed_copy(*args: Any, **kwargs: Any) -> tuple[dict[str, tuple[str, int]], set[str]]:
+        events.append("snapshot")
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(performance_module.time, "perf_counter_ns", observed_clock)
+    monkeypatch.setattr(performance_module, "_copy_frozen_private_tree", observed_copy)
+
+    def race_builder(options: Any) -> dict[str, Any]:
+        assert options.development_run != development
+        assert options.development_run.parent == temporary_root / "inputs"
+        for name in ("validation.jsonl", "memberships.jsonl"):
+            replacement = tmp_path / f"replacement-{name}"
+            replacement.write_bytes(b'{"source":"substituted-private"}\n')
+            replacement.chmod(0o600)
+            replacement.replace(development / name)
+            assert (options.development_run / name).read_bytes() == payloads[name]
+        assert (options.development_run / "samples.jsonl").read_bytes() == payloads["samples.jsonl"]
+        assert (options.development_run / "empty-support").is_dir()
+        assert not any((options.development_run / "empty-support").iterdir())
+        return {"bank": {"stats": {"active_totals": {"patterns": 1}}}}
+
+    monkeypatch.setattr(performance_module, "build_enron_intelligence_bank", race_builder)
+    request = {
+        "schema_version": "nerb.enron_performance_source_build_request.v1",
+        "nonce": "safe-nonce",
+        "workload_sha256": _HASH_1,
+        "development_run": str(development.resolve()),
+        "annotation_run": None,
+        "cmu_catalog_bindings": None,
+        "source_identities": identities,
+        "benchmark_version": "safe-v2",
+        "created_at": "2026-07-11T00:00:00Z",
+        "expected_projection_sha256": performance_module._canonical_hash(projection),
+        "output_dir": str((temporary_root / "build").resolve()),
+    }
+
+    result = performance_module._source_build_worker_result(_canonical(request))
+
+    assert result["status"] == "ok"
+    assert result["error_code"] is None
+    assert result["elapsed_ns"] > 0
+    assert events.index("clock") < events.index("snapshot")
 
 
 def test_source_build_parent_removes_private_temp_tree_after_forced_child_failure(
@@ -694,9 +923,15 @@ def _prepare_run(
     bank = json.loads((test_data_path / "enron_bank_v2_fake.json").read_text(encoding="utf-8"))
     bank_payload = _canonical(bank)
     development_run = tmp_path / f"{name}-development"
-    development_run.mkdir()
+    development_run.mkdir(mode=0o700)
+    development_run.chmod(0o700)
     train_payload = b'{"safe":"train"}\n'
     (development_run / "train.jsonl").write_bytes(train_payload)
+    (development_run / "train.jsonl").chmod(0o600)
+    development_manifest_payload = b'{"safe":"development-manifest"}\n'
+    (development_run / "manifest.json").write_bytes(development_manifest_payload)
+    (development_run / "manifest.json").chmod(0o600)
+    development_manifest_sha256 = _sha256(development_manifest_payload)
     stats = bank_stats(bank)
     card = {
         "benchmark_version": "safe-benchmark-v2",
@@ -704,7 +939,7 @@ def _prepare_run(
         "promotable": False,
         "run_sha256": _HASH_1,
         "source": {
-            "development_manifest_sha256": _HASH_2,
+            "development_manifest_sha256": development_manifest_sha256,
             "train_artifact_sha256": _sha256(train_payload),
             "train_records": 1,
             "sealed_test_accessed": False,
@@ -754,7 +989,7 @@ def _prepare_run(
                 }
             }
         },
-        manifest_sha256=_HASH_2,
+        manifest_sha256=development_manifest_sha256,
     )
 
     class _SafeNativeBank:
@@ -842,6 +1077,69 @@ def test_prepare_rejects_snapshot_bank_bytes_that_do_not_match_verified_card(
         )
 
     assert not (tmp_path / "mismatched-snapshot-bank-prepared-output").exists()
+
+
+def test_source_build_complete_request_budget_accepts_exact_limit_and_rejects_one_byte_less(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared_path = _prepare_run(tmp_path, test_data_path, monkeypatch, name="source-request-budget")
+    prepared = performance_module._load_prepared_performance_run(prepared_path)
+    workloads = [
+        workload
+        for profile in performance_module.PERFORMANCE_PROFILE_IDS
+        for workload in prepared.plan["profiles"][profile]["performance"]["workloads"]
+        if workload["phase"] == "source_build"
+    ]
+    reserved_sizes = [
+        len(
+            _canonical(
+                {
+                    **performance_module._source_build_request_from_bindings(
+                        workload,
+                        prepared.plan,
+                        prepared.locations,
+                        nonce="N" * 128,
+                    ),
+                    "output_dir": performance_module._reserved_source_build_output_path(),
+                }
+            )
+        )
+        for workload in workloads
+    ]
+    exact_limit = max(reserved_sizes)
+    monkeypatch.setattr(performance_module, "DEFAULT_MAX_REQUEST_BYTES", exact_limit)
+    performance_module._validate_source_build_request_budget(prepared.plan, prepared.locations)
+
+    monkeypatch.setattr(performance_module, "DEFAULT_MAX_REQUEST_BYTES", exact_limit - 1)
+    with pytest.raises(EnronPerformanceError, match="complete worker budget"):
+        performance_module._validate_source_build_request_budget(prepared.plan, prepared.locations)
+    with pytest.raises(EnronPerformanceError, match="complete worker budget"):
+        performance_module._load_prepared_performance_run(prepared_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("build_created_at", "x" * (performance_module.MAX_BUILD_TIMESTAMP_BYTES + 1)),
+        ("development_run", "/" + "x" * performance_module.MAX_PRIVATE_PATH_BYTES),
+    ],
+)
+def test_private_source_location_strings_have_explicit_utf8_bounds(
+    field: str,
+    value: str,
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared_path = _prepare_run(tmp_path, test_data_path, monkeypatch, name=f"source-string-bound-{field}")
+    prepared = performance_module._load_prepared_performance_run(prepared_path)
+    locations = json.loads(json.dumps(prepared.locations))
+    locations[field] = value
+
+    with pytest.raises(EnronPerformanceError, match="invalid"):
+        performance_module._validate_performance_locations(locations, prepared.plan)
 
 
 def _aggregate_observations(
@@ -999,6 +1297,168 @@ def test_prepared_and_smoke_runs_commit_verify_and_detect_artifact_tampering(
     report_path.write_bytes(report_path.read_bytes() + b" ")
     with pytest.raises(EnronPerformanceError, match="artifact"):
         verify_enron_performance_run(output)
+
+
+def _mutate_private_bundle(bundle: Path, mutation: str) -> None:
+    if mutation == "root_permissions":
+        bundle.chmod(0o750)
+    elif mutation == "file_permissions":
+        (bundle / "manifest.json").chmod(0o640)
+    elif mutation == "hard_link":
+        os.link(bundle / "manifest.json", bundle.parent / f"{bundle.name}-manifest-link.json")
+    elif mutation == "extra_file":
+        extra = bundle / "undeclared-private.json"
+        extra.write_text("{}\n", encoding="utf-8")
+        extra.chmod(0o600)
+    else:  # pragma: no cover - test helper guard.
+        raise AssertionError(mutation)
+
+
+def _set_private_bundle_read_only(bundle: Path, *, read_only: bool) -> None:
+    files = [path for path in bundle.rglob("*") if path.is_file()]
+    directories = [path for path in bundle.rglob("*") if path.is_dir()]
+    for path in files:
+        path.chmod(0o400 if read_only else 0o600)
+    for path in sorted(directories, key=lambda item: len(item.parts), reverse=read_only):
+        path.chmod(0o500 if read_only else 0o700)
+    bundle.chmod(0o500 if read_only else 0o700)
+
+
+@pytest.mark.parametrize("mutation", ["root_permissions", "file_permissions", "hard_link", "extra_file"])
+def test_prepared_bundle_rejects_unsafe_or_undeclared_tree_entries(
+    mutation: str,
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name=f"prepared-tree-{mutation}")
+    _mutate_private_bundle(prepared, mutation)
+
+    with pytest.raises(EnronPerformanceError):
+        performance_module._load_prepared_performance_run(prepared)
+
+
+@pytest.mark.parametrize("mutation", ["root_permissions", "file_permissions", "hard_link", "extra_file"])
+def test_measured_bundle_rejects_unsafe_or_undeclared_tree_entries(
+    mutation: str,
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name=f"evidence-tree-{mutation}")
+    _patch_execution(monkeypatch)
+    output = tmp_path / f"evidence-tree-{mutation}-run"
+    run_enron_performance(
+        EnronPerformanceRunOptions(
+            prepared_run=prepared,
+            output_dir=output,
+            profile="smoke",
+            allow_unignored_output=True,
+        )
+    )
+    _mutate_private_bundle(output, mutation)
+
+    with pytest.raises(EnronPerformanceError):
+        verify_enron_performance_run(output)
+
+
+def test_prepared_and_measured_bundles_accept_owner_read_only_modes(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name="read-only-private-bundles")
+    _set_private_bundle_read_only(prepared, read_only=True)
+    try:
+        loaded = performance_module._load_prepared_performance_run(prepared)
+        assert loaded.plan["plan_sha256"] == loaded.manifest["plan_sha256"]
+    finally:
+        _set_private_bundle_read_only(prepared, read_only=False)
+
+    _patch_execution(monkeypatch)
+    output = tmp_path / "read-only-private-evidence"
+    run_enron_performance(
+        EnronPerformanceRunOptions(
+            prepared_run=prepared,
+            output_dir=output,
+            profile="smoke",
+            allow_unignored_output=True,
+        )
+    )
+    _set_private_bundle_read_only(output, read_only=True)
+    try:
+        assert verify_enron_performance_run(output)["valid"] is True
+    finally:
+        _set_private_bundle_read_only(output, read_only=False)
+
+
+def test_prepared_bundle_rejects_directory_substitution_during_descriptor_verification(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name="prepared-directory-race")
+    replacement = tmp_path / "replacement-inputs"
+    shutil.copytree(prepared / "inputs", replacement)
+    parked = tmp_path / "parked-inputs"
+    original = performance_module._fingerprint_performance_private_file
+    substituted = False
+
+    def substitute_directory(
+        root: Path,
+        relative_path: str,
+        tree: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        nonlocal substituted
+        if relative_path == "inputs/real-validation.raw" and not substituted:
+            (prepared / "inputs").rename(parked)
+            replacement.rename(prepared / "inputs")
+            substituted = True
+        return original(root, relative_path, tree, **kwargs)
+
+    monkeypatch.setattr(performance_module, "_fingerprint_performance_private_file", substitute_directory)
+
+    with pytest.raises(EnronPerformanceError):
+        performance_module._load_prepared_performance_run(prepared)
+    assert substituted is True
+
+
+def test_measured_bundle_rejects_file_substitution_during_descriptor_read(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name="evidence-file-race")
+    _patch_execution(monkeypatch)
+    output = tmp_path / "evidence-file-race-run"
+    run_enron_performance(
+        EnronPerformanceRunOptions(
+            prepared_run=prepared,
+            output_dir=output,
+            profile="smoke",
+            allow_unignored_output=True,
+        )
+    )
+    report_path = output / "report.json"
+    replacement = tmp_path / "replacement-report.json"
+    replacement.write_bytes(report_path.read_bytes())
+    replacement.chmod(0o600)
+    original = performance_module._read_fingerprinted_private_bytes
+    substituted = False
+
+    def substitute_file(path: Path, fingerprint: Any, **kwargs: Any) -> bytes:
+        nonlocal substituted
+        if path == report_path and not substituted:
+            replacement.replace(report_path)
+            substituted = True
+        return original(path, fingerprint, **kwargs)
+
+    monkeypatch.setattr(performance_module, "_read_fingerprinted_private_bytes", substitute_file)
+
+    with pytest.raises(EnronPerformanceError):
+        verify_enron_performance_run(output)
+    assert substituted is True
 
 
 def test_privacy_safe_smoke_routes_real_requests_through_worker_subprocesses(
