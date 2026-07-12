@@ -1,7 +1,7 @@
 # Performance And Scale Evidence
 
-This page summarizes the current Rust-backed performance posture and the reproducible gate commands. Detailed historical
-engine notes were condensed after the Rust-backed `Bank` path became the production extraction engine.
+This page summarizes the current Rust-backed performance posture, the decision-grade Enron development result, and the
+reproducible gate commands.
 
 Rust engine conformance, benchmark, dense-memory, mode-strategy, and distribution gate evidence is recorded in
 [`rust-engine-gates.md`](rust-engine-gates.md). The semantic contract is recorded in
@@ -20,9 +20,9 @@ Rust engine conformance, benchmark, dense-memory, mode-strategy, and distributio
 - `all_overlaps` and `global_leftmost` are internal measurement modes only; they are not public JSON-bank extraction
   semantics.
 
-## Enron v2 Cache-Value Workflow
+## Enron Intelligence-Cache Workflow
 
-The Enron v2 workflow freezes a private workload before it measures anything. It accepts verified train/validation
+The Enron workflow freezes a private workload before it measures anything. It accepts verified train/validation
 development and bank-build runs; there is deliberately no preparation-source or sealed-test input. Source profiling is
 restricted to the verified development-train artifact used by the builder. Use ignored directories
 for both outputs because the prepared run contains the evaluated bank, selected validation documents, generated scale
@@ -30,24 +30,24 @@ fixtures, inventories, and private source locations.
 
 ```shell
 uv run nerb prepare-enron-performance \
-  --bank-build-run .nerb/enron-v2/bank-build \
-  --development-run .nerb/enron-v2/development \
-  --output-dir .nerb/enron-v2/performance-plan
+  --bank-build-run .nerb/enron/bank-build \
+  --development-run .nerb/enron/development \
+  --output-dir .nerb/enron/performance-plan
 
 # Five samples per cell: useful for correctness and workflow smoke only.
 uv run nerb run-enron-performance \
-  --prepared-run .nerb/enron-v2/performance-plan \
-  --output-dir .nerb/enron-v2/performance-smoke \
+  --prepared-run .nerb/enron/performance-plan \
+  --output-dir .nerb/enron/performance-smoke \
   --profile smoke
 
 # Long-running evidence: 20 setup samples, 100 whole-input scans, and 500 paired document timings.
 uv run nerb run-enron-performance \
-  --prepared-run .nerb/enron-v2/performance-plan \
-  --output-dir .nerb/enron-v2/performance-decision \
+  --prepared-run .nerb/enron/performance-plan \
+  --output-dir .nerb/enron/performance-decision \
   --profile decision
 
 uv run nerb verify-enron-performance \
-  --run-dir .nerb/enron-v2/performance-decision
+  --run-dir .nerb/enron/performance-decision
 ```
 
 The decision plan keeps these paths separate:
@@ -57,7 +57,7 @@ The decision plan keeps these paths separate:
 | Direct compiled-`Bank` reuse | Cost after constructing one native bank and scanning repeatedly through that same object. This is the primary cache-value path. |
 | Helper cache hit/miss | Cost of the higher-level compile/extract helper with its process-local canonical-bank cache either warm or cold. |
 | Uncached/end to end | Cost when validation, compilation, input handling, or application work is included as declared by the frozen harness. |
-| Exact same-path stability control | An ABBA-interleaved duplicate with the same operation, bank, input, process model, warmups, work, and sample policy. It estimates run noise and order effects; because both sides use the current implementation, it is not a historical regression baseline. |
+| Exact same-path stability control | An ABBA-interleaved duplicate with the same operation, bank, input, process model, warmups, work, and sample policy. It estimates run noise and order effects; because both sides use the current implementation, it is not a prior-code regression baseline. |
 | Cross-path cache-value comparison | Direct reuse, helper-cache hit/miss, and end-to-end paths scan the same whole-input population in a four-path Williams-balanced schedule nested inside ABBA. Canonical aggregate digests prove identical mapped outputs before paired-block latency and throughput comparisons. |
 | Generic regex and Python literal scans | Exploratory, explicitly non-equivalent baselines. They cannot support a semantic regression claim or the promoted break-even comparison. |
 
@@ -86,6 +86,74 @@ population and document count; a median of heterogeneous per-document timings is
 average. `--source-curation-seconds` is a shared declared scenario—not a measured model invocation, token,
 hosted-service, or dollar cost—and cannot manufacture the crossing.
 
+## Decision-Grade Development Result
+
+The complete decision profile passed on Apple M4 arm64 hardware with 10 logical CPUs, 16 GiB RAM, macOS, and Python
+3.13.12. The run used package 0.0.11 at clean commit `e25f6dd30457daddd58f17a001643788d5deb201`, passed its
+aggregate privacy scan, and recorded `sealed_test_accessed: false`. Its performance manifest is
+`sha256:04ef751f1bba1e76d6f2eb5013cb6877a9359087e379af400767de852bad1980`; the deep-verified run is
+`sha256:3b1c39cbfcb3db519acdca49eee8743fee1358d3c1ff23a3aaad4d5879bd3b2f`.
+
+This is development evidence over the frozen 50,000-row train/validation build, not the final public full-source claim.
+The mandatory full 517,401-row streaming/resource proof and one-shot sealed evaluation remain separate gates. The real
+performance input contains 100 validation documents, 35,837 UTF-8 bytes, and 1,314 expected mapped records. The evaluated
+bank has two semantic classes, 628 active patterns, 127 aliases, 8,783,376 canonical JSON bytes, 1,266,398 native-source
+bytes, and a 13,293,272-byte private bank artifact.
+
+### Frozen promotion gates
+
+| Gate | Frozen threshold | Measured result | Status |
+| --- | ---: | ---: | --- |
+| Real document p99 | at most 50 ms | 0.147 ms | passed |
+| Real whole-input documents/s | at least 100 | 116,369 | passed |
+| Real whole-input MiB/s | at least 1 | 39.77 | passed |
+| 100k-pattern MiB/s | at least 1 | 324.32 | passed |
+| Peak RSS | at most 8 GiB | 561.2 MiB maximum measured setup phase | passed |
+| Exact-control noise floor | at most 25% | 12.21% maximum | passed |
+
+### Lifecycle and cache value
+
+Setup phases use 20 fresh-process samples and report p95; scan-bearing phases use 100 whole-input samples and p99. The
+document-latency cell uses 500 balanced samples.
+
+| Path | Median | Tail | Throughput | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Train-source profile | 2.683 s | p95 2.698 s | one-time setup | 40.0 MiB |
+| Intelligence-bank build | 43.598 s | p95 43.892 s | one-time setup | 561.2 MiB |
+| Cold compile | 3.124 s | p95 3.147 s | one-time setup | 125.3 MiB |
+| Direct compiled `Bank`, one document | 0.0042 ms | p99 0.147 ms | document sample | 116.8 MiB |
+| Direct compiled `Bank`, 100 documents | 0.859 ms | p99 0.934 ms | 116,369 docs/s; 39.77 MiB/s; 1.53M records/s | 116.1 MiB |
+| Helper cache hit | 3.107 s | p99 3.187 s | 32.2 docs/s; 0.0110 MiB/s | 160.2 MiB |
+| Helper cache miss | 3.166 s | p99 3.256 s | 31.6 docs/s; 0.0108 MiB/s | 117.9 MiB |
+| End to end | 3.222 s | p99 3.305 s | 31.0 docs/s; 0.0106 MiB/s | 138.2 MiB |
+
+Direct reuse is about 3,684× faster than the exact helper-cache-miss path on median whole-input time. That comparison is
+not a generic promise: helper paths include JSON-bank validation, canonicalization, hashing, and adapter work that a
+caller avoids by retaining the compiled `Bank`. With the measured 3.124-second cold compile, direct reuse has a finite
+breakeven at 99 scanned documents. Shared profiling, curation, and bank-build costs cancel on both sides.
+
+The exploratory generic email regex reached 77.76 MiB/s and emitted the same record count on this contact-only input, but
+it cannot map a mention to a known canonical identity or implement the full bank semantics. The Python literal baseline
+reached 2.71 MiB/s and emitted only 631 records, so neither is an equivalent correctness baseline. All 37 same-path
+comparisons were equivalent within measured noise; all nine cross-path cache-value comparisons improved.
+
+### Matcher scale
+
+Each scale row scans the same deterministic 100-document, 1,024,000-byte negative workload. Composition preserves the
+evaluated bank's contact/person and alias proportions while reporting active patterns separately from aliases.
+
+| Active patterns | Native shards | Aliases | Canonical JSON | Native source | Median / 100 docs | p99 | MiB/s | Peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 4 | 202 | 226,282 B | 138,018 B | 0.087 ms | 0.092 ms | 11,270.72 | 40.2 MiB |
+| 10,000 | 32 | 2,022 | 2,261,222 B | 1,380,174 B | 0.343 ms | 0.362 ms | 2,844.18 | 79.4 MiB |
+| 25,000 | 80 | 5,056 | 5,652,832 B | 3,450,440 B | 0.808 ms | 0.821 ms | 1,208.12 | 140.1 MiB |
+| 100,000 | 318 | 20,223 | 22,610,807 B | 13,801,751 B | 3.011 ms | 3.094 ms | 324.32 | 478.9 MiB |
+
+Four-thread scanning of the tiny 1k negative cell was slower than single-thread scanning because coordination and Python
+projection overhead dominate sub-millisecond work. Concurrency is deterministic and bounded, but this cell does not
+support a parallel-speedup claim. NERB does not expose an exact compiled-object-size API, so the report uses physical
+artifact bytes, canonical/native source bytes, and process peak RSS as distinct size proxies.
+
 ## Reproducible Gate
 
 Routine local gate:
@@ -109,40 +177,6 @@ timeout 180s uv run python scripts/rust_engine_gate_report.py --iterations 1 --t
 The report emits JSON with conformance, performance, dense-memory, mode-strategy, distribution, and bank-owner
 cardinality sections. The measured sections in `overall.passed` are performance, dense memory, and mode strategy.
 Conformance and distribution are external-required sections proven by PR validation commands and wheel smoke tests.
-
-## Recorded Gate Highlights
-
-Final routine 100 KB report highlights:
-
-| Workload | Records | Scan/project median | Scan/project throughput |
-| --- | ---: | ---: | ---: |
-| small-bank floor | 870 | 0.000643s | 15.6 MB/s |
-| literal-heavy | 96 | 0.000648s | 154.3 MB/s |
-| regex-heavy | 75 | 0.000211s | 473.9 MB/s |
-| mixed | 181 | 0.000660s | 151.5 MB/s |
-
-The mixed corpus-size gate passed at 10 KB and 100 KB in the routine report. The 1 MB report passed with 1,805 records,
-0.002356s scan/project median, and 424.4 MB/s scan/project throughput.
-
-The production medium-bank case validates 1,000 top-level entities with 8 generated patterns per entity over the
-configured 100 KB sparse no-match document. The routine report measured:
-
-| Metric | Value |
-| --- | ---: |
-| Patterns | 8,000 |
-| JSONL bank-source bytes | 1,000,000 |
-| Native compile median | 0.635903s |
-| Raw scan median | 0.003640s |
-| Scan/project median | 0.008654s |
-| Scan/project throughput | 11.6 MB/s |
-
-The corresponding 1 MB evidence measured 0.704808s native compile median, 0.034258s raw scan median, 0.043692s
-scan/project median, and 22.9 MB/s scan/project throughput.
-
-Dense prefix stress validates semantic reconstruction through 64 synthetic entity classes, with 8 dense prefix detectors
-per entity over 256 bytes. At 64 entities, `entity_independent` emitted 2,048 production matches, raw `all_overlaps`
-emitted 129,280 matches, and `global_leftmost` emitted 32 matches. The 64-to-2 dense scan ratio was 18.875x under the
-80x ceiling.
 
 ## Smoke Profiles
 
@@ -176,30 +210,6 @@ summary = {
 print(json.dumps(summary, indent=2, sort_keys=True))
 PY
 ```
-
-## Large Synthetic Bank Review
-
-The pre-release large-bank review showed exact-literal warm extraction was not the target-tier bottleneck; cold setup
-and bank hashing dominated large synthetic banks.
-
-| Workload | Names | Patterns | Engine Profile | Cold Compile | Warm Cache Lookup | Target Warm Extraction | Notes |
-| --- | ---: | ---: | --- | ---: | ---: | ---: | --- |
-| Target exact literals | 10,000 | 100,000 literal | literal: 64 | 24.657s | 0.750s | 0.032s | Cache hit verified; target records stable. |
-| Target mixed | 10,000 | 95,000 literal / 5,000 regex | literal: 64, regex: 32 | 26.461s | 0.777s | 1.266s | Regex shard scanning dominates warm extraction. |
-| Stress probe exact literals | 25,000 | 250,000 literal | literal: 128 | 61.522s | 1.899s | 0.015s | Cold setup scales linearly enough to dominate. |
-| Full stress cap exact literals | 100,000 | 1,000,000 literal | intended literal: 128 | >180s | not reached | not reached | Timed out before payload. |
-
-The full stress tier is not practical as a routine local or CI check.
-
-## Dependency Decision
-
-NERB does not add a separate literal-matcher runtime dependency for the current production path. The portable Rust
-literal automaton meets the target tier without adding binary build, wheel availability, or supply-chain risk. Revisit an
-external matcher only if real workloads show long-document warm extraction is the bottleneck after the current engine
-path.
-
-PCRE2 remains optional and is not a current blocker. The engine boundary leaves room for a future PCRE2 backend, but the
-recorded review does not justify making it part of the production path.
 
 ## Resource Limits
 

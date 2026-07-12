@@ -1,15 +1,13 @@
-# Enron Benchmark v2 Charter
+# Enron Benchmark Charter
 
 > **Status: contract, private preparation, immutable splitting, train-only bank construction, independent quality
-> execution, catalog conformance, and the private performance runner implemented.**
-> The v2 manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
+> execution, catalog conformance, and decision-grade development performance implemented.**
+> The manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
 > [group-aware split and sealing workflow](enron-splits.md), and [privacy evaluation workflow](enron-evaluation.md) are
 > implemented alongside the [train-only bank workflow](enron-bank-building.md) and
-> [performance workflow](performance.md#enron-v2-cache-value-workflow). Development bank cards remain non-promotable
-> until frozen real-corpus, one-shot sealed-test, privacy, decision-grade performance, and lineage evidence is complete.
-> The existing `scripts/enron_bank_build_benchmark.py`, its `nerb.enron_benchmark.v1` output, the v1 autoresearch
-> harness, committed hero measurements, and previously published Enron numbers are historical. They do **not** satisfy
-> this charter and must not support a public quality, privacy, performance, or product claim.
+> [deep-verified performance workflow](performance.md#decision-grade-development-result). Development bank cards remain
+> non-promotable until the mandatory full-source streaming/resource proof, one-shot sealed evaluation, final privacy
+> verification, and append-only lineage evidence are complete.
 
 NERB's Enron benchmark demonstrates a privacy-first intelligence-cache workflow: a capable agent turns a large private
 organizational source into a reviewed entity bank once; an application compiles that bank once and reuses it for fast,
@@ -23,7 +21,7 @@ important constraints, but an aggregate F1 score or a fast scan cannot compensat
 
 ## User Workflow
 
-The v2 demonstration models the following production workflow:
+The demonstration models the following production workflow:
 
 1. A user authorizes a specific source, revision, purpose, taxonomy, and retention policy.
 2. Private preparation profiles and cleans the source and assigns stable document identities and grouping features; the
@@ -77,7 +75,7 @@ NERB can make a narrow deterministic guarantee:
 > and mapped according to its declared normalization, regex, boundary, priority, and overlap semantics when the input
 > contains a qualifying occurrence.
 
-V2 promotion requires 100% synthetic catalog conformance and zero wrong canonical mappings for those approved cases.
+Promotion requires 100% synthetic catalog conformance and zero wrong canonical mappings for those approved cases.
 Natural-text cataloged spans provide a second check that preparation and scanning preserve that behavior.
 
 The guarantee does not cover an unknown name or free-form identifier merely because it is PII. Detection of unknown PII
@@ -92,7 +90,7 @@ clone can verify schema conformance, hashes, aggregate arithmetic, gates, lineag
 
 ## Taxonomy And Bank Policy
 
-Taxonomy follows the privacy workflow and corpus evidence rather than a universal NER label set. The initial v2 bank is
+Taxonomy follows the privacy workflow and corpus evidence rather than a universal NER label set. The initial bank is
 expected to consider high-confidence people and contact aliases, organizations and domains, and defensible generic
 structured-PII fallbacks. Additional classes require a written threat rationale and appropriate labels. A class without
 credible quality evidence may remain exploratory but cannot contribute to a promoted headline claim.
@@ -154,7 +152,7 @@ The implemented commands, private-bundle boundary, exact/reference/thread/near-d
 assignment, diagnostic sampling, support floors, and one-shot access behavior are documented in the
 [immutable split guide](enron-splits.md).
 
-V2 uses three immutable roles, created before candidate tuning:
+The benchmark uses three immutable roles, created before candidate tuning:
 
 - **Train:** available for profiling, candidate mining, bank construction, and curation.
 - **Validation:** available for error analysis and tuning construction policy, thresholds, and generic fallbacks. It is not
@@ -252,7 +250,7 @@ The evidence also reports total positive/negative documents, gold/predicted span
 numerators and denominators for every rate. Per-class, head/tail, seen/unseen identity, temporal/future, document-size,
 hit-density, and challenge slices are required when applicable. Micro averages never replace these slices.
 
-V2 does not assert a binomial confidence interval for quality. The sealed benchmark is a fixed finite evaluation, and
+The benchmark does not assert a binomial confidence interval for quality. The sealed test is a fixed finite evaluation, and
 the contract makes no independent-and-identically-distributed sampling claim that would justify one. This does not
 excuse small evidence: raw support counts and promotion support floors are mandatory and stay visible beside every rate.
 
@@ -316,7 +314,7 @@ Every decision cell has same-machine stability comparisons against an exact sema
 specification, source artifact, phase, bank, input, warmup policy, sample count, sample unit, work, and concurrency.
 One-time setup cells compare p95; scan-bearing cells compare p99; whole-input cells also compare MiB/second. Promotion
 rejects instability beyond the frozen noise multiplier and tolerance. These duplicate-current-path controls measure
-noise/order effects, not historical code regression. Direct reuse, helper-cache hit/miss, and end-to-end exact paths are
+noise/order effects, not prior-code regression. Direct reuse, helper-cache hit/miss, and end-to-end exact paths are
 also measured in four-path Williams-balanced temporal blocks nested inside ABBA. Candidate samples are index-aligned by
 block, and cross-path cache-value comparisons use paired timing-ratio MAD on the same evaluated bank, input, work, and
 concurrency; canonical aggregate digests must prove identical mapped results first. Comparison hashes commit comparison
@@ -347,9 +345,9 @@ units, range, and declared shared scenario, but not later measured workload valu
 requires a finite supported advantage or break-even. This model supplements privacy/quality gates; it never discounts a
 miss.
 
-## V2 Artifact Contract
+## Artifact Contract
 
-V2 has two versioned JSON contracts:
+The benchmark has two versioned JSON contracts:
 
 - `nerb.enron_manifest.v2` binds evaluator ID/digest; source ID, revision, and content hashes;
   cleaning/group/split policy hashes; the split-manifest hash; train/validation/test artifact hashes and counts; the
@@ -381,7 +379,7 @@ numeric serialization drift can never round a structured claim in the favorable 
 target only those recomputed workload statistics or raw peak RSS, not downstream display fields. This
 lets a clean clone verify arithmetic and claim consistency without access to private email text.
 
-The schema and synthetic fixtures are part of the v2 contract, but a schema-valid fixture is not real-corpus evidence.
+The schema and synthetic fixtures are part of the contract, but a schema-valid fixture is not real-corpus evidence.
 Preparation and immutable split commands now implement the private data stages; the evaluator and verified real-corpus
 evidence remain staged. Neither a prepared corpus nor a split manifest is a quality, performance, or promotion result.
 
@@ -406,7 +404,7 @@ A result is promotable only when all applicable checks pass:
 8. an independent reviewer verifies the evidence/claim mapping at the final commit.
 
 Every promotion-gate quality slice must contain at least 100 documents, 100 gold spans, 20 negative documents, and 500
-sensitive-gold characters. Validation may tighten, but cannot weaken, the v2 policy floors: open-world recall at least
+sensitive-gold characters. Validation may tighten, but cannot weaken, the policy floors: open-world recall at least
 0.95, catalog coverage at least 0.80, cataloged recall exactly 1.0, and sensitive-character recall at least 0.98. The
 corresponding ceilings are document leak rate 0.05, sensitive-character leak rate 0.02, negative-document false-alarm
 rate 0.50, and over-redaction rate 0.05. Zero cataloged misses, wrong canonical mappings, and catalog-miss documents are
@@ -451,26 +449,3 @@ and trusted-lineage prefixes must use bounded exact JSON-like built-in container
 performance artifacts are normalized once per content ID and share an aggregate item budget. File loaders enforce
 node, collection, and depth limits before materializing JSON as well as after parsing. Charts are regenerated solely
 from the verified aggregate evidence bundle.
-
-## Historical V1 Quarantine
-
-V1 is useful as a record of what needed improvement, not as a baseline claim. Its two-way split fed held-out F1 back into
-autoresearch; evaluated text included injected address inventory; regex/structured derivations were treated as gold;
-catalog coverage was described as recall; public arithmetic drifted from stored counts; and public evidence was tied to
-stale runtime identities.
-
-| Historical validity problem | V2 control |
-| --- | --- |
-| Test score used for optimization | Train/validation-only tuning and one-shot sealed final test |
-| Answer-bearing address inventory in scan text | User-visible cleaned content is the only primary scan view |
-| Regex/structured labels presented as independent gold | Required `label_strength` and non-combinable evidence slices |
-| Catalog coverage called recall | Separate formulas and raw counts for coverage, conformance, cataloged recall, and open-world recall |
-| Two-way row split and duplicate/thread leakage risk | Immutable group-aware three-way split plus cross-split audit |
-| F1-first promotion | Miss counts, document leak rate, open-world recall, and catalog guarantees lead |
-| Stale runtime metadata and arithmetic drift | Versioned identities, integer numerators/denominators, and independent verification |
-| Public artifacts containing aggregate v1 numbers | Explicit historical label; no promotion until verified v2 evidence exists |
-
-Do not rerun the v1 command and relabel its output v2. Do not use its historical benchmark JSON, generated images, or
-autoresearch rows to claim current Enron quality or performance. The v2 bank builder produces new private artifacts and
-an aggregate non-promotable card under the contracts above; only the later frozen release workflow may produce a public
-benchmark claim.

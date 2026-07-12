@@ -1,11 +1,11 @@
 ---
 icon: lucide/database-zap
-description: "Train-only Enron v2 entity-bank construction, validation iterations, private artifacts, and verification."
+description: "Train-only Enron entity-bank construction, validation iterations, private artifacts, and verification."
 ---
 
-# Enron v2 Bank Construction
+# Enron Bank Construction
 
-The v2 bank builder turns one committed [development split](enron-splits.md) into a deterministic private entity bank.
+The bank builder turns one committed [development split](enron-splits.md) into a deterministic private entity bank.
 It mines candidates from **train only**, evaluates three frozen construction policies on validation, selects the bounded
 email-recall policy, and generates catalog-conformance evidence for every active pattern. It never accepts a sealed-test
 path or role.
@@ -78,7 +78,7 @@ commitments.
 
 ## Deferred candidate pools
 
-The v2 builder does not mine the following pools, including as draft patterns. Structured headers do not provide enough
+The builder does not mine the following pools, including as draft patterns. Structured headers do not provide enough
 independent semantic evidence for them, and opportunistic body-text mining would increase both false positives and the
 amount of private source material retained. Each pool needs a bounded train-only source plus independently reviewed
 validation before it can enter the lifecycle:
@@ -188,12 +188,12 @@ funnel, iteration decisions, supported validation summaries, explicit `null` met
 auxiliary totals, and privacy declarations. Before committing the private run, the builder rejects a card containing an
 email shape or `@`, a phone shape, a document ID, or a private path. The card remains non-promotable until the separate
 freeze, one-shot sealed-test, privacy-verification, performance, and lineage requirements in the
-[v2 charter](enron-benchmark.md) are satisfied.
+[charter](enron-benchmark.md) are satisfied.
 
 ## Scale and fail-closed caps
 
 The SQLite spool keeps raw candidate mining disk-backed and deterministic, while explicit ceilings prevent a malformed
-or unexpectedly large source from causing unbounded work. The default v2 policy uses these limits:
+or unexpectedly large source from causing unbounded work. The default policy uses these limits:
 
 | Resource | Limit |
 | --- | ---: |

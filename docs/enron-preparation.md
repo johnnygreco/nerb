@@ -1,6 +1,6 @@
-# Enron v2 Preparation
+# Enron Preparation
 
-The v2 preparation command turns the pinned parsed Enron email source into deterministic private records and a
+The preparation command turns the pinned parsed Enron email source into deterministic private records and a
 privacy-safe aggregate profile. It deliberately does **not** create train, validation, or test roles, build a bank, or
 compute quality scores. Leakage grouping and immutable role assignment happen in the implemented
 [split and sealing stage](enron-splits.md).

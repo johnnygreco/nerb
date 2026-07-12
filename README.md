@@ -260,14 +260,14 @@ The final Rust engine gate covers conformance, dense memory, mode strategy, whee
 synthetic medium bank with 1,000 entities. See [`docs/performance.md`](docs/performance.md) for the current performance
 summary and [`docs/rust-engine-gates.md`](docs/rust-engine-gates.md) for recorded release-gate evidence.
 
-For large-source bank construction, see the privacy-first Enron v2 charter in
+For large-source bank construction, see the privacy-first Enron charter in
 [`docs/enron-benchmark.md`](docs/enron-benchmark.md), the
 [train-only bank construction guide](docs/enron-bank-building.md), its
-[private evaluation guide](docs/enron-evaluation.md), and its train/validation-only experiment policy in
-[`docs/autoresearch.md`](docs/autoresearch.md). V2 bank construction is implemented, but its development bank cards
-remain non-promotable until frozen real-corpus, one-shot sealed-test, privacy, performance, and lineage evidence exists.
-Existing v1 benchmark/autoresearch scores and hero artifacts are historical and do not support current public Enron
-quality or performance claims. Agent workflows can also use the reusable
+[private evaluation guide](docs/enron-evaluation.md), and the
+[decision-grade performance result](docs/performance.md#decision-grade-development-result). Train-only bank construction
+and development performance are implemented and deep-verified. The development bank remains non-promotable until the
+full pinned source passes its mandatory streaming/resource proof, the sealed test is evaluated exactly once, and the
+final privacy and lineage evidence passes. Agent workflows can also use the reusable
 [`nerb-large-source-bank-building`](.agents/skills/nerb-large-source-bank-building/SKILL.md) skill for corpus profiling
 and privacy-safe handoff guidance.
 

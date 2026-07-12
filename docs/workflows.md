@@ -87,17 +87,17 @@ decision profile:
 
 ```shell
 nerb prepare-enron-performance \
-  --bank-build-run .nerb/enron-v2/bank-build \
-  --development-run .nerb/enron-v2/development \
-  --output-dir .nerb/enron-v2/performance-plan
+  --bank-build-run .nerb/enron/bank-build \
+  --development-run .nerb/enron/development \
+  --output-dir .nerb/enron/performance-plan
 nerb run-enron-performance \
-  --prepared-run .nerb/enron-v2/performance-plan \
-  --output-dir .nerb/enron-v2/performance-smoke \
+  --prepared-run .nerb/enron/performance-plan \
+  --output-dir .nerb/enron/performance-smoke \
   --profile smoke
-nerb verify-enron-performance --run-dir .nerb/enron-v2/performance-smoke
+nerb verify-enron-performance --run-dir .nerb/enron/performance-smoke
 ```
 
 The commands expose neither a preparation-source nor sealed-test path; profiling is confined to the verified train
 artifact. Outputs remain private and ignored; only privacy-scanned aggregate evidence is
-suitable for a later reviewed handoff. The smoke profile is non-promotable. See [Performance](performance.md#enron-v2-cache-value-workflow)
+suitable for a later reviewed handoff. The smoke profile is non-promotable. See [Performance](performance.md#enron-intelligence-cache-workflow)
 for the decision command, measurement boundaries, scale semantics, and sample policy.
