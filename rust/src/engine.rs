@@ -9,7 +9,6 @@ use regex_automata::{Anchored, Input, MatchKind as RegexMatchKind};
 use regex_syntax::hir::{Hir, HirKind, Look};
 use regex_syntax::{is_word_character, ParserBuilder};
 use std::cmp::Ordering;
-use std::sync::{Arc, Mutex};
 
 const ENTITY_INDEPENDENT_NFA_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT: usize = 2 * 1024 * 1024;
@@ -56,26 +55,30 @@ struct LiteralMatcherShard {
     matcher: AhoCorasick,
     case_insensitive: bool,
     local_to_detector: Vec<u32>,
-    fallback_patterns: Option<Vec<Hir>>,
-    fallback_regex: Mutex<Option<Arc<Regex>>>,
+    unicode_fallback_regex: Option<Regex>,
 }
 
 #[derive(Debug)]
 struct LayeredMatcherShard {
     entity: String,
-    case_sensitive_literals: Option<LiteralMatcherLayer>,
-    ascii_case_insensitive_literals: Option<LiteralMatcherLayer>,
+    case_sensitive_literals: LiteralMatcherLayers,
+    ascii_case_insensitive_literals: LiteralMatcherLayers,
     residual_regex: Option<RegexMatcherLayer>,
-    fallback_patterns: Option<Vec<Hir>>,
     fallback_local_to_detector: Option<Vec<u32>>,
-    fallback_regex: Mutex<Option<Arc<Regex>>>,
+    unicode_fallback_regex: Option<Regex>,
+}
+
+#[derive(Debug, Default)]
+struct LiteralMatcherLayers {
+    without_left_boundary: Option<LiteralMatcherLayer>,
+    with_left_boundary: Option<LiteralMatcherLayer>,
 }
 
 #[derive(Debug)]
 struct LiteralMatcherLayer {
     matcher: AhoCorasick,
     case_insensitive: bool,
-    all_require_left_unicode_word_boundary: bool,
+    requires_left_unicode_word_boundary: bool,
     patterns: Vec<LayerLiteralPattern>,
     prefix_index: LiteralPrefixIndex,
 }
@@ -303,33 +306,13 @@ fn scan_literal_shard(
     buffer: &mut NativeMatchBuffer,
 ) -> Result<()> {
     if shard.case_insensitive && !haystack.is_ascii() {
-        let regex = {
-            let mut fallback = shard.fallback_regex.lock().map_err(|_| {
-                validation(
-                    format!("/engine/shards/{}/fallback_regex", shard.entity),
-                    "literal matcher fallback lock was poisoned",
-                )
-            })?;
-            if fallback.is_none() {
-                let fallback_patterns = shard.fallback_patterns.as_ref().ok_or_else(|| {
-                    validation(
-                        format!("/engine/shards/{}/fallback_patterns", shard.entity),
-                        "case-insensitive literal shard is missing fallback regex patterns",
-                    )
-                })?;
-                *fallback = Some(Arc::new(compile_entity_regex(
-                    &shard.entity,
-                    fallback_patterns,
-                )?));
-            }
-            fallback
-                .as_ref()
-                .expect("fallback regex is initialized above")
-                .clone()
-        };
+        let regex = shard
+            .unicode_fallback_regex
+            .as_ref()
+            .expect("case-insensitive literal shards compile their Unicode fallback");
         return scan_regex_matches(
             &shard.entity,
-            &regex,
+            regex,
             &shard.local_to_detector,
             haystack,
             buffer,
@@ -365,32 +348,51 @@ fn scan_layered_shard(
     // Aho-Corasick's case-insensitive mode is deliberately ASCII-only. A
     // non-ASCII haystack can participate in Unicode folds (for example, `k`
     // and the Kelvin sign), so use the full entity regex in that case.
-    if shard.ascii_case_insensitive_literals.is_some() && !haystack.is_ascii() {
-        let regex = lazy_fallback_regex(
-            &shard.entity,
-            shard.fallback_patterns.as_deref(),
-            &shard.fallback_regex,
-        )?;
+    if !shard.ascii_case_insensitive_literals.is_empty() && !haystack.is_ascii() {
+        let regex = shard
+            .unicode_fallback_regex
+            .as_ref()
+            .expect("layered shards with case-insensitive literals compile their Unicode fallback");
         let local_to_detector = shard
             .fallback_local_to_detector
             .as_ref()
             .expect("fallback detector map is present when a fallback regex is required");
-        return scan_regex_matches(&shard.entity, &regex, local_to_detector, haystack, buffer);
+        return scan_regex_matches(&shard.entity, regex, local_to_detector, haystack, buffer);
     }
     let haystack_text = std::str::from_utf8(haystack)
         .expect("scan_bytes_into validates UTF-8 before dispatching to the layered matcher");
 
     let mut cursor = 0;
-    let mut case_sensitive = next_literal_candidate(
+    let mut case_sensitive_without_left_boundary = next_literal_candidate(
         &shard.entity,
-        shard.case_sensitive_literals.as_ref(),
+        shard.case_sensitive_literals.without_left_boundary.as_ref(),
         haystack,
         haystack_text,
         cursor,
     )?;
-    let mut case_insensitive = next_literal_candidate(
+    let mut case_sensitive_with_left_boundary = next_literal_candidate(
         &shard.entity,
-        shard.ascii_case_insensitive_literals.as_ref(),
+        shard.case_sensitive_literals.with_left_boundary.as_ref(),
+        haystack,
+        haystack_text,
+        cursor,
+    )?;
+    let mut case_insensitive_without_left_boundary = next_literal_candidate(
+        &shard.entity,
+        shard
+            .ascii_case_insensitive_literals
+            .without_left_boundary
+            .as_ref(),
+        haystack,
+        haystack_text,
+        cursor,
+    )?;
+    let mut case_insensitive_with_left_boundary = next_literal_candidate(
+        &shard.entity,
+        shard
+            .ascii_case_insensitive_literals
+            .with_left_boundary
+            .as_ref(),
         haystack,
         haystack_text,
         cursor,
@@ -406,11 +408,16 @@ fn scan_layered_shard(
         // Each layer applies its own leftmost-first semantics. Merging the
         // layers by start and then original pattern order reconstructs the
         // same winner as one leftmost-first regex over every entity pattern.
-        let Some(winner) = [case_sensitive, case_insensitive, residual]
-            .into_iter()
-            .flatten()
-            .min_by_key(|candidate| (candidate.start, candidate.pattern_order))
-        else {
+        let Some(winner) = [
+            case_sensitive_without_left_boundary,
+            case_sensitive_with_left_boundary,
+            case_insensitive_without_left_boundary,
+            case_insensitive_with_left_boundary,
+            residual,
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|candidate| (candidate.start, candidate.pattern_order)) else {
             break;
         };
         debug_assert!(winner.end > winner.start);
@@ -426,19 +433,43 @@ fn scan_layered_shard(
         // Keep a losing candidate when it starts beyond the consumed span.
         // It remains the first candidate in its layer, avoiding rescans of a
         // distant residual regex after every dense literal match.
-        if candidate_precedes_cursor(case_sensitive, cursor) {
-            case_sensitive = next_literal_candidate(
+        if candidate_precedes_cursor(case_sensitive_without_left_boundary, cursor) {
+            case_sensitive_without_left_boundary = next_literal_candidate(
                 &shard.entity,
-                shard.case_sensitive_literals.as_ref(),
+                shard.case_sensitive_literals.without_left_boundary.as_ref(),
                 haystack,
                 haystack_text,
                 cursor,
             )?;
         }
-        if candidate_precedes_cursor(case_insensitive, cursor) {
-            case_insensitive = next_literal_candidate(
+        if candidate_precedes_cursor(case_sensitive_with_left_boundary, cursor) {
+            case_sensitive_with_left_boundary = next_literal_candidate(
                 &shard.entity,
-                shard.ascii_case_insensitive_literals.as_ref(),
+                shard.case_sensitive_literals.with_left_boundary.as_ref(),
+                haystack,
+                haystack_text,
+                cursor,
+            )?;
+        }
+        if candidate_precedes_cursor(case_insensitive_without_left_boundary, cursor) {
+            case_insensitive_without_left_boundary = next_literal_candidate(
+                &shard.entity,
+                shard
+                    .ascii_case_insensitive_literals
+                    .without_left_boundary
+                    .as_ref(),
+                haystack,
+                haystack_text,
+                cursor,
+            )?;
+        }
+        if candidate_precedes_cursor(case_insensitive_with_left_boundary, cursor) {
+            case_insensitive_with_left_boundary = next_literal_candidate(
+                &shard.entity,
+                shard
+                    .ascii_case_insensitive_literals
+                    .with_left_boundary
+                    .as_ref(),
                 haystack,
                 haystack_text,
                 cursor,
@@ -456,30 +487,10 @@ fn scan_layered_shard(
     Ok(())
 }
 
-fn lazy_fallback_regex(
-    entity: &str,
-    fallback_patterns: Option<&[Hir]>,
-    fallback_regex: &Mutex<Option<Arc<Regex>>>,
-) -> Result<Arc<Regex>> {
-    let mut fallback = fallback_regex.lock().map_err(|_| {
-        validation(
-            format!("/engine/shards/{entity}/fallback_regex"),
-            "layered matcher fallback lock was poisoned",
-        )
-    })?;
-    if fallback.is_none() {
-        let patterns = fallback_patterns.ok_or_else(|| {
-            validation(
-                format!("/engine/shards/{entity}/fallback_patterns"),
-                "layered matcher is missing fallback regex patterns",
-            )
-        })?;
-        *fallback = Some(Arc::new(compile_entity_regex(entity, patterns)?));
+impl LiteralMatcherLayers {
+    fn is_empty(&self) -> bool {
+        self.without_left_boundary.is_none() && self.with_left_boundary.is_none()
     }
-    Ok(fallback
-        .as_ref()
-        .expect("fallback regex is initialized above")
-        .clone())
 }
 
 fn candidate_precedes_cursor(candidate: Option<LayerCandidate>, cursor: usize) -> bool {
@@ -651,7 +662,7 @@ fn next_utf8_start(haystack: &str, start: usize) -> usize {
 }
 
 fn next_literal_search_start(layer: &LiteralMatcherLayer, haystack: &str, start: usize) -> usize {
-    if !layer.all_require_left_unicode_word_boundary {
+    if !layer.requires_left_unicode_word_boundary {
         return next_utf8_start(haystack, start);
     }
     let mut at = next_utf8_start(haystack, start);
@@ -1167,7 +1178,14 @@ fn compile_layered_shard(
         .iter()
         .flatten()
         .any(|literal| literal.case_insensitive);
-    let fallback_patterns = has_case_insensitive_literals.then(|| patterns.clone());
+    // Aho-Corasick only provides ASCII case folding. Compile the complete
+    // Unicode fallback now so a successful engine construction guarantees
+    // every scan path is ready and within the configured regex limits.
+    let unicode_fallback_regex = if has_case_insensitive_literals {
+        Some(compile_entity_regex(entity_name, &patterns)?)
+    } else {
+        None
+    };
 
     for (pattern_order, ((hir, literal), detector_index)) in patterns
         .into_iter()
@@ -1200,12 +1218,12 @@ fn compile_layered_shard(
 
     Ok(LayeredMatcherShard {
         entity: entity_name.to_string(),
-        case_sensitive_literals: compile_literal_layer(
+        case_sensitive_literals: compile_literal_layers(
             entity_name,
             case_sensitive_patterns,
             false,
         )?,
-        ascii_case_insensitive_literals: compile_literal_layer(
+        ascii_case_insensitive_literals: compile_literal_layers(
             entity_name,
             case_insensitive_patterns,
             true,
@@ -1223,9 +1241,38 @@ fn compile_layered_shard(
                 local_to_pattern_order: residual_orders,
             })
         },
-        fallback_patterns,
         fallback_local_to_detector: has_case_insensitive_literals.then_some(local_to_detector),
-        fallback_regex: Mutex::new(None),
+        unicode_fallback_regex,
+    })
+}
+
+fn compile_literal_layers(
+    entity_name: &str,
+    patterns: Vec<LayerLiteralPattern>,
+    case_insensitive: bool,
+) -> Result<LiteralMatcherLayers> {
+    let mut without_left_boundary = Vec::new();
+    let mut with_left_boundary = Vec::new();
+    for pattern in patterns {
+        if pattern.literal.left_unicode_word_boundary {
+            with_left_boundary.push(pattern);
+        } else {
+            without_left_boundary.push(pattern);
+        }
+    }
+    Ok(LiteralMatcherLayers {
+        without_left_boundary: compile_literal_layer(
+            entity_name,
+            without_left_boundary,
+            case_insensitive,
+            false,
+        )?,
+        with_left_boundary: compile_literal_layer(
+            entity_name,
+            with_left_boundary,
+            case_insensitive,
+            true,
+        )?,
     })
 }
 
@@ -1233,13 +1280,14 @@ fn compile_literal_layer(
     entity_name: &str,
     patterns: Vec<LayerLiteralPattern>,
     case_insensitive: bool,
+    requires_left_unicode_word_boundary: bool,
 ) -> Result<Option<LiteralMatcherLayer>> {
     if patterns.is_empty() {
         return Ok(None);
     }
-    let all_require_left_unicode_word_boundary = patterns
-        .iter()
-        .all(|pattern| pattern.literal.left_unicode_word_boundary);
+    debug_assert!(patterns.iter().all(|pattern| {
+        pattern.literal.left_unicode_word_boundary == requires_left_unicode_word_boundary
+    }));
     let prefix_index = LiteralPrefixIndex::new(&patterns, case_insensitive);
     Ok(Some(LiteralMatcherLayer {
         matcher: compile_literal_matcher(
@@ -1250,7 +1298,7 @@ fn compile_literal_layer(
             case_insensitive,
         )?,
         case_insensitive,
-        all_require_left_unicode_word_boundary,
+        requires_left_unicode_word_boundary,
         patterns,
         prefix_index,
     }))
@@ -1377,18 +1425,18 @@ fn compile_literal_shard(
         literal_patterns.iter().map(String::as_str),
         case_insensitive,
     )?;
+    let unicode_fallback_regex = if case_insensitive {
+        Some(compile_entity_regex(entity_name, &fallback_patterns)?)
+    } else {
+        None
+    };
 
     Ok(LiteralMatcherShard {
         entity: entity_name.to_string(),
         matcher,
         case_insensitive,
         local_to_detector,
-        fallback_patterns: if case_insensitive {
-            Some(fallback_patterns)
-        } else {
-            None
-        },
-        fallback_regex: Mutex::new(None),
+        unicode_fallback_regex,
     })
 }
 
@@ -1685,7 +1733,15 @@ mod tests {
     }
 
     fn engine_for_patterns(patterns: Vec<CanonicalPattern>) -> NativeEngine {
-        let canonical = CanonicalBank {
+        NativeEngine::compile(
+            &canonical_for_patterns(patterns),
+            MatchMode::EntityIndependent,
+        )
+        .unwrap()
+    }
+
+    fn canonical_for_patterns(patterns: Vec<CanonicalPattern>) -> CanonicalBank {
+        CanonicalBank {
             schema: 1,
             defaults: CanonicalDefaults {
                 engine: "rust-regex-meta".to_string(),
@@ -1699,8 +1755,7 @@ mod tests {
                 name: "entity".to_string(),
                 patterns,
             }],
-        };
-        NativeEngine::compile(&canonical, MatchMode::EntityIndependent).unwrap()
+        }
     }
 
     fn canonical_pattern(regex: &str, flags: &[&str]) -> CanonicalPattern {
@@ -1754,7 +1809,7 @@ mod tests {
 
     fn assert_layered_matches_monolithic(patterns: Vec<CanonicalPattern>, text: &str) {
         let expected = monolithic_raw_matches(&patterns, text);
-        let engine = engine_for_patterns(patterns);
+        let engine = engine_for_patterns(patterns.clone());
         assert!(matches!(
             engine.shards.as_slice(),
             [MatcherShard::Layered(_)]
@@ -1783,11 +1838,75 @@ mod tests {
     fn literal_shard_falls_back_for_non_ascii_case_folding() {
         let engine = engine_for_patterns(vec![canonical_pattern("k", &["IGNORECASE"])]);
 
-        assert!(matches!(
-            engine.shards.as_slice(),
-            [MatcherShard::Literal(_)]
-        ));
+        let [MatcherShard::Literal(shard)] = engine.shards.as_slice() else {
+            panic!("case-insensitive exact literals should use a literal shard");
+        };
+        assert!(shard.unicode_fallback_regex.is_some());
+        assert_eq!(engine_raw_matches(&engine, "K"), [(0, 0, 1)]);
         assert_eq!(engine_raw_matches(&engine, "K"), [(0, 0, 3)]);
+    }
+
+    #[test]
+    fn unicode_fallback_compile_limits_fail_engine_construction() {
+        const LITERAL_COUNT: usize = 1_500;
+        const LITERAL_LENGTH: usize = 128;
+        let padding = "a".repeat(LITERAL_LENGTH - 16);
+        let mut patterns = (0..LITERAL_COUNT)
+            .map(|index| canonical_pattern(&format!("contact{index:08}{padding}"), &["IGNORECASE"]))
+            .collect::<Vec<_>>();
+        patterns.push(canonical_pattern(r"\d+", &[]));
+
+        // The optimized pieces are independently valid: exact ASCII-CI
+        // literals fit the Aho-Corasick layer and the true residual fits its
+        // small regex layer. Only the complete Unicode-correct fallback,
+        // which must represent every long case-insensitive literal, exceeds
+        // the entity regex NFA limit.
+        let literal_layers = compile_literal_layers(
+            "entity",
+            patterns[..LITERAL_COUNT]
+                .iter()
+                .enumerate()
+                .map(|(pattern_order, pattern)| LayerLiteralPattern {
+                    literal: simple_literal_pattern(pattern)
+                        .expect("the fixture must remain an optimized exact literal"),
+                    detector_index: u32::try_from(pattern_order).unwrap(),
+                    pattern_order,
+                })
+                .collect(),
+            true,
+        )
+        .expect("the literal layer should compile independently");
+        assert_eq!(
+            literal_layers
+                .without_left_boundary
+                .as_ref()
+                .unwrap()
+                .patterns
+                .len(),
+            LITERAL_COUNT
+        );
+        assert!(literal_layers.with_left_boundary.is_none());
+        let residual = parse_pattern_with_flags(
+            "entity",
+            LITERAL_COUNT,
+            &patterns[LITERAL_COUNT].regex,
+            &patterns[LITERAL_COUNT].flags,
+        )
+        .unwrap();
+        compile_entity_regex_with_pattern_orders("entity", &[residual], Some(&[LITERAL_COUNT]))
+            .expect("the residual regex layer should compile independently");
+
+        let error = match NativeEngine::compile(
+            &canonical_for_patterns(patterns),
+            MatchMode::EntityIndependent,
+        ) {
+            Ok(_) => panic!("the full Unicode fallback must compile before construction succeeds"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("could not compile entity-independent regex matcher"));
     }
 
     #[test]
@@ -1853,14 +1972,17 @@ mod tests {
             canonical_pattern("done", &[]),
         ];
         let expected = monolithic_raw_matches(&patterns, "K done");
-        let engine = engine_for_patterns(patterns);
+        let engine = engine_for_patterns(patterns.clone());
         let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
             panic!("mixed case-folding entity should use a layered matcher");
         };
 
-        assert!(shard.fallback_regex.lock().unwrap().is_none());
+        assert!(shard.unicode_fallback_regex.is_some());
         assert_eq!(engine_raw_matches(&engine, "K done"), expected);
-        assert!(shard.fallback_regex.lock().unwrap().is_some());
+        assert_eq!(
+            engine_raw_matches(&engine, "K K"),
+            monolithic_raw_matches(&patterns, "K K")
+        );
     }
 
     #[test]
@@ -1916,7 +2038,11 @@ mod tests {
         let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
             panic!("bounded literals should use the layered matcher");
         };
-        let layer = shard.case_sensitive_literals.as_ref().unwrap();
+        let layer = shard
+            .case_sensitive_literals
+            .with_left_boundary
+            .as_ref()
+            .unwrap();
         let text = "token1024x";
         let lookup = indexed_valid_literal_at_start(layer, text.as_bytes(), text, 0);
 
@@ -1957,14 +2083,30 @@ mod tests {
         let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
             panic!("mixed boundary signatures should use the layered matcher");
         };
-        let layer = shard.case_sensitive_literals.as_ref().unwrap();
+        let bounded_layer = shard
+            .case_sensitive_literals
+            .with_left_boundary
+            .as_ref()
+            .unwrap();
+        let unbounded_layer = shard
+            .case_sensitive_literals
+            .without_left_boundary
+            .as_ref()
+            .unwrap();
         let text = "tokenx";
-        let lookup = indexed_valid_literal_at_start(layer, text.as_bytes(), text, 0);
+        let bounded_lookup =
+            indexed_valid_literal_at_start(bounded_layer, text.as_bytes(), text, 0);
+        let unbounded_lookup =
+            indexed_valid_literal_at_start(unbounded_layer, text.as_bytes(), text, 0);
 
-        assert_eq!(layer.patterns.len(), 4_096);
-        assert_eq!(layer.prefix_index.sorted_pattern_indices.len(), 4);
-        assert!(lookup.terminal_candidates_examined <= 4);
-        assert_eq!(lookup.candidate.unwrap().pattern_order, 2);
+        assert_eq!(bounded_layer.patterns.len(), 2_048);
+        assert_eq!(unbounded_layer.patterns.len(), 2_048);
+        assert_eq!(bounded_layer.prefix_index.sorted_pattern_indices.len(), 2);
+        assert_eq!(unbounded_layer.prefix_index.sorted_pattern_indices.len(), 2);
+        assert!(bounded_lookup.terminal_candidates_examined <= 2);
+        assert!(unbounded_lookup.terminal_candidates_examined <= 2);
+        assert_eq!(bounded_lookup.candidate.unwrap().pattern_order, 2);
+        assert_eq!(unbounded_lookup.candidate.unwrap().pattern_order, 3);
         assert_eq!(
             engine_raw_matches(&engine, text),
             monolithic_raw_matches(&patterns, text)
@@ -1978,10 +2120,14 @@ mod tests {
         let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
             panic!("bounded literals should use the layered matcher");
         };
-        let layer = shard.case_sensitive_literals.as_ref().unwrap();
+        let layer = shard
+            .case_sensitive_literals
+            .with_left_boundary
+            .as_ref()
+            .unwrap();
         let text = "aaaaaaaaaaaaaaaaa";
 
-        assert!(layer.all_require_left_unicode_word_boundary);
+        assert!(layer.requires_left_unicode_word_boundary);
         assert_eq!(next_literal_search_start(layer, text, 0), text.len());
         let repeated = std::iter::repeat(text)
             .take(128)
@@ -1990,6 +2136,46 @@ mod tests {
         assert_eq!(
             engine_raw_matches(&engine, &repeated),
             monolithic_raw_matches(&patterns, &repeated)
+        );
+    }
+
+    #[test]
+    fn unbounded_peer_cannot_disable_long_bounded_literal_skip() {
+        let literal = "a".repeat(8_192);
+        let patterns = vec![
+            canonical_pattern(&format!(r"\b(?:{literal})\b"), &[]),
+            canonical_pattern("needle", &[]),
+        ];
+        let engine = engine_for_patterns(patterns.clone());
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("mixed boundary signatures should use the layered matcher");
+        };
+        let bounded_layer = shard
+            .case_sensitive_literals
+            .with_left_boundary
+            .as_ref()
+            .unwrap();
+        let unbounded_layer = shard
+            .case_sensitive_literals
+            .without_left_boundary
+            .as_ref()
+            .unwrap();
+        let text = "a".repeat(literal.len() + 1);
+        let lookup = indexed_valid_literal_at_start(bounded_layer, text.as_bytes(), &text, 0);
+
+        assert_eq!(bounded_layer.patterns.len(), 1);
+        assert_eq!(unbounded_layer.patterns.len(), 1);
+        assert!(bounded_layer.requires_left_unicode_word_boundary);
+        assert!(!unbounded_layer.requires_left_unicode_word_boundary);
+        assert!(lookup.candidate.is_none());
+        assert_eq!(lookup.prefix_bytes_examined, text.len());
+        assert_eq!(
+            next_literal_search_start(bounded_layer, &text, 0),
+            text.len()
+        );
+        assert_eq!(
+            engine_raw_matches(&engine, &text),
+            monolithic_raw_matches(&patterns, &text)
         );
     }
 
@@ -2040,6 +2226,7 @@ mod tests {
         assert_eq!(
             shard
                 .ascii_case_insensitive_literals
+                .with_left_boundary
                 .as_ref()
                 .unwrap()
                 .patterns
@@ -2087,6 +2274,7 @@ mod tests {
         assert_eq!(
             shard
                 .case_sensitive_literals
+                .with_left_boundary
                 .as_ref()
                 .unwrap()
                 .patterns
@@ -2106,6 +2294,43 @@ mod tests {
         assert_eq!(
             engine_raw_matches(&engine, "alpha John   Doe"),
             monolithic_raw_matches(&patterns, "alpha John   Doe")
+        );
+    }
+
+    #[test]
+    fn scale_character_class_shape_remains_in_residual_regex_layer() {
+        let patterns = vec![
+            canonical_pattern("anchor", &[]),
+            canonical_pattern(r"NERB00079[6X]", &[]),
+        ];
+        let engine = engine_for_patterns(patterns.clone());
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("an exact literal plus a character class should use the layered matcher");
+        };
+
+        assert_eq!(
+            shard
+                .case_sensitive_literals
+                .without_left_boundary
+                .as_ref()
+                .unwrap()
+                .patterns
+                .iter()
+                .map(|pattern| pattern.pattern_order)
+                .collect::<Vec<_>>(),
+            [0]
+        );
+        assert_eq!(
+            shard
+                .residual_regex
+                .as_ref()
+                .unwrap()
+                .local_to_pattern_order,
+            [1]
+        );
+        assert_eq!(
+            engine_raw_matches(&engine, "anchor NERB000796 NERB00079X"),
+            monolithic_raw_matches(&patterns, "anchor NERB000796 NERB00079X")
         );
     }
 
@@ -2150,6 +2375,7 @@ mod tests {
         assert_eq!(
             shard
                 .case_sensitive_literals
+                .without_left_boundary
                 .as_ref()
                 .unwrap()
                 .patterns
@@ -2266,6 +2492,7 @@ mod tests {
         assert_eq!(
             shard
                 .case_sensitive_literals
+                .with_left_boundary
                 .as_ref()
                 .unwrap()
                 .patterns
