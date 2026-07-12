@@ -255,7 +255,7 @@ def _assert_aggregate_private(profile: Mapping[str, Any], manifest: Mapping[str,
 def test_reordered_source_produces_identical_prepared_profile_and_manifest(
     tmp_path: Path, test_data_path: Path
 ) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     reversed_source = tmp_path / "reversed.jsonl"
     lines = source.read_text(encoding="utf-8").splitlines()
     reversed_source.write_text("\n".join(reversed(lines)) + "\n", encoding="utf-8")
@@ -278,7 +278,7 @@ def test_reordered_source_produces_identical_prepared_profile_and_manifest(
 
 
 def test_row_limited_local_receipt_labels_prefix_hash_as_incomplete(tmp_path: Path, test_data_path: Path) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     _, run = _prepare(source, tmp_path / "limited", max_rows=1)
     receipt = json.loads((run.root / "transport-receipt.json").read_text(encoding="utf-8"))
 
@@ -291,7 +291,7 @@ def test_row_limited_local_receipt_labels_prefix_hash_as_incomplete(tmp_path: Pa
 def test_exact_duplicate_rows_collapse_but_distinct_mailbox_copies_remain_grouped(
     tmp_path: Path, test_data_path: Path
 ) -> None:
-    _, run = _prepare(test_data_path / "enron_preparation_v2.jsonl", tmp_path / "run")
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
 
     document_ids = [str(record["document_id"]) for record in run.records]
     assert len(document_ids) == len(set(document_ids))
@@ -325,7 +325,7 @@ def test_exact_duplicate_rows_collapse_but_distinct_mailbox_copies_remain_groupe
 
 
 def test_mailbox_owner_hash_groups_files_without_exposing_mailbox_paths(tmp_path: Path, test_data_path: Path) -> None:
-    _, run = _prepare(test_data_path / "enron_preparation_v2.jsonl", tmp_path / "run")
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
     alpha = [record for record in run.records if record["headers"]["message_id"] == "<alpha-001@fixture.invalid>"]
     beta = next(record for record in run.records if record["headers"]["message_id"] == "<beta-002@fixture.invalid>")
 
@@ -347,7 +347,7 @@ def test_cleaning_dates_and_natural_views_are_auditable_without_answer_injection
     tmp_path: Path, test_data_path: Path
 ) -> None:
     _, run = _prepare(
-        test_data_path / "enron_preparation_v2.jsonl",
+        test_data_path / "enron_preparation.jsonl",
         tmp_path / "run",
         max_recipients_per_field=2,
     )
@@ -734,7 +734,7 @@ def test_huggingface_source_rejects_mutable_revision_before_loading(
 def test_public_provenance_labels_reject_free_form_or_identifier_bearing_values(
     tmp_path: Path, test_data_path: Path
 ) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     for dataset_id in ("Private Person", "private.person@example.test"):
         with pytest.raises(ValueError, match="public identifier token"):
             prepare_enron_source(_options(source, tmp_path / dataset_id.replace("@", "-"), dataset_id=dataset_id))
@@ -765,7 +765,7 @@ def test_huggingface_source_rejects_empty_stream_transactionally(
 def test_outputs_are_owner_only_and_source_or_output_symlinks_are_rejected(
     tmp_path: Path, test_data_path: Path
 ) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     _, run = _prepare(source, tmp_path / "private-run")
 
     for path in (run.root, *run.root.rglob("*")):
@@ -794,7 +794,7 @@ def test_outputs_are_owner_only_and_source_or_output_symlinks_are_rejected(
 def test_repo_visible_output_requires_ignore_or_explicit_override_without_weakening_symlink_checks(
     tmp_path: Path, test_data_path: Path
 ) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
@@ -823,7 +823,7 @@ def test_repo_visible_output_requires_ignore_or_explicit_override_without_weaken
 def test_promotion_failure_cleans_staging_and_preserves_an_existing_valid_run(
     tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     _, stable = _prepare(source, tmp_path / "stable")
     stable_bytes = {
         path.relative_to(stable.root): path.read_bytes() for path in stable.root.rglob("*") if path.is_file()
@@ -846,7 +846,7 @@ def test_promotion_failure_cleans_staging_and_preserves_an_existing_valid_run(
 
 
 def test_loader_verifies_artifact_hashes_and_rejects_tampering(tmp_path: Path, test_data_path: Path) -> None:
-    _, run = _prepare(test_data_path / "enron_preparation_v2.jsonl", tmp_path / "run")
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
 
     loaded = load_enron_preparation_run(tmp_path / "run")
     assert isinstance(loaded, Mapping)
@@ -863,7 +863,7 @@ def test_loader_verifies_artifact_hashes_and_rejects_tampering(tmp_path: Path, t
 def test_loader_recomputes_conservation_instead_of_trusting_rebound_aggregate(
     tmp_path: Path, test_data_path: Path
 ) -> None:
-    _, run = _prepare(test_data_path / "enron_preparation_v2.jsonl", tmp_path / "run")
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
     profile = json.loads(run.profile_path.read_text(encoding="utf-8"))
     manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
     profile["records"]["prepared_occurrences"] = 999
@@ -885,7 +885,7 @@ def test_loader_recomputes_conservation_instead_of_trusting_rebound_aggregate(
 
 
 def test_loader_recomputes_duplicate_aggregates_after_full_rebinding(tmp_path: Path, test_data_path: Path) -> None:
-    _, run = _prepare(test_data_path / "enron_preparation_v2.jsonl", tmp_path / "run")
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
     profile = json.loads(run.profile_path.read_text(encoding="utf-8"))
     manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
     profile["duplicates"]["duplicate_exact_content_occurrences"] += 1
@@ -896,7 +896,7 @@ def test_loader_recomputes_duplicate_aggregates_after_full_rebinding(tmp_path: P
 
 
 def test_loader_cross_checks_rejection_reasons_against_ingestion_counters(tmp_path: Path, test_data_path: Path) -> None:
-    fixture = (test_data_path / "enron_preparation_v2.jsonl").read_text(encoding="utf-8")
+    fixture = (test_data_path / "enron_preparation.jsonl").read_text(encoding="utf-8")
     source = tmp_path / "source.jsonl"
     source.write_text("\n" + fixture, encoding="utf-8")
     _, run = _prepare(source, tmp_path / "run")
@@ -914,7 +914,7 @@ def test_loader_cross_checks_rejection_reasons_against_ingestion_counters(tmp_pa
 
 
 def test_loader_rejects_fabricated_source_provenance_and_row_limits(tmp_path: Path, test_data_path: Path) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     mutations = (
         ("kind", "fabricated_reader"),
         ("reader_package_version", "fabricated-package"),
@@ -932,7 +932,7 @@ def test_loader_rejects_fabricated_source_provenance_and_row_limits(tmp_path: Pa
 
 
 def test_loader_rejects_fabricated_nerb_version_provenance(tmp_path: Path, test_data_path: Path) -> None:
-    _, run = _prepare(test_data_path / "enron_preparation_v2.jsonl", tmp_path / "run")
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
     profile = json.loads(run.profile_path.read_text(encoding="utf-8"))
     manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
     profile["software"]["nerb_version"] = "999.0.0-fabricated"
@@ -948,7 +948,7 @@ def test_aggregate_privacy_validation_checks_mapping_keys() -> None:
 
 
 def test_loader_rejects_invalid_commit_marker_and_profile_descriptor(tmp_path: Path, test_data_path: Path) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     _, marker_run = _prepare(source, tmp_path / "marker-run")
     (marker_run.root / "COMMITTED").write_text("fabricated\n", encoding="utf-8")
     with pytest.raises(ValueError, match="(?i)commit marker"):
@@ -963,7 +963,7 @@ def test_loader_rejects_invalid_commit_marker_and_profile_descriptor(tmp_path: P
 
 
 def test_loader_rejects_unknown_aggregate_and_prepared_answer_fields(tmp_path: Path, test_data_path: Path) -> None:
-    source = test_data_path / "enron_preparation_v2.jsonl"
+    source = test_data_path / "enron_preparation.jsonl"
     _, profile_run = _prepare(source, tmp_path / "profile-run")
     profile = json.loads(profile_run.profile_path.read_text(encoding="utf-8"))
     manifest = json.loads(profile_run.manifest_path.read_text(encoding="utf-8"))
@@ -993,7 +993,7 @@ def test_loader_rejects_unknown_aggregate_and_prepared_answer_fields(tmp_path: P
 def test_loader_rejects_unknown_transform_counter_keys_even_when_aggregates_match(
     tmp_path: Path, test_data_path: Path
 ) -> None:
-    _, run = _prepare(test_data_path / "enron_preparation_v2.jsonl", tmp_path / "run")
+    _, run = _prepare(test_data_path / "enron_preparation.jsonl", tmp_path / "run")
     profile = json.loads(run.profile_path.read_text(encoding="utf-8"))
     manifest = json.loads(run.manifest_path.read_text(encoding="utf-8"))
     records = [dict(row) for row in run.records]
@@ -1009,7 +1009,7 @@ def test_loader_rejects_unknown_transform_counter_keys_even_when_aggregates_matc
 
 def test_loader_binds_view_truncation_metadata_to_cleaning_audit(tmp_path: Path, test_data_path: Path) -> None:
     _, run = _prepare(
-        test_data_path / "enron_preparation_v2.jsonl",
+        test_data_path / "enron_preparation.jsonl",
         tmp_path / "run",
         max_body_chars=32,
         max_body_bytes=128,

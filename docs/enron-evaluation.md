@@ -54,10 +54,10 @@ uv run nerb download-enron-annotations \
 
 uv run nerb prepare-enron-annotations \
   --archive .nerb/sources/cmu-enron-meetings/EnronMeetings-XML.zip \
-  --output-dir .nerb/enron-annotations/cmu-meetings-v2
+  --output-dir .nerb/enron-annotations/cmu-meetings
 
 uv run nerb verify-enron-annotations \
-  --run-dir .nerb/enron-annotations/cmu-meetings-v2
+  --run-dir .nerb/enron-annotations/cmu-meetings
 ```
 
 The downloader has no caller-supplied URL. It accepts only the pinned HTTPS source, rejects cross-origin redirects and
@@ -82,7 +82,7 @@ Run the generic executor over explicit private JSONL artifacts with:
 
 ```shell
 uv run nerb eval-enron-quality \
-  --bank .nerb/banks/enron-v2.json \
+  --bank .nerb/banks/enron.json \
   --documents .nerb/evals/documents.jsonl \
   --gold-spans .nerb/evals/gold-spans.jsonl \
   --slice-plan .nerb/evals/quality-slices.jsonl \
@@ -108,8 +108,8 @@ out-of-catalog occurrence. Missing, duplicate, or extra span rows fail closed. R
 
 ```shell
 uv run nerb eval-enron-cmu-train \
-  --bank .nerb/banks/enron-v2.json \
-  --annotation-run .nerb/enron-annotations/cmu-meetings-v2 \
+  --bank .nerb/banks/enron.json \
+  --annotation-run .nerb/enron-annotations/cmu-meetings \
   --catalog-bindings .nerb/evals/cmu-train-catalog-bindings.jsonl
 ```
 
@@ -202,7 +202,7 @@ leftmost, boundary, and overlap shadowing remains visible.
 
 ```shell
 uv run nerb eval-enron-conformance \
-  --bank .nerb/banks/enron-v2.json \
+  --bank .nerb/banks/enron.json \
   --positive-cases .nerb/evals/conformance-positive.jsonl \
   --negative-cases .nerb/evals/conformance-negative.jsonl \
   --output-dir .nerb/evals/conformance-run

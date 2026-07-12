@@ -1,4 +1,4 @@
-"""Privacy-first, leakage-aware train/validation/sealed-test splitting for Enron v2.
+"""Privacy-first, leakage-aware train/validation/sealed-test splitting for Enron.
 
 The public development surface deliberately has no generic role selector.  Test
 records live in a separate private run and can only be opened by the one-shot
@@ -434,7 +434,7 @@ def _validate_options(options: EnronSplitOptions) -> None:
         options.train_fraction != 0.8 or options.validation_fraction != 0.1 or options.near_hamming != 3
     ):
         raise EnronSplitError(
-            "Promotable Enron v2 splits require the frozen 80/10/10 allocation and Hamming-radius-three policy."
+            "Promotable Enron splits require the frozen 80/10/10 allocation and Hamming-radius-three policy."
         )
 
 

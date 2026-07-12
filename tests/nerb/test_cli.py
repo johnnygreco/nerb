@@ -566,14 +566,14 @@ def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_dat
     assert regress_payload["gates"]["passed"] == expected_regression["gates"]["passed"]
 
 
-def test_prepare_enron_command_writes_private_v2_run_and_returns_aggregate_json(tmp_path, test_data_path):
+def test_prepare_enron_command_writes_private_run_and_returns_aggregate_json(tmp_path, test_data_path):
     output_dir = tmp_path / "prepared-run"
     result = runner.invoke(
         app,
         [
             "prepare-enron",
             "--input-jsonl",
-            str(test_data_path / "enron_preparation_v2.jsonl"),
+            str(test_data_path / "enron_preparation.jsonl"),
             "--dataset",
             "synthetic/enron-preparation",
             "--dataset-revision",
@@ -622,7 +622,7 @@ def test_split_enron_commands_create_and_verify_redacted_and_sealed_bundles(tmp_
         [
             "prepare-enron",
             "--input-jsonl",
-            str(test_data_path / "enron_preparation_v2.jsonl"),
+            str(test_data_path / "enron_preparation.jsonl"),
             "--dataset",
             "synthetic/enron-preparation",
             "--dataset-revision",

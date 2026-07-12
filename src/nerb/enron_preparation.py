@@ -51,7 +51,7 @@ DEFAULT_DATASET_ID = "corbt/enron-emails"
 DEFAULT_DATASET_REVISION = "cfc06c758093d90993abce1a43668fb7357258a6"
 DEFAULT_DATASET_SPLIT = "train"
 PINNED_DATASET_RECORDS = 517_401
-DEFAULT_OUTPUT_DIR = ".nerb/enron-preparation/enron-v2"
+DEFAULT_OUTPUT_DIR = ".nerb/enron-preparation/run"
 DEFAULT_MAX_JSONL_LINE_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_BODY_CHARS = 2_500_000
 DEFAULT_MAX_BODY_BYTES = 16 * 1024 * 1024
@@ -317,7 +317,7 @@ class _NonfiniteJsonNumber(ValueError):
 
 
 def prepare_enron_source(options: EnronPreparationOptions) -> dict[str, Any]:
-    """Prepare a pinned Enron-like source into a deterministic private v2 run."""
+    """Prepare a pinned Enron-like source into a deterministic private run."""
     _validate_options(options)
     implementation_sha256 = _implementation_sha256()
     runtime_provenance = {

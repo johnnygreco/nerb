@@ -48,10 +48,10 @@ def _strings(value: Any) -> Iterator[str]:
 
 
 def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
-    bank_path = _DATA / "enron_bank_v2_fake.json"
+    bank_path = _DATA / "enron_bank_fake.json"
     bank = _load(bank_path.name)
-    card = _load("enron_bank_card_v2_fake.json")
-    funnel = _load("enron_candidate_funnel_v2_fake.json")
+    card = _load("enron_bank_card_fake.json")
+    funnel = _load("enron_candidate_funnel_fake.json")
 
     structural = validate_bank(bank, level="deep", strict=True, check_engine_compile=True)
     assert structural["valid"] is True
@@ -104,8 +104,8 @@ def test_committed_fake_bank_card_and_funnel_are_self_consistent() -> None:
 
 
 def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_bound() -> None:
-    card_path = _DATA / "enron_bank_card_v2_real_50000.json"
-    funnel_path = _DATA / "enron_candidate_funnel_v2_real_50000.json"
+    card_path = _DATA / "enron_bank_card_real_50000.json"
+    funnel_path = _DATA / "enron_candidate_funnel_real_50000.json"
     card = _load(card_path.name)
     funnel = _load(funnel_path.name)
 
@@ -170,7 +170,7 @@ def test_committed_real_50000_aggregate_card_and_funnel_are_public_safe_and_boun
     ],
 )
 def test_real_aggregate_card_rejects_impossible_auxiliary_metric_arithmetic(metric: str) -> None:
-    card = _load("enron_bank_card_v2_real_50000.json")
+    card = _load("enron_bank_card_real_50000.json")
     metrics = card["independent_auxiliary"]["metrics"]
     metrics[metric] = 1.0 if metrics[metric] != 1.0 else 0.0
     card["run_sha256"] = _canonical_hash({key: value for key, value in card.items() if key != "run_sha256"})
@@ -180,7 +180,7 @@ def test_real_aggregate_card_rejects_impossible_auxiliary_metric_arithmetic(metr
 
 
 def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tampering() -> None:
-    card = _load("enron_bank_card_v2_fake.json")
+    card = _load("enron_bank_card_fake.json")
     missing_iteration_field = copy.deepcopy(card)
     del missing_iteration_field["iterations"][0]["policy_sha256"]
     missing_iteration_field["run_sha256"] = _canonical_hash(
@@ -199,9 +199,9 @@ def test_committed_fake_card_rejects_nested_schema_and_privacy_commitment_tamper
 
 
 def test_committed_fake_artifacts_contain_only_fictitious_identifier_shapes() -> None:
-    bank = _load("enron_bank_v2_fake.json")
-    card = _load("enron_bank_card_v2_fake.json")
-    funnel = _load("enron_candidate_funnel_v2_fake.json")
+    bank = _load("enron_bank_fake.json")
+    card = _load("enron_bank_card_fake.json")
+    funnel = _load("enron_candidate_funnel_fake.json")
     serialized = json.dumps((bank, card, funnel), ensure_ascii=False, sort_keys=True)
 
     assert bank["metadata"]["privacy"] == "fictitious_values_only"
@@ -235,7 +235,7 @@ def test_public_card_scanner_commitment_binds_wrapper_and_canonical_scanner() ->
 
 
 def test_generated_conformance_cases_exercise_case_whitespace_and_boundaries() -> None:
-    bank = _load("enron_bank_v2_fake.json")
+    bank = _load("enron_bank_fake.json")
     positives, negatives = _conformance_cases(bank)
     result = evaluate_enron_conformance(bank, positives, negatives)
     assert result["catalog_conformance"]["passed"] is True

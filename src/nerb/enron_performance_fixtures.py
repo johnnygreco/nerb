@@ -1,4 +1,4 @@
-"""Deterministic, privacy-safe fixtures for Enron-v2 performance evidence.
+"""Deterministic, privacy-safe fixtures for Enron performance evidence.
 
 The generators in this module are deliberately in-memory.  Callers decide if
 and where to persist the returned immutable byte artifacts, normally through a

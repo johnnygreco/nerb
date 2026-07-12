@@ -58,24 +58,23 @@ uv run nerb benchmark-bank --bank path/to/bank.json --benchmark-iterations 3
 uv run nerb regress-bank --old-bank baseline.json --new-bank candidate.json --benchmark-iterations 3
 ```
 
-For the implemented Enron v2 train-only workflow, build from a committed private development bundle and deep-verify the
+For the supported Enron train-only workflow, build from a committed private development bundle and deep-verify the
 transactional output:
 
 ```shell
 uv run nerb build-enron-bank \
-  --development-run .nerb/enron-splits/enron-v2-development \
-  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --development-run .nerb/enron-splits/development \
+  --output-dir .nerb/enron-bank-builds/run \
   --benchmark-version enron-v2
 
 uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/enron-bank-builds/enron-v2
+  --run-dir .nerb/enron-bank-builds/run
 ```
 
 The builder has no sealed-test option. It mines train only, uses validation for three frozen policy iterations, and emits
 private artifacts plus an aggregate non-promotable card. Structured-weak labeled-span recall is not open-world recall;
 precision, false-alarm, and over-redaction metrics remain unsupported without independent exhaustive annotations. Never
-tune a builder or autoresearch loop on final-test quality. The retired v1 script remains historical-only and must not
-support a current claim.
+tune bank construction or policy selection on final-test quality.
 
 ## Handoff Summary
 

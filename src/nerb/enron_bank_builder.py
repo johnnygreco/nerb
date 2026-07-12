@@ -1,6 +1,6 @@
 """Train-only construction of privacy-first Enron intelligence banks.
 
-The v2 builder consumes only the sealed split workflow's development reader.
+The builder consumes only the sealed split workflow's development reader.
 Candidate surfaces and the resulting real bank are private artifacts; public
 results are aggregate cards and commitments.  Validation can choose among
 predeclared policies, but validation surfaces are never eligible candidates.
@@ -81,7 +81,7 @@ _ROLE_NAME_TOKENS = frozenset(
 
 
 class EnronBankBuildError(ValueError):
-    """Raised when a bank cannot be built without weakening the v2 contract."""
+    """Raised when a bank cannot be built without weakening the benchmark contract."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1667,10 +1667,6 @@ def _canonical_json_bytes(value: Any) -> bytes:
 
 def _canonical_hash(value: Any) -> str:
     return _SHA256_PREFIX + hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
-
-
-# Historical v1 support remains quarantined inside ``enron_benchmark``.  New
-# code must use the development-split v2 workflow in this module.
 
 
 def summarize_bank(bank: Mapping[str, Any]) -> dict[str, Any]:

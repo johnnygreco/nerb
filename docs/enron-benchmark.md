@@ -157,8 +157,8 @@ The benchmark uses three immutable roles, created before candidate tuning:
 - **Train:** available for profiling, candidate mining, bank construction, and curation.
 - **Validation:** available for error analysis and tuning construction policy, thresholds, and generic fallbacks. It is not
   a literal alias feed.
-- **Final test:** content, labels, and per-document outputs remain sealed from builders and autoresearch until the bank,
-  evaluator, thresholds, claims, and workload hashes are frozen.
+- **Final test:** content, labels, and per-document outputs remain sealed from bank-building and policy-tuning processes
+  until the bank, evaluator, thresholds, claims, and workload hashes are frozen.
 
 Split assignment is row-order independent and operates on leakage groups rather than individual rows. A group joins exact
 duplicates, normalized near duplicates, reply/forward/thread relatives, and other answer-sharing records identified by
@@ -166,13 +166,13 @@ the frozen preparation policy. No group may cross roles. The manifest records gr
 hashes, row and group counts, cross-split audit results, and explicit temporal/future, seen-identity, unseen-identity,
 head/tail, and challenge cohorts where labels support them.
 
-Builders and autoresearch may read train and validation artifacts only. They may not read the final-test text, labels,
-per-document metrics, failure examples, or a scalar derived from final-test quality. The final test is run once for the
-frozen release candidate; it is never an optimization objective. Every access and its privacy-safe aggregate outcome,
-including a failed or aborted run, enters an append-only public benchmark lineage. A failure may be followed by a new
-benchmark version and newly sealed test, but the successor must link the failed version and disclose the changes and
-decisions informed by its outcome; it never replaces or hides that result. Repeatedly tuning against the same final test
-or selectively surfacing only successful benchmark versions invalidates promotion.
+Bank-building and policy-tuning processes may read train and validation artifacts only. They may not read the final-test
+text, labels, per-document metrics, failure examples, or a scalar derived from final-test quality. The final test is run
+once for the frozen release candidate; it is never an optimization objective. Every access and its privacy-safe aggregate
+outcome, including a failed or aborted run, enters an append-only public benchmark lineage. A failure may be followed by
+a new benchmark version and newly sealed test, but the successor must link the failed version and disclose the changes
+and decisions informed by its outcome; it never replaces or hides that result. Repeatedly tuning against the same final
+test or selectively surfacing only successful benchmark versions invalidates promotion.
 
 Before access, the manifest designates exactly one prepared primary natural-content view and binds its artifact and
 content policy. A promoted quality run must attest that this view contains no answer-bearing fields. The manifest also
@@ -451,10 +451,10 @@ gaps, historical-domain bias, source integrity limitations, access terms, and in
 manifest.
 
 Raw downloads, cleaned text, annotations, split files, real banks, aliases, match records, failure examples, and
-autoresearch logs stay under ignored `.nerb/` paths or an equivalently access-controlled store. Encrypt them at rest where
-practical, grant least-privilege access, and record an owner, purpose, creation time, retention deadline, and deletion
-outcome. A production user's operational bank may have its own approved lifecycle; benchmark copies do not inherit
-indefinite retention.
+optimization logs stay under ignored `.nerb/` paths or an equivalently access-controlled store. Encrypt them at rest
+where practical, grant least-privilege access, and record an owner, purpose, creation time, retention deadline, and
+deletion outcome. A production user's operational bank may have its own approved lifecycle; benchmark copies do not
+inherit indefinite retention.
 
 Git may contain only schemas, synthetic fixtures, source/policy hashes, aggregate evidence, and sanitized examples that
 pass automated privacy checks. Public evidence must omit raw strings, context snippets, addresses, names, local paths,

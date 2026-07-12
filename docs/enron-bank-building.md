@@ -21,8 +21,8 @@ path, and choose a new output directory: the transactional writer does not repla
 
 ```shell
 uv run nerb build-enron-bank \
-  --development-run .nerb/enron-splits/enron-v2-development \
-  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --development-run .nerb/enron-splits/development \
+  --output-dir .nerb/enron-bank-builds/run \
   --benchmark-version enron-v2
 ```
 
@@ -32,10 +32,10 @@ exactly covers the bundle's training labels. It remains auxiliary and non-promot
 
 ```shell
 uv run nerb build-enron-bank \
-  --development-run .nerb/enron-splits/enron-v2-development \
-  --annotation-run .nerb/enron-annotations/cmu-v2 \
-  --cmu-catalog-bindings .nerb/enron-annotations/cmu-v2-reviewed-catalog-bindings.jsonl \
-  --output-dir .nerb/enron-bank-builds/enron-v2 \
+  --development-run .nerb/enron-splits/development \
+  --annotation-run .nerb/enron-annotations/cmu-meetings \
+  --cmu-catalog-bindings .nerb/enron-annotations/cmu-reviewed-catalog-bindings.jsonl \
+  --output-dir .nerb/enron-bank-builds/run \
   --benchmark-version enron-v2
 ```
 
@@ -46,8 +46,8 @@ only checking its stored commitment.
 
 ```shell
 uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/enron-bank-builds/enron-v2 \
-  --annotation-run .nerb/enron-annotations/cmu-v2
+  --run-dir .nerb/enron-bank-builds/run \
+  --annotation-run .nerb/enron-annotations/cmu-meetings
 ```
 
 Omit both `--annotation-run` and `--cmu-catalog-bindings` from the build when no auxiliary bundle is available; supplying
@@ -254,8 +254,8 @@ access if that development-stage proof has not landed; a higher numeric limit al
 
 ## Reviewed 50k development evidence
 
-The committed aggregate-only evidence files `tests/data/enron_bank_card_v2_real_50000.json` and
-`tests/data/enron_candidate_funnel_v2_real_50000.json` come from a frozen 50,000-row real-source development fixture.
+The committed aggregate-only evidence files `tests/data/enron_bank_card_real_50000.json` and
+`tests/data/enron_candidate_funnel_real_50000.json` come from a frozen 50,000-row real-source development fixture.
 The fixture is deliberately marked `fixture_mode: true` and non-promotable; it contains 40,007 train and 4,995
 validation records, and the sealed test remained unopened.
 

@@ -75,11 +75,11 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 
      ```shell
      uv run nerb build-enron-bank \
-       --development-run .nerb/enron-splits/enron-v2-development \
-       --output-dir .nerb/enron-bank-builds/enron-v2 \
+       --development-run .nerb/enron-splits/development \
+       --output-dir .nerb/enron-bank-builds/run \
        --benchmark-version enron-v2
      uv run nerb verify-enron-bank-build \
-       --run-dir .nerb/enron-bank-builds/enron-v2
+       --run-dir .nerb/enron-bank-builds/run
      ```
    - Treat the builder's structured-header validation as `structured_weak` labeled-span evidence. It is not open-world
      recall; unsupported precision, false-alarm, and over-redaction metrics stay `null`. Perfect synthetic conformance
@@ -87,8 +87,6 @@ For detailed checklists, read `references/build-checklist.md` only when planning
    - Do not optimize against an Enron final-test score. Stop after train mining, validation-only policy selection,
      optional auxiliary-train diagnostics, and catalog conformance. Only a release steward may use the one-shot sealed
      final-test path after the bank, evaluator, thresholds, claims, and workloads are frozen.
-   - `scripts/enron_bank_build_benchmark.py` and historical v1 autoresearch remain quarantined and must not support a
-     current quality, privacy, performance, or promotion claim.
 
 8. Leave a handoff another agent can use.
    - Summarize entity classes, split policy, artifact locations, eval coverage, known false positives, and next candidate

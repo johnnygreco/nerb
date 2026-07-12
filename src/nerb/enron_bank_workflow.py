@@ -1,4 +1,4 @@
-"""Private transactional workflow for Enron v2 bank construction."""
+"""Private transactional workflow for Enron bank construction."""
 
 from __future__ import annotations
 
