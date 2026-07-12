@@ -605,7 +605,7 @@ def test_source_build_worker_never_echoes_exception_text_or_invalid_correlation_
     monkeypatch.setattr(performance_module.tempfile, "gettempdir", lambda: str(tmp_path))
     temporary_root = tmp_path / "nerb-performance-build-test"
     temporary_root.mkdir()
-    request = {
+    request: dict[str, Any] = {
         "schema_version": "nerb.enron_performance_source_build_request.v1",
         "nonce": "safe-nonce",
         "workload_sha256": _HASH_1,
