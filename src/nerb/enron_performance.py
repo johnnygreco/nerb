@@ -91,7 +91,7 @@ PERFORMANCE_GENERIC_REGEX_BASELINE_ID = "generic_email_format_regex"
 PERFORMANCE_PYTHON_LITERAL_BASELINE_ID = "python_literal_catalog_scan"
 PERFORMANCE_PROFILE_IDS = ("smoke", "decision")
 PERFORMANCE_EXACT_VALUE_PATHS = (
-    "real_direct_throughput",
+    "real_direct_cache_value",
     "real_helper_cache_hit",
     "real_helper_cache_miss",
     "real_end_to_end",
@@ -107,13 +107,19 @@ DEFAULT_REAL_INPUT_DOCUMENTS = 100
 DEFAULT_WARMUPS = 3
 DEFAULT_SMOKE_SAMPLES = 5
 DEFAULT_SETUP_SAMPLES = 20
-DEFAULT_SCAN_SAMPLES = 100
-DEFAULT_DOCUMENT_SAMPLES = 500
+DEFAULT_SCAN_SAMPLES = 1_000
+DEFAULT_CACHE_VALUE_SAMPLES = 100
+DEFAULT_DOCUMENT_SAMPLES = 1_000
+DEFAULT_EXACT_CONTROL_BLOCKS = 10
+DEFAULT_SETUP_SAMPLES_PER_BLOCK = DEFAULT_SETUP_SAMPLES // DEFAULT_EXACT_CONTROL_BLOCKS
+DEFAULT_SCAN_SAMPLES_PER_BLOCK = DEFAULT_SCAN_SAMPLES // DEFAULT_EXACT_CONTROL_BLOCKS
+DEFAULT_CACHE_VALUE_SAMPLES_PER_BLOCK = DEFAULT_CACHE_VALUE_SAMPLES // DEFAULT_EXACT_CONTROL_BLOCKS
+DEFAULT_DOCUMENT_SAMPLES_PER_BLOCK = DEFAULT_DOCUMENT_SAMPLES // DEFAULT_EXACT_CONTROL_BLOCKS
 DEFAULT_CONCURRENCY = 4
 DEFAULT_WORKER_TIMEOUT_SECONDS = 120.0
 DEFAULT_SOURCE_BUILD_TIMEOUT_SECONDS = 900.0
 PERFORMANCE_DECISION_THRESHOLDS = {
-    "max_exact_control_noise_floor": 0.25,
+    "max_cross_path_noise_floor": 0.25,
     "max_document_p99_seconds": 0.05,
     "min_documents_per_second": 100.0,
     "min_mib_per_second": 1.0,
@@ -132,6 +138,24 @@ MAX_SOURCE_SNAPSHOT_BYTES = 16 * 1024 * 1024 * 1024
 MAX_SOURCE_BUILD_SECONDS = 24 * 60 * 60
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _derive_exact_block_assignment() -> tuple[str, ...]:
+    """Derive the balanced physical twin order before any timings exist."""
+
+    domain = b"nerb/enron/performance/exact-block-assignment/v1\0"
+    ranked = sorted(
+        range(DEFAULT_EXACT_CONTROL_BLOCKS),
+        key=lambda index: hashlib.sha256(domain + index.to_bytes(2, "big")).digest(),
+    )
+    candidate_first = frozenset(ranked[: DEFAULT_EXACT_CONTROL_BLOCKS // 2])
+    return tuple(
+        "candidate_first" if block_index in candidate_first else "control_first"
+        for block_index in range(DEFAULT_EXACT_CONTROL_BLOCKS)
+    )
+
+
+PERFORMANCE_EXACT_BLOCK_ASSIGNMENT = _derive_exact_block_assignment()
 
 PerformanceProfile = Literal["smoke", "decision"]
 
@@ -540,11 +564,12 @@ def _source_sha256(paths: Sequence[Path]) -> str:
 
 
 def _performance_harness_source_sha256() -> str:
-    """Bind the runner, worker, fixture generator, bank builder, and frozen policy."""
+    """Bind the runner, contract, worker, fixture generator, bank builder, and frozen policy."""
 
     runner_source_sha256 = _source_sha256(
         (
             Path(__file__),
+            Path(__file__).with_name("enron_contract.py"),
             Path(__file__).with_name("enron_performance_worker.py"),
             Path(__file__).with_name("enron_performance_fixtures.py"),
         )
@@ -909,6 +934,68 @@ def _harness_descriptor(
     return descriptor
 
 
+def _performance_harnesses(
+    *,
+    source_sha256: str,
+    source_profile_artifact: Mapping[str, Any],
+    source_build_artifact: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    operations = {
+        phase: {
+            "schema_version": "nerb.enron_performance_operation.v1",
+            "phase": phase,
+            "operation_spec_version": PERFORMANCE_OPERATION_SPEC_VERSION,
+            "implementation": (
+                "source_build_subprocess"
+                if phase == "source_build"
+                else "source_profile"
+                if phase == "source_profile"
+                else "bank_compile"
+                if phase == "cold_compile"
+                else "json_helper_scan"
+                if phase in {"helper_cache_miss", "helper_cache_hit", "end_to_end"}
+                else "direct_bank_scan"
+            ),
+        }
+        for phase in PERFORMANCE_PHASE_PROCESS_MODELS
+    }
+    harnesses = [
+        _harness_descriptor(
+            identifier=f"{phase}_harness",
+            phase=phase,
+            source_sha256=source_sha256,
+            operation=operations[phase],
+            source_artifact=(
+                source_profile_artifact
+                if phase == "source_profile"
+                else source_build_artifact
+                if phase == "source_build"
+                else None
+            ),
+        )
+        for phase in PERFORMANCE_PHASE_PROCESS_MODELS
+    ]
+    harnesses.extend(
+        (
+            _harness_descriptor(
+                identifier="generic_regex_harness",
+                phase="direct_bank_scan",
+                source_sha256=source_sha256,
+                operation={"implementation": "generic_email_regex", "semantic_equivalence": "not_equivalent"},
+                source_artifact=None,
+            ),
+            _harness_descriptor(
+                identifier="python_literal_harness",
+                phase="direct_bank_scan",
+                source_sha256=source_sha256,
+                operation={"implementation": "python_literal_catalog", "semantic_equivalence": "not_equivalent"},
+                source_artifact=None,
+            ),
+        )
+    )
+    return sorted(harnesses, key=lambda item: item["id"])
+
+
 def _workload_plan(
     *,
     identifier: str,
@@ -958,12 +1045,37 @@ def _comparison_plan(
     *,
     comparison_kind: str = "same_path_stability",
 ) -> dict[str, Any]:
+    if comparison_kind == "same_path_stability":
+        samples_per_block = (
+            DEFAULT_SETUP_SAMPLES_PER_BLOCK
+            if candidate["phase"] in {"source_profile", "source_build", "cold_compile"}
+            else DEFAULT_SCAN_SAMPLES_PER_BLOCK
+            if metric == "p99_seconds"
+            else DEFAULT_CACHE_VALUE_SAMPLES_PER_BLOCK
+        )
+        comparison = {
+            "id": f"compare_{candidate['id']}_vs_{baseline['id']}_{metric}",
+            "candidate_workload_id": candidate["id"],
+            "baseline_workload_id": baseline["id"],
+            "comparison_kind": comparison_kind,
+            "metric": metric,
+            "direction": "symmetric",
+            "noise_method": "exact_block_swap",
+            "block_count": DEFAULT_EXACT_CONTROL_BLOCKS,
+            "samples_per_block": samples_per_block,
+            "block_assignment": list(PERFORMANCE_EXACT_BLOCK_ASSIGNMENT),
+            "significance_level": 0.05,
+            "stability_tolerance": 0.05,
+            "comparison_plan_sha256": "",
+        }
+        comparison["comparison_plan_sha256"] = hash_enron_performance_comparison_plan(comparison)
+        return comparison
     direction = (
         "lower_is_better"
         if metric in {"median_seconds", "p95_seconds", "p99_seconds", "seconds_per_document"}
         else "higher_is_better"
     )
-    comparison: dict[str, Any] = {
+    comparison = {
         "id": f"compare_{candidate['id']}_vs_{baseline['id']}_{metric}",
         "candidate_workload_id": candidate["id"],
         "baseline_workload_id": baseline["id"],
@@ -971,13 +1083,7 @@ def _comparison_plan(
         "metric": metric,
         "direction": direction,
         "noise_multiplier": 2.0,
-        "noise_method": (
-            "paired_block_ratio_mad"
-            if comparison_kind == "cross_path_value"
-            else "paired_relative_mad"
-            if comparison_kind == "same_path_stability" and candidate["sample_unit"] == "document"
-            else "independent_mad"
-        ),
+        "noise_method": "paired_block_ratio_mad",
         "regression_tolerance": 0.05,
         "comparison_plan_sha256": "",
     }
@@ -1139,6 +1245,7 @@ def _performance_profile_plan(
         *,
         cell_concurrency: int = 1,
         promotion_gate: bool = False,
+        decision_cell: bool = True,
     ) -> None:
         candidates.append(
             _workload_plan(
@@ -1150,7 +1257,7 @@ def _performance_profile_plan(
                 sample_unit=sample_unit,
                 concurrency=cell_concurrency,
                 warmups=warmups,
-                decision_grade=decision,
+                decision_grade=decision and decision_cell,
                 promotion_gate=decision and promotion_gate,
             )
         )
@@ -1175,6 +1282,14 @@ def _performance_profile_plan(
         real_input["id"],
         "whole_input",
         promotion_gate=True,
+    )
+    add(
+        "real_direct_cache_value",
+        "direct_bank_scan",
+        "evaluated_bank",
+        real_input["id"],
+        "whole_input",
+        decision_cell=False,
     )
     add("real_end_to_end", "end_to_end", "evaluated_bank", real_input["id"], "whole_input")
     for pattern_count in PERFORMANCE_SCALE_PATTERNS:
@@ -1209,8 +1324,8 @@ def _performance_profile_plan(
         "whole_input",
         cell_concurrency=concurrency,
     )
-    if len(candidates) != 19:
-        raise EnronPerformanceError("Frozen performance matrix does not contain exactly 19 candidate cells.")
+    if len(candidates) != 20:
+        raise EnronPerformanceError("Frozen performance matrix does not contain exactly 20 candidate cells.")
     if not decision:
         smoke_ids = {
             "real_cold_compile",
@@ -1294,20 +1409,19 @@ def _performance_profile_plan(
             )
             control["workload_sha256"] = hash_enron_workload(control)
             workloads.append(control)
-            tail_metric = (
-                "p95_seconds"
+            stability_metric = (
+                "median_seconds"
                 if candidate["phase"] in {"source_profile", "source_build", "cold_compile"}
+                or candidate["id"] in PERFORMANCE_EXACT_VALUE_PATHS
                 else "p99_seconds"
             )
-            comparisons.append(_comparison_plan(candidate, control, tail_metric))
-            if candidate["sample_unit"] == "whole_input":
-                comparisons.append(_comparison_plan(candidate, control, "mib_per_second"))
+            comparisons.append(_comparison_plan(candidate, control, stability_metric))
         candidate_by_id = {str(item["id"]): item for item in candidates}
         for candidate_id, baseline_id in (
             ("real_helper_cache_hit", "real_helper_cache_miss"),
-            ("real_direct_throughput", "real_helper_cache_miss"),
-            ("real_direct_throughput", "real_helper_cache_hit"),
-            ("real_direct_throughput", "real_end_to_end"),
+            ("real_direct_cache_value", "real_helper_cache_miss"),
+            ("real_direct_cache_value", "real_helper_cache_hit"),
+            ("real_direct_cache_value", "real_end_to_end"),
         ):
             for metric in ("median_seconds", "p99_seconds", "mib_per_second"):
                 comparisons.append(
@@ -1357,9 +1471,15 @@ def _performance_profile_plan(
         "sample_policy": {
             "setup_samples": DEFAULT_SETUP_SAMPLES if decision else DEFAULT_SMOKE_SAMPLES,
             "scan_samples": DEFAULT_SCAN_SAMPLES if decision else DEFAULT_SMOKE_SAMPLES,
+            "cache_value_samples": DEFAULT_CACHE_VALUE_SAMPLES if decision else None,
             "document_samples": DEFAULT_DOCUMENT_SAMPLES if decision else None,
+            "exact_control_blocks": DEFAULT_EXACT_CONTROL_BLOCKS if decision else None,
+            "setup_samples_per_block": DEFAULT_SETUP_SAMPLES_PER_BLOCK if decision else None,
+            "scan_samples_per_block": DEFAULT_SCAN_SAMPLES_PER_BLOCK if decision else None,
+            "cache_value_samples_per_block": DEFAULT_CACHE_VALUE_SAMPLES_PER_BLOCK if decision else None,
+            "document_samples_per_block": DEFAULT_DOCUMENT_SAMPLES_PER_BLOCK if decision else None,
             "warmups": warmups,
-            "interleaving": "williams_blocked_cross_path_with_abba_controls" if decision else "candidate_only",
+            "interleaving": "ten_block_exact_swap_with_williams_cross_path" if decision else "candidate_only",
             "promotable": decision,
         },
         "performance_manifest_sha256": hash_enron_performance_manifest(performance),
@@ -1380,58 +1500,10 @@ def _performance_plan(
     source_curation_seconds: float,
 ) -> dict[str, Any]:
     source_sha256 = _performance_harness_source_sha256()
-    operations = {
-        phase: {
-            "schema_version": "nerb.enron_performance_operation.v1",
-            "phase": phase,
-            "operation_spec_version": PERFORMANCE_OPERATION_SPEC_VERSION,
-            "implementation": (
-                "source_build_subprocess"
-                if phase == "source_build"
-                else "source_profile"
-                if phase == "source_profile"
-                else "bank_compile"
-                if phase == "cold_compile"
-                else "json_helper_scan"
-                if phase in {"helper_cache_miss", "helper_cache_hit", "end_to_end"}
-                else "direct_bank_scan"
-            ),
-        }
-        for phase in PERFORMANCE_PHASE_PROCESS_MODELS
-    }
-    harnesses = [
-        _harness_descriptor(
-            identifier=f"{phase}_harness",
-            phase=phase,
-            source_sha256=source_sha256,
-            operation=operations[phase],
-            source_artifact=(
-                source_profile_artifact
-                if phase == "source_profile"
-                else source_build_artifact
-                if phase == "source_build"
-                else None
-            ),
-        )
-        for phase in PERFORMANCE_PHASE_PROCESS_MODELS
-    ]
-    harnesses.extend(
-        (
-            _harness_descriptor(
-                identifier="generic_regex_harness",
-                phase="direct_bank_scan",
-                source_sha256=source_sha256,
-                operation={"implementation": "generic_email_regex", "semantic_equivalence": "not_equivalent"},
-                source_artifact=None,
-            ),
-            _harness_descriptor(
-                identifier="python_literal_harness",
-                phase="direct_bank_scan",
-                source_sha256=source_sha256,
-                operation={"implementation": "python_literal_catalog", "semantic_equivalence": "not_equivalent"},
-                source_artifact=None,
-            ),
-        )
+    harnesses = _performance_harnesses(
+        source_sha256=source_sha256,
+        source_profile_artifact=source_profile_artifact,
+        source_build_artifact=source_build_artifact,
     )
     banks = [dict(evaluated_bank), *(fixture.descriptor for fixture in bank_fixtures)]
     inputs = [dict(real_input), *(fixture.descriptor for fixture in input_fixtures)]
@@ -1493,6 +1565,7 @@ def _validate_performance_plan_shape(plan: Mapping[str, Any]) -> None:
     profiles = plan.get("profiles")
     if not isinstance(profiles, Mapping) or set(profiles) != set(PERFORMANCE_PROFILE_IDS):
         raise EnronPerformanceError("Performance plan profiles are invalid.")
+    validated_profiles: dict[str, Mapping[str, Any]] = {}
     for profile in PERFORMANCE_PROFILE_IDS:
         profile_plan = profiles.get(profile)
         if not isinstance(profile_plan, Mapping) or set(profile_plan) != {
@@ -1504,11 +1577,17 @@ def _validate_performance_plan_shape(plan: Mapping[str, Any]) -> None:
         expected_policy = {
             "setup_samples": DEFAULT_SETUP_SAMPLES if profile == "decision" else DEFAULT_SMOKE_SAMPLES,
             "scan_samples": DEFAULT_SCAN_SAMPLES if profile == "decision" else DEFAULT_SMOKE_SAMPLES,
+            "cache_value_samples": DEFAULT_CACHE_VALUE_SAMPLES if profile == "decision" else None,
             "document_samples": DEFAULT_DOCUMENT_SAMPLES if profile == "decision" else None,
+            "exact_control_blocks": DEFAULT_EXACT_CONTROL_BLOCKS if profile == "decision" else None,
+            "setup_samples_per_block": DEFAULT_SETUP_SAMPLES_PER_BLOCK if profile == "decision" else None,
+            "scan_samples_per_block": DEFAULT_SCAN_SAMPLES_PER_BLOCK if profile == "decision" else None,
+            "cache_value_samples_per_block": (DEFAULT_CACHE_VALUE_SAMPLES_PER_BLOCK if profile == "decision" else None),
+            "document_samples_per_block": DEFAULT_DOCUMENT_SAMPLES_PER_BLOCK if profile == "decision" else None,
             "warmups": DEFAULT_WARMUPS,
-            "interleaving": (
-                "williams_blocked_cross_path_with_abba_controls" if profile == "decision" else "candidate_only"
-            ),
+            "interleaving": "ten_block_exact_swap_with_williams_cross_path"
+            if profile == "decision"
+            else "candidate_only",
             "promotable": profile == "decision",
         }
         performance = profile_plan.get("performance")
@@ -1530,6 +1609,65 @@ def _validate_performance_plan_shape(plan: Mapping[str, Any]) -> None:
             or any(not isinstance(performance[name], list) for name in set(performance) - {"evaluated"})
         ):
             raise EnronPerformanceError("Performance plan workload collections are invalid.")
+        validated_profiles[profile] = profile_plan
+
+    decision_performance = validated_profiles["decision"]["performance"]
+    decision_workloads = decision_performance["workloads"]
+    if not decision_workloads or any(
+        not isinstance(workload, Mapping) or type(workload.get("concurrency")) is not int
+        for workload in decision_workloads
+    ):
+        raise EnronPerformanceError("Performance plan concurrency policy is invalid.")
+    concurrency = max(int(workload["concurrency"]) for workload in decision_workloads)
+    if not 2 <= concurrency <= 8:
+        raise EnronPerformanceError("Performance plan concurrency policy is invalid.")
+
+    harnesses = decision_performance["harnesses"]
+    if not harnesses or any(not isinstance(harness, Mapping) for harness in harnesses):
+        raise EnronPerformanceError("Performance plan harness policy is invalid.")
+    harness_source_sha256 = {harness.get("source_sha256") for harness in harnesses}
+    if len(harness_source_sha256) != 1:
+        raise EnronPerformanceError("Performance plan harness policy is invalid.")
+    baseline_source_sha256 = next(iter(harness_source_sha256))
+    if not isinstance(baseline_source_sha256, str) or _SHA256_RE.fullmatch(baseline_source_sha256) is None:
+        raise EnronPerformanceError("Performance plan harness policy is invalid.")
+    expected_harnesses = _performance_harnesses(
+        source_sha256=baseline_source_sha256,
+        source_profile_artifact=cast(Mapping[str, Any], plan["source_profile_artifact"]),
+        source_build_artifact=cast(Mapping[str, Any], plan["source_build_artifact"]),
+    )
+
+    models = decision_performance["breakeven_models"]
+    if len(models) != 1 or not isinstance(models[0], Mapping):
+        raise EnronPerformanceError("Performance plan source-curation policy is invalid.")
+    components = models[0].get("components")
+    if not isinstance(components, list) or any(not isinstance(component, Mapping) for component in components):
+        raise EnronPerformanceError("Performance plan source-curation policy is invalid.")
+    source_curation_values = [
+        component.get("value")
+        for component in components
+        if component.get("category") == "source_curation" and component.get("source") == "declared_assumption"
+    ]
+    if len(source_curation_values) != 2 or source_curation_values[0] != source_curation_values[1]:
+        raise EnronPerformanceError("Performance plan source-curation policy is invalid.")
+    source_curation_seconds = _positive_finite(
+        source_curation_values[0],
+        "Performance plan source-curation scenario",
+        maximum=MAX_SOURCE_BUILD_SECONDS,
+    )
+
+    for profile in PERFORMANCE_PROFILE_IDS:
+        expected = _performance_profile_plan(
+            profile=_validate_profile(profile),
+            banks=decision_performance["banks"],
+            inputs=decision_performance["inputs"],
+            harnesses=expected_harnesses,
+            baseline_source_sha256=baseline_source_sha256,
+            concurrency=concurrency,
+            source_curation_seconds=source_curation_seconds,
+        )
+        if validated_profiles[profile] != expected:
+            raise EnronPerformanceError("Performance plan profile differs from the frozen protocol.")
 
 
 def _validate_run_report_envelope(report: Mapping[str, Any]) -> None:
@@ -2239,7 +2377,8 @@ def _load_prepared_performance_run(run_dir: Path) -> _PreparedPerformanceRun:
     except EnronPerformanceError:
         raise
     except (AttributeError, IndexError, KeyError, OverflowError, RecursionError, StopIteration, TypeError, ValueError):
-        raise EnronPerformanceError("Performance preparation failed closed structural verification.") from None
+        pass
+    raise EnronPerformanceError("Performance preparation failed closed structural verification.")
 
 
 def _prepared_artifact_paths(prepared: _PreparedPerformanceRun) -> dict[str, Path]:
@@ -2826,13 +2965,51 @@ def _interleaved_labels(sample_count: int) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _exact_value_schedule(sample_count: int) -> tuple[str, ...]:
-    """Return a Williams-balanced path order inside the exact-control ABBA schedule."""
+def _exact_block_labels(
+    block_index: int,
+    samples_per_block: int,
+    block_assignment: Sequence[str] = PERFORMANCE_EXACT_BLOCK_ASSIGNMENT,
+) -> tuple[str, ...]:
+    """Return one exact-control block in its frozen ABBA or BAAB order."""
 
-    if type(sample_count) is not int or sample_count < 4 or sample_count % 4:
-        raise EnronPerformanceError("Exact cache-value samples require a positive multiple-of-four block size.")
+    if type(block_index) is not int or block_index < 0 or block_index >= len(block_assignment):
+        raise EnronPerformanceError("Exact-control block index must be a nonnegative integer.")
+    if type(samples_per_block) is not int or samples_per_block < 1:
+        raise EnronPerformanceError("Exact-control samples per block must be a positive integer.")
+    assignment = block_assignment[block_index]
+    if assignment not in {"candidate_first", "control_first"}:
+        raise EnronPerformanceError("Exact-control block assignment is invalid.")
+    labels = _interleaved_labels(samples_per_block)
+    if assignment == "control_first":
+        return tuple("control" if label == "candidate" else "candidate" for label in labels)
+    return labels
+
+
+def _exact_pair_schedule(
+    block_count: int,
+    samples_per_block: int,
+    block_assignment: Sequence[str] = PERFORMANCE_EXACT_BLOCK_ASSIGNMENT,
+) -> tuple[str, ...]:
+    """Return the frozen block-major label schedule for one exact twin pair."""
+
+    if type(block_count) is not int or block_count < 1:
+        raise EnronPerformanceError("Exact-control block count must be a positive integer.")
+    return tuple(
+        label
+        for block_index in range(block_count)
+        for label in _exact_block_labels(block_index, samples_per_block, block_assignment)
+    )
+
+
+def _exact_value_block_schedule(
+    block_index: int,
+    samples_per_block: int,
+    block_assignment: Sequence[str] = PERFORMANCE_EXACT_BLOCK_ASSIGNMENT,
+) -> tuple[str, ...]:
+    """Return a Williams-balanced four-path schedule for one exact-control block."""
+
     schedule: list[str] = []
-    for round_index, label in enumerate(_interleaved_labels(sample_count)):
+    for round_index, label in enumerate(_exact_block_labels(block_index, samples_per_block, block_assignment)):
         row = _EXACT_VALUE_WILLIAMS_ROWS[_EXACT_VALUE_ROW_PATTERN[round_index % 8]]
         for path_index in row:
             identifier = PERFORMANCE_EXACT_VALUE_PATHS[path_index]
@@ -2840,45 +3017,70 @@ def _exact_value_schedule(sample_count: int) -> tuple[str, ...]:
     return tuple(schedule)
 
 
+def _exact_value_schedule(
+    block_count: int,
+    samples_per_block: int,
+    block_assignment: Sequence[str] = PERFORMANCE_EXACT_BLOCK_ASSIGNMENT,
+) -> tuple[str, ...]:
+    """Return all exact cache-value blocks in their frozen order."""
+
+    if type(block_count) is not int or block_count < 1:
+        raise EnronPerformanceError("Exact cache-value block count must be a positive integer.")
+    return tuple(
+        identifier
+        for block_index in range(block_count)
+        for identifier in _exact_value_block_schedule(block_index, samples_per_block, block_assignment)
+    )
+
+
 def _execute_exact_value_block(
     workloads: Mapping[str, Mapping[str, Any]],
     performance: Mapping[str, Any],
     prepared: _PreparedPerformanceRun,
     *,
-    sample_count: int,
+    block_count: int,
+    samples_per_block: int,
     worker_timeout_seconds: float,
     source_build_timeout_seconds: float,
     sequence_start: int,
 ) -> tuple[dict[str, list[dict[str, Any]]], int]:
-    """Measure exact cache paths in temporally balanced, paired blocks."""
+    """Measure exact cache paths in fresh, label-swapped Williams blocks."""
 
-    schedule = _exact_value_schedule(sample_count)
     required_ids = {identifier for path in PERFORMANCE_EXACT_VALUE_PATHS for identifier in (path, f"control_{path}")}
     if not required_ids <= set(workloads):
         raise EnronPerformanceError("Decision cache-value block is missing a frozen workload.")
     results: dict[str, list[dict[str, Any]]] = {identifier: [] for identifier in required_ids}
-    sessions: dict[str, _WorkerSession] = {}
     sequence = sequence_start
-    try:
-        for identifier in sorted(required_ids):
-            if workloads[identifier]["process_model"] == "reused_process":
-                sessions[identifier] = _WorkerSession(timeout_seconds=worker_timeout_seconds)
-        for identifier in schedule:
-            workload = workloads[identifier]
-            observation = _run_one_observation(
-                workload,
-                performance,
-                prepared,
-                sequence=sequence,
-                worker_timeout_seconds=worker_timeout_seconds,
-                source_build_timeout_seconds=source_build_timeout_seconds,
-                session=sessions.get(identifier),
-            )
-            results[identifier].append({**observation, "sequence": sequence})
-            sequence += 1
-    finally:
-        for session in sessions.values():
-            session.close()
+    for block_index in range(block_count):
+        sessions: dict[str, _WorkerSession] = {}
+        candidate_first = PERFORMANCE_EXACT_BLOCK_ASSIGNMENT[block_index] == "candidate_first"
+        creation_order = [
+            identifier
+            for path in PERFORMANCE_EXACT_VALUE_PATHS
+            for identifier in ((path, f"control_{path}") if candidate_first else (f"control_{path}", path))
+        ]
+        try:
+            for identifier in creation_order:
+                if workloads[identifier]["process_model"] == "reused_process":
+                    sessions[identifier] = _WorkerSession(timeout_seconds=worker_timeout_seconds)
+            for identifier in _exact_value_block_schedule(block_index, samples_per_block):
+                workload = workloads[identifier]
+                observation = _run_one_observation(
+                    workload,
+                    performance,
+                    prepared,
+                    sequence=sequence,
+                    worker_timeout_seconds=worker_timeout_seconds,
+                    source_build_timeout_seconds=source_build_timeout_seconds,
+                    session=sessions.get(identifier),
+                )
+                results[identifier].append({**observation, "sequence": sequence})
+                sequence += 1
+        finally:
+            for identifier in reversed(creation_order):
+                session = sessions.get(identifier)
+                if session is not None:
+                    session.close()
 
     reference: list[tuple[int, str]] | None = None
     for path in PERFORMANCE_EXACT_VALUE_PATHS:
@@ -2949,7 +3151,8 @@ def _execute_pair(
     performance: Mapping[str, Any],
     prepared: _PreparedPerformanceRun,
     *,
-    sample_count: int,
+    block_count: int,
+    samples_per_block: int,
     worker_timeout_seconds: float,
     source_build_timeout_seconds: float,
     sequence_start: int,
@@ -2957,28 +3160,37 @@ def _execute_pair(
     results: dict[str, list[dict[str, Any]]] = {"candidate": [], "control": []}
     sequence = sequence_start
     reused = candidate["process_model"] == "reused_process"
-    candidate_session = _WorkerSession(timeout_seconds=worker_timeout_seconds) if reused else None
-    control_session = _WorkerSession(timeout_seconds=worker_timeout_seconds) if reused else None
-    try:
-        for label in _interleaved_labels(sample_count):
-            workload = candidate if label == "candidate" else control
-            session = candidate_session if label == "candidate" else control_session
-            observation = _run_one_observation(
-                workload,
-                performance,
-                prepared,
-                sequence=sequence,
-                worker_timeout_seconds=worker_timeout_seconds,
-                source_build_timeout_seconds=source_build_timeout_seconds,
-                session=session,
-            )
-            results[label].append({**observation, "sequence": sequence})
-            sequence += 1
-    finally:
-        if candidate_session is not None:
-            candidate_session.close()
-        if control_session is not None:
-            control_session.close()
+    if control["process_model"] != candidate["process_model"]:
+        raise EnronPerformanceError("Exact performance twins use different process models.")
+    for block_index in range(block_count):
+        sessions: dict[str, _WorkerSession] = {}
+        creation_order = (
+            ("candidate", "control")
+            if PERFORMANCE_EXACT_BLOCK_ASSIGNMENT[block_index] == "candidate_first"
+            else ("control", "candidate")
+        )
+        try:
+            if reused:
+                for label in creation_order:
+                    sessions[label] = _WorkerSession(timeout_seconds=worker_timeout_seconds)
+            for label in _exact_block_labels(block_index, samples_per_block):
+                workload = candidate if label == "candidate" else control
+                observation = _run_one_observation(
+                    workload,
+                    performance,
+                    prepared,
+                    sequence=sequence,
+                    worker_timeout_seconds=worker_timeout_seconds,
+                    source_build_timeout_seconds=source_build_timeout_seconds,
+                    session=sessions.get(label),
+                )
+                results[label].append({**observation, "sequence": sequence})
+                sequence += 1
+        finally:
+            for label in reversed(creation_order):
+                session = sessions.get(label)
+                if session is not None:
+                    session.close()
     candidate_results = results["candidate"]
     control_results = results["control"]
     if (
@@ -3036,17 +3248,31 @@ def _materialize_workload(
 def _materialize_comparison(plan: Mapping[str, Any], workloads: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     candidate = workloads[str(plan["candidate_workload_id"])]
     baseline = workloads[str(plan["baseline_workload_id"])]
-    paired = plan["noise_method"] in {"paired_relative_mad", "paired_block_ratio_mad"}
-    outputs = calculate_enron_performance_comparison(
-        candidate["stats"],
-        baseline["stats"],
-        metric=str(plan["metric"]),
-        noise_multiplier=float(plan["noise_multiplier"]),
-        regression_tolerance=float(plan["regression_tolerance"]),
-        noise_method=str(plan["noise_method"]),
-        candidate_samples=candidate["samples_seconds"] if paired else None,
-        baseline_samples=baseline["samples_seconds"] if paired else None,
-    )
+    exact_block_swap = plan["noise_method"] == "exact_block_swap"
+    kwargs: dict[str, Any] = {
+        "metric": str(plan["metric"]),
+        "noise_method": str(plan["noise_method"]),
+        "candidate_samples": candidate["samples_seconds"],
+        "baseline_samples": baseline["samples_seconds"],
+    }
+    if exact_block_swap:
+        kwargs.update(
+            {
+                "block_count": int(plan["block_count"]),
+                "samples_per_block": int(plan["samples_per_block"]),
+                "block_assignment": plan["block_assignment"],
+                "significance_level": float(plan["significance_level"]),
+                "stability_tolerance": float(plan["stability_tolerance"]),
+            }
+        )
+    else:
+        kwargs.update(
+            {
+                "noise_multiplier": float(plan["noise_multiplier"]),
+                "regression_tolerance": float(plan["regression_tolerance"]),
+            }
+        )
+    outputs = calculate_enron_performance_comparison(candidate["stats"], baseline["stats"], **kwargs)
     return {**plan, **outputs}
 
 
@@ -3117,7 +3343,8 @@ def _decision_grade_summary(
     ):
         failures.append("execution_memory_capacity")
     if any(
-        item["result"] == "regressed" or item["noise_floor"] > float(thresholds["max_exact_control_noise_floor"])
+        item["result"] in {"regressed", "unstable", "inconclusive"}
+        or ("noise_floor" in item and item["noise_floor"] > float(thresholds["max_cross_path_noise_floor"]))
         for item in comparisons
     ):
         failures.append("comparison_regression_or_noise")
@@ -3197,19 +3424,20 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
             control = workload_plans.get(f"control_{candidate['id']}")
             if control is None:
                 raise EnronPerformanceError("Decision candidate lacks its exact control twin.")
-            sample_count = (
-                DEFAULT_SETUP_SAMPLES
+            samples_per_block = (
+                DEFAULT_SETUP_SAMPLES_PER_BLOCK
                 if candidate["phase"] in {"source_profile", "source_build", "cold_compile"}
-                else DEFAULT_DOCUMENT_SAMPLES
+                else DEFAULT_DOCUMENT_SAMPLES_PER_BLOCK
                 if candidate["sample_unit"] == "document"
-                else DEFAULT_SCAN_SAMPLES
+                else DEFAULT_SCAN_SAMPLES_PER_BLOCK
             )
             candidate_results, control_results, sequence = _execute_pair(
                 candidate,
                 control,
                 performance_plan,
                 prepared,
-                sample_count=sample_count,
+                block_count=DEFAULT_EXACT_CONTROL_BLOCKS,
+                samples_per_block=samples_per_block,
                 worker_timeout_seconds=worker_timeout,
                 source_build_timeout_seconds=source_build_timeout,
                 sequence_start=sequence,
@@ -3220,7 +3448,8 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
             workload_plans,
             performance_plan,
             prepared,
-            sample_count=DEFAULT_SCAN_SAMPLES,
+            block_count=DEFAULT_EXACT_CONTROL_BLOCKS,
+            samples_per_block=DEFAULT_CACHE_VALUE_SAMPLES_PER_BLOCK,
             worker_timeout_seconds=worker_timeout,
             source_build_timeout_seconds=source_build_timeout,
             sequence_start=sequence,
@@ -3232,7 +3461,7 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
                 workload,
                 performance_plan,
                 prepared,
-                sample_count=DEFAULT_SCAN_SAMPLES,
+                sample_count=DEFAULT_CACHE_VALUE_SAMPLES,
                 worker_timeout_seconds=worker_timeout,
                 source_build_timeout_seconds=source_build_timeout,
                 sequence_start=sequence,
@@ -3253,7 +3482,8 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
 
     if all(identifier in observations for identifier in PERFORMANCE_EXACT_VALUE_PATHS):
         reference = [
-            (item["record_count"], item["correctness_sha256"]) for item in observations["real_direct_throughput"]
+            (item["record_count"], item["correctness_sha256"])
+            for item in observations[PERFORMANCE_EXACT_VALUE_PATHS[0]]
         ]
         for identifier in PERFORMANCE_EXACT_VALUE_PATHS[1:]:
             observed = [(item["record_count"], item["correctness_sha256"]) for item in observations[identifier]]
@@ -3445,8 +3675,18 @@ def run_enron_performance(options: EnronPerformanceRunOptions) -> dict[str, Any]
         return _run_enron_performance_impl(options)
     except EnronPerformanceError:
         raise
-    except (AttributeError, IndexError, KeyError, OverflowError, RecursionError, StopIteration, TypeError, ValueError):
-        raise EnronPerformanceError("Performance run failed closed structural verification.") from None
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        OverflowError,
+        RecursionError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ):
+        pass
+    raise EnronPerformanceError("Performance run failed closed structural verification.")
 
 
 def _open_frozen_private_input(path: Path, expected_identity: Mapping[str, Any], *, description: str) -> Any:
@@ -4084,24 +4324,36 @@ def _verify_materialized_performance(
     for comparison in performance["comparisons"]:
         if comparison["comparison_plan_sha256"] != hash_enron_performance_comparison_plan(comparison):
             raise EnronPerformanceError("Performance comparison plan hash is invalid.")
-        paired = comparison["noise_method"] in {"paired_relative_mad", "paired_block_ratio_mad"}
-        expected = calculate_enron_performance_comparison(
-            workload_by_id[str(comparison["candidate_workload_id"])]["stats"],
-            workload_by_id[str(comparison["baseline_workload_id"])]["stats"],
-            metric=str(comparison["metric"]),
-            noise_multiplier=float(comparison["noise_multiplier"]),
-            regression_tolerance=float(comparison["regression_tolerance"]),
-            noise_method=str(comparison["noise_method"]),
-            candidate_samples=(
-                workload_by_id[str(comparison["candidate_workload_id"])]["samples_seconds"] if paired else None
-            ),
-            baseline_samples=(
-                workload_by_id[str(comparison["baseline_workload_id"])]["samples_seconds"] if paired else None
-            ),
-        )
+        candidate = workload_by_id[str(comparison["candidate_workload_id"])]
+        baseline = workload_by_id[str(comparison["baseline_workload_id"])]
+        exact_block_swap = comparison["noise_method"] == "exact_block_swap"
+        kwargs: dict[str, Any] = {
+            "metric": str(comparison["metric"]),
+            "noise_method": str(comparison["noise_method"]),
+            "candidate_samples": candidate["samples_seconds"],
+            "baseline_samples": baseline["samples_seconds"],
+        }
+        if exact_block_swap:
+            kwargs.update(
+                {
+                    "block_count": int(comparison["block_count"]),
+                    "samples_per_block": int(comparison["samples_per_block"]),
+                    "block_assignment": comparison["block_assignment"],
+                    "significance_level": float(comparison["significance_level"]),
+                    "stability_tolerance": float(comparison["stability_tolerance"]),
+                }
+            )
+        else:
+            kwargs.update(
+                {
+                    "noise_multiplier": float(comparison["noise_multiplier"]),
+                    "regression_tolerance": float(comparison["regression_tolerance"]),
+                }
+            )
+        expected = calculate_enron_performance_comparison(candidate["stats"], baseline["stats"], **kwargs)
         if any(
             comparison[field] != value
-            if isinstance(value, str)
+            if isinstance(value, (str, list))
             else not math.isclose(float(comparison[field]), float(value), rel_tol=1e-12, abs_tol=1e-15)
             for field, value in expected.items()
         ):
@@ -4232,6 +4484,11 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
             if profile == "smoke"
             else DEFAULT_SETUP_SAMPLES
             if workload["phase"] in {"source_profile", "source_build", "cold_compile"}
+            else DEFAULT_CACHE_VALUE_SAMPLES
+            if workload["id"] in PERFORMANCE_EXACT_VALUE_PATHS
+            or str(workload["id"]).removeprefix("control_") in PERFORMANCE_EXACT_VALUE_PATHS
+            else DEFAULT_CACHE_VALUE_SAMPLES
+            if str(workload["id"]).startswith("explore_")
             else DEFAULT_DOCUMENT_SAMPLES
             if workload["sample_unit"] == "document"
             else DEFAULT_SCAN_SAMPLES
@@ -4279,8 +4536,22 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
             raise EnronPerformanceError("Performance correctness audit workload ids are invalid.")
         audit_rows[identifier] = value
     workload_by_id = {str(item["id"]): item for item in report_performance["workloads"]}
+    input_by_id = {str(item["id"]): item for item in report_performance["inputs"]}
     if set(audit_rows) != set(workload_by_id):
         raise EnronPerformanceError("Performance correctness audit coverage is invalid.")
+    exact_block_specs: dict[str, tuple[int, int, tuple[str, ...]]] = {}
+    for comparison in report_performance["comparisons"]:
+        if comparison["comparison_kind"] != "same_path_stability":
+            continue
+        candidate_id = str(comparison["candidate_workload_id"])
+        spec = (
+            int(comparison["block_count"]),
+            int(comparison["samples_per_block"]),
+            tuple(str(item) for item in comparison["block_assignment"]),
+        )
+        prior = exact_block_specs.setdefault(candidate_id, spec)
+        if prior != spec:
+            raise EnronPerformanceError("Performance exact-control block policy is inconsistent.")
     sequence_to_workload: dict[int, str] = {}
     for identifier, row in audit_rows.items():
         samples = row["samples"]
@@ -4322,9 +4593,23 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
         ):
             raise EnronPerformanceError("Performance correctness audit record denominator is invalid.")
         pids = [item["pid"] for item in samples]
-        if (workload["process_model"] == "reused_process" and len(set(pids)) != 1) or (
-            workload["process_model"] == "fresh_process_per_sample" and len(set(pids)) != len(pids)
-        ):
+        base_identifier = identifier.removeprefix("control_")
+        block_spec = exact_block_specs.get(base_identifier) if profile == "decision" else None
+        if workload["process_model"] == "reused_process" and block_spec is not None:
+            block_count, samples_per_block, _block_assignment = block_spec
+            block_pids = [
+                {item["pid"] for item in samples[index * samples_per_block : (index + 1) * samples_per_block]}
+                for index in range(block_count)
+            ]
+            invalid_process_shape = (
+                any(len(block) != 1 for block in block_pids)
+                or len({next(iter(block)) for block in block_pids if block}) != block_count
+            )
+        else:
+            invalid_process_shape = (workload["process_model"] == "reused_process" and len(set(pids)) != 1) or (
+                workload["process_model"] == "fresh_process_per_sample" and len(set(pids)) != len(pids)
+            )
+        if invalid_process_shape:
             raise EnronPerformanceError("Performance correctness audit process isolation is invalid.")
     if set(sequence_to_workload) != set(range(len(sequence_to_workload))):
         raise EnronPerformanceError("Performance correctness audit global sequence is invalid.")
@@ -4353,15 +4638,47 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
             ) + sorted(
                 ((item["sequence"], "control") for item in audit_rows[control_id]["samples"]),
             )
-            observed_labels = tuple(label for _sequence, label in sorted(ordered))
-            if observed_labels != _interleaved_labels(workload["stats"]["sample_count"]):
-                raise EnronPerformanceError("Performance correctness audit ABBA ordering is invalid.")
+            ordered = sorted(ordered)
+            observed_sequences = [sequence for sequence, _label in ordered]
+            observed_labels = tuple(label for _sequence, label in ordered)
+            block_count, samples_per_block, block_assignment = exact_block_specs[candidate_id]
+            expected_labels = _exact_pair_schedule(block_count, samples_per_block, block_assignment)
+            expected_sequences = list(range(observed_sequences[0], observed_sequences[0] + len(observed_sequences)))
+            if (
+                candidate_id not in PERFORMANCE_EXACT_VALUE_PATHS and observed_sequences != expected_sequences
+            ) or observed_labels != expected_labels:
+                raise EnronPerformanceError("Performance correctness audit exact-block ordering is invalid.")
             control = workload_by_id[control_id]
-            if workload["process_model"] == "reused_process" and (
-                control["process_model"] != "reused_process"
-                or audit_rows[candidate_id]["samples"][0]["pid"] == audit_rows[control_id]["samples"][0]["pid"]
-            ):
+            candidate_pids = {item["pid"] for item in audit_rows[candidate_id]["samples"]}
+            control_pids = {item["pid"] for item in audit_rows[control_id]["samples"]}
+            if control["process_model"] != workload["process_model"] or candidate_pids & control_pids:
                 raise EnronPerformanceError("Performance reused exact-control process isolation is invalid.")
+            if workload["sample_unit"] == "document":
+                candidate_samples = audit_rows[candidate_id]["samples"]
+                input_descriptor = input_by_id[str(workload["input_id"])]
+                inventory = inventories[str(input_descriptor["inventory_ref"]["id"])]
+                document_count = int(input_descriptor["documents"])
+                if samples_per_block != document_count or len(inventory) != document_count:
+                    raise EnronPerformanceError("Performance document block size differs from its frozen inventory.")
+                expected_record_counts = [int(item["records"]) for item in inventory]
+                blocks = [
+                    candidate_samples[block_index * samples_per_block : (block_index + 1) * samples_per_block]
+                    for block_index in range(block_count)
+                ]
+                if any([item["record_count"] for item in block] != expected_record_counts for block in blocks):
+                    raise EnronPerformanceError(
+                        "Performance document block record counts differ from the frozen inventory."
+                    )
+                if any(len({item["correctness_sha256"] for item in block}) != document_count for block in blocks):
+                    raise EnronPerformanceError(
+                        "Performance document block lacks one index-bound commitment per frozen document."
+                    )
+                first_block = [(item["record_count"], item["correctness_sha256"]) for item in blocks[0]]
+                if any(
+                    [(item["record_count"], item["correctness_sha256"]) for item in block] != first_block
+                    for block in blocks[1:]
+                ):
+                    raise EnronPerformanceError("Performance document blocks do not repeat the frozen population.")
     if all(path in audit_rows for path in PERFORMANCE_EXACT_VALUE_PATHS):
         reference_sequence = [
             (item["record_count"], item["correctness_sha256"])
@@ -4388,17 +4705,24 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
             range(observed_value_sequences[0], observed_value_sequences[0] + len(observed_value_sequences))
         )
         if observed_value_sequences != contiguous_value_sequences or observed_value_schedule != _exact_value_schedule(
-            DEFAULT_SCAN_SAMPLES
+            DEFAULT_EXACT_CONTROL_BLOCKS,
+            DEFAULT_CACHE_VALUE_SAMPLES_PER_BLOCK,
+            PERFORMANCE_EXACT_BLOCK_ASSIGNMENT,
         ):
             raise EnronPerformanceError("Performance correctness audit cache-value block ordering is invalid.")
-        reused_value_ids = [
+        reused_value_ids = tuple(
             identifier
-            for identifier in exact_value_ids
+            for path in PERFORMANCE_EXACT_VALUE_PATHS
+            for identifier in (path, f"control_{path}")
             if workload_by_id[identifier]["process_model"] == "reused_process"
-        ]
-        reused_value_pids = [audit_rows[identifier]["samples"][0]["pid"] for identifier in reused_value_ids]
-        if len(set(reused_value_pids)) != len(reused_value_pids):
-            raise EnronPerformanceError("Performance cache-value reused-process isolation is invalid.")
+        )
+        for block_index in range(DEFAULT_EXACT_CONTROL_BLOCKS):
+            block_pids = [
+                audit_rows[identifier]["samples"][block_index * DEFAULT_CACHE_VALUE_SAMPLES_PER_BLOCK]["pid"]
+                for identifier in reused_value_ids
+            ]
+            if len(set(block_pids)) != len(block_pids):
+                raise EnronPerformanceError("Performance cache-value reused-process isolation is invalid.")
     _assert_performance_private_tree_current(
         root,
         initial_tree,
@@ -4425,7 +4749,8 @@ def verify_enron_performance_run(run_dir: Path) -> dict[str, Any]:
     except EnronPerformanceError:
         raise
     except (AttributeError, IndexError, KeyError, OverflowError, RecursionError, StopIteration, TypeError, ValueError):
-        raise EnronPerformanceError("Performance run failed closed structural verification.") from None
+        pass
+    raise EnronPerformanceError("Performance run failed closed structural verification.")
 
 
 def _module_main(argv: Sequence[str] | None = None) -> None:

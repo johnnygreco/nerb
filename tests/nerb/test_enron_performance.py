@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
+import traceback
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,7 +18,10 @@ from nerb.bank import bank_stats, canonicalize_bank, hash_bank
 from nerb.enron_contract import (
     PERFORMANCE_PHASE_PROCESS_MODELS,
     PERFORMANCE_SCALE_PATTERNS,
+    hash_enron_breakeven_plan,
     hash_enron_performance_bank,
+    hash_enron_performance_comparison_plan,
+    hash_enron_performance_harness,
     hash_enron_performance_input,
     hash_enron_performance_manifest,
     hash_enron_workload,
@@ -280,16 +285,31 @@ def test_plan_freezes_exact_matrix_controls_comparisons_and_hashes(
     decision = performance_plan["profiles"]["decision"]
     performance = decision["performance"]
     workloads = {item["id"]: item for item in performance["workloads"]}
-    candidates = [item for item in workloads.values() if item["decision_grade"]]
+    candidates = [item for item in workloads.values() if not item["id"].startswith(("control_", "explore_"))]
+    decision_candidates = [item for item in candidates if item["decision_grade"]]
     controls = [item for item in workloads.values() if item["id"].startswith("control_")]
     exploratory = [item for item in workloads.values() if item["id"].startswith("explore_")]
-    assert len(candidates) == 19
-    assert len(controls) == 19
+    assert len(candidates) == 20
+    assert len(decision_candidates) == 19
+    assert len(controls) == 20
     assert len(exploratory) == 2
-    assert len(performance["comparisons"]) == 46
+    support = workloads["real_direct_cache_value"]
+    assert support["decision_grade"] is False
+    assert support["promotion_gate"] is False
+    assert len(performance["comparisons"]) == 32
     cross_path = [item for item in performance["comparisons"] if item["comparison_kind"] == "cross_path_value"]
+    same_path = [item for item in performance["comparisons"] if item["comparison_kind"] == "same_path_stability"]
     assert len(cross_path) == 12
     assert {item["noise_method"] for item in cross_path} == {"paired_block_ratio_mad"}
+    assert len(same_path) == 20
+    assert {item["noise_method"] for item in same_path} == {"exact_block_swap"}
+    assert {item["direction"] for item in same_path} == {"symmetric"}
+    assert {item["block_count"] for item in same_path} == {10}
+    assert {tuple(item["block_assignment"]) for item in same_path} == {
+        performance_module.PERFORMANCE_EXACT_BLOCK_ASSIGNMENT
+    }
+    assert {item["significance_level"] for item in same_path} == {0.05}
+    assert {item["stability_tolerance"] for item in same_path} == {0.05}
     assert len(performance["breakeven_models"]) == 1
     breakeven = performance["breakeven_models"][0]
     assert breakeven["parameter_name"] == "whole_input_scan_requests"
@@ -320,13 +340,27 @@ def test_plan_freezes_exact_matrix_controls_comparisons_and_hashes(
             "process_model",
         ):
             assert control[field] == candidate[field]
-    tail_metrics = [
-        item["metric"]
-        for item in performance["comparisons"]
-        if item["metric"].startswith("p") and item["comparison_kind"] == "same_path_stability"
+    stability_metrics = [
+        item["metric"] for item in performance["comparisons"] if item["comparison_kind"] == "same_path_stability"
     ]
-    assert tail_metrics.count("p95_seconds") == 3
-    assert tail_metrics.count("p99_seconds") == 16
+    assert stability_metrics.count("median_seconds") == 7
+    assert stability_metrics.count("p99_seconds") == 13
+    assert {item["samples_per_block"] for item in same_path if item["metric"] == "median_seconds"} == {2, 10}
+    assert {item["samples_per_block"] for item in same_path if item["metric"] == "p99_seconds"} == {100}
+    assert decision["sample_policy"] == {
+        "setup_samples": 20,
+        "scan_samples": 1_000,
+        "cache_value_samples": 100,
+        "document_samples": 1_000,
+        "exact_control_blocks": 10,
+        "setup_samples_per_block": 2,
+        "scan_samples_per_block": 100,
+        "cache_value_samples_per_block": 10,
+        "document_samples_per_block": 100,
+        "warmups": 3,
+        "interleaving": "ten_block_exact_swap_with_williams_cross_path",
+        "promotable": True,
+    }
 
 
 def test_smoke_plan_is_explicitly_nonpromotable(performance_plan: dict[str, Any]) -> None:
@@ -335,7 +369,13 @@ def test_smoke_plan_is_explicitly_nonpromotable(performance_plan: dict[str, Any]
     assert smoke["sample_policy"] == {
         "setup_samples": 5,
         "scan_samples": 5,
+        "cache_value_samples": None,
         "document_samples": None,
+        "exact_control_blocks": None,
+        "setup_samples_per_block": None,
+        "scan_samples_per_block": None,
+        "cache_value_samples_per_block": None,
+        "document_samples_per_block": None,
         "warmups": 3,
         "interleaving": "candidate_only",
         "promotable": False,
@@ -346,6 +386,47 @@ def test_smoke_plan_is_explicitly_nonpromotable(performance_plan: dict[str, Any]
     assert performance["comparisons"] == []
     assert performance["breakeven_models"] == []
     assert smoke["performance_manifest_sha256"] == hash_enron_performance_manifest(performance)
+
+
+@pytest.mark.parametrize(
+    ("result", "noise_floor", "passed"),
+    [
+        ("regressed", 0.0, False),
+        ("equivalent_within_noise", 0.25, True),
+        ("equivalent_within_noise", math.nextafter(0.25, math.inf), False),
+    ],
+)
+def test_decision_summary_enforces_directional_regression_and_cross_path_noise_ceiling(
+    result: str,
+    noise_floor: float,
+    passed: bool,
+) -> None:
+    performance = {
+        "workloads": [
+            {
+                "id": f"setup_{index}",
+                "decision_grade": True,
+                "peak_rss_bytes": 1,
+                "concurrency": 1,
+                "phase": "cold_compile",
+                "baseline_id": None,
+            }
+            for index in range(19)
+        ],
+        "comparisons": [{"result": result, "noise_floor": noise_floor}],
+        "inputs": [],
+        "breakeven_models": [{"result": "candidate_already_better"}],
+    }
+    summary = performance_module._decision_grade_summary(
+        performance,
+        performance_module.PERFORMANCE_DECISION_THRESHOLDS,
+        {"cpu_count": 1, "memory_bytes": 1024},
+    )
+
+    assert summary == {
+        "passed": passed,
+        "failure_codes": [] if passed else ["comparison_regression_or_noise"],
+    }
 
 
 def test_software_records_native_engine_version(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -363,6 +444,30 @@ def test_software_records_native_engine_version(monkeypatch: pytest.MonkeyPatch)
         "git_commit": "1" * 40,
         "git_dirty": False,
     }
+
+
+def test_harness_source_fingerprint_includes_contract_and_all_execution_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_names: list[str] = []
+
+    def source_sha256(paths: Sequence[Path]) -> str:
+        observed_names.extend(path.name for path in paths)
+        return _HASH_1
+
+    monkeypatch.setattr(performance_module, "_source_sha256", source_sha256)
+    monkeypatch.setattr(performance_module, "_builder_implementation_sha256", lambda: _HASH_1)
+    monkeypatch.setattr(performance_module, "extraction_execution_sha256", lambda: _HASH_2)
+
+    fingerprint = performance_module._performance_harness_source_sha256()
+
+    assert observed_names == [
+        "enron_performance.py",
+        "enron_contract.py",
+        "enron_performance_worker.py",
+        "enron_performance_fixtures.py",
+    ]
+    assert performance_module._SHA256_RE.fullmatch(fingerprint) is not None
 
 
 def test_plan_reports_aliases_separately_from_matcher_patterns(performance_plan: dict[str, Any]) -> None:
@@ -405,23 +510,46 @@ def test_exact_controls_use_balanced_abba_order(sample_count: int, expected: tup
     assert performance_module._interleaved_labels(sample_count) == expected
 
 
-def test_exact_cache_value_schedule_balances_paths_inside_abba_rounds() -> None:
-    paths = performance_module.PERFORMANCE_EXACT_VALUE_PATHS
-    schedule = performance_module._exact_value_schedule(4)
-    expected_rounds = (
-        (paths[0], paths[1], paths[3], paths[2]),
-        tuple(f"control_{paths[index]}" for index in (1, 2, 0, 3)),
-        tuple(f"control_{paths[index]}" for index in (2, 3, 1, 0)),
-        (paths[3], paths[0], paths[2], paths[1]),
-        (paths[1], paths[2], paths[0], paths[3]),
-        tuple(f"control_{paths[index]}" for index in (0, 1, 3, 2)),
-        tuple(f"control_{paths[index]}" for index in (3, 0, 2, 1)),
-        (paths[2], paths[3], paths[1], paths[0]),
-    )
+def test_exact_block_assignment_is_frozen_balanced_and_drives_abba_baab() -> None:
+    assignment = performance_module.PERFORMANCE_EXACT_BLOCK_ASSIGNMENT
 
-    assert tuple(tuple(schedule[index : index + 4]) for index in range(0, len(schedule), 4)) == expected_rounds
-    assert len(schedule) == 32
-    assert all(schedule.count(identifier) == 4 for round_ids in expected_rounds for identifier in round_ids)
+    assert len(assignment) == 10
+    assert assignment.count("candidate_first") == 5
+    assert assignment.count("control_first") == 5
+    for block_index, first in enumerate(assignment):
+        expected = (
+            ("candidate", "control", "control", "candidate")
+            if first == "candidate_first"
+            else ("control", "candidate", "candidate", "control")
+        )
+        assert performance_module._exact_block_labels(block_index, 2) == expected
+
+
+def test_exact_cache_value_schedule_balances_paths_inside_each_swap_block() -> None:
+    paths = performance_module.PERFORMANCE_EXACT_VALUE_PATHS
+    for block_index in range(10):
+        schedule = performance_module._exact_value_block_schedule(block_index, 10)
+        labels = performance_module._exact_block_labels(block_index, 10)
+        rounds = tuple(tuple(schedule[index : index + 4]) for index in range(0, len(schedule), 4))
+
+        assert len(schedule) == 80
+        assert all(
+            all(identifier.startswith("control_") == (label == "control") for identifier in round_ids)
+            for label, round_ids in zip(labels, rounds, strict=True)
+        )
+        assert all(schedule.count(identifier) == 10 for path in paths for identifier in (path, f"control_{path}"))
+        for path in paths:
+            positions = [
+                position
+                for round_ids in rounds
+                for position, identifier in enumerate(round_ids)
+                if identifier.removeprefix("control_") == path
+            ]
+            assert sorted(positions) == [0] * 5 + [1] * 5 + [2] * 5 + [3] * 5
+
+    full_schedule = performance_module._exact_value_schedule(10, 10)
+    assert len(full_schedule) == 800
+    assert all(full_schedule.count(identifier) == 100 for path in paths for identifier in (path, f"control_{path}"))
 
 
 def test_materialization_recomputes_statistics_comparisons_and_breakeven(
@@ -433,10 +561,12 @@ def test_materialization_recomputes_statistics_comparisons_and_breakeven(
     candidate_plan = workload_by_id["real_direct_throughput"]
     control_plan = workload_by_id["control_real_direct_throughput"]
     candidate_observations = [
-        {"elapsed_ns": 1_000_000 + index, "record_count": 0, "peak_rss_bytes": 64 * 1024 * 1024} for index in range(100)
+        {"elapsed_ns": 1_000_000 + index, "record_count": 0, "peak_rss_bytes": 64 * 1024 * 1024}
+        for index in range(1_000)
     ]
     control_observations = [
-        {"elapsed_ns": 2_000_000 + index, "record_count": 0, "peak_rss_bytes": 65 * 1024 * 1024} for index in range(100)
+        {"elapsed_ns": 2_000_000 + index, "record_count": 0, "peak_rss_bytes": 65 * 1024 * 1024}
+        for index in range(1_000)
     ]
     candidate = performance_module._materialize_workload(
         candidate_plan,
@@ -450,17 +580,17 @@ def test_materialization_recomputes_statistics_comparisons_and_breakeven(
         input_by_id,
         require_rss=True,
     )
-    comparison_plan = performance_module._comparison_plan(candidate_plan, control_plan, "mib_per_second")
+    comparison_plan = performance_module._comparison_plan(candidate_plan, control_plan, "p99_seconds")
     comparison = performance_module._materialize_comparison(
         comparison_plan,
         {candidate["id"]: candidate, control["id"]: control},
     )
 
-    assert candidate["stats"]["sample_count"] == 100
-    assert candidate["stats"]["p99_seconds"] == candidate["samples_seconds"][98]
+    assert candidate["stats"]["sample_count"] == 1_000
+    assert candidate["stats"]["p99_seconds"] == candidate["samples_seconds"][989]
     assert candidate["peak_rss_bytes"] == 64 * 1024 * 1024
-    assert comparison["direction"] == "higher_is_better"
-    assert comparison["result"] == "improved"
+    assert comparison["direction"] == "symmetric"
+    assert comparison["result"] == "unstable"
 
     candidates = {
         identifier: {"id": identifier}
@@ -1016,8 +1146,11 @@ def _prepare_run(
     )
 
     class _SafeNativeBank:
-        def scan_bytes(self, _document: bytes) -> list[Any]:
-            return []
+        def scan_bytes(self, document: bytes) -> list[Any]:
+            if real_fixtures:
+                return []
+            document_index = int(document.rsplit(b" ", 1)[-1])
+            return [document_index] * (1 + document_index % 3)
 
     verification = {
         "valid": True,
@@ -1080,7 +1213,7 @@ def _prepare_run(
     assert summary["committed"] is True
     assert summary["banks"] == 5
     assert summary["inputs"] == 11
-    assert summary["decision_workloads"] == 40
+    assert summary["decision_workloads"] == 42
     assert summary["sealed_test_accessed"] is False
     return output
 
@@ -1171,36 +1304,95 @@ def _aggregate_observations(
     *,
     control: bool = False,
     sequences: Sequence[int] | None = None,
+    reused_pid: int | None = None,
+    document_record_counts: Sequence[int] | None = None,
+    whole_input_record_count: int = 0,
 ) -> list[dict[str, Any]]:
     base_identifier = str(workload["id"]).removeprefix("control_")
     digest_group = (
         "exact-real-cache-value"
-        if base_identifier
-        in {"real_direct_throughput", "real_helper_cache_hit", "real_helper_cache_miss", "real_end_to_end"}
+        if base_identifier in performance_module.PERFORMANCE_EXACT_VALUE_PATHS
         else base_identifier
     )
-    digest = _sha256(f"correctness:{digest_group}".encode())
     base_ns = 2_200_000 if control else 2_000_000
     resolved_sequences = list(range(sample_count)) if sequences is None else list(sequences)
-    reused_pid = 10_000 + int.from_bytes(hashlib.sha256(str(workload["id"]).encode()).digest()[:4], "big")
-    return [
-        {
-            "sequence": sequence,
-            "pid": reused_pid if workload["process_model"] == "reused_process" else 10_000 + sequence,
-            "record_count": 0,
-            "correctness_sha256": digest,
-            "elapsed_ns": base_ns + index,
-            "peak_rss_bytes": 64 * 1024 * 1024,
-        }
-        for index, sequence in enumerate(resolved_sequences)
-    ]
+    resolved_reused_pid = (
+        10_000 + int.from_bytes(hashlib.sha256(str(workload["id"]).encode()).digest()[:4], "big")
+        if reused_pid is None
+        else reused_pid
+    )
+    observations: list[dict[str, Any]] = []
+    for index, sequence in enumerate(resolved_sequences):
+        if document_record_counts is not None:
+            document_index = index % len(document_record_counts)
+            record_count = int(document_record_counts[document_index])
+            digest = _sha256(f"correctness:{digest_group}:document:{document_index}".encode())
+        else:
+            record_count = whole_input_record_count if workload["sample_unit"] == "whole_input" else 0
+            digest = _sha256(f"correctness:{digest_group}".encode())
+        observations.append(
+            {
+                "sequence": sequence,
+                "pid": resolved_reused_pid if workload["process_model"] == "reused_process" else 10_000 + sequence,
+                "record_count": record_count,
+                "correctness_sha256": digest,
+                "elapsed_ns": base_ns + index,
+                "peak_rss_bytes": 64 * 1024 * 1024,
+            }
+        )
+    return observations
 
 
 def _patch_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    inventory_records: dict[str, tuple[int, ...]] = {}
+
+    def block_pid(workload: Mapping[str, Any], block_index: int) -> int:
+        base = int.from_bytes(hashlib.sha256(str(workload["id"]).encode()).digest()[:6], "big")
+        return 1_000_000 + base * 10 + block_index
+
+    def observation_counts(
+        workload: Mapping[str, Any],
+        performance: Mapping[str, Any],
+        prepared: Any,
+    ) -> tuple[tuple[int, ...] | None, int]:
+        input_id = workload["input_id"]
+        if input_id is None:
+            return None, 0
+        input_descriptor = next(item for item in performance["inputs"] if item["id"] == input_id)
+        if workload["sample_unit"] != "document":
+            return None, int(input_descriptor["records"])
+        inventory_id = str(input_descriptor["inventory_ref"]["id"])
+        if inventory_id not in inventory_records:
+            payload = performance_module._read_prepared_artifact(
+                prepared,
+                inventory_id,
+                maximum_bytes=int(input_descriptor["inventory_ref"]["bytes"]),
+                description="Test performance inventory",
+            )
+            inventory = json.loads(payload)
+            inventory_records[inventory_id] = tuple(int(item["records"]) for item in inventory)
+        return inventory_records[inventory_id], int(input_descriptor["records"])
+
+    def aggregate(
+        workload: Mapping[str, Any],
+        performance: Mapping[str, Any],
+        prepared: Any,
+        sample_count: int,
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        document_counts, whole_input_count = observation_counts(workload, performance, prepared)
+        return _aggregate_observations(
+            workload,
+            sample_count,
+            document_record_counts=document_counts,
+            whole_input_record_count=whole_input_count,
+            **kwargs,
+        )
+
     def execute_workload(
         workload: Mapping[str, Any],
-        _performance: Mapping[str, Any],
-        _prepared: Any,
+        performance: Mapping[str, Any],
+        prepared: Any,
         *,
         sample_count: int,
         worker_timeout_seconds: float,
@@ -1210,50 +1402,85 @@ def _patch_execution(monkeypatch: pytest.MonkeyPatch) -> None:
         assert worker_timeout_seconds > 0
         assert source_build_timeout_seconds > 0
         sequences = list(range(sequence_start, sequence_start + sample_count))
-        return _aggregate_observations(workload, sample_count, sequences=sequences), sequence_start + sample_count
+        return aggregate(
+            workload,
+            performance,
+            prepared,
+            sample_count,
+            sequences=sequences,
+        ), sequence_start + sample_count
 
     def execute_pair(
         candidate: Mapping[str, Any],
         control: Mapping[str, Any],
-        _performance: Mapping[str, Any],
-        _prepared: Any,
+        performance: Mapping[str, Any],
+        prepared: Any,
         *,
-        sample_count: int,
+        block_count: int,
+        samples_per_block: int,
         worker_timeout_seconds: float,
         source_build_timeout_seconds: float,
         sequence_start: int,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
         assert worker_timeout_seconds > 0
         assert source_build_timeout_seconds > 0
-        labels = performance_module._interleaved_labels(sample_count)
-        candidate_sequences = [sequence_start + index for index, label in enumerate(labels) if label == "candidate"]
-        control_sequences = [sequence_start + index for index, label in enumerate(labels) if label == "control"]
-        return (
-            _aggregate_observations(candidate, sample_count, sequences=candidate_sequences),
-            _aggregate_observations(control, sample_count, control=True, sequences=control_sequences),
-            sequence_start + sample_count * 2,
-        )
+        candidate_results: list[dict[str, Any]] = []
+        control_results: list[dict[str, Any]] = []
+        sequence = sequence_start
+        for block_index in range(block_count):
+            labels = performance_module._exact_block_labels(block_index, samples_per_block)
+            candidate_sequences = [sequence + index for index, label in enumerate(labels) if label == "candidate"]
+            control_sequences = [sequence + index for index, label in enumerate(labels) if label == "control"]
+            candidate_results.extend(
+                aggregate(
+                    candidate,
+                    performance,
+                    prepared,
+                    samples_per_block,
+                    sequences=candidate_sequences,
+                    reused_pid=block_pid(candidate, block_index),
+                )
+            )
+            control_results.extend(
+                aggregate(
+                    control,
+                    performance,
+                    prepared,
+                    samples_per_block,
+                    control=True,
+                    sequences=control_sequences,
+                    reused_pid=block_pid(control, block_index),
+                )
+            )
+            sequence += samples_per_block * 2
+        return candidate_results, control_results, sequence
 
     def execute_exact_value_block(
         workloads: Mapping[str, Mapping[str, Any]],
-        _performance: Mapping[str, Any],
-        _prepared: Any,
+        performance: Mapping[str, Any],
+        prepared: Any,
         *,
-        sample_count: int,
+        block_count: int,
+        samples_per_block: int,
         worker_timeout_seconds: float,
         source_build_timeout_seconds: float,
         sequence_start: int,
     ) -> tuple[dict[str, list[dict[str, Any]]], int]:
         assert worker_timeout_seconds > 0
         assert source_build_timeout_seconds > 0
-        schedule = performance_module._exact_value_schedule(sample_count)
+        schedule = performance_module._exact_value_schedule(block_count, samples_per_block)
         results = {identifier: [] for identifier in set(schedule)}
+        block_width = samples_per_block * 2 * len(performance_module.PERFORMANCE_EXACT_VALUE_PATHS)
         for offset, identifier in enumerate(schedule):
-            observation = _aggregate_observations(
+            block_index = offset // block_width
+            observation = aggregate(
                 workloads[identifier],
+                performance,
+                prepared,
                 1,
                 control=identifier.startswith("control_"),
                 sequences=[sequence_start + offset],
+                reused_pid=block_pid(workloads[identifier], block_index),
             )[0]
             results[identifier].append(observation)
         return results, sequence_start + len(schedule)
@@ -1523,6 +1750,195 @@ def _rewrite_aggregate_report(output: Path, report: dict[str, Any]) -> None:
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
 
+def _rewrite_private_audit(output: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+    payload = b"".join(_canonical(item) + b"\n" for item in rows)
+    (output / "audit" / "results.jsonl").write_bytes(payload)
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifact = next(item for item in manifest["artifacts"] if item["id"] == "performance_audit")
+    artifact["sha256"] = _sha256(payload)
+    artifact["bytes"] = len(payload)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _rewrite_rehashed_protocol_mutation(bundle: Path, mutation: str) -> None:
+    plan_path = bundle / "plan.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    decision = plan["profiles"]["decision"]
+    performance = decision["performance"]
+    if mutation == "direct_stability_median":
+        comparison = next(
+            item
+            for item in performance["comparisons"]
+            if item["candidate_workload_id"] == "real_direct_throughput"
+            and item["comparison_kind"] == "same_path_stability"
+        )
+        comparison["metric"] = "median_seconds"
+        comparison["comparison_plan_sha256"] = hash_enron_performance_comparison_plan(comparison)
+    elif mutation == "breakeven_proxy_marginal":
+        model = performance["breakeven_models"][0]
+        component = next(item for item in model["components"] if item["id"] == "candidate_per_request_direct_reuse")
+        component["workload_id"] = "real_direct_cache_value"
+        model["model_plan_sha256"] = hash_enron_breakeven_plan(model)
+    elif mutation == "decision_proxy_role_swap":
+        workloads = {item["id"]: item for item in performance["workloads"]}
+        workloads["real_direct_cache_value"]["decision_grade"] = True
+        workloads["real_helper_cache_hit"]["decision_grade"] = False
+        for identifier in ("real_direct_cache_value", "real_helper_cache_hit"):
+            workloads[identifier]["workload_sha256"] = hash_enron_workload(workloads[identifier])
+    elif mutation == "harness_descriptor_drift":
+        for profile in performance_module.PERFORMANCE_PROFILE_IDS:
+            profile_performance = plan["profiles"][profile]["performance"]
+            harness = next(item for item in profile_performance["harnesses"] if item["id"] == "cold_compile_harness")
+            harness.update(
+                {
+                    "phase": "direct_bank_scan",
+                    "command_id": "alternate_safe_runner",
+                    "operation_spec_sha256": _HASH_2,
+                }
+            )
+            harness["descriptor_sha256"] = hash_enron_performance_harness(harness)
+            for workload in profile_performance["workloads"]:
+                if workload["harness_id"] == harness["id"]:
+                    workload["harness_sha256"] = harness["descriptor_sha256"]
+                    workload["workload_sha256"] = hash_enron_workload(workload)
+            plan["profiles"][profile]["performance_manifest_sha256"] = hash_enron_performance_manifest(
+                profile_performance
+            )
+    elif mutation == "duplicate_harness":
+        for profile in performance_module.PERFORMANCE_PROFILE_IDS:
+            profile_performance = plan["profiles"][profile]["performance"]
+            harness = next(item for item in profile_performance["harnesses"] if item["id"] == "cold_compile_harness")
+            profile_performance["harnesses"].append(dict(harness))
+            profile_performance["harnesses"].sort(key=lambda item: item["id"])
+            plan["profiles"][profile]["performance_manifest_sha256"] = hash_enron_performance_manifest(
+                profile_performance
+            )
+    elif mutation == "harness_source_artifact_drift":
+        for profile in performance_module.PERFORMANCE_PROFILE_IDS:
+            profile_performance = plan["profiles"][profile]["performance"]
+            harness = next(item for item in profile_performance["harnesses"] if item["id"] == "source_profile_harness")
+            harness["source_artifact"] = _artifact("alternate_train", b"safe-alternate-train")
+            harness["descriptor_sha256"] = hash_enron_performance_harness(harness)
+            for workload in profile_performance["workloads"]:
+                if workload["harness_id"] == harness["id"]:
+                    workload["harness_sha256"] = harness["descriptor_sha256"]
+                    workload["workload_sha256"] = hash_enron_workload(workload)
+            plan["profiles"][profile]["performance_manifest_sha256"] = hash_enron_performance_manifest(
+                profile_performance
+            )
+    elif mutation == "extra_harness":
+        for profile in performance_module.PERFORMANCE_PROFILE_IDS:
+            profile_performance = plan["profiles"][profile]["performance"]
+            harness = dict(
+                next(item for item in profile_performance["harnesses"] if item["id"] == "cold_compile_harness")
+            )
+            harness["id"] = "extra_safe_harness"
+            harness["descriptor_sha256"] = hash_enron_performance_harness(harness)
+            profile_performance["harnesses"].append(harness)
+            profile_performance["harnesses"].sort(key=lambda item: item["id"])
+            plan["profiles"][profile]["performance_manifest_sha256"] = hash_enron_performance_manifest(
+                profile_performance
+            )
+    elif mutation == "missing_harness":
+        for profile in performance_module.PERFORMANCE_PROFILE_IDS:
+            profile_performance = plan["profiles"][profile]["performance"]
+            profile_performance["harnesses"] = [
+                item for item in profile_performance["harnesses"] if item["id"] != "python_literal_harness"
+            ]
+            profile_performance["workloads"] = [
+                item for item in profile_performance["workloads"] if item["id"] != "explore_python_literal_scan"
+            ]
+            profile_performance["baselines"] = [
+                item
+                for item in profile_performance["baselines"]
+                if item["id"] != performance_module.PERFORMANCE_PYTHON_LITERAL_BASELINE_ID
+            ]
+            plan["profiles"][profile]["performance_manifest_sha256"] = hash_enron_performance_manifest(
+                profile_performance
+            )
+    else:  # pragma: no cover - test helper guard.
+        raise AssertionError(mutation)
+    if mutation not in {
+        "duplicate_harness",
+        "extra_harness",
+        "harness_descriptor_drift",
+        "harness_source_artifact_drift",
+        "missing_harness",
+    }:
+        decision["performance_manifest_sha256"] = hash_enron_performance_manifest(performance)
+    plan["plan_sha256"] = performance_module._canonical_hash(
+        {key: value for key, value in plan.items() if key != "plan_sha256"}
+    )
+    plan_payload = performance_module._pretty_json_bytes(plan)
+    plan_path.write_bytes(plan_payload)
+
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["plan_sha256"] = plan["plan_sha256"]
+    plan_artifact = next(item for item in manifest["artifacts"] if item["id"] == "performance_plan")
+    plan_artifact["sha256"] = _sha256(plan_payload)
+    plan_artifact["bytes"] = len(plan_payload)
+    manifest_path.write_bytes(performance_module._pretty_json_bytes(manifest))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "direct_stability_median",
+        "breakeven_proxy_marginal",
+        "decision_proxy_role_swap",
+        "harness_descriptor_drift",
+        "duplicate_harness",
+        "harness_source_artifact_drift",
+        "extra_harness",
+        "missing_harness",
+    ],
+)
+def test_rehashed_protocol_mutations_fail_before_measurement_and_in_deep_verification(
+    mutation: str,
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name=f"protocol-{mutation}")
+    _patch_execution(monkeypatch)
+    measured = tmp_path / f"protocol-{mutation}-measured"
+    run_enron_performance(
+        EnronPerformanceRunOptions(
+            prepared_run=prepared,
+            output_dir=measured,
+            profile="decision",
+            allow_unignored_output=True,
+        )
+    )
+    assert verify_enron_performance_run(measured)["valid"] is True
+
+    _rewrite_rehashed_protocol_mutation(measured, mutation)
+    with pytest.raises(EnronPerformanceError, match="frozen protocol"):
+        verify_enron_performance_run(measured)
+
+    _rewrite_rehashed_protocol_mutation(prepared, mutation)
+
+    with pytest.raises(EnronPerformanceError, match="frozen protocol"):
+        performance_module._load_prepared_performance_run(prepared)
+
+    def fail_measurement(*_args: Any, **_kwargs: Any) -> Any:
+        pytest.fail("measurement started before frozen-protocol validation")
+
+    for name in ("_execute_workload", "_execute_pair", "_execute_exact_value_block"):
+        monkeypatch.setattr(performance_module, name, fail_measurement)
+    with pytest.raises(EnronPerformanceError, match="frozen protocol"):
+        run_enron_performance(
+            EnronPerformanceRunOptions(
+                prepared_run=prepared,
+                output_dir=tmp_path / f"protocol-{mutation}-rejected",
+                profile="decision",
+                allow_unignored_output=True,
+            )
+        )
+
+
 def test_run_verifier_rejects_rehashed_free_text_and_forged_smoke_decision(
     tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1592,12 +2008,17 @@ def test_run_rejects_workload_concurrency_above_execution_host_before_measuremen
         )
 
 
-def test_run_rejects_stale_harness_source_before_measurement(
+def test_run_rejects_changed_contract_source_before_measurement(
     tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name="stale-harness")
     _patch_execution(monkeypatch)
-    monkeypatch.setattr(performance_module, "_performance_harness_source_sha256", lambda: _HASH_2)
+
+    def changed_contract_source(paths: Sequence[Path]) -> str:
+        assert "enron_contract.py" in {path.name for path in paths}
+        return _HASH_2
+
+    monkeypatch.setattr(performance_module, "_source_sha256", changed_contract_source)
     monkeypatch.setattr(
         performance_module,
         "_execute_workload",
@@ -1962,6 +2383,51 @@ def test_prepared_manifest_rejects_duplicate_json_keys(
         performance_module._load_prepared_performance_run(prepared)
 
 
+@pytest.mark.parametrize(
+    ("wrapper_name", "implementation_name", "public_message"),
+    [
+        (
+            "_load_prepared_performance_run",
+            "_load_prepared_performance_run_impl",
+            "Performance preparation failed closed structural verification.",
+        ),
+        (
+            "run_enron_performance",
+            "_run_enron_performance_impl",
+            "Performance run failed closed structural verification.",
+        ),
+        (
+            "verify_enron_performance_run",
+            "_verify_enron_performance_run_impl",
+            "Performance run failed closed structural verification.",
+        ),
+    ],
+)
+def test_structural_failure_sanitization_discards_sensitive_exception_state(
+    wrapper_name: str,
+    implementation_name: str,
+    public_message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sensitive_token = "SENSITIVE_PRIVATE_PATH_TOKEN"
+
+    def fail_structurally(_value: Any) -> Any:
+        raise ValueError(sensitive_token)
+
+    monkeypatch.setattr(performance_module, implementation_name, fail_structurally)
+    wrapper = getattr(performance_module, wrapper_name)
+    with pytest.raises(EnronPerformanceError) as caught:
+        wrapper(cast(Any, None))
+
+    error = caught.value
+    rendered = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    assert str(error) == public_message
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert sensitive_token not in str(error)
+    assert sensitive_token not in rendered
+
+
 def test_decision_run_verifier_rejects_exact_control_audit_mismatch(
     tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1978,6 +2444,18 @@ def test_decision_run_verifier_rejects_exact_control_audit_mismatch(
     )
     assert report["profile"] == "decision"
     assert len([item for item in report["performance"]["workloads"] if item["decision_grade"]]) == 19
+    support = next(item for item in report["performance"]["workloads"] if item["id"] == "real_direct_cache_value")
+    assert support["decision_grade"] is False
+    assert support["promotion_gate"] is False
+    inventory = json.loads((output / "inventories" / "real_validation_inventory.json").read_text(encoding="utf-8"))
+    assert all(item["records"] > 0 for item in inventory)
+    positive_rows = [
+        json.loads(line) for line in (output / "audit" / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    latency = next(item for item in positive_rows if item["workload_id"] == "real_direct_latency")
+    first_block = latency["samples"][: performance_module.DEFAULT_DOCUMENT_SAMPLES_PER_BLOCK]
+    assert [item["record_count"] for item in first_block] == [item["records"] for item in inventory]
+    assert len({item["correctness_sha256"] for item in first_block}) == len(inventory)
     assert verify_enron_performance_run(output)["valid"] is True
 
     audit_path = output / "audit" / "results.jsonl"
@@ -1998,6 +2476,86 @@ def test_decision_run_verifier_rejects_exact_control_audit_mismatch(
         verify_enron_performance_run(output)
 
 
+def _patched_decision_audit(
+    tmp_path: Path,
+    test_data_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    name: str,
+) -> tuple[Path, list[dict[str, Any]]]:
+    prepared = _prepare_run(tmp_path, test_data_path, monkeypatch, name=name)
+    _patch_execution(monkeypatch)
+    output = tmp_path / f"{name}-run"
+    run_enron_performance(
+        EnronPerformanceRunOptions(
+            prepared_run=prepared,
+            output_dir=output,
+            profile="decision",
+            allow_unignored_output=True,
+        )
+    )
+    rows = [json.loads(line) for line in (output / "audit" / "results.jsonl").read_text(encoding="utf-8").splitlines()]
+    return output, rows
+
+
+def test_decision_run_verifier_rejects_document_counts_rebound_away_from_inventory(
+    tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output, rows = _patched_decision_audit(
+        tmp_path,
+        test_data_path,
+        monkeypatch,
+        name="decision-document-counts",
+    )
+    by_id = {item["workload_id"]: item for item in rows}
+    for identifier in ("real_direct_latency", "control_real_direct_latency"):
+        by_id[identifier]["samples"][0]["record_count"] += 1
+    _rewrite_private_audit(output, rows)
+
+    with pytest.raises(EnronPerformanceError, match="record counts differ from the frozen inventory"):
+        verify_enron_performance_run(output)
+
+
+def test_decision_run_verifier_rejects_one_document_repeated_as_a_full_block(
+    tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output, rows = _patched_decision_audit(
+        tmp_path,
+        test_data_path,
+        monkeypatch,
+        name="decision-repeated-document",
+    )
+    by_id = {item["workload_id"]: item for item in rows}
+    repeated_commitment = by_id["real_direct_latency"]["samples"][0]["correctness_sha256"]
+    for identifier in ("real_direct_latency", "control_real_direct_latency"):
+        for sample in by_id[identifier]["samples"]:
+            sample["correctness_sha256"] = repeated_commitment
+    _rewrite_private_audit(output, rows)
+
+    with pytest.raises(EnronPerformanceError, match="one index-bound commitment per frozen document"):
+        verify_enron_performance_run(output)
+
+
+def test_decision_run_verifier_rejects_reused_cache_value_cross_path_pid_aliasing(
+    tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    output, rows = _patched_decision_audit(
+        tmp_path,
+        test_data_path,
+        monkeypatch,
+        name="decision-cache-value-pid-alias",
+    )
+    by_id = {item["workload_id"]: item for item in rows}
+    direct_samples = by_id["real_direct_cache_value"]["samples"]
+    helper_samples = by_id["real_helper_cache_hit"]["samples"]
+    for direct, helper in zip(direct_samples, helper_samples, strict=True):
+        helper["pid"] = direct["pid"]
+    _rewrite_private_audit(output, rows)
+
+    with pytest.raises(EnronPerformanceError, match="cache-value reused-process isolation"):
+        verify_enron_performance_run(output)
+
+
 def test_decision_run_verifier_rejects_rehashed_cross_path_order_swap(
     tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2015,7 +2573,7 @@ def test_decision_run_verifier_rejects_rehashed_cross_path_order_swap(
     audit_path = output / "audit" / "results.jsonl"
     rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     by_id = {item["workload_id"]: item for item in rows}
-    direct = by_id["real_direct_throughput"]["samples"][0]
+    direct = by_id["real_direct_cache_value"]["samples"][0]
     helper_hit = by_id["real_helper_cache_hit"]["samples"][0]
     direct["sequence"], helper_hit["sequence"] = helper_hit["sequence"], direct["sequence"]
     audit_payload = b"".join(_canonical(item) + b"\n" for item in rows)
@@ -2048,7 +2606,9 @@ def test_decision_run_verifier_rejects_nonchronological_workload_samples(
     audit_path = output / "audit" / "results.jsonl"
     rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     direct = next(item for item in rows if item["workload_id"] == "real_direct_throughput")
-    direct["samples"].reverse()
+    sequences = [sample["sequence"] for sample in direct["samples"]]
+    for sample, sequence in zip(direct["samples"], reversed(sequences), strict=True):
+        sample["sequence"] = sequence
     audit_payload = b"".join(_canonical(item) + b"\n" for item in rows)
     audit_path.write_bytes(audit_payload)
     manifest_path = output / "manifest.json"
@@ -2091,7 +2651,7 @@ def test_decision_run_verifier_rejects_reused_candidate_control_pid_aliasing(
     audit_artifact["bytes"] = len(audit_payload)
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
-    with pytest.raises(EnronPerformanceError, match="reused exact-control process isolation"):
+    with pytest.raises(EnronPerformanceError, match="process isolation"):
         verify_enron_performance_run(output)
 
 
@@ -2115,22 +2675,80 @@ def test_execute_pair_rejects_correctness_mismatch_before_materialization(
         )
     )
     monkeypatch.setattr(performance_module, "_run_one_observation", lambda *_args, **_kwargs: next(results))
-    monkeypatch.setattr(performance_module, "_interleaved_labels", lambda _count: ("candidate", "control"))
+    monkeypatch.setattr(
+        performance_module,
+        "_exact_block_labels",
+        lambda _block_index, _count: ("candidate", "control"),
+    )
     with pytest.raises(EnronPerformanceError, match="differs from its candidate"):
         performance_module._execute_pair(
             candidate,
             control,
             {},
             cast(Any, None),
-            sample_count=1,
+            block_count=1,
+            samples_per_block=1,
             worker_timeout_seconds=1.0,
             source_build_timeout_seconds=1.0,
             sequence_start=0,
         )
 
 
+def test_execute_pair_uses_fresh_balanced_reused_sessions_per_exact_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = {"id": "candidate", "process_model": "reused_process", "sample_unit": "whole_input"}
+    control = {"id": "control_candidate", "process_model": "reused_process", "sample_unit": "whole_input"}
+    sessions: list[Any] = []
+
+    class _Session:
+        def __init__(self, *, timeout_seconds: float) -> None:
+            assert timeout_seconds == 1.0
+            self.pid = 50_000 + len(sessions)
+            self.closed = False
+            sessions.append(self)
+
+        def close(self) -> None:
+            self.closed = True
+
+    def observe(_workload: Mapping[str, Any], *_args: Any, session: Any = None, **_kwargs: Any) -> dict[str, Any]:
+        assert session is not None
+        return {
+            "pid": session.pid,
+            "record_count": 1,
+            "correctness_sha256": _HASH_1,
+            "elapsed_ns": 1_000_000,
+            "peak_rss_bytes": 64 * 1024 * 1024,
+        }
+
+    monkeypatch.setattr(performance_module, "_WorkerSession", _Session)
+    monkeypatch.setattr(performance_module, "_run_one_observation", observe)
+    candidate_results, control_results, next_sequence = performance_module._execute_pair(
+        candidate,
+        control,
+        {},
+        cast(Any, None),
+        block_count=10,
+        samples_per_block=2,
+        worker_timeout_seconds=1.0,
+        source_build_timeout_seconds=1.0,
+        sequence_start=7,
+    )
+
+    assert len(sessions) == 20
+    assert all(session.closed for session in sessions)
+    assert next_sequence == 47
+    for block_index, assignment in enumerate(performance_module.PERFORMANCE_EXACT_BLOCK_ASSIGNMENT):
+        candidate_pids = {item["pid"] for item in candidate_results[block_index * 2 : (block_index + 1) * 2]}
+        control_pids = {item["pid"] for item in control_results[block_index * 2 : (block_index + 1) * 2]}
+        assert len(candidate_pids) == len(control_pids) == 1
+        candidate_pid = next(iter(candidate_pids))
+        control_pid = next(iter(control_pids))
+        assert (candidate_pid < control_pid) is (assignment == "candidate_first")
+
+
 def test_exact_value_block_preserves_reused_and_fresh_process_models(monkeypatch: pytest.MonkeyPatch) -> None:
-    reused_paths = {"real_direct_throughput", "real_helper_cache_hit"}
+    reused_paths = {"real_direct_cache_value", "real_helper_cache_hit"}
     workloads: dict[str, dict[str, Any]] = {
         identifier: {
             "id": identifier,
@@ -2148,6 +2766,7 @@ def test_exact_value_block_preserves_reused_and_fresh_process_models(monkeypatch
         def __init__(self, *, timeout_seconds: float) -> None:
             assert timeout_seconds == 1.0
             self.closed = False
+            self.workload_id: str | None = None
             sessions.append(self)
 
         def close(self) -> None:
@@ -2157,6 +2776,10 @@ def test_exact_value_block_preserves_reused_and_fresh_process_models(monkeypatch
         expected_reused = workload["process_model"] == "reused_process"
         calls.append((str(workload["id"]), session is not None))
         assert (session is not None) is expected_reused
+        if session is not None:
+            if session.workload_id is None:
+                session.workload_id = str(workload["id"])
+            assert session.workload_id == workload["id"]
         return {"record_count": 1, "correctness_sha256": _HASH_1}
 
     monkeypatch.setattr(performance_module, "_WorkerSession", _Session)
@@ -2165,18 +2788,31 @@ def test_exact_value_block_preserves_reused_and_fresh_process_models(monkeypatch
         workloads,
         {},
         cast(Any, None),
-        sample_count=4,
+        block_count=10,
+        samples_per_block=4,
         worker_timeout_seconds=1.0,
         source_build_timeout_seconds=1.0,
         sequence_start=7,
     )
 
-    assert [identifier for identifier, _reused in calls] == list(performance_module._exact_value_schedule(4))
+    assert [identifier for identifier, _reused in calls] == list(performance_module._exact_value_schedule(10, 4))
     assert set(results) == set(workloads)
-    assert all(len(items) == 4 for items in results.values())
-    assert next_sequence == 39
-    assert len(sessions) == 4
+    assert all(len(items) == 40 for items in results.values())
+    assert next_sequence == 327
+    reused_path_order = [path for path in performance_module.PERFORMANCE_EXACT_VALUE_PATHS if path in reused_paths]
+    sessions_per_block = len(reused_path_order) * 2
+    assert len(sessions) == 10 * sessions_per_block
     assert all(session.closed for session in sessions)
+    for block_index, assignment in enumerate(performance_module.PERFORMANCE_EXACT_BLOCK_ASSIGNMENT):
+        expected_creation_order = [
+            identifier
+            for path in reused_path_order
+            for identifier in (
+                (path, f"control_{path}") if assignment == "candidate_first" else (f"control_{path}", path)
+            )
+        ]
+        block_sessions = sessions[block_index * sessions_per_block : (block_index + 1) * sessions_per_block]
+        assert [session.workload_id for session in block_sessions] == expected_creation_order
 
 
 def test_public_privacy_scanner_accepts_plan_and_rejects_private_paths_and_identifiers(

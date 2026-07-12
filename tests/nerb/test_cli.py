@@ -944,9 +944,9 @@ def test_enron_performance_commands_map_private_options_and_emit_json(monkeypatc
             "--setup-samples",
             "20",
             "--scan-samples",
-            "100",
+            "1000",
             "--document-samples",
-            "500",
+            "1000",
             "--worker-timeout-seconds",
             "90.5",
             "--source-build-timeout-seconds",
@@ -967,8 +967,8 @@ def test_enron_performance_commands_map_private_options_and_emit_json(monkeypatc
     assert run_options.warmups == 3
     assert run_options.smoke_samples == 5
     assert run_options.setup_samples == 20
-    assert run_options.scan_samples == 100
-    assert run_options.document_samples == 500
+    assert run_options.scan_samples == 1_000
+    assert run_options.document_samples == 1_000
     assert run_options.worker_timeout_seconds == 90.5
     assert run_options.source_build_timeout_seconds == 700.5
     assert run_options.allow_unignored_output is True
@@ -1061,6 +1061,12 @@ def test_enron_performance_commands_sanitize_helper_errors_and_exclude_sealed_in
         assert help_result.exit_code == 0
         assert "sealed" in help_result.output.lower()
         assert "--sealed" not in help_result.output
+        if command == "run-enron-performance":
+            normalized_help = " ".join(help_result.output.split()).lower()
+            assert "true direct decision cells; frozen at 1,000" in normalized_help
+            assert "helper, end-to-end, and support cells remain fixed at 100" in normalized_help
+            assert "ten complete balanced 100-document passes (1,000 samples)" in normalized_help
+            assert "five balanced passes" not in normalized_help
 
 
 def test_enron_quality_commands_route_private_inputs_and_fail_closed(monkeypatch, tmp_path):

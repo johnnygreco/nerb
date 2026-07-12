@@ -40,7 +40,7 @@ uv run nerb run-enron-performance \
   --output-dir .nerb/enron/performance-smoke \
   --profile smoke
 
-# Long-running evidence: 20 setup samples, 100 whole-input scans, and 500 paired document timings.
+# Long-running evidence: ten paired blocks with phase-specific frozen sample counts.
 uv run nerb run-enron-performance \
   --prepared-run .nerb/enron/performance-plan \
   --output-dir .nerb/enron/performance-decision \
@@ -57,21 +57,35 @@ The decision plan keeps these paths separate:
 | Direct compiled-`Bank` reuse | Cost after constructing one native bank and scanning repeatedly through that same object. This is the primary cache-value path. |
 | Helper cache hit/miss | Cost of the higher-level compile/extract helper with its process-local canonical-bank cache either warm or cold. |
 | Uncached/end to end | Cost when validation, compilation, input handling, or application work is included as declared by the frozen harness. |
-| Exact same-path stability control | An ABBA-interleaved duplicate with the same operation, bank, input, process model, warmups, work, and sample policy. It estimates run noise and order effects; because both sides use the current implementation, it is not a prior-code regression baseline. |
-| Cross-path cache-value comparison | Direct reuse, helper-cache hit/miss, and end-to-end paths scan the same whole-input population in a four-path Williams-balanced schedule nested inside ABBA. Canonical aggregate digests prove identical mapped outputs before paired-block latency and throughput comparisons. |
+| Exact same-path stability control | An exact twin with the same operation, bank, input, process model, warmups, work, and sample policy. Candidate/twin pairs use ten frozen blocks with a hash-derived balanced mix of ABBA and BAAB order. Reused paths receive fresh candidate and control worker sessions in every block. Runner source and tests enforce balanced construction order; verifier-observable evidence binds chronology, per-block PID reuse or freshness, and disjoint twin PIDs rather than unrecorded creation events. One symmetric metric per true decision cell—and a median metric for the support proxy—checks measured stability, not prior-code regression or statistical equivalence. |
+| Cross-path cache-value comparison | A separate 100-sample `real_direct_cache_value` support cell, helper-cache hit/miss, and end-to-end paths scan the same whole-input population in ten four-path Williams-balanced blocks. The support cell has `decision_grade: false` and cannot be a headline, absolute gate, or break-even input. Canonical aggregate digests prove identical mapped outputs before the separate directional comparisons. |
 | Generic regex and Python literal scans | Exploratory, explicitly non-equivalent baselines. They cannot support a semantic regression claim or the promoted break-even comparison. |
 
 Scale banks contain 1k, 10k, 25k, and 100k **active matcher patterns**. Alias and canonical-name counts remain separate
 composition metrics; a matcher-pattern count must never be reported as an alias count. The 100k controlled fixture has
 two semantic taxonomy classes backed by 318 native matcher shards (159 per class, at most 502 patterns per shard). A
 non-promotable five-native-shard feasibility probe exceeded 5 GiB and did not complete, so the 100k result must not be
-presented as small-shard-topology evidence. One-time source profiling, source
-building, and cold compilation use 20 fresh-process samples and nearest-rank p95. Whole-input decision cells use 100
-samples and p99. Document latency uses 500 paired timings—five balanced passes over exactly 100 documents—so paired
-relative MAD measures timing variation instead of document-size heterogeneity. The five-sample smoke profile is
+presented as small-shard-topology evidence. One-time source profiling, source building, and cold compilation use 20
+fresh-process samples in ten two-sample blocks; their one same-path stability metric is median time. Helper-cache
+hit/miss and end-to-end cells use 100 samples in ten ten-sample blocks and also compare median time. The matrix has 19
+true decision cells; every true direct whole-input and document-latency cell uses 1,000 pooled samples in ten 100-sample
+blocks and compares p99. The additional direct-cache-value support proxy uses 100 samples and median stability. Every
+document block is one complete balanced pass over the exact 100-document population, so document composition cannot be
+confounded with worker-session effects. The five-sample smoke profile is
 non-promotable and intentionally limited to evaluated-bank compile/cache/direct/end-to-end paths plus 1k serial and
 bounded-concurrency cells and the two exploratory baselines. It does not rebuild/profile the source or load the 100k
 bank.
+
+For a same-path metric with candidate value `C` and exact-twin value `B`, the symmetric gap is
+`max(C, B) / min(C, B) - 1`, equivalently bounded by `abs(log(C / B)) <= log(1.05)`. A gap at or below 5% is
+`within_tolerance`. For a larger gap, the diagnostic enumerates all `2^10` whole-block label swaps and recomputes the
+pooled metric for each assignment. A diagnostic p-value at or below 0.05 yields `unstable`; a larger value yields
+`inconclusive`. Both outcomes fail promotion. `within_tolerance` means only that this measurement met the frozen
+engineering tolerance; it is not a confidence interval or an equivalence claim. Cross-path comparisons remain
+directional and do not reuse these symmetric outcome semantics. Absolute latency, throughput, and RSS gates are always
+evaluated independently of the exact twin. Only directional cross-path comparisons use paired-block timing-ratio MAD;
+their noise floor has an unconditional 25% ceiling, and exceeding it fails promotion regardless of whether the measured
+direction would otherwise be improved or within its directional boundary.
 
 Preparation and execution commit private transactional runs. The path-free plan and aggregate report contain hashes,
 counts, timing/resource samples, environment metadata, and privacy-safe inventories—not message text, detected surfaces,
@@ -89,14 +103,16 @@ the crossing.
 
 ## Decision-Grade Development Result
 
-Here, *decision-grade* means the workload and thresholds were frozen before measurement; equivalent paths prove the same
-mapped outputs; repeated isolated samples quantify tails, dispersion, noise, and memory; software, hardware, and artifact
+Here, *decision-grade* means the workload and thresholds were frozen before measurement; exact paths prove the same
+mapped outputs; repeated isolated blocks quantify tails, session variation, and memory; software, hardware, and artifact
 lineage are recorded; and the aggregate result passes privacy and integrity verification. That is sufficient to choose
 the compile-once/scan-many runtime path. It is not a recall claim or final publication approval: quality, full-source
 capacity, and the one-shot sealed evaluation retain their own gates.
 
-The complete decision profile passed on Apple M4 arm64 hardware with 10 logical CPUs, 16 GiB RAM, macOS, and Python
-3.13.12. The run used package and native engine 0.0.11 at clean commit
+The recorded decision profile passed the plan bound to its existing hashes on Apple M4 arm64 hardware with 10 logical
+CPUs, 16 GiB RAM, macOS, and Python 3.13.12. Its measurements remain unchanged below while the exact-block protocol is
+adopted, but a refreshed run must pass the current protocol before these results can support promotion. The run used
+package and native engine 0.0.11 at clean commit
 `270c5e1fddcd9afecf1c15df118e172325c540a6`, passed its aggregate privacy scan with zero violations, and recorded
 `sealed_test_accessed: false`. Its frozen plan is
 `sha256:f28c6a1d24515ad942f8601f59de01f94fe06b1ce17638e9a7f2b7ceb3ee0693`, its performance manifest is
@@ -118,12 +134,14 @@ bytes, and a 13,293,272-byte private bank artifact.
 | Real whole-input MiB/s | at least 1 | 39.69 | passed |
 | 100k-pattern MiB/s | at least 1 | 99.54 | passed |
 | Peak RSS | at most 8 GiB | 485.9 MiB maximum measured cell | passed |
-| Exact-control noise floor | at most 25% | 12.61% maximum | passed |
+| Cross-path paired-ratio MAD noise floor | at most 25% | not evaluated under the current protocol | refresh required |
 
 ### Lifecycle and cache value
 
-Setup phases use 20 fresh-process samples and report p95; scan-bearing phases use 100 whole-input samples and p99. The
-document-latency cell uses 500 balanced samples.
+The table retains the recorded run's measured values. Under the current plan, setup stability uses the median of 20
+fresh-process samples, slow cache-path stability uses the median of 100 samples, and direct/document p99 stability uses
+1,000 pooled samples. The separate direct comparison-support proxy uses 100 samples and median stability. All
+candidate/exact-twin pairs are acquired in ten frozen paired blocks.
 
 | Path | Median | Tail | Throughput | Peak RSS |
 | --- | ---: | ---: | ---: | ---: |
@@ -145,9 +163,11 @@ minimum of one complete 100-document request; the result must not be translated 
 
 The exploratory generic email regex reached 77.74 MiB/s and happened to emit the same aggregate record count, but it
 cannot map a mention to a known canonical identity or implement the full bank semantics. The Python literal baseline
-reached 2.73 MiB/s and emitted only 631 records, so neither is an equivalent correctness baseline. All 34 same-path
-comparisons were equivalent within measured noise. Of 12 cross-path cache-value comparisons, nine improved and three
-were equivalent within noise.
+reached 2.73 MiB/s and emitted only 631 records, so neither is a semantically exact correctness baseline. The recorded
+report contains 34 same-path and 12 cross-path comparison outcomes, including nine directional cross-path improvements
+and three other directional outcomes. Those comparison outcomes remain bound to the displayed run hash but do not
+satisfy the current exact-block stability protocol; a refreshed run must materialize one `within_tolerance` same-path
+metric for every true decision cell and the comparison-support proxy.
 
 ### Matcher scale
 

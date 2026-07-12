@@ -2840,13 +2840,19 @@ def run_enron_performance_command(
         DEFAULT_ENRON_PERFORMANCE_SCAN_SAMPLES,
         "--scan-samples",
         min=1,
-        help="Samples for decision-grade scan-bearing cells; must match the frozen policy.",
+        help=(
+            "Samples for true direct decision cells; frozen at 1,000. "
+            "Helper, end-to-end, and support cells remain fixed at 100."
+        ),
     ),
     document_samples: int = typer.Option(
         DEFAULT_ENRON_PERFORMANCE_DOCUMENT_SAMPLES,
         "--document-samples",
         min=1,
-        help="Paired document timings across five balanced passes; must match the frozen policy.",
+        help=(
+            "Paired document timings across ten complete balanced 100-document passes (1,000 samples); "
+            "must match the frozen policy."
+        ),
     ),
     worker_timeout_seconds: float = typer.Option(
         DEFAULT_ENRON_PERFORMANCE_WORKER_TIMEOUT_SECONDS,

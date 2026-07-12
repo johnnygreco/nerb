@@ -466,22 +466,39 @@ Performance scale descriptors use active matcher-pattern counts of 1k, 10k, 25k,
 name, alias, literal, and regex totals remain independent truthful fields and must preserve the evaluated composition.
 The frozen 100k fixture records 318 native matcher shards under two semantic taxonomy classes; it is not a 100k
 small-shard-topology claim. One-time
-source-profile, source-build, and cold-compile decision cells use at least 20 samples with median, MAD, and p95; p99 is
-null. Whole-input decision cells retain at least 100 samples and p99; document latency uses 500 aligned samples over
-five balanced passes and a paired-relative-MAD noise method. Each materialized workload records its stable observed
-whole-input record count, so non-equivalent baselines compute their own records/second. Comparison descriptors identify
-same-path stability versus cross-path cache-value evidence and freeze their noise method. Cross-path timings are acquired
-in Williams-balanced blocks and use paired-block timing-ratio MAD; same-path document controls retain paired-relative
-MAD. The public helpers in
-`nerb.enron_contract`
-calculate canonical inventory summaries, phase-aware sample statistics, noise-aware comparisons, and additive breakeven
-results so evidence producers share the verifier's exact arithmetic. The promoted value model compares direct reuse
-against a semantically exact NERB helper-cache-miss alternative on the same bank and input; each phase has its own exact
-same-path stability control, and both value paths use the same whole-input population. Shared curation, profiling, and
-bank-build costs are recorded identically on both sides and cancel, leaving cold compile plus the two marginal scan
-rates to determine the crossing. Breakeven inputs
-whose bounded component/unit products cannot remain finite
-are rejected with `ValueError` rather than leaking an arithmetic overflow from the helper.
+source-profile, source-build, and cold-compile decision cells use 20 samples with median, MAD, and p95; p99 is null.
+Helper-cache hit/miss and end-to-end cells use 100 samples. The matrix contains 19 true decision cells; all true direct
+whole-input and document cells use 1,000 pooled samples and report p99. One additional 100-sample direct-cache-value
+comparison-support cell has `decision_grade: false`, uses median stability, and cannot satisfy a headline, absolute gate,
+or break-even role. Every candidate/exact-twin pair is divided into ten frozen paired blocks with a hash-derived balanced
+mix of ABBA and BAAB observation order. Reused paths receive a fresh worker session for each twin in each block. Runner
+source and tests enforce balanced construction order. Verifier-observable evidence binds sample chronology, per-block PID
+reuse or freshness, and disjoint twin PIDs; it does not represent process-creation events. Each 100-sample document block
+is one complete pass over the exact frozen 100-document population. Each materialized workload records its stable
+observed whole-input record count, so non-equivalent baselines compute their own records/second.
+
+Same-path comparison objects use `direction: "symmetric"`, `noise_method: "exact_block_swap"`, exactly ten blocks, and
+one metric per true decision cell: median for setup, helper-cache hit/miss, and end-to-end cells, or p99 for true
+direct/document cells. The comparison-support proxy uses median.
+They record the balanced block assignment, candidate/control values, absolute log ratio, symmetric relative gap,
+diagnostic permutation p-value, 0.05 significance level, 0.05 stability tolerance, and one of `within_tolerance`,
+`unstable`, or `inconclusive`. A gap no greater than 5% is `within_tolerance`. Larger gaps enumerate all `2^10`
+whole-block swaps and recompute the pooled metric; p <= 0.05 distinguishes `unstable` from `inconclusive`, but both fail
+promotion. `within_tolerance` is not a statistical equivalence claim.
+
+Cross-path comparison objects remain a separate directional contract. A dedicated 100-sample direct-cache-value cell,
+helper-cache hit/miss, and end-to-end cells use ten Williams-balanced blocks with identical bank, input, work, and
+concurrency. The support cell cannot replace the 1,000-sample direct cell used for absolute p99 gates or the direct rate
+bound into the break-even model. Only these directional cross-path comparisons use paired-block timing-ratio MAD. Their
+noise floor has an unconditional 25% ceiling; a larger value fails promotion independently of the directional result.
+Same-path comparisons do not use this noise-floor field or ceiling. The public helpers in `nerb.enron_contract` calculate
+canonical inventory summaries, phase-aware sample statistics, symmetric same-path outcomes, directional cross-path
+outcomes, and additive breakeven results so evidence producers share the verifier's exact arithmetic. The promoted value
+model compares direct reuse against a semantically exact NERB helper-cache-miss alternative on the same bank and input;
+each phase has its own exact same-path stability control, and both value paths use the same whole-input population.
+Shared curation, profiling, and bank-build costs are recorded identically on both sides and cancel, leaving cold compile
+plus the two marginal scan rates to determine the crossing. Breakeven inputs whose bounded component/unit products cannot
+remain finite are rejected with `ValueError` rather than leaking an arithmetic overflow from the helper.
 
 The executable workflow adds four private-run contracts around that evidence object:
 
@@ -495,8 +512,8 @@ The executable workflow adds four private-run contracts around that evidence obj
 The prepared and measured directories use the private-run commit marker and fail closed on changed hashes, unsafe
 relative paths, unexpected shapes, or privacy diagnostics. Inventories contain per-document byte and record counts, not
 text or matched surfaces. `verify_enron_performance_run` recomputes statistics, comparisons, break-even arithmetic,
-decision status, sample policy, ABBA and Williams-block sequence, execution-host CPU/memory bounds, fresh/reused process
-isolation, cross-path correctness, and audit bindings
+decision status, sample policy, the exact-block assignment, balanced ABBA/BAAB and Williams-block sequences, per-block
+fresh/reused process isolation, disjoint twin PIDs, cross-path correctness, and audit bindings
 without accepting or opening a preparation-source or sealed-test input.
 
 ## Enron bank-build artifacts

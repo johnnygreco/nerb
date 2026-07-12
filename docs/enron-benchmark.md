@@ -301,10 +301,13 @@ Each lifecycle phase—source profile, source build, cold compile, helper cache 
 and end to end—has an evaluated-bank decision cell. Decision-grade source-profile, source-build, and cold-compile cells
 bind the exact frozen development-train artifact; performance work cannot accept the pre-split preparation source or a
 sealed-test selector. Those setup cells
-use at least 20 fresh-process samples and report median, median absolute deviation, and nearest-rank p95; p99 is
-unsupported and remains null for those one-time setup phases. Scan-bearing phases use at least 100 samples and also
-report nearest-rank p99. The promoted document-latency cell uses five balanced passes over 100 documents (500 paired
-candidate/control samples); its paired relative MAD isolates timing variation from document heterogeneity. Every
+use 20 fresh-process samples and report median, median absolute deviation, and nearest-rank p95; p99 is unsupported and
+remains null for those one-time setup phases. Their same-path stability metric is median time. Helper-cache hit/miss and
+end-to-end cells use 100 samples and compare median time. All true direct whole-input and document-latency cells use
+1,000 pooled samples and compare nearest-rank p99. The frozen matrix contains 19 true decision cells plus one separate
+100-sample direct-cache-value comparison-support proxy. The proxy has `decision_grade: false`, compares median time, and
+cannot serve as a headline, absolute gate, or break-even input. Every true direct/document block contains 100 samples;
+each document block is one complete balanced pass over the exact 100-document population. Every
 decision cell uses one work unit plus one positive RSS sample per timing sample with peak
 RSS equal to their maximum. Fresh-process phases use zero warmups; reused-process phases use at least three. Every
 decision-grade harness command must succeed, concurrency cannot exceed the recorded CPU count in any phase, and measured
@@ -312,18 +315,35 @@ peak RSS cannot exceed the recorded machine memory.
 
 Every decision cell has same-machine stability comparisons against an exact semantic control on an identical operation
 specification, source artifact, phase, bank, input, warmup policy, sample count, sample unit, work, and concurrency.
-One-time setup cells compare p95; scan-bearing cells compare p99; whole-input cells also compare MiB/second. Promotion
-rejects instability beyond the frozen noise multiplier and tolerance. These duplicate-current-path controls measure
-noise/order effects, not prior-code regression. Direct reuse, helper-cache hit/miss, and end-to-end exact paths are
-also measured in four-path Williams-balanced temporal blocks nested inside ABBA. Candidate samples are index-aligned by
-block, and cross-path cache-value comparisons use paired timing-ratio MAD on the same evaluated bank, input, work, and
-concurrency; canonical aggregate digests must prove identical mapped results first. Comparison hashes commit comparison
-kind, candidate and baseline cell IDs, metric, direction, and noise method/policy, not observed values or outcomes.
+Every measured candidate/exact-twin pair is split into ten frozen paired blocks with a hash-derived, balanced
+candidate-first/control-first assignment. The blocks use a balanced mix of ABBA and BAAB observation orders; the
+hash-derived order is not required to alternate strictly. Reused-process paths receive fresh candidate and control worker
+sessions for each block. Runner source and unit tests enforce construction order from the frozen assignment. The
+verifier-observable correctness audit separately binds sample chronology, per-block PID reuse or freshness, and disjoint
+candidate/control PIDs; it does not claim to observe process-creation events. Each true decision cell has exactly one
+symmetric same-path metric: median for setup, helper-cache hit/miss, and end-to-end cells, and p99 for true direct
+whole-input and document cells. The comparison-support proxy uses median. These exact twins measure session and order
+stability, not prior-code regression.
+
+For candidate metric `C` and control metric `B`, the frozen symmetric gap is `max(C, B) / min(C, B) - 1`, which is
+equivalent to testing `abs(log(C / B))` against `log(1.05)`. A gap no greater than 5% is `within_tolerance`. A larger
+gap causes all `2^10` whole-block label swaps to be enumerated with the pooled metric recomputed after every assignment.
+The resulting diagnostic classifies the failed cell as `unstable` at p <= 0.05 or `inconclusive` otherwise; both are
+nonpromotable. `within_tolerance` is a frozen engineering decision, not a statistical equivalence claim.
+
+Cross-path cache-value evidence remains separate and directional. A dedicated 100-sample direct-cache-value cell joins
+helper-cache hit/miss and end-to-end paths in ten four-path Williams-balanced blocks on the same evaluated bank, input,
+work, and concurrency; canonical aggregate digests must prove identical mapped results first. It is a non-decision
+comparison-support proxy and does not replace the 1,000-sample direct cell used for absolute p99 gates or the direct rate
+used by the break-even model. Cross-path comparisons alone use directional paired-block timing-ratio MAD, and a noise
+floor above the unconditional 25% ceiling is nonpromotable regardless of the directional outcome. Same-path symmetric
+comparisons do not use this noise-floor policy. Comparison hashes commit comparison kind, candidate and baseline cell
+IDs, metric, direction, and the applicable frozen policy, not observed values or outcomes.
 Capability differences must still be stated for non-equivalent exploratory baseline measurements, which are not exact
 cache-value comparisons.
 
 Absolute results are hardware-specific. Promotion uses thresholds frozen in the public plan and same-machine repeated
-stability controls, reports noise diagnostics, and fails closed when required samples, input inventories, RSS, or environment
+stability controls and fails closed when required samples, block/session schedules, input inventories, RSS, or environment
 provenance are missing. Setup cells gate median, median absolute deviation, p95, and peak RSS. Scan-bearing cells gate
 median, p95, p99, and peak RSS; document cells also gate seconds per document, while whole-input cells gate
 documents/second and MiB/second. Validation may tighten but cannot weaken the deliberately conservative direct-scan
@@ -339,8 +359,9 @@ same request. The two paths are `K + C + nD` and `K + nM`; because they consume 
 identically on both sides and cancels. Report the smallest integer `n` for which `C + nD <= nM`, where `n` is the number
 of complete `whole_input_scan_requests` and the minimum is one. For the current frozen input, one request means one scan
 of all 100 documents; the model never fractionalizes it into per-document costs or projects it onto an arbitrary batch.
-Each path retains a non-regressed same-path stability control, and the paired-block cross-path comparison is separately
-identified. Generic regex, Python, external-call, or arbitrary extra-cost components cannot satisfy the promoted model.
+Each path retains a `within_tolerance` same-path stability control on its decision metric, and the directional cross-path
+comparison is separately identified. Generic regex, Python, external-call, or arbitrary extra-cost components cannot
+satisfy the promoted model.
 The value-plan hash commits the exact shared, compile, and marginal roles and sources, units, range, and declared shared
 scenario, but not later measured workload values or the derived result. Promotion requires a finite supported advantage
 or break-even. This model supplements privacy/quality gates; it never discounts a miss.
