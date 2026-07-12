@@ -248,7 +248,7 @@ The 150,000-span ceiling bounds retained weak-label and per-iteration gold objec
 preflight. A bank can produce matches outside labeled spans, so the evaluator independently enforces its frozen
 500,000-prediction runtime ceiling and still fails closed if scanning reaches it.
 
-Raising these limits for the full pinned source requires #152 to demonstrate a streaming/capacity design with peak-RSS
+Raising these limits for the full pinned source requires #163 to demonstrate a streaming/capacity design with peak-RSS
 and runtime evidence and to review any evaluator-capacity change separately. The #153 run must fail before any sealed-test
 access if that development-stage proof has not landed; a higher numeric limit alone is not evidence of acceptable scale.
 
@@ -272,36 +272,36 @@ cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.7
 over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
 hidden by the catalog guarantee.
 
-On an Apple M4 with 16 GiB RAM, the CMU-enabled build took 129.43 seconds and 1,181,171,712 bytes peak RSS. Deep replay
-took 119.04 seconds and 1,249,689,600 bytes peak RSS. These are one-time construction/audit costs, not steady-state scan
-latency claims; #152 owns runtime benchmarks.
+On an Apple M4 with 16 GiB RAM, the fresh transactional rebuild took 44.43 seconds and 458,129,408 bytes peak RSS. Deep
+verification passed. The repeated setup and steady-state measurements are reported separately in the
+[decision-grade performance result](performance.md#decision-grade-development-result); a single construction timing is
+not a latency claim.
 
 Key commitments are:
 
-- selected bank: `sha256:a38ea885243ab00c9f90d2a8024fb6cf2e4cb3fbcdd7f4c837de58630deb95a4`;
-- bank artifact: `sha256:403a8e760e22166dba42e8381bbdbe781e1e4613281b14e2d55d6b0147f59037`;
+- selected bank: `sha256:670f180d3ca8173d4a4269e0deb963566aeca68f3cb8ad893d69baa4e99f2f6d`;
+- bank artifact: `sha256:7c2a408f5c5167d35b953eae32f72a1f6aaa8bdaf1daeb4fc412f66db4df313e`;
 - candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
-- builder implementation: `sha256:802671dd6d4775f7e22ce8e4565d74cb261bbacbd5632f077c111a628007d82e`;
-- privacy scanner implementation: `sha256:1a1bfe706e2efc2c243bf0758e96f34dbb572a4f3e2cd9006b0776d166347cd0`;
+- builder implementation: `sha256:ccf3619150ee309a96004002c376b583b2b5233287f76e209be0636d7ee968e2`;
+- privacy scanner implementation: `sha256:1f40d710da53f78e76f2731606ba83d70a3659ca8e994d733b86485d54a3f798`;
 - reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
 - canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:bd599da34fdeec3fa8113190c92c8ed37e0053f22b5bd9b0e58d140e3c78266c`;
-- committed bank-card file: `sha256:0d37b61e5ca0b2105ac3cf906e0c79ba95fc82c3050cbdc291fb3e66f869c7f7`; and
+- bank-card run: `sha256:08a76ada9561912861757b91c9b8e53e94fab18b6a0777080df7d86de9a5a012`;
+- committed bank-card file: `sha256:50e28331458a6e98c9ed8205f1ab01fafee008950fcccc3b75a0affd15936024`; and
 - committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
 
-The exact private commands were:
+The exact invocations remain bound inside the private run. Their privacy-safe CLI shape is:
 
 ```shell
 /usr/bin/time -l uv run nerb build-enron-bank \
-  --development-run .nerb/issue149-development-50000-v6 \
-  --output-dir .nerb/issue151-real-50000-v6-final \
-  --annotation-run .nerb/issue150-cmu/annotations-run-final4 \
-  --cmu-catalog-bindings .nerb/issue151-cmu-v4-proposal.jsonl \
-  --benchmark-version enron-v2-issue149-scale-50000
+  --development-run .nerb/enron/development \
+  --output-dir .nerb/enron/bank-build \
+  --annotation-run .nerb/enron/annotations \
+  --cmu-catalog-bindings .nerb/enron/cmu-catalog-bindings.jsonl
 
 /usr/bin/time -l uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/issue151-real-50000-v6-final \
-  --annotation-run .nerb/issue150-cmu/annotations-run-final4
+  --run-dir .nerb/enron/bank-build \
+  --annotation-run .nerb/enron/annotations
 ```
 
 ## Sealed-test boundary

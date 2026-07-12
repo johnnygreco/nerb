@@ -1,6 +1,6 @@
 # Rust Engine Gate Evidence
 
-Historical Rust engine gate evidence was recorded on 2026-06-05, then updated by the final gate follow-up after the
+Rust engine gate evidence was first recorded on 2026-06-05, then updated by the final gate follow-up after the
 Rust-backed `Bank` surface, wheel matrix, and record contract follow-ups merged. Use this file as recorded release-gate
 evidence for the current Rust-backed engine path.
 

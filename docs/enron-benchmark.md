@@ -334,20 +334,20 @@ promotable. CI smoke timing is robustness evidence, not a substitute for the dec
 
 The value demonstration records an additive parameterized break-even model rather than inventing hosted-model prices.
 Let `K` be the shared declared curation plus measured profiling and bank-build acquisition cost, `C` the measured cold
-compile, `D` direct-reuse seconds per document, and `M` exact helper-cache-miss seconds per document. The two paths are
-`K + C + nD` and `K + nM`; because they consume the same evaluated bank, `K` is recorded identically on both sides and
-cancels. Report the smallest `n` for which `C + nD <= nM`. Both marginal costs come from the same promoted real-input
-whole-input population and exact document count, avoiding a comparison between a median of heterogeneous document
-timings and a whole-input average. Each path retains a non-regressed same-path stability control, and the paired-block
-cross-path comparison is separately identified. Generic regex, Python, external-call, or arbitrary extra-cost components
-cannot satisfy the promoted model. The value-plan hash commits the exact shared, compile, and marginal roles and sources,
-units, range, and declared shared scenario, but not later measured workload values or the derived result. Promotion
-requires a finite supported advantage or break-even. This model supplements privacy/quality gates; it never discounts a
-miss.
+compile, `D` direct-reuse seconds per exact frozen whole-input request, and `M` exact helper-cache-miss seconds for that
+same request. The two paths are `K + C + nD` and `K + nM`; because they consume the same evaluated bank, `K` is recorded
+identically on both sides and cancels. Report the smallest integer `n` for which `C + nD <= nM`, where `n` is the number
+of complete `whole_input_scan_requests` and the minimum is one. For the current frozen input, one request means one scan
+of all 100 documents; the model never fractionalizes it into per-document costs or projects it onto an arbitrary batch.
+Each path retains a non-regressed same-path stability control, and the paired-block cross-path comparison is separately
+identified. Generic regex, Python, external-call, or arbitrary extra-cost components cannot satisfy the promoted model.
+The value-plan hash commits the exact shared, compile, and marginal roles and sources, units, range, and declared shared
+scenario, but not later measured workload values or the derived result. Promotion requires a finite supported advantage
+or break-even. This model supplements privacy/quality gates; it never discounts a miss.
 
 ## Artifact Contract
 
-The benchmark has two versioned JSON contracts:
+The benchmark has two JSON contracts:
 
 - `nerb.enron_manifest.v2` binds evaluator ID/digest; source ID, revision, and content hashes;
   cleaning/group/split policy hashes; the split-manifest hash; train/validation/test artifact hashes and counts; the

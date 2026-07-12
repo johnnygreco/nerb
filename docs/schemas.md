@@ -3,7 +3,7 @@
 This document describes the public JSON-compatible contracts for NERB banks, extraction records, replacement databases,
 anonymization responses, eval refs, YAML detector configs, and shared diagnostic objects. The runtime source of truth is
 the code in `src/nerb/schema.py`, `src/nerb/extraction.py`, `src/nerb/replacements_schema.py`,
-`src/nerb/deanonymization.py`, `src/nerb/reports.py`, and `src/nerb/evals.py`. The purpose-specific Enron v2 bank-build
+`src/nerb/deanonymization.py`, `src/nerb/reports.py`, and `src/nerb/evals.py`. The purpose-specific Enron bank-build
 contracts are implemented in `src/nerb/enron_bank_builder.py` and `src/nerb/enron_bank_workflow.py`.
 
 ## Shared Rules
@@ -449,7 +449,7 @@ Diagnostics are JSON objects with stable core fields:
 | `suggested_patch` | array | no | Optional RFC 6902 JSON Patch operations. |
 | `metadata` | object | no | Optional JSON-compatible metadata. |
 
-## Enron v2 benchmark evidence
+## Enron benchmark evidence
 
 `nerb.enron_manifest.v2` and `nerb.enron_evidence.v2` use verifier `nerb-enron-contract` version 2.2.0. Bank provenance
 keeps the physical content-addressed artifact identity (`artifact_sha256` plus `artifact_bytes`) separate from
@@ -499,7 +499,7 @@ decision status, sample policy, ABBA and Williams-block sequence, execution-host
 isolation, cross-path correctness, and audit bindings
 without accepting or opening a preparation-source or sealed-test input.
 
-## Enron v2 bank-build artifacts
+## Enron bank-build artifacts
 
 The [Enron bank construction workflow](enron-bank-building.md) emits a strict, manifest-bound private run. These
 workflow contracts are separate from the general `nerb.bank.v1` schema:

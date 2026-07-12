@@ -75,24 +75,33 @@ bank.
 
 Preparation and execution commit private transactional runs. The path-free plan and aggregate report contain hashes,
 counts, timing/resource samples, environment metadata, and privacy-safe inventories—not message text, detected surfaces,
-scan records, or local paths. Verification rechecks those bindings without reading protected corpus text, and every
-stage records `sealed_test_accessed: false`. Whole-input `records_per_second` uses the worker's stable observed aggregate
+scan records, or local paths. Verification rechecks those bindings without returning or publishing protected text, and
+every stage records `sealed_test_accessed: false`. Whole-input `records_per_second` uses the worker's stable observed aggregate
 count; this prevents non-equivalent regex/literal baselines from borrowing NERB's record denominator.
 
 The break-even model records source curation, train-source profiling, and bank building as the same shared acquisition
-cost on both paths, so those terms cancel. Direct reuse then adds one cold compile and its per-document scan cost; the
-helper-cache-miss alternative pays its measured per-document cost. Both marginal costs use the same whole-input
-population and document count; a median of heterogeneous per-document timings is never compared with a whole-input
-average. `--source-curation-seconds` is a shared declared scenario—not a measured model invocation, token,
-hosted-service, or dollar cost—and cannot manufacture the crossing.
+cost on both paths, so those terms cancel. Direct reuse then adds one cold compile and its cost per frozen whole-input
+request; the helper-cache-miss alternative pays its measured cost for that same request. The unit is one complete scan
+of the exact 100-document, 35,837-byte input, not an individual document or an arbitrary batch size. A median of
+heterogeneous per-document timings is never compared with a whole-input average. `--source-curation-seconds` is a
+shared declared scenario—not a measured model invocation, token, hosted-service, or dollar cost—and cannot manufacture
+the crossing.
 
 ## Decision-Grade Development Result
 
+Here, *decision-grade* means the workload and thresholds were frozen before measurement; equivalent paths prove the same
+mapped outputs; repeated isolated samples quantify tails, dispersion, noise, and memory; software, hardware, and artifact
+lineage are recorded; and the aggregate result passes privacy and integrity verification. That is sufficient to choose
+the compile-once/scan-many runtime path. It is not a recall claim or final publication approval: quality, full-source
+capacity, and the one-shot sealed evaluation retain their own gates.
+
 The complete decision profile passed on Apple M4 arm64 hardware with 10 logical CPUs, 16 GiB RAM, macOS, and Python
-3.13.12. The run used package 0.0.11 at clean commit `e25f6dd30457daddd58f17a001643788d5deb201`, passed its
-aggregate privacy scan, and recorded `sealed_test_accessed: false`. Its performance manifest is
-`sha256:04ef751f1bba1e76d6f2eb5013cb6877a9359087e379af400767de852bad1980`; the deep-verified run is
-`sha256:3b1c39cbfcb3db519acdca49eee8743fee1358d3c1ff23a3aaad4d5879bd3b2f`.
+3.13.12. The run used package and native engine 0.0.11 at clean commit
+`270c5e1fddcd9afecf1c15df118e172325c540a6`, passed its aggregate privacy scan with zero violations, and recorded
+`sealed_test_accessed: false`. Its frozen plan is
+`sha256:f28c6a1d24515ad942f8601f59de01f94fe06b1ce17638e9a7f2b7ceb3ee0693`, its performance manifest is
+`sha256:f19018f5a897d1b7ef285e9874bc35964f0ad190ad1ca39708183585f685b778`, and the deep-verified run is
+`sha256:9819206cba50b81850f99a08e2237b3b9458af44a7b440f18209f52a01703593`.
 
 This is development evidence over the frozen 50,000-row train/validation build, not the final public full-source claim.
 The mandatory full 517,401-row streaming/resource proof and one-shot sealed evaluation remain separate gates. The real
@@ -104,12 +113,12 @@ bytes, and a 13,293,272-byte private bank artifact.
 
 | Gate | Frozen threshold | Measured result | Status |
 | --- | ---: | ---: | --- |
-| Real document p99 | at most 50 ms | 0.147 ms | passed |
-| Real whole-input documents/s | at least 100 | 116,369 | passed |
-| Real whole-input MiB/s | at least 1 | 39.77 | passed |
-| 100k-pattern MiB/s | at least 1 | 324.32 | passed |
-| Peak RSS | at most 8 GiB | 561.2 MiB maximum measured setup phase | passed |
-| Exact-control noise floor | at most 25% | 12.21% maximum | passed |
+| Real document p99 | at most 50 ms | 0.140 ms | passed |
+| Real whole-input documents/s | at least 100 | 116,130 | passed |
+| Real whole-input MiB/s | at least 1 | 39.69 | passed |
+| 100k-pattern MiB/s | at least 1 | 99.54 | passed |
+| Peak RSS | at most 8 GiB | 485.9 MiB maximum measured cell | passed |
+| Exact-control noise floor | at most 25% | 12.61% maximum | passed |
 
 ### Lifecycle and cache value
 
@@ -118,36 +127,41 @@ document-latency cell uses 500 balanced samples.
 
 | Path | Median | Tail | Throughput | Peak RSS |
 | --- | ---: | ---: | ---: | ---: |
-| Train-source profile | 2.683 s | p95 2.698 s | one-time setup | 40.0 MiB |
-| Intelligence-bank build | 43.598 s | p95 43.892 s | one-time setup | 561.2 MiB |
-| Cold compile | 3.124 s | p95 3.147 s | one-time setup | 125.3 MiB |
-| Direct compiled `Bank`, one document | 0.0042 ms | p99 0.147 ms | document sample | 116.8 MiB |
-| Direct compiled `Bank`, 100 documents | 0.859 ms | p99 0.934 ms | 116,369 docs/s; 39.77 MiB/s; 1.53M records/s | 116.1 MiB |
-| Helper cache hit | 3.107 s | p99 3.187 s | 32.2 docs/s; 0.0110 MiB/s | 160.2 MiB |
-| Helper cache miss | 3.166 s | p99 3.256 s | 31.6 docs/s; 0.0108 MiB/s | 117.9 MiB |
-| End to end | 3.222 s | p99 3.305 s | 31.0 docs/s; 0.0106 MiB/s | 138.2 MiB |
+| Train-source profile | 2.676 s | p95 2.684 s | one-time setup | 38.6 MiB |
+| Intelligence-bank build, including private snapshot setup | 45.211 s | p95 45.526 s | one-time setup | 438.2 MiB |
+| Cold compile | 3.177 s | p95 3.207 s | one-time setup | 130.6 MiB |
+| Direct compiled `Bank`, one document | 0.0043 ms | p99 0.140 ms | document sample | 121.0 MiB |
+| Direct compiled `Bank`, 100 documents | 0.861 ms | p99 0.929 ms | 116,130 docs/s; 39.69 MiB/s; 1.53M records/s | 121.8 MiB |
+| Helper cache hit | 3.103 s | p99 3.164 s | 32.2 docs/s; 0.0110 MiB/s | 155.0 MiB |
+| Helper cache miss | 3.235 s | p99 3.297 s | 30.9 docs/s; 0.0106 MiB/s | 123.5 MiB |
+| End to end | 3.282 s | p99 3.361 s | 30.5 docs/s; 0.0104 MiB/s | 143.4 MiB |
 
-Direct reuse is about 3,684× faster than the exact helper-cache-miss path on median whole-input time. That comparison is
+Direct reuse is about 3,757× faster than the exact helper-cache-miss path on median whole-input time. That comparison is
 not a generic promise: helper paths include JSON-bank validation, canonicalization, hashing, and adapter work that a
-caller avoids by retaining the compiled `Bank`. With the measured 3.124-second cold compile, direct reuse has a finite
-breakeven at 99 scanned documents. Shared profiling, curation, and bank-build costs cancel on both sides.
+caller avoids by retaining the compiled `Bank`. After shared profiling, curation, and bank-build costs cancel, the
+direct path pays 3.177056 seconds to compile plus 0.000861 seconds for its first frozen whole-input request, versus
+3.234750 seconds for one helper-cache-miss request. It is therefore already ahead by about 56.8 ms at the model's
+minimum of one complete 100-document request; the result must not be translated into a per-document crossing.
 
-The exploratory generic email regex reached 77.76 MiB/s and emitted the same record count on this contact-only input, but
-it cannot map a mention to a known canonical identity or implement the full bank semantics. The Python literal baseline
-reached 2.71 MiB/s and emitted only 631 records, so neither is an equivalent correctness baseline. All 37 same-path
-comparisons were equivalent within measured noise; all nine cross-path cache-value comparisons improved.
+The exploratory generic email regex reached 77.74 MiB/s and happened to emit the same aggregate record count, but it
+cannot map a mention to a known canonical identity or implement the full bank semantics. The Python literal baseline
+reached 2.73 MiB/s and emitted only 631 records, so neither is an equivalent correctness baseline. All 34 same-path
+comparisons were equivalent within measured noise. Of 12 cross-path cache-value comparisons, nine improved and three
+were equivalent within noise.
 
 ### Matcher scale
 
 Each scale row scans the same deterministic 100-document, 1,024,000-byte negative workload. Composition preserves the
-evaluated bank's contact/person and alias proportions while reporting active patterns separately from aliases.
+evaluated bank's contact/person and alias proportions while reporting active patterns separately from aliases. Every
+contact shard includes a nonempty residual regex, so these are mixed literal/regex banks rather than literal-only
+exact-match fixtures.
 
 | Active patterns | Native shards | Aliases | Canonical JSON | Native source | Median / 100 docs | p99 | MiB/s | Peak RSS |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 4 | 202 | 226,282 B | 138,018 B | 0.087 ms | 0.092 ms | 11,270.72 | 40.2 MiB |
-| 10,000 | 32 | 2,022 | 2,261,222 B | 1,380,174 B | 0.343 ms | 0.362 ms | 2,844.18 | 79.4 MiB |
-| 25,000 | 80 | 5,056 | 5,652,832 B | 3,450,440 B | 0.808 ms | 0.821 ms | 1,208.12 | 140.1 MiB |
-| 100,000 | 318 | 20,223 | 22,610,807 B | 13,801,751 B | 3.011 ms | 3.094 ms | 324.32 | 478.9 MiB |
+| 1,000 | 4 | 202 | 226,280 B | 138,016 B | 0.172 ms | 0.178 ms | 5,688.70 | 40.8 MiB |
+| 10,000 | 32 | 2,022 | 2,261,206 B | 1,380,158 B | 1.015 ms | 1.048 ms | 962.11 | 80.0 MiB |
+| 25,000 | 80 | 5,056 | 5,652,792 B | 3,450,400 B | 2.486 ms | 2.518 ms | 392.80 | 143.7 MiB |
+| 100,000 | 318 | 20,223 | 22,610,648 B | 13,801,592 B | 9.811 ms | 9.956 ms | 99.54 | 485.9 MiB |
 
 Four-thread scanning of the tiny 1k negative cell was slower than single-thread scanning because coordination and Python
 projection overhead dominate sub-millisecond work. Concurrency is deterministic and bounded, but this cell does not
