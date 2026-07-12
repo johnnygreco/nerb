@@ -291,6 +291,12 @@ def test_plan_freezes_exact_matrix_controls_comparisons_and_hashes(
     assert len(cross_path) == 12
     assert {item["noise_method"] for item in cross_path} == {"paired_block_ratio_mad"}
     assert len(performance["breakeven_models"]) == 1
+    breakeven = performance["breakeven_models"][0]
+    assert breakeven["parameter_name"] == "whole_input_scan_requests"
+    assert breakeven["parameter_unit"] == "request"
+    assert {item["source"] for item in breakeven["components"] if item["category"] == "scan"} == {
+        "workload_seconds_per_request"
+    }
     assert decision["performance_manifest_sha256"] == hash_enron_performance_manifest(performance)
     assert all(item["workload_sha256"] == hash_enron_workload(item) for item in workloads.values())
 
@@ -340,6 +346,23 @@ def test_smoke_plan_is_explicitly_nonpromotable(performance_plan: dict[str, Any]
     assert performance["comparisons"] == []
     assert performance["breakeven_models"] == []
     assert smoke["performance_manifest_sha256"] == hash_enron_performance_manifest(performance)
+
+
+def test_software_records_native_engine_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        performance_module.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(__version__="9.8.7") if name == "nerb._engine" else None,
+    )
+    monkeypatch.setattr(performance_module, "_git_commit", lambda: "1" * 40)
+    monkeypatch.setattr(performance_module, "_git_dirty", lambda: False)
+
+    assert performance_module._software() == {
+        "package_version": performance_module.__version__,
+        "engine_version": "9.8.7",
+        "git_commit": "1" * 40,
+        "git_dirty": False,
+    }
 
 
 def test_plan_reports_aliases_separately_from_matcher_patterns(performance_plan: dict[str, Any]) -> None:
@@ -454,11 +477,11 @@ def test_materialization_recomputes_statistics_comparisons_and_breakeven(
         source_curation_seconds=6.0,
     )
     measured = {
-        "real_helper_cache_miss": {"stats": {"seconds_per_document": 1.0}},
+        "real_helper_cache_miss": {"work_per_sample": 1, "stats": {"median_seconds": 1.0}},
         "real_source_build": {"stats": {"median_seconds": 2.0}},
         "real_cold_compile": {"stats": {"median_seconds": 1.0}},
         "real_source_profile": {"stats": {"median_seconds": 1.0}},
-        "real_direct_throughput": {"stats": {"seconds_per_document": 0.5}},
+        "real_direct_throughput": {"work_per_sample": 1, "stats": {"median_seconds": 0.5}},
     }
     breakeven = performance_module._materialize_breakeven(breakeven_plan, measured)
     assert breakeven["candidate_fixed_value"] == 10.0

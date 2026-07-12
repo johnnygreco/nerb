@@ -679,15 +679,15 @@ def _add_baseline_comparisons_and_breakeven(
             "value": candidate_profile["stats"]["median_seconds"],
         },
         {
-            "id": "baseline_per_document_scan",
+            "id": "baseline_per_request_scan",
             "side": "baseline",
             "application": "per_unit",
             "category": "scan",
-            "source": "workload_seconds_per_document",
-            "description": "Exact NERB helper-cache-miss alternative time per document.",
+            "source": "workload_seconds_per_request",
+            "description": "Exact NERB helper-cache-miss time per frozen whole-input request.",
             "workload_id": baseline_marginal["id"],
             "assumption_sha256": None,
-            "value": baseline_marginal["stats"]["seconds_per_document"],
+            "value": baseline_marginal["stats"]["median_seconds"],
         },
         {
             "id": "candidate_fixed_build",
@@ -734,15 +734,15 @@ def _add_baseline_comparisons_and_breakeven(
             "value": candidate_profile["stats"]["median_seconds"],
         },
         {
-            "id": "candidate_per_document_scan",
+            "id": "candidate_per_request_scan",
             "side": "candidate",
             "application": "per_unit",
             "category": "scan",
-            "source": "workload_seconds_per_document",
-            "description": "Candidate marginal scan time per document.",
+            "source": "workload_seconds_per_request",
+            "description": "Candidate scan time per frozen whole-input request.",
             "workload_id": candidate_marginal["id"],
             "assumption_sha256": None,
-            "value": candidate_marginal["stats"]["seconds_per_document"],
+            "value": candidate_marginal["stats"]["median_seconds"],
         },
     ]
     candidate_fixed_value = sum(
@@ -760,8 +760,8 @@ def _add_baseline_comparisons_and_breakeven(
             0.001,
         )
     )
-    candidate_value_per_unit = candidate_marginal["stats"]["seconds_per_document"]
-    baseline_value_per_unit = baseline_marginal["stats"]["seconds_per_document"]
+    candidate_value_per_unit = candidate_marginal["stats"]["median_seconds"]
+    baseline_value_per_unit = baseline_marginal["stats"]["median_seconds"]
     breakeven = calculate_enron_breakeven(
         candidate_fixed_value,
         baseline_fixed_value,
@@ -772,8 +772,8 @@ def _add_baseline_comparisons_and_breakeven(
     )
     model: JsonObject = {
         "id": "fixture_build_scan_breakeven",
-        "parameter_name": "scanned_documents",
-        "parameter_unit": "document",
+        "parameter_name": "whole_input_scan_requests",
+        "parameter_unit": "request",
         "value_unit": "seconds",
         "minimum_units": 1,
         "maximum_units": 1_000_000,
@@ -3188,6 +3188,50 @@ def test_promoted_breakeven_shared_acquisition_costs_cancel(manifest: JsonObject
     assert model["candidate_fixed_value"] - model["baseline_fixed_value"] == pytest.approx(cold_compile["value"])
 
 
+def test_promoted_breakeven_rejects_fractionalized_whole_input_helper_cost(
+    manifest: JsonObject,
+    evidence: JsonObject,
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
+    model["parameter_name"] = "scanned_documents"
+    model["parameter_unit"] = "document"
+    for component in model["components"]:
+        if component["category"] != "scan":
+            continue
+        component["source"] = "workload_seconds_per_document"
+        component["value"] = workloads[component["workload_id"]]["stats"]["seconds_per_document"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.missing_breakeven_value_model",
+    )
+
+
+def test_request_breakeven_component_requires_a_whole_input_workload(
+    manifest: JsonObject,
+    evidence: JsonObject,
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    model = promoted["performance"]["breakeven_models"][0]
+    component = next(item for item in model["components"] if item["id"] == "candidate_per_request_scan")
+    latency = next(item for item in promoted["performance"]["workloads"] if item["id"] == "direct_bank_latency")
+    component["workload_id"] = latency["id"]
+    component["value"] = latency["stats"]["median_seconds"]
+    _refresh_breakeven_outputs(model)
+    _refresh_frozen_contract(promoted)
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.invalid_breakeven_component",
+    )
+
+
 def test_promoted_value_model_requires_measured_source_profiling(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     model = promoted["performance"]["breakeven_models"][0]
@@ -3209,13 +3253,13 @@ def test_synthetic_scale_scan_pair_cannot_stand_in_for_evaluated_bank_value_mode
     model = promoted["performance"]["breakeven_models"][0]
     workloads = {item["id"]: item for item in promoted["performance"]["workloads"]}
     for component_id, workload_id in (
-        ("candidate_per_document_scan", "scale_1000_scan"),
-        ("baseline_per_document_scan", "baseline_scale_1000_scan"),
+        ("candidate_per_request_scan", "scale_1000_scan"),
+        ("baseline_per_request_scan", "baseline_scale_1000_scan"),
     ):
         component = next(item for item in model["components"] if item["id"] == component_id)
         workload = workloads[workload_id]
         component["workload_id"] = workload_id
-        component["value"] = workload["stats"]["seconds_per_document"]
+        component["value"] = workload["stats"]["median_seconds"]
     _refresh_breakeven_outputs(model)
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
@@ -3884,7 +3928,7 @@ def test_breakeven_component_category_must_match_its_workload_phase(manifest: Js
 def test_breakeven_alternative_must_use_the_exact_same_frozen_input(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     model = promoted["performance"]["breakeven_models"][0]
-    baseline_component = next(item for item in model["components"] if item["id"] == "baseline_per_document_scan")
+    baseline_component = next(item for item in model["components"] if item["id"] == "baseline_per_request_scan")
     baseline_workload = next(
         item for item in promoted["performance"]["workloads"] if item["id"] == baseline_component["workload_id"]
     )
@@ -3906,12 +3950,12 @@ def test_direct_same_path_control_cannot_replace_uncached_breakeven_alternative(
 ) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     model = promoted["performance"]["breakeven_models"][0]
-    component = next(item for item in model["components"] if item["id"] == "baseline_per_document_scan")
+    component = next(item for item in model["components"] if item["id"] == "baseline_per_request_scan")
     direct_control = next(
         item for item in promoted["performance"]["workloads"] if item["id"] == "baseline_direct_bank_latency"
     )
     component["workload_id"] = direct_control["id"]
-    component["value"] = direct_control["stats"]["seconds_per_document"]
+    component["value"] = direct_control["stats"]["median_seconds"]
     _refresh_breakeven_outputs(model)
     _refresh_frozen_contract(promoted)
     _sync_bound_manifest(bound_manifest, promoted)
@@ -3937,7 +3981,7 @@ def test_non_equivalent_baseline_cannot_satisfy_uncached_breakeven_alternative(
 def test_breakeven_paths_retain_independent_same_path_controls(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     model = promoted["performance"]["breakeven_models"][0]
-    component = next(item for item in model["components"] if item["id"] == "baseline_per_document_scan")
+    component = next(item for item in model["components"] if item["id"] == "baseline_per_request_scan")
     promoted["performance"]["comparisons"] = [
         item
         for item in promoted["performance"]["comparisons"]

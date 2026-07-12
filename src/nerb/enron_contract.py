@@ -1017,6 +1017,7 @@ _PERFORMANCE_VALUE_COMPONENT = _closed_object(
             "enum": [
                 "workload_median_seconds",
                 "workload_seconds_per_document",
+                "workload_seconds_per_request",
                 "workload_seconds_per_scan",
                 "workload_seconds_per_mib",
                 "workload_seconds_per_record",
@@ -1049,7 +1050,7 @@ _PERFORMANCE_BREAKEVEN = _closed_object(
     {
         "id": {"type": "string", "minLength": 1},
         "parameter_name": {"type": "string", "minLength": 1},
-        "parameter_unit": {"type": "string", "enum": ["document", "scan", "mib", "record"]},
+        "parameter_unit": {"type": "string", "enum": ["document", "request", "scan", "mib", "record"]},
         "value_unit": {"type": "string", "enum": ["seconds", "usd"]},
         "minimum_units": _NONNEGATIVE_INTEGER,
         "maximum_units": _POSITIVE_INTEGER,
@@ -4398,6 +4399,7 @@ def _breakeven_component_value(
         return None
     metric_by_source = {
         "workload_seconds_per_document": ("document", "seconds_per_document"),
+        "workload_seconds_per_request": ("request", "median_seconds"),
         "workload_seconds_per_scan": ("scan", "median_seconds"),
         "workload_seconds_per_mib": ("mib", "mib_per_second"),
         "workload_seconds_per_record": ("record", "records_per_second"),
@@ -4405,12 +4407,14 @@ def _breakeven_component_value(
     expected_unit, metric = metric_by_source[source]
     if model["parameter_unit"] != expected_unit:
         return None
+    if source == "workload_seconds_per_request" and workload["sample_unit"] != "whole_input":
+        return None
     metric_value = workload_statistics[metric]
     if metric_value is None or metric_value <= 0:
         return None
     if source in {"workload_seconds_per_mib", "workload_seconds_per_record"}:
         return 1.0 / float(metric_value)
-    if source == "workload_seconds_per_scan":
+    if source in {"workload_seconds_per_request", "workload_seconds_per_scan"}:
         return float(metric_value) / int(workload["work_per_sample"])
     return float(metric_value)
 
@@ -4988,7 +4992,8 @@ def _performance_promotion_diagnostics(
             for candidate_component, baseline_component in shared_acquisition_pairs
         )
         if (
-            model["parameter_unit"] == "document"
+            model["parameter_name"] == "whole_input_scan_requests"
+            and model["parameter_unit"] == "request"
             and model["value_unit"] == "seconds"
             and curation["source"] == "declared_assumption"
             and curation["value"] > 0
@@ -5009,13 +5014,13 @@ def _performance_promotion_diagnostics(
             and candidate_scan_workload["sample_unit"] == "whole_input"
             and promoted_throughput_workload is not None
             and candidate_scan_workload["id"] == promoted_throughput_workload["id"]
-            and candidate_scan["source"] == "workload_seconds_per_document"
+            and candidate_scan["source"] == "workload_seconds_per_request"
             and baseline_scan_workload is not None
             and baseline_scan_workload["phase"] in {"helper_cache_miss", "end_to_end"}
             and baseline_scan_workload["sample_unit"] == "whole_input"
             and all(candidate_scan_workload[field] == baseline_scan_workload[field] for field in value_pair_fields)
             and baseline_scan_workload["baseline_id"] is None
-            and baseline_scan["source"] == "workload_seconds_per_document"
+            and baseline_scan["source"] == "workload_seconds_per_request"
             and has_same_path_controls
             and len(cache_value_comparisons) == 1
             and cache_value_comparisons[0]["result"] != "regressed"
@@ -5029,9 +5034,10 @@ def _performance_promotion_diagnostics(
             _error(
                 "contract.missing_breakeven_value_model",
                 "/performance/breakeven_models",
-                "Promotion requires an evaluated-bank document-value model that records identical shared curation, "
-                "profiling, and build costs on both cache paths, then separates one-time compile, promoted direct "
-                "reuse, and an exact NERB uncached or end-to-end alternative with independent same-path controls.",
+                "Promotion requires an evaluated-bank whole-input request-value model that records identical shared "
+                "curation, profiling, and build costs on both cache paths, then separates one-time compile, promoted "
+                "direct reuse, and an exact NERB uncached or end-to-end alternative with independent same-path "
+                "controls.",
             )
         )
     return diagnostics, required_gate_specs

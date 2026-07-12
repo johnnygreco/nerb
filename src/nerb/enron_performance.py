@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import heapq
+import importlib
 import json
 import math
 import os
@@ -621,14 +622,11 @@ def _cpu_model() -> str:
 def _software() -> dict[str, Any]:
     engine_version = "unknown"
     try:
-        from .engine import Bank
-
-        probe = Bank.from_config({"probe": {"literal": "nerb-performance-probe"}}, use_cache=False)
-        metadata = probe.metadata()
-        candidate = metadata.get("engine")
+        native_engine = importlib.import_module("nerb._engine")
+        candidate = getattr(native_engine, "__version__", None)
         if isinstance(candidate, str) and candidate:
             engine_version = candidate
-    except (ImportError, RuntimeError, TypeError, ValueError):
+    except (ImportError, RuntimeError):
         pass
     return {
         "package_version": __version__,
@@ -1030,12 +1028,12 @@ def _breakeven_plan(
             "value": None,
         },
         {
-            "id": "baseline_per_document_uncached",
+            "id": "baseline_per_request_uncached",
             "side": "baseline",
             "application": "per_unit",
             "category": "scan",
-            "source": "workload_seconds_per_document",
-            "description": "Exact NERB helper-cache-miss cost per document.",
+            "source": "workload_seconds_per_request",
+            "description": "Exact NERB helper-cache-miss cost per frozen whole-input request.",
             "workload_id": candidate_by_id["real_helper_cache_miss"]["id"],
             "assumption_sha256": None,
             "value": None,
@@ -1085,12 +1083,12 @@ def _breakeven_plan(
             "value": None,
         },
         {
-            "id": "candidate_per_document_direct_reuse",
+            "id": "candidate_per_request_direct_reuse",
             "side": "candidate",
             "application": "per_unit",
             "category": "scan",
-            "source": "workload_seconds_per_document",
-            "description": "Measured whole-input direct compiled-Bank reuse cost divided by its document count.",
+            "source": "workload_seconds_per_request",
+            "description": "Measured direct compiled-Bank reuse cost per frozen whole-input request.",
             "workload_id": candidate_by_id["real_direct_throughput"]["id"],
             "assumption_sha256": None,
             "value": None,
@@ -1098,8 +1096,8 @@ def _breakeven_plan(
     ]
     model: dict[str, Any] = {
         "id": "compile_once_scan_many_breakeven",
-        "parameter_name": "scanned_documents",
-        "parameter_unit": "document",
+        "parameter_name": "whole_input_scan_requests",
+        "parameter_unit": "request",
         "value_unit": "seconds",
         "minimum_units": 1,
         "maximum_units": 1_000_000_000,
@@ -3065,6 +3063,8 @@ def _materialize_breakeven(plan: Mapping[str, Any], workloads: Mapping[str, Mapp
                 value = float(stats["median_seconds"])
             elif component["source"] == "workload_seconds_per_document":
                 value = float(stats["seconds_per_document"])
+            elif component["source"] == "workload_seconds_per_request":
+                value = float(stats["median_seconds"]) / int(workload["work_per_sample"])
             else:
                 raise EnronPerformanceError("Unsupported measured breakeven component source.")
         component["value"] = value
