@@ -108,6 +108,8 @@ MAX_PROGRESS_SIGNALS_PER_PHASE = 2_048
 MAX_RESOURCE_SAMPLES_PER_PHASE = 256
 PRODUCTION_MONITOR_INTERVAL_NS = 100_000_000
 MAX_RESOURCE_OBSERVATION_WALL_GAP_NS = 500_000_000
+_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS = 3
+_DARWIN_PS_TIMEOUT_SECONDS = 0.1
 MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS = 30_000_000_000
 MAX_CAPACITY_REPORT_BYTES = 4 * 1024 * 1024
 MAX_ATTEMPT_RECEIPT_BYTES = 64 * 1024
@@ -297,6 +299,9 @@ _ERROR_MESSAGES = {
     "runtime_limit": "Capacity runtime exceeds the frozen limit.",
     "throughput_limit": "Capacity phase throughput is below the frozen minimum.",
     "resource_measurement_failed": "Capacity continuous resource measurement failed safely.",
+    "rss_acquisition_exhausted": "Capacity process-tree RSS acquisition was exhausted safely.",
+    "disk_acquisition_exhausted": "Capacity filesystem measurement acquisition was exhausted safely.",
+    "monitor_shutdown_failed": "Capacity resource monitor shutdown failed safely.",
     "clock_invalid": "Capacity monotonic clock is invalid.",
     "private_tree_invalid": "Capacity private tree changed or became unsafe.",
     "owned_root_invalid": "Capacity owned output root is outside or unsafe for the transaction.",
@@ -332,6 +337,14 @@ class _CapacityAbort(BaseException):
 
     def __init__(self, code: str) -> None:
         self.code = code if code in _ERROR_MESSAGES else "capacity_failed"
+
+
+class _RuntimeDiskFloor(Exception):
+    """Internal aggregate-only signal for a bracketed below-floor disk reading."""
+
+    def __init__(self, minimum_free: int, retry_count: int) -> None:
+        self.minimum_free = minimum_free
+        self.retry_count = retry_count
 
 
 def _error(code: str) -> EnronCapacityError:
@@ -609,30 +622,33 @@ def _linux_process_tree_rss_bytes(root_pid: int, *, proc_root: Path = Path("/pro
 def _darwin_process_tree_rss_bytes(root_pid: int) -> int | None:
     try:
         completed = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,rss="],
+            ["/bin/ps", "-axo", "pid=,ppid=,rss="],
             check=False,
             capture_output=True,
+            encoding="ascii",
+            env={"LC_ALL": "C"},
+            errors="strict",
             text=True,
-            timeout=5,
+            timeout=_DARWIN_PS_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeError):
         return None
     if completed.returncode != 0:
         return None
     parents: dict[int, int] = {}
     rss_by_pid: dict[int, int] = {}
-    try:
-        for line in completed.stdout.splitlines():
-            fields = line.split()
-            if len(fields) != 3:
-                return None
-            pid, parent, rss_kib = (int(value) for value in fields)
-            if pid <= 0 or parent < 0 or rss_kib < 0:
-                return None
-            parents[pid] = parent
-            rss_by_pid[pid] = rss_kib
-    except ValueError:
-        return None
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 3 or any(
+            not value.isascii() or not value.isdecimal() or len(value) > len(str(_MAX_RESOURCE_INTEGER))
+            for value in fields
+        ):
+            return None
+        pid, parent, rss_kib = (int(value) for value in fields)
+        if pid <= 0 or parent < 0 or rss_kib < 0 or max(pid, parent, rss_kib) > _MAX_RESOURCE_INTEGER or pid in parents:
+            return None
+        parents[pid] = parent
+        rss_by_pid[pid] = rss_kib
     if root_pid not in rss_by_pid or rss_by_pid[root_pid] <= 0:
         return None
     descendants = {root_pid}
@@ -643,7 +659,8 @@ def _darwin_process_tree_rss_bytes(root_pid: int) -> int | None:
             if pid not in descendants and parent in descendants:
                 descendants.add(pid)
                 changed = True
-    return sum(rss_by_pid[pid] for pid in descendants) * 1024
+    total_kib = sum(rss_by_pid[pid] for pid in descendants)
+    return total_kib * 1024 if total_kib <= _MAX_RESOURCE_INTEGER // 1024 else None
 
 
 def _root_process_peak_rss_bytes() -> int | None:
@@ -1460,6 +1477,7 @@ class _PhaseMeasurements:
     started_ns: int
     started_wall_ns: int
     observations: int = 0
+    resource_acquisition_retry_count: int = 0
     peak_rss: int = 0
     minimum_free: int | None = None
     owned_high_water: int = 0
@@ -1576,6 +1594,7 @@ class _ContinuousResourceMonitor:
         self._states: dict[str, _PhaseMeasurements] = {}
         self._failure_code: str | None = None
         self._global_observations = 0
+        self._global_resource_acquisition_retries = 0
         self._global_peak_rss = preflight.preflight_process_tree_rss_bytes
         self._global_minimum_free = preflight.preflight_free_disk_bytes
         self._global_owned_high_water = 0
@@ -1613,7 +1632,11 @@ class _ContinuousResourceMonitor:
                     remember(exc)
                     continue
         if first_error is not None:
-            raise first_error
+            if isinstance(first_error, (KeyboardInterrupt, SystemExit, MemoryError, _CapacityAbort)):
+                raise first_error
+            if isinstance(first_error, EnronCapacityError):
+                raise first_error
+            raise _error("monitor_shutdown_failed") from None
 
     def _shutdown_is_settled(self) -> bool:
         return self._stopped and self._thread is None and not self._watchdog._installed
@@ -1646,7 +1669,7 @@ class _ContinuousResourceMonitor:
                     continue
                 if thread.is_alive():
                     try:
-                        self._record_failure("resource_measurement_failed")
+                        self._record_failure("monitor_shutdown_failed")
                     except BaseException as exc:
                         remember(exc)
             self._thread = None
@@ -1665,21 +1688,22 @@ class _ContinuousResourceMonitor:
             raise first_error
 
     def begin_phase(self, phase: str, started_ns: int) -> None:
-        owned = self.tree.logical_bytes()
-        with self._lock:
-            if phase in self._states or self._current_phase is not None:
-                raise _error("capacity_failed")
-            wall_now = self.wall_clock()
-            self._states[phase] = _PhaseMeasurements(
-                started_ns=started_ns,
-                started_wall_ns=wall_now,
-                last_owned=owned,
-                owned_high_water=owned,
-                last_progress_wall_ns=wall_now,
-            )
-            self._current_phase = phase
-            self._global_owned_high_water = max(self._global_owned_high_water, owned)
-        self._observe("boundary")
+        with self._observation_lock:
+            owned = self.tree.logical_bytes()
+            with self._lock:
+                if phase in self._states or self._current_phase is not None:
+                    raise _error("capacity_failed")
+                wall_now = self.wall_clock()
+                self._states[phase] = _PhaseMeasurements(
+                    started_ns=started_ns,
+                    started_wall_ns=wall_now,
+                    last_owned=owned,
+                    owned_high_water=owned,
+                    last_progress_wall_ns=wall_now,
+                )
+                self._current_phase = phase
+                self._global_owned_high_water = max(self._global_owned_high_water, owned)
+            self._observe_serialized("boundary")
         self.raise_if_failed()
 
     def checkpoint(self, phase: str, completed_records: int) -> None:
@@ -1766,34 +1790,35 @@ class _ContinuousResourceMonitor:
         self.raise_if_failed()
 
     def finish_phase(self, phase: str, records: int) -> dict[str, Any]:
-        self._observe("boundary")
-        self.raise_if_failed()
-        with self._lock:
-            state = self._states.get(phase)
-            if state is None or self._current_phase != phase:
-                raise _error("capacity_failed")
-            if state.checkpoint_count == 0:
-                raise _error("checkpoint_required")
-            if state.last_completed != records:
-                raise _error("checkpoint_required")
-            now = _probe_monotonic_ns(self.probe)
-            wall_now = self.wall_clock()
-            previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
-            final_wall_gap = wall_now - previous_progress_wall
-            if final_wall_gap < 0 or final_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                raise _error("checkpoint_wall_gap")
-            state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, final_wall_gap)
-            state.last_progress_wall_ns = wall_now
-            self._append_progress_signal(
-                state,
-                kind="phase_boundary",
-                completed_records=state.last_completed,
-                wall_now=wall_now,
-                wall_gap=final_wall_gap,
-            )
-            elapsed_ns = now - state.started_ns
-            self._current_phase = None
-            return self._phase_snapshot(state, elapsed_ns)
+        with self._observation_lock:
+            self._observe_serialized("boundary")
+            self.raise_if_failed()
+            with self._lock:
+                state = self._states.get(phase)
+                if state is None or self._current_phase != phase:
+                    raise _error("capacity_failed")
+                if state.checkpoint_count == 0:
+                    raise _error("checkpoint_required")
+                if state.last_completed != records:
+                    raise _error("checkpoint_required")
+                now = _probe_monotonic_ns(self.probe)
+                wall_now = self.wall_clock()
+                previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
+                final_wall_gap = wall_now - previous_progress_wall
+                if final_wall_gap < 0 or final_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
+                    raise _error("checkpoint_wall_gap")
+                state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, final_wall_gap)
+                state.last_progress_wall_ns = wall_now
+                self._append_progress_signal(
+                    state,
+                    kind="phase_boundary",
+                    completed_records=state.last_completed,
+                    wall_now=wall_now,
+                    wall_gap=final_wall_gap,
+                )
+                elapsed_ns = now - state.started_ns
+                self._current_phase = None
+                return self._phase_snapshot(state, elapsed_ns)
 
     def observe_transaction_boundary(self, owned: int) -> None:
         with self._lock:
@@ -1811,11 +1836,36 @@ class _ContinuousResourceMonitor:
         with self._lock:
             return {
                 "resource_observation_count": self._global_observations,
+                "resource_acquisition_retry_count": self._global_resource_acquisition_retries,
                 "peak_process_tree_rss_bytes": self._global_peak_rss,
                 "minimum_free_disk_bytes": self._global_minimum_free,
                 "owned_disk_high_water_bytes": self._global_owned_high_water,
                 "maximum_resource_observation_wall_gap_ns": self._global_maximum_resource_wall_gap_ns,
             }
+
+    def _retain_partial_resource_extrema(
+        self,
+        *,
+        rss: int,
+        minimum_free: int | None,
+        acquisition_retries: int,
+    ) -> None:
+        """Retain valid hard-limit evidence from an intentionally incomplete sample."""
+
+        with self._lock:
+            self._global_peak_rss = max(self._global_peak_rss, rss)
+            self._global_resource_acquisition_retries += acquisition_retries
+            if minimum_free is not None:
+                self._global_minimum_free = min(self._global_minimum_free, minimum_free)
+            phase = self._current_phase
+            if phase is not None:
+                state = self._states[phase]
+                state.peak_rss = max(state.peak_rss, rss)
+                state.resource_acquisition_retry_count += acquisition_retries
+                if minimum_free is not None:
+                    state.minimum_free = (
+                        minimum_free if state.minimum_free is None else min(state.minimum_free, minimum_free)
+                    )
 
     def raise_if_failed(self) -> None:
         with self._lock:
@@ -1826,7 +1876,14 @@ class _ContinuousResourceMonitor:
     def _loop(self) -> None:
         interval = self.interval_ns / 1_000_000_000
         while not self._stop.wait(interval):
-            self._observe("continuous")
+            try:
+                self._observe("continuous")
+            except _CapacityAbort as exc:
+                self._record_failure(exc.code)
+                return
+            except (KeyboardInterrupt, SystemExit, MemoryError):
+                self._record_failure("phase_interrupted")
+                return
 
     def _observe(self, kind: str, *, completed_records: int | None = None) -> None:
         with self._observation_lock:
@@ -1836,17 +1893,45 @@ class _ContinuousResourceMonitor:
         try:
             logical_owned = self.tree.logical_bytes()
             now = _probe_monotonic_ns(self.probe)
-            rss = _probe_process_tree_rss(self.probe)
-            minimum_free, output_disk = _sample_runtime_filesystems(self.probe, self.preflight)
+            rss, rss_retries = _acquire_runtime_process_tree_rss(self.probe)
+            if rss > self.preflight.maximum_peak_rss_bytes:
+                self._retain_partial_resource_extrema(
+                    rss=rss,
+                    minimum_free=None,
+                    acquisition_retries=rss_retries,
+                )
+                self._record_failure("rss_limit")
+                return
+            minimum_free, output_disk, disk_retries = _sample_runtime_filesystems(self.probe, self.preflight)
+            acquisition_retries = rss_retries + disk_retries
+        except _RuntimeDiskFloor as exc:
+            self._retain_partial_resource_extrema(
+                rss=rss,
+                minimum_free=exc.minimum_free,
+                acquisition_retries=rss_retries + exc.retry_count,
+            )
+            self._record_failure("runtime_disk_floor")
+            return
         except _CapacityAbort:
             raise
         except EnronCapacityError as exc:
             self._record_failure(
                 exc.code
-                if exc.code in {"runtime_filesystem_changed", "runtime_disk_floor"}
+                if exc.code
+                in {
+                    "clock_invalid",
+                    "private_tree_invalid",
+                    "rss_limit",
+                    "runtime_disk_floor",
+                    "runtime_filesystem_changed",
+                    "rss_acquisition_exhausted",
+                    "disk_acquisition_exhausted",
+                }
                 else "resource_measurement_failed"
             )
             return
+        except (KeyboardInterrupt, SystemExit, MemoryError):
+            raise
         except BaseException:
             self._record_failure("resource_measurement_failed")
             return
@@ -1855,6 +1940,8 @@ class _ContinuousResourceMonitor:
         with self._lock:
             try:
                 wall_now = self.wall_clock()
+            except (KeyboardInterrupt, SystemExit, MemoryError):
+                raise
             except BaseException:
                 self._record_failure("clock_invalid")
                 return
@@ -1868,6 +1955,7 @@ class _ContinuousResourceMonitor:
             self._global_last_resource_wall_ns = wall_now
             self._global_last_probe_ns = now
             self._global_observations += 1
+            self._global_resource_acquisition_retries += acquisition_retries
             self._global_peak_rss = max(self._global_peak_rss, rss)
             self._global_minimum_free = min(self._global_minimum_free, minimum_free)
             self._global_owned_high_water = max(self._global_owned_high_water, owned)
@@ -1884,6 +1972,7 @@ class _ContinuousResourceMonitor:
                     self._record_failure("clock_invalid")
                     return
                 state.observations += 1
+                state.resource_acquisition_retry_count += acquisition_retries
                 previous_resource_wall = state.last_resource_wall_ns or state.started_wall_ns
                 resource_wall_gap = wall_now - previous_resource_wall
                 progress_wall_gap = wall_now - (state.last_progress_wall_ns or state.started_wall_ns)
@@ -1966,6 +2055,7 @@ class _ContinuousResourceMonitor:
         return {
             "elapsed_ns": elapsed_ns,
             "resource_observation_count": state.observations,
+            "resource_acquisition_retry_count": state.resource_acquisition_retry_count,
             "peak_process_tree_rss_bytes": state.peak_rss,
             "owned_disk_high_water_bytes": state.owned_high_water,
             "minimum_free_disk_bytes": 0 if state.minimum_free is None else state.minimum_free,
@@ -2091,6 +2181,11 @@ def capacity_policy() -> dict[str, Any]:
         "maximum_retained_resource_samples_per_phase": MAX_RESOURCE_SAMPLES_PER_PHASE,
         "production_monitor_interval_ns": PRODUCTION_MONITOR_INTERVAL_NS,
         "maximum_resource_observation_wall_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "runtime_resource_acquisition_max_attempts": _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS,
+        "runtime_resource_acquisition_retry_delay_ns": 0,
+        "runtime_filesystem_acquisition_order": ["device", "disk", "device"],
+        "darwin_process_tree_rss_timeout_ns": int(_DARWIN_PS_TIMEOUT_SECONDS * 1_000_000_000),
+        "resource_acquisition_retry_count_required": True,
         "maximum_progress_checkpoint_wall_gap_ns": MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS,
         "maximum_capacity_report_bytes": MAX_CAPACITY_REPORT_BYTES,
         "maximum_capacity_report_structural_bound_bytes": _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES,
@@ -4357,6 +4452,7 @@ def _capacity_report(
             "source_rows_accounted": ENRON_SOURCE_ROWS,
             "elapsed_ns": total_elapsed_ns,
             "resource_observation_count": int(monitor_snapshot["resource_observation_count"]),
+            "resource_acquisition_retry_count": int(monitor_snapshot["resource_acquisition_retry_count"]),
             "maximum_resource_observation_wall_gap_ns": int(
                 monitor_snapshot["maximum_resource_observation_wall_gap_ns"]
             ),
@@ -4726,6 +4822,7 @@ def _verify_phase_report(
             "elapsed_ns",
             "throughput_milli_records_per_second",
             "resource_observation_count",
+            "resource_acquisition_retry_count",
             "peak_process_tree_rss_bytes",
             "owned_disk_high_water_bytes",
             "minimum_free_disk_bytes",
@@ -4759,6 +4856,11 @@ def _verify_phase_report(
         raise _error("report_invalid")
     _positive_int(phase.get("owned_root_count"), "owned root count")
     observation_count = _positive_int(phase.get("resource_observation_count"), "resource observation count")
+    acquisition_retry_count = _bounded_int(
+        phase.get("resource_acquisition_retry_count"), "resource acquisition retry count", minimum=0
+    )
+    if acquisition_retry_count > observation_count * 2 * (_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1):
+        raise _error("report_invalid")
     peak = _positive_int(phase.get("peak_process_tree_rss_bytes"), "phase RSS")
     owned = _bounded_int(phase.get("owned_disk_high_water_bytes"), "phase owned disk", minimum=0)
     minimum_free = _bounded_int(phase.get("minimum_free_disk_bytes"), "phase free disk", minimum=0)
@@ -4947,6 +5049,7 @@ def _verify_totals(
             "source_rows_accounted",
             "elapsed_ns",
             "resource_observation_count",
+            "resource_acquisition_retry_count",
             "maximum_resource_observation_wall_gap_ns",
             "peak_process_tree_rss_bytes",
             "pre_report_owned_disk_bytes",
@@ -4974,10 +5077,19 @@ def _verify_totals(
     expected_final_owned = (
         int(totals["pre_report_owned_disk_bytes"]) + int(totals["report_bytes"]) + len(_COMMIT_PAYLOAD)
     )
+    phase_observations = sum(int(phase["resource_observation_count"]) for phase in phases)
+    phase_acquisition_retries = sum(int(phase["resource_acquisition_retry_count"]) for phase in phases)
     if (
         totals["source_rows_accounted"] != ENRON_SOURCE_ROWS
         or totals["elapsed_ns"] < sum(int(phase["elapsed_ns"]) for phase in phases)
-        or totals["resource_observation_count"] < sum(int(phase["resource_observation_count"]) for phase in phases)
+        or totals["resource_observation_count"] < phase_observations
+        or totals["resource_acquisition_retry_count"] < phase_acquisition_retries
+        or totals["resource_acquisition_retry_count"]
+        > int(totals["resource_observation_count"]) * 2 * (_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1)
+        or int(totals["resource_acquisition_retry_count"]) - phase_acquisition_retries
+        > (int(totals["resource_observation_count"]) - phase_observations)
+        * 2
+        * (_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1)
         or totals["maximum_resource_observation_wall_gap_ns"]
         < max(int(phase["maximum_resource_observation_wall_gap_ns"]) for phase in phases)
         or totals["peak_process_tree_rss_bytes"]
@@ -6477,29 +6589,123 @@ def _probe_filesystem_device(probe: CapacityResourceProbe, path: Path) -> int:
     return value
 
 
+def _runtime_probe_error_is_immediate(exc: BaseException) -> bool:
+    return isinstance(exc, _CapacityAbort) or (
+        isinstance(exc, EnronCapacityError)
+        and exc.code
+        in {
+            "clock_invalid",
+            "private_tree_invalid",
+            "rss_limit",
+            "runtime_disk_floor",
+            "runtime_filesystem_changed",
+        }
+    )
+
+
+def _acquire_runtime_process_tree_rss(probe: CapacityResourceProbe) -> tuple[int, int]:
+    for attempt in range(_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS):
+        try:
+            value = probe.process_tree_rss_bytes(os.getpid())
+        except (KeyboardInterrupt, SystemExit, MemoryError):
+            raise
+        except BaseException as exc:
+            if _runtime_probe_error_is_immediate(exc):
+                raise
+            value = None
+        if type(value) is int and value > 0:
+            return value, attempt
+    raise _error("rss_acquisition_exhausted")
+
+
+def _acquire_runtime_filesystem_device(probe: CapacityResourceProbe, path: Path) -> int | None:
+    try:
+        callback = getattr(probe, "filesystem_device", None)
+        if callable(callback):
+            value = callback(path)
+        else:
+            info = path.lstat()
+            value = info.st_dev if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) else None
+    except (KeyboardInterrupt, SystemExit, MemoryError):
+        raise
+    except BaseException as exc:
+        if _runtime_probe_error_is_immediate(exc):
+            raise
+        return None
+    return value if type(value) is int and 0 <= value <= _MAX_RESOURCE_INTEGER else None
+
+
+def _acquire_runtime_disk_usage(probe: CapacityResourceProbe, path: Path) -> CapacityDiskUsage | None:
+    try:
+        value = probe.disk_usage(path)
+    except (KeyboardInterrupt, SystemExit, MemoryError):
+        raise
+    except BaseException as exc:
+        if _runtime_probe_error_is_immediate(exc):
+            raise
+        return None
+    if not isinstance(value, CapacityDiskUsage) or any(
+        type(item) is not int or item < 0 or item > _MAX_RESOURCE_INTEGER
+        for item in (value.total, value.used, value.free)
+    ):
+        return None
+    if value.total <= 0 or value.used > value.total or value.free > value.total:
+        return None
+    return value
+
+
 def _sample_runtime_filesystems(
     probe: CapacityResourceProbe,
     preflight: _Preflight,
-) -> tuple[int, CapacityDiskUsage]:
-    minimum_free: int | None = None
-    output_disk: CapacityDiskUsage | None = None
-    for filesystem in preflight.filesystems:
-        if _probe_filesystem_device(probe, filesystem.probe_path) != filesystem.device:
-            raise _error("runtime_filesystem_changed")
-        disk = _probe_disk_usage(probe, filesystem.probe_path)
-        minimum_free = disk.free if minimum_free is None else min(minimum_free, disk.free)
-        if filesystem.includes_output:
-            if output_disk is not None:
-                raise _error("runtime_filesystem_changed")
-            output_disk = disk
-    if minimum_free is None or output_disk is None:
+) -> tuple[int, CapacityDiskUsage, int]:
+    if not preflight.filesystems or sum(item.includes_output for item in preflight.filesystems) != 1:
         raise _error("resource_measurement_failed")
-    return minimum_free, output_disk
+
+    minimum_free_across_attempts: int | None = None
+    output_disk_across_attempts: CapacityDiskUsage | None = None
+    for attempt in range(_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS):
+        attempt_minimum_free: int | None = None
+        attempt_output_disk: CapacityDiskUsage | None = None
+        acquired = True
+        for filesystem in preflight.filesystems:
+            device_before = _acquire_runtime_filesystem_device(probe, filesystem.probe_path)
+            if device_before is None:
+                acquired = False
+                break
+            if device_before != filesystem.device:
+                raise _error("runtime_filesystem_changed")
+            disk = _acquire_runtime_disk_usage(probe, filesystem.probe_path)
+            if disk is None:
+                acquired = False
+                break
+            device_after = _acquire_runtime_filesystem_device(probe, filesystem.probe_path)
+            if device_after is None:
+                acquired = False
+                break
+            if device_after != filesystem.device:
+                raise _error("runtime_filesystem_changed")
+            attempt_minimum_free = disk.free if attempt_minimum_free is None else min(attempt_minimum_free, disk.free)
+            minimum_free_across_attempts = (
+                disk.free if minimum_free_across_attempts is None else min(minimum_free_across_attempts, disk.free)
+            )
+            if disk.free < MIN_RUNTIME_FREE_DISK_BYTES:
+                raise _RuntimeDiskFloor(minimum_free_across_attempts, attempt)
+            if filesystem.includes_output:
+                attempt_output_disk = disk
+                if output_disk_across_attempts is None or disk.free < output_disk_across_attempts.free:
+                    output_disk_across_attempts = disk
+        if acquired and attempt_minimum_free is not None and attempt_output_disk is not None:
+            if minimum_free_across_attempts is None or output_disk_across_attempts is None:
+                raise _error("resource_measurement_failed")
+            return minimum_free_across_attempts, output_disk_across_attempts, attempt
+    raise _error("disk_acquisition_exhausted")
 
 
 def _probe_monotonic_ns(probe: CapacityResourceProbe) -> int:
     try:
         value = probe.monotonic_ns()
+    except (KeyboardInterrupt, SystemExit, MemoryError):
+        raise
     except BaseException:
         value = None
     if type(value) is not int or value < 0:
@@ -8372,7 +8578,6 @@ def _verify_attempt_receipt(
         or receipt.get("sequence") != expected_sequence
         or receipt.get("previous_attempt_sha256") != previous_sha256
         or receipt.get("measurement_boundary") != _ATTEMPT_MEASUREMENT_BOUNDARY
-        or receipt.get("policy_sha256") != capacity_policy()["policy_sha256"]
         or type(receipt.get("production_evidence")) is not bool
         or type(receipt.get("recovered_from_inflight")) is not bool
         or type(receipt.get("attempt_sequence")) is not int

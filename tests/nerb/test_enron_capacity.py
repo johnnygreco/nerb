@@ -21,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -124,6 +124,91 @@ class _Probe:
     def set_path_device(self, path: Path, value: int) -> None:
         with self._lock:
             self.device_by_path[path] = value
+
+
+class _StaticTree:
+    def __init__(self, failure: EnronCapacityError | None = None) -> None:
+        self.failure = failure
+        self.calls = 0
+
+    def logical_bytes(self) -> int:
+        self.calls += 1
+        if self.failure is not None:
+            raise self.failure
+        return 0
+
+
+class _ObservedLock:
+    def __init__(self, observed_thread: str) -> None:
+        self._lock = threading.Lock()
+        self._observed_thread = observed_thread
+        self.attempted = threading.Event()
+
+    def __enter__(self) -> _ObservedLock:
+        if threading.current_thread().name == self._observed_thread:
+            self.attempted.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self._lock.release()
+
+
+class _ObservedExitLock:
+    def __init__(self, observed_thread: str) -> None:
+        self._lock = threading.Lock()
+        self._observed_thread = observed_thread
+        self.exited = threading.Event()
+        self.release_exit = threading.Event()
+
+    def __enter__(self) -> _ObservedExitLock:
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+        self._lock.release()
+        if threading.current_thread().name == self._observed_thread:
+            self.exited.set()
+            if not self.release_exit.wait(timeout=5):
+                raise RuntimeError("observed lock exit was not released")
+
+
+def _runtime_preflight(path: Path) -> enron_capacity._Preflight:
+    device = path.stat().st_dev
+    return enron_capacity._Preflight(
+        physical_memory_bytes=16 * _GIB,
+        effective_rss_cap_bytes=8 * _GIB,
+        maximum_peak_rss_bytes=6 * _GIB,
+        preflight_process_tree_rss_bytes=64 * _MIB,
+        preflight_free_disk_bytes=30 * _GIB,
+        output_preflight_free_disk_bytes=30 * _GIB,
+        preexisting_private_tombstone_count=0,
+        filesystems=(
+            enron_capacity._FilesystemPreflight(
+                device=device,
+                probe_path=path,
+                preflight_free_disk_bytes=30 * _GIB,
+                includes_output=True,
+            ),
+        ),
+    )
+
+
+def _runtime_monitor(
+    path: Path,
+    probe: _Probe,
+    *,
+    tree: _StaticTree | None = None,
+    preflight: enron_capacity._Preflight | None = None,
+) -> enron_capacity._ContinuousResourceMonitor:
+    return enron_capacity._ContinuousResourceMonitor(
+        tree=cast(Any, _StaticTree() if tree is None else tree),
+        probe=probe,
+        preflight=_runtime_preflight(path) if preflight is None else preflight,
+        run_started_ns=1,
+        interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+        wall_clock=lambda: 1,
+    )
 
 
 def _hash(label: str) -> str:
@@ -1524,6 +1609,11 @@ def test_policy_freezes_streaming_monitoring_checkpoint_and_attempt_gates() -> N
     assert policy["phases"] == list(CAPACITY_PHASES)
     assert policy["maximum_checkpoint_record_gap"] == 10_000
     assert policy["production_monitor_interval_ns"] == 100_000_000
+    assert policy["runtime_resource_acquisition_max_attempts"] == 3
+    assert policy["runtime_resource_acquisition_retry_delay_ns"] == 0
+    assert policy["runtime_filesystem_acquisition_order"] == ["device", "disk", "device"]
+    assert policy["darwin_process_tree_rss_timeout_ns"] == 100_000_000
+    assert policy["resource_acquisition_retry_count_required"] is True
     assert policy["continuous_process_tree_rss_required"] is True
     assert policy["continuous_free_disk_required"] is True
     assert policy["append_only_attempt_receipt_required"] is True
@@ -1532,6 +1622,427 @@ def test_policy_freezes_streaming_monitoring_checkpoint_and_attempt_gates() -> N
     assert policy["pinned_cleanup_fd_reserve"] == 72
     assert policy["nested_phase_cleanup_ownership_required"] is True
     assert policy["stopped_phase_writer_tree_adoption_required"] is True
+
+
+@pytest.mark.parametrize("component", ["rss", "disk", "device"])
+def test_runtime_resource_acquisition_recovers_once_without_sleep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    probe = _Probe()
+    rss_calls = 0
+    disk_calls = 0
+    device_calls = 0
+    original_rss = probe.process_tree_rss_bytes
+    original_disk = probe.disk_usage
+    original_device = probe.filesystem_device
+
+    def rss(root_pid: int) -> int | None:
+        nonlocal rss_calls
+        rss_calls += 1
+        return None if component == "rss" and rss_calls == 1 else original_rss(root_pid)
+
+    def disk(path: Path) -> CapacityDiskUsage | None:
+        nonlocal disk_calls
+        disk_calls += 1
+        return None if component == "disk" and disk_calls == 1 else original_disk(path)
+
+    def device(path: Path) -> int | None:
+        nonlocal device_calls
+        device_calls += 1
+        return None if component == "device" and device_calls == 1 else original_device(path)
+
+    monkeypatch.setattr(probe, "process_tree_rss_bytes", rss)
+    monkeypatch.setattr(probe, "disk_usage", disk)
+    monkeypatch.setattr(probe, "filesystem_device", device)
+    monitor = _runtime_monitor(tmp_path, probe)
+
+    monitor._observe_serialized("boundary")
+
+    assert monitor._failure_code is None
+    assert monitor.global_snapshot()["resource_observation_count"] == 1
+    assert monitor.global_snapshot()["resource_acquisition_retry_count"] == 1
+    if component == "rss":
+        assert rss_calls == 2
+    elif component == "disk":
+        assert disk_calls == 2
+        assert device_calls == 3
+    else:
+        assert device_calls == 3
+        assert disk_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("component", "expected_code"),
+    [
+        ("rss", "rss_acquisition_exhausted"),
+        ("disk", "disk_acquisition_exhausted"),
+        ("device", "disk_acquisition_exhausted"),
+    ],
+)
+def test_runtime_resource_acquisition_exhaustion_has_closed_component_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+    expected_code: str,
+) -> None:
+    probe = _Probe()
+    calls = 0
+
+    if component == "rss":
+
+        def missing_rss(_root_pid: int) -> None:
+            nonlocal calls
+            calls += 1
+            raise RuntimeError(f"private acquisition path {tmp_path}; pid={os.getpid()}")
+
+        monkeypatch.setattr(probe, "process_tree_rss_bytes", missing_rss)
+    elif component == "disk":
+
+        def missing_disk(_path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            return None
+
+        monkeypatch.setattr(probe, "disk_usage", missing_disk)
+    else:
+
+        def missing_device(_path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            return None
+
+        monkeypatch.setattr(probe, "filesystem_device", missing_device)
+    monitor = _runtime_monitor(tmp_path, probe)
+
+    monitor._observe_serialized("boundary")
+
+    assert monitor._failure_code == expected_code
+    assert monitor.global_snapshot()["resource_observation_count"] == 0
+    assert calls == 3
+    assert str(enron_capacity._error(expected_code)) == enron_capacity._ERROR_MESSAGES[expected_code]
+
+
+@pytest.mark.parametrize(("mismatch_read", "expected_disk_calls"), [(1, 0), (2, 1)])
+def test_runtime_filesystem_valid_mismatch_fails_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch_read: int,
+    expected_disk_calls: int,
+) -> None:
+    probe = _Probe()
+    device_calls = 0
+    disk_calls = 0
+
+    def changed_device(path: Path) -> int:
+        nonlocal device_calls
+        device_calls += 1
+        return path.stat().st_dev + (1 if device_calls == mismatch_read else 0)
+
+    def disk(path: Path) -> CapacityDiskUsage | None:
+        nonlocal disk_calls
+        disk_calls += 1
+        return _Probe.disk_usage(probe, path)
+
+    monkeypatch.setattr(probe, "filesystem_device", changed_device)
+    monkeypatch.setattr(probe, "disk_usage", disk)
+    monitor = _runtime_monitor(tmp_path, probe)
+
+    monitor._observe_serialized("boundary")
+
+    assert monitor._failure_code == "runtime_filesystem_changed"
+    assert device_calls == mismatch_read
+    assert disk_calls == expected_disk_calls
+
+
+def test_valid_rss_limit_preempts_later_disk_acquisition_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    probe.rss = 6 * _GIB + 1
+    disk_calls = 0
+
+    def missing_disk(_path: Path) -> None:
+        nonlocal disk_calls
+        disk_calls += 1
+        return None
+
+    monkeypatch.setattr(probe, "disk_usage", missing_disk)
+    monitor = _runtime_monitor(tmp_path, probe)
+
+    monitor._observe_serialized("boundary")
+
+    assert monitor._failure_code == "rss_limit"
+    assert disk_calls == 0
+    assert monitor.global_snapshot()["resource_observation_count"] == 0
+    assert monitor.global_snapshot()["peak_process_tree_rss_bytes"] == 6 * _GIB + 1
+
+
+def test_bracketed_disk_floor_preempts_later_filesystem_acquisition_exhaustion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first-filesystem"
+    second = tmp_path / "second-filesystem"
+    first.mkdir(mode=0o700)
+    second.mkdir(mode=0o700)
+    probe = _Probe()
+    floor_reading = 5 * _GIB - 1
+    probe.set_path_free(first, floor_reading)
+    disk_paths: list[Path] = []
+    original_disk = probe.disk_usage
+
+    def disk(path: Path) -> CapacityDiskUsage | None:
+        disk_paths.append(path)
+        return None if path == second else original_disk(path)
+
+    monkeypatch.setattr(probe, "disk_usage", disk)
+    preflight = enron_capacity._Preflight(
+        physical_memory_bytes=16 * _GIB,
+        effective_rss_cap_bytes=8 * _GIB,
+        maximum_peak_rss_bytes=6 * _GIB,
+        preflight_process_tree_rss_bytes=64 * _MIB,
+        preflight_free_disk_bytes=30 * _GIB,
+        output_preflight_free_disk_bytes=30 * _GIB,
+        preexisting_private_tombstone_count=0,
+        filesystems=(
+            enron_capacity._FilesystemPreflight(
+                device=first.stat().st_dev,
+                probe_path=first,
+                preflight_free_disk_bytes=30 * _GIB,
+                includes_output=False,
+            ),
+            enron_capacity._FilesystemPreflight(
+                device=second.stat().st_dev,
+                probe_path=second,
+                preflight_free_disk_bytes=30 * _GIB,
+                includes_output=True,
+            ),
+        ),
+    )
+    monitor = _runtime_monitor(tmp_path, probe, preflight=preflight)
+
+    monitor._observe_serialized("boundary")
+
+    assert monitor._failure_code == "runtime_disk_floor"
+    assert disk_paths == [first]
+    assert monitor.global_snapshot()["resource_observation_count"] == 0
+    assert monitor.global_snapshot()["minimum_free_disk_bytes"] == floor_reading
+
+
+@pytest.mark.parametrize(("failure", "expected_code"), [("tree", "private_tree_invalid"), ("clock", "clock_invalid")])
+def test_runtime_integrity_and_clock_failures_are_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    expected_code: str,
+) -> None:
+    probe = _Probe()
+    rss_calls = 0
+    original_rss = probe.process_tree_rss_bytes
+
+    def rss(root_pid: int) -> int | None:
+        nonlocal rss_calls
+        rss_calls += 1
+        return original_rss(root_pid)
+
+    monkeypatch.setattr(probe, "process_tree_rss_bytes", rss)
+    tree = _StaticTree(enron_capacity._error("private_tree_invalid") if failure == "tree" else None)
+    if failure == "clock":
+        monkeypatch.setattr(probe, "monotonic_ns", lambda: None)
+    monitor = _runtime_monitor(tmp_path, probe, tree=tree)
+
+    monitor._observe_serialized("boundary")
+
+    assert monitor._failure_code == expected_code
+    assert tree.calls == 1
+    assert rss_calls == 0
+
+
+def test_begin_phase_waits_for_an_inflight_resource_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    original_rss = probe.process_tree_rss_bytes
+
+    def blocking_rss(root_pid: int) -> int | None:
+        if threading.current_thread().name == "inflight-observation":
+            entered.set()
+            if not release.wait(timeout=5):
+                raise RuntimeError("resource observation was not released")
+        return original_rss(root_pid)
+
+    monkeypatch.setattr(probe, "process_tree_rss_bytes", blocking_rss)
+    monitor = _runtime_monitor(tmp_path, probe)
+    observation_lock = _ObservedLock("phase-begin")
+    monkeypatch.setattr(monitor, "_observation_lock", observation_lock)
+
+    def observe() -> None:
+        try:
+            monitor._observe("continuous")
+        except BaseException as exc:
+            errors.append(exc)
+
+    def begin() -> None:
+        try:
+            monitor.begin_phase("preparation", 2)
+        except BaseException as exc:
+            errors.append(exc)
+
+    observation = threading.Thread(target=observe, name="inflight-observation")
+    phase_begin = threading.Thread(target=begin, name="phase-begin")
+    observation.start()
+    assert entered.wait(timeout=5)
+    phase_begin.start()
+    assert observation_lock.attempted.wait(timeout=5)
+    try:
+        with monitor._lock:
+            assert monitor._current_phase is None
+        assert phase_begin.is_alive()
+        probe.advance_ns(2)
+    finally:
+        release.set()
+        observation.join(timeout=5)
+        phase_begin.join(timeout=5)
+
+    assert not observation.is_alive()
+    assert not phase_begin.is_alive()
+    assert errors == []
+    assert monitor._failure_code is None
+    assert monitor.global_snapshot()["resource_observation_count"] == 2
+    assert monitor._states["preparation"].observations == 1
+
+
+def test_finish_phase_keeps_observation_lock_until_phase_is_cleared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    errors: list[BaseException] = []
+    snapshots: list[dict[str, Any]] = []
+    monitor = _runtime_monitor(tmp_path, probe)
+    monitor.begin_phase("preparation", 1)
+    monitor.checkpoint("preparation", 10)
+    observations_before_overlap = monitor._states["preparation"].observations
+    observation_lock = _ObservedExitLock("phase-finish")
+    monkeypatch.setattr(monitor, "_observation_lock", observation_lock)
+
+    def finish() -> None:
+        try:
+            snapshots.append(monitor.finish_phase("preparation", 10))
+        except BaseException as exc:
+            errors.append(exc)
+
+    phase_finish = threading.Thread(target=finish, name="phase-finish")
+    phase_finish.start()
+    assert observation_lock.exited.wait(timeout=5)
+    try:
+        with monitor._lock:
+            assert monitor._current_phase is None
+        assert phase_finish.is_alive()
+    finally:
+        observation_lock.release_exit.set()
+        phase_finish.join(timeout=5)
+
+    assert not phase_finish.is_alive()
+    assert errors == []
+    assert monitor._failure_code is None
+    assert len(snapshots) == 1
+    assert snapshots[0]["resource_observation_count"] == observations_before_overlap + 1
+    assert monitor._current_phase is None
+
+
+@pytest.mark.parametrize("failure", ["nonzero", "malformed", "oversized", "timeout"])
+def test_darwin_rss_subprocess_contract_recovers_from_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    root_pid = os.getpid()
+    valid = subprocess.CompletedProcess(
+        args=["/bin/ps"],
+        returncode=0,
+        stdout=f"{root_pid} 1 64\n{root_pid + 1} {root_pid} 32\n",
+        stderr="",
+    )
+    invalid: BaseException | subprocess.CompletedProcess[str]
+    if failure == "nonzero":
+        invalid = subprocess.CompletedProcess(args=["/bin/ps"], returncode=1, stdout="", stderr="closed")
+    elif failure == "malformed":
+        invalid = subprocess.CompletedProcess(args=["/bin/ps"], returncode=0, stdout=f"{root_pid} 1 ６４\n", stderr="")
+    elif failure == "oversized":
+        invalid = subprocess.CompletedProcess(
+            args=["/bin/ps"], returncode=0, stdout=f"{root_pid} 1 {'9' * 5_000}\n", stderr=""
+        )
+    else:
+        invalid = subprocess.TimeoutExpired(cmd=["/bin/ps"], timeout=0.1)
+    actions: list[BaseException | subprocess.CompletedProcess[str]] = [invalid, valid]
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs))
+        action = actions.pop(0)
+        if isinstance(action, BaseException):
+            raise action
+        return action
+
+    monkeypatch.setattr(enron_capacity.sys, "platform", "darwin")
+    monkeypatch.setattr(enron_capacity.subprocess, "run", run)
+    monkeypatch.setattr(enron_capacity, "_root_process_peak_rss_bytes", lambda: None)
+
+    rss, retries = enron_capacity._acquire_runtime_process_tree_rss(enron_capacity._SystemResourceProbe())
+
+    assert (rss, retries) == (96 * 1024, 1)
+    assert len(calls) == 2
+    for command, kwargs in calls:
+        assert command == ["/bin/ps", "-axo", "pid=,ppid=,rss="]
+        assert kwargs["env"] == {"LC_ALL": "C"}
+        assert kwargs["encoding"] == "ascii"
+        assert kwargs["errors"] == "strict"
+        assert kwargs["timeout"] == 0.1
+
+
+def test_successful_report_counts_recovered_acquisitions_without_changing_receipt_shape(tmp_path: Path) -> None:
+    class TransientProbe(_Probe):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rss_calls = 0
+            self.disk_calls = 0
+            self.device_calls = 0
+
+        def process_tree_rss_bytes(self, root_pid: int) -> int | None:
+            self.rss_calls += 1
+            if self.rss_calls == 3:
+                return None
+            return super().process_tree_rss_bytes(root_pid)
+
+        def disk_usage(self, path: Path) -> CapacityDiskUsage | None:
+            self.disk_calls += 1
+            if self.disk_calls == 4:
+                return None
+            return super().disk_usage(path)
+
+        def filesystem_device(self, path: Path) -> int | None:
+            self.device_calls += 1
+            if self.device_calls == 5:
+                return None
+            return super().filesystem_device(path)
+
+    probe = TransientProbe()
+
+    report, _ = _run(tmp_path, probe, monitor_interval_ns=1_000_000_000)
+
+    assert report["phases"][0]["resource_acquisition_retry_count"] == 3
+    assert sum(int(phase["resource_acquisition_retry_count"]) for phase in report["phases"]) == 3
+    assert report["totals"]["resource_acquisition_retry_count"] == 3
+    verify_capacity_report(report, require_production=False)
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert "resource_acquisition_retry_count" not in receipt
 
 
 def test_linux_process_tree_rss_enumerates_children_of_every_thread(tmp_path: Path) -> None:
@@ -1948,6 +2459,58 @@ def test_repeated_failed_attempts_append_without_rewriting_prior_receipts(tmp_pa
     assert [item["retained_private_tombstone_count"] for item in receipts] == [1, 1]
     assert len(list(tmp_path.glob(".nerb-cleanup-*"))) == 2
     assert "private-attempt-payload" not in json.dumps(receipts)
+
+
+def test_append_only_attempt_ledger_remains_chained_across_policy_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(_context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
+        raise ValueError("private-attempt-payload")
+
+    with pytest.raises(EnronCapacityError):
+        _run(tmp_path, name="mixed-policy-run", replacements={"build": fail})
+    first_path = tmp_path / "attempts" / "attempt-00000001.json"
+    first_payload = first_path.read_bytes()
+    first_receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[0]
+    original_policy = enron_capacity.capacity_policy
+
+    def changed_policy() -> dict[str, Any]:
+        policy = original_policy()
+        policy["test_policy_change"] = True
+        policy["policy_sha256"] = _canonical_hash(
+            {key: value for key, value in policy.items() if key != "policy_sha256"}
+        )
+        return policy
+
+    monkeypatch.setattr(enron_capacity, "capacity_policy", changed_policy)
+    report, _ = _run(tmp_path, name="mixed-policy-run")
+
+    receipts = verify_capacity_attempt_ledger(tmp_path / "attempts")
+    assert first_path.read_bytes() == first_payload
+    assert len(receipts) == 2
+    assert receipts[0] == first_receipt
+    assert receipts[0]["policy_sha256"] != receipts[1]["policy_sha256"]
+    assert receipts[1]["policy_sha256"] == changed_policy()["policy_sha256"]
+    assert receipts[1]["previous_attempt_sha256"] == receipts[0]["attempt_sha256"]
+    assert receipts[1]["policy_sha256"] == report["policy"]["policy_sha256"]
+    decision = verify_capacity_run(tmp_path / "mixed-policy-run", tmp_path / "attempts", require_production=False)
+    assert decision["report"] == report
+    monkeypatch.setattr(
+        enron_capacity,
+        "_native_build_source_sha256_at_commit",
+        lambda _commit: report["execution"]["native_build_source_sha256"],
+    )
+    portable_path = tmp_path / "mixed-policy-portable.json"
+    portable = export_capacity_decision(
+        tmp_path / "mixed-policy-run",
+        tmp_path / "attempts",
+        portable_path,
+        require_production=False,
+    )
+    assert portable["attempt_chain"][0]["policy_sha256"] == receipts[0]["policy_sha256"]
+    assert portable["terminal_attempt"]["policy_sha256"] == report["policy"]["policy_sha256"]
+    assert verify_portable_capacity_decision(portable_path, require_production=False) == portable
 
 
 def test_retry_counts_payload_empty_tombstones_without_treating_them_as_active_stages(tmp_path: Path) -> None:
@@ -5226,8 +5789,11 @@ def test_monitor_stop_restores_watchdog_and_is_idempotent_after_observation_erro
 
     monitor._observe = interrupted_observation
 
-    with pytest.raises(RuntimeError, match="boundary observation interrupted"):
+    with pytest.raises(EnronCapacityError) as raised:
         monitor.stop()
+    assert raised.value.code == "monitor_shutdown_failed"
+    assert str(raised.value) == "Capacity resource monitor shutdown failed safely."
+    assert "boundary observation interrupted" not in str(raised.value)
     assert monitor._stopped is True
     assert watchdog._installed is False
     assert watchdog.close_calls == 1
