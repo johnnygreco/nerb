@@ -1521,12 +1521,14 @@ class _ContinuousResourceMonitor:
         preflight: _Preflight,
         run_started_ns: int,
         interval_ns: int,
+        wall_clock: Callable[[], int],
     ) -> None:
         self.tree = tree
         self.probe = probe
         self.preflight = preflight
         self.run_started_ns = run_started_ns
         self.interval_ns = interval_ns
+        self.wall_clock = wall_clock
         self._lock = threading.RLock()
         self._observation_lock = threading.Lock()
         self._stop = threading.Event()
@@ -1546,7 +1548,7 @@ class _ContinuousResourceMonitor:
     def start(self) -> None:
         self._watchdog.install()
         with self._lock:
-            self._global_last_resource_wall_ns = time.monotonic_ns()
+            self._global_last_resource_wall_ns = self.wall_clock()
         self._observe("boundary")
         thread = threading.Thread(target=self._loop, name="nerb-capacity-resource-monitor", daemon=True)
         self._thread = thread
@@ -1568,7 +1570,7 @@ class _ContinuousResourceMonitor:
         with self._lock:
             if phase in self._states or self._current_phase is not None:
                 raise _error("capacity_failed")
-            wall_now = time.monotonic_ns()
+            wall_now = self.wall_clock()
             self._states[phase] = _PhaseMeasurements(
                 started_ns=started_ns,
                 started_wall_ns=wall_now,
@@ -1600,7 +1602,7 @@ class _ContinuousResourceMonitor:
                 raise _CapacityAbort("checkpoint_gap")
             if state.checkpoint_count >= MAX_CHECKPOINTS_PER_PHASE:
                 raise _CapacityAbort("checkpoint_limit")
-            wall_now = time.monotonic_ns()
+            wall_now = self.wall_clock()
             previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
             wall_gap = wall_now - previous_progress_wall
             if wall_gap < 0:
@@ -1640,8 +1642,8 @@ class _ContinuousResourceMonitor:
         self.raise_if_failed()
 
     def heartbeat(self, phase: str) -> None:
-        wall_now = time.monotonic_ns()
         with self._lock:
+            wall_now = self.wall_clock()
             state = self._states.get(phase)
             if state is None or self._current_phase != phase:
                 raise _CapacityAbort("checkpoint_invalid")
@@ -1676,7 +1678,7 @@ class _ContinuousResourceMonitor:
             if state.last_completed != records:
                 raise _error("checkpoint_required")
             now = _probe_monotonic_ns(self.probe)
-            wall_now = time.monotonic_ns()
+            wall_now = self.wall_clock()
             previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
             final_wall_gap = wall_now - previous_progress_wall
             if final_wall_gap < 0 or final_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
@@ -1737,7 +1739,6 @@ class _ContinuousResourceMonitor:
             now = _probe_monotonic_ns(self.probe)
             rss = _probe_process_tree_rss(self.probe)
             minimum_free, output_disk = _sample_runtime_filesystems(self.probe, self.preflight)
-            wall_now = time.monotonic_ns()
         except _CapacityAbort:
             raise
         except EnronCapacityError as exc:
@@ -1753,6 +1754,11 @@ class _ContinuousResourceMonitor:
         filesystem_delta = max(0, self.preflight.output_preflight_free_disk_bytes - output_disk.free)
         owned = max(logical_owned, filesystem_delta)
         with self._lock:
+            try:
+                wall_now = self.wall_clock()
+            except BaseException:
+                self._record_failure("clock_invalid")
+                return
             previous_global_wall = self._global_last_resource_wall_ns
             if previous_global_wall is None:
                 previous_global_wall = wall_now
@@ -2265,6 +2271,7 @@ def _production_worker_main() -> int:
             resource_probe=_SystemResourceProbe(),
             production_evidence=True,
             monitor_interval_ns=PRODUCTION_MONITOR_INTERVAL_NS,
+            wall_clock=time.monotonic_ns,
         )
         response = {"ok": True, "code": None, "report": report}
     except BaseException as exc:
@@ -2285,6 +2292,7 @@ def _run_enron_capacity_for_test(
     phase_runners: Mapping[str, CapacityPhaseRunner],
     resource_probe: CapacityResourceProbe,
     monitor_interval_ns: int = PRODUCTION_MONITOR_INTERVAL_NS,
+    wall_clock: Callable[[], int] | None = None,
 ) -> dict[str, Any]:
     """Private fixture seam; its reports can never verify as production."""
 
@@ -2296,7 +2304,23 @@ def _run_enron_capacity_for_test(
         resource_probe=resource_probe,
         production_evidence=False,
         monitor_interval_ns=monitor_interval_ns,
+        wall_clock=_deterministic_fixture_wall_clock() if wall_clock is None else wall_clock,
     )
+
+
+def _deterministic_fixture_wall_clock() -> Callable[[], int]:
+    """Return a thread-safe logical wall clock for non-production fixture runs."""
+
+    lock = threading.Lock()
+    current = 0
+
+    def read() -> int:
+        nonlocal current
+        with lock:
+            current += 1_000_000
+            return current
+
+    return read
 
 
 def _production_phase_runners() -> dict[str, CapacityPhaseRunner]:
@@ -2981,6 +3005,7 @@ def _run_capacity_entry(
     resource_probe: CapacityResourceProbe,
     production_evidence: bool,
     monitor_interval_ns: int,
+    wall_clock: Callable[[], int],
 ) -> dict[str, Any]:
     _validate_options(options)
     runners = _validated_phase_runners(phase_runners)
@@ -3042,6 +3067,7 @@ def _run_capacity_entry(
                 execution=execution,
                 monitor_interval_ns=monitor_interval_ns,
                 metrics=metrics,
+                wall_clock=wall_clock,
             )
             report = completed_run.report
         except BaseException as exc:
@@ -3147,6 +3173,7 @@ def _execute_capacity_transaction(
     execution: Mapping[str, Any],
     monitor_interval_ns: int,
     metrics: _AttemptMetrics,
+    wall_clock: Callable[[], int],
 ) -> _CompletedCapacityRun:
     preflight = _resource_preflight(
         final_dir,
@@ -3191,6 +3218,7 @@ def _execute_capacity_transaction(
                 preflight=preflight,
                 run_started_ns=run_started_ns,
                 interval_ns=monitor_interval_ns,
+                wall_clock=wall_clock,
             )
             monitor.start()
             phase_reports: list[dict[str, Any]] = []

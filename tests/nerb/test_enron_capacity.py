@@ -310,6 +310,7 @@ def _run(
     ledger: str = "attempts",
     replacements: Mapping[str, Callable[[EnronCapacityPhaseContext], EnronCapacityPhaseResult]] | None = None,
     monitor_interval_ns: int = enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+    wall_clock: Callable[[], int] | None = None,
 ) -> tuple[dict[str, Any], _Probe]:
     actual_probe = _Probe() if probe is None else probe
     report = enron_capacity._run_enron_capacity_for_test(
@@ -317,6 +318,7 @@ def _run(
         phase_runners=_successful_runners(actual_probe, replacements),
         resource_probe=actual_probe,
         monitor_interval_ns=monitor_interval_ns,
+        wall_clock=wall_clock,
     )
     return report, actual_probe
 
@@ -625,7 +627,6 @@ def test_same_five_adapters_complete_a_private_synthetic_capacity_run(
     monkeypatch.setattr(enron_capacity, "ENRON_DATASET_ID", dataset_id)
     monkeypatch.setattr(enron_capacity, "ENRON_DATASET_REVISION", dataset_revision)
     monkeypatch.setattr(enron_capacity, "ENRON_SOURCE_ROWS", source_rows)
-    monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 30_000_000_000)
 
     config = enron_capacity._IntegratedCapacityConfig(
         dataset_id=dataset_id,
@@ -2138,7 +2139,13 @@ def test_terminal_resource_observation_gap_is_enforced_outside_phases(
 
     name = f"blocked-{blocked_boundary}"
     with pytest.raises(EnronCapacityError) as raised:
-        _run(tmp_path, probe, name=name, monitor_interval_ns=1_000_000_000)
+        _run(
+            tmp_path,
+            probe,
+            name=name,
+            monitor_interval_ns=1_000_000_000,
+            wall_clock=enron_capacity.time.monotonic_ns,
+        )
 
     assert raised.value.code == "resource_observation_gap"
     assert not (tmp_path / name).exists()
@@ -2176,7 +2183,12 @@ def test_terminal_resource_envelope_strictly_contains_pre_report_observations(
     monkeypatch.setattr(enron_capacity, "_write_report_and_fsync", advance_after_report)
     monkeypatch.setattr(enron_capacity.PrivateRun, "commit", advance_after_promotion)
 
-    report, _ = _run(tmp_path, probe, monitor_interval_ns=1_000_000_000)
+    report, _ = _run(
+        tmp_path,
+        probe,
+        monitor_interval_ns=1_000_000_000,
+        wall_clock=enron_capacity.time.monotonic_ns,
+    )
     terminal = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     totals = report["totals"]
 
@@ -4152,7 +4164,13 @@ def test_watchdog_interrupts_resource_and_progress_wall_gap_at_production_interv
 
     started = time.monotonic()
     with pytest.raises(EnronCapacityError) as resource_error:
-        _run(tmp_path, resource_probe, name="resource-gap", replacements={"split": block_resource})
+        _run(
+            tmp_path,
+            resource_probe,
+            name="resource-gap",
+            replacements={"split": block_resource},
+            wall_clock=time.monotonic_ns,
+        )
     assert resource_error.value.code == "resource_observation_gap"
     assert time.monotonic() - started < 0.8
 
@@ -4172,6 +4190,7 @@ def test_watchdog_interrupts_resource_and_progress_wall_gap_at_production_interv
             name="progress-gap",
             ledger="progress-attempts",
             replacements={"build": block_progress},
+            wall_clock=time.monotonic_ns,
         )
     assert progress_error.value.code == "checkpoint_wall_gap"
     assert time.monotonic() - started < 0.8
@@ -4243,6 +4262,79 @@ def test_private_tree_guard_concurrent_scans_use_independent_directory_offsets(t
     assert results == [expected_bytes] * 16
 
 
+def test_concurrent_heartbeats_serialize_wall_clock_reads_with_progress_state() -> None:
+    first_clock_entered = threading.Event()
+    release_first_clock = threading.Event()
+    second_clock_called = threading.Event()
+    second_lock_attempted = threading.Event()
+    clock_lock = threading.Lock()
+    clock_calls = 0
+
+    def ordered_clock() -> int:
+        nonlocal clock_calls
+        with clock_lock:
+            clock_calls += 1
+            call = clock_calls
+        if call == 1:
+            first_clock_entered.set()
+            if not release_first_clock.wait(timeout=5):
+                raise AssertionError("first clock call was not released")
+        else:
+            second_clock_called.set()
+        return call * 100
+
+    class ObservedRLock:
+        def __init__(self) -> None:
+            self._inner = threading.RLock()
+
+        def __enter__(self) -> ObservedRLock:
+            if threading.current_thread().name == "second-heartbeat":
+                second_lock_attempted.set()
+            self._inner.acquire()
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            self._inner.release()
+
+    monitor = enron_capacity._ContinuousResourceMonitor.__new__(enron_capacity._ContinuousResourceMonitor)
+    monitor.wall_clock = ordered_clock
+    monitor._lock = ObservedRLock()
+    monitor._states = {
+        "phase": enron_capacity._PhaseMeasurements(started_ns=0, started_wall_ns=0),
+    }
+    monitor._current_phase = "phase"
+    monitor._failure_code = None
+    monitor._observe = lambda _kind, **_kwargs: None
+    errors: list[BaseException] = []
+
+    def heartbeat() -> None:
+        try:
+            monitor.heartbeat("phase")
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=heartbeat, name="first-heartbeat")
+    second = threading.Thread(target=heartbeat, name="second-heartbeat")
+    first.start()
+    try:
+        assert first_clock_entered.wait(timeout=5)
+        second.start()
+        assert second_lock_attempted.wait(timeout=5)
+        assert not second_clock_called.is_set()
+    finally:
+        release_first_clock.set()
+        first.join(timeout=5)
+        if second.ident is not None:
+            second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert clock_calls == 2
+    assert second_clock_called.is_set()
+    assert monitor._states["phase"].last_progress_wall_ns == 200
+
+
 def test_legitimate_non_record_heartbeats_do_not_inflate_record_progress(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4251,6 +4343,7 @@ def test_legitimate_non_record_heartbeats_do_not_inflate_record_progress(
     # heartbeats, while leaving enough scheduler/filesystem margin for the
     # phase-boundary resource observation itself.
     test_wall_gap_ns = 120_000_000
+    monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 30_000_000_000)
     monkeypatch.setattr(enron_capacity, "MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS", test_wall_gap_ns)
     probe = _Probe()
 
@@ -4265,6 +4358,7 @@ def test_legitimate_non_record_heartbeats_do_not_inflate_record_progress(
         tmp_path,
         probe,
         replacements={"streaming_validation": finalization},
+        wall_clock=time.monotonic_ns,
     )
     phase = report["phases"][3]
     assert phase["checkpoint_samples"][-1]["completed_records"] == _VALIDATION_RECORDS
@@ -4279,9 +4373,7 @@ def test_legitimate_non_record_heartbeats_do_not_inflate_record_progress(
 
 def test_heartbeat_enforcement_is_unbounded_while_report_evidence_is_deterministically_bounded(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 30_000_000_000)
     probe = _Probe()
     heartbeat_count = enron_capacity.MAX_PROGRESS_SIGNALS_PER_PHASE + 257
 
