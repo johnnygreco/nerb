@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from typing import Any
 
 import pytest
 
+import nerb.enron_activity as enron_activity_module
 import nerb.enron_preparation as enron_preparation
 from nerb.enron_preparation import (
     PREPARED_RECORD_SCHEMA_VERSION,
@@ -455,6 +457,61 @@ def test_preparation_construction_spool_move_out_wipes_original_and_replacement(
     assert parked.read_bytes() == b""
     _assert_cleanup_tombstones(temp_root, count=1)
     assert all(path.read_bytes() == b"" for path in temp_root.rglob("records.sqlite3"))
+
+
+def test_preparation_spool_reports_scalar_sql_work_and_removes_handler_before_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "private-temp"
+    temp_root.mkdir(mode=0o700)
+    monkeypatch.setattr(enron_preparation.tempfile, "tempdir", os.fspath(temp_root))
+    opened: list[TrackingConnection] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        handler_removed = False
+        closed_after_removal = False
+
+        def set_progress_handler(self, progress_handler, n):
+            if progress_handler is None:
+                self.handler_removed = True
+            return super().set_progress_handler(progress_handler, n)
+
+        def close(self) -> None:
+            self.closed_after_removal = self.handler_removed
+            super().close()
+
+    original_connect = sqlite3.connect
+
+    def tracked_connect(*args: Any, **kwargs: Any) -> TrackingConnection:
+        kwargs["factory"] = TrackingConnection
+        connection = original_connect(*args, **kwargs)
+        assert isinstance(connection, TrackingConnection)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(enron_preparation.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(enron_activity_module, "SQLITE_ACTIVITY_VM_STEP_INTERVAL", 1)
+    control = KeyboardInterrupt("stop preparation after verified SQLite work")
+    armed = False
+    observed_sql_activity = False
+
+    def activity() -> None:
+        nonlocal observed_sql_activity
+        if armed:
+            observed_sql_activity = True
+            raise control
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with enron_preparation._private_preparation_spool(activity) as connection:
+            armed = True
+            enron_preparation._feature_aggregates(connection)
+
+    assert raised.value is control
+    assert observed_sql_activity is True
+    assert len(opened) == 1
+    assert opened[0].handler_removed is True
+    assert opened[0].closed_after_removal is True
 
 
 def test_preparation_spool_close_failure_supersedes_body_failure(

@@ -40,6 +40,7 @@ from typing import Any, Protocol, cast
 
 from . import _capacity_bootstrap as _capacity_import_guard
 from . import enron_private_io as _private_io
+from .enron_activity import ACTIVITY_RECORD_INTERVAL
 from .enron_private_io import (
     EnronPrivateIOError,
     PrivateRun,
@@ -111,6 +112,7 @@ MAX_RESOURCE_OBSERVATION_WALL_GAP_NS = 500_000_000
 _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS = 3
 _DARWIN_PS_TIMEOUT_SECONDS = 0.1
 MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS = 30_000_000_000
+ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS = 5_000_000_000
 MAX_CAPACITY_REPORT_BYTES = 4 * 1024 * 1024
 MAX_ATTEMPT_RECEIPT_BYTES = 64 * 1024
 MAX_INFLIGHT_RECORD_BYTES = 16 * 1024
@@ -185,6 +187,7 @@ _PRODUCTION_CORE_SOURCE_NAMES = (
     "_capacity_bootstrap.py",
     "engine.py",
     "engines.py",
+    "enron_activity.py",
     "enron_bank_builder.py",
     "enron_bank_workflow.py",
     "enron_capacity.py",
@@ -193,7 +196,7 @@ _PRODUCTION_CORE_SOURCE_NAMES = (
     "enron_quality.py",
     "enron_splitting.py",
 )
-_READER_MODULE_PREFIXES = ("datasets", "huggingface_hub", "fsspec", "pyarrow", "transformers")
+_READER_MODULE_PREFIXES = ("datasets", "huggingface_hub", "httpx", "fsspec", "pyarrow", "transformers")
 _READER_OFFICIAL_ENDPOINT = "https://huggingface.co"
 _PHASE_RUNTIME_PATH_ENVIRONMENT_KEYS = frozenset(
     {
@@ -255,12 +258,14 @@ _READER_EFFECTIVE_PATH_LABELS = (
 _CRITICAL_READER_DISTRIBUTIONS = (
     ("datasets", "datasets", "datasets/__init__.py", "5.0.0"),
     ("huggingface-hub", "huggingface_hub", "huggingface_hub/__init__.py", "1.23.0"),
+    ("httpx", "httpx", "httpx/__init__.py", "0.28.1"),
     ("fsspec", "fsspec", "fsspec/__init__.py", "2026.4.0"),
     ("pyarrow", "pyarrow", "pyarrow/__init__.py", "25.0.0"),
 )
 _READER_UPSTREAM_CACHE_LOCK_MODE = 0o664
 _READER_OWNER_ONLY_CACHE_LOCK_MODE = 0o600
 _ACTIVE_READER_CACHE_LOCK_ADAPTER: _ReaderCacheLockAdapter | None = None
+_ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER: _ReaderNetworkActivityAdapter | None = None
 _NATIVE_BUILD_SOURCE_DOMAIN = b"nerb-native-build-source-v1\0"
 _NATIVE_BUILD_SOURCE_FILES = (
     "Cargo.lock",
@@ -326,13 +331,93 @@ _ERROR_MESSAGES = {
     "portable_write_failed": "Portable capacity decision evidence could not be written safely.",
 }
 
+_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "phase",
+        "origin",
+        "last_accepted_progress_kind",
+        "attempted_progress_kind",
+        "last_completed_records",
+        "checkpoint_count",
+        "progress_signal_count",
+        "phase_wall_elapsed_ns",
+        "observed_progress_gap_ns",
+    }
+)
+_FAILURE_DIAGNOSTIC_ORIGINS = frozenset(
+    {
+        "continuous_observation",
+        "checkpoint_call",
+        "heartbeat_call",
+        "activity_call",
+        "phase_finish",
+    }
+)
+_FAILURE_ACCEPTED_PROGRESS_KINDS = frozenset(
+    {
+        "phase_start",
+        "checkpoint",
+        "heartbeat",
+        "activity",
+    }
+)
+_FAILURE_ATTEMPT_BY_ORIGIN = {
+    "continuous_observation": "continuous_observation",
+    "checkpoint_call": "checkpoint",
+    "heartbeat_call": "heartbeat",
+    "activity_call": "activity",
+    "phase_finish": "phase_finish",
+}
+
+
+def _validated_failure_diagnostic(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != _FAILURE_DIAGNOSTIC_FIELDS:
+        return None
+    candidate = cast(dict[str, Any], value)
+    origin = candidate.get("origin")
+    if (
+        candidate.get("phase") not in CAPACITY_PHASES
+        or candidate.get("origin") not in _FAILURE_DIAGNOSTIC_ORIGINS
+        or candidate.get("last_accepted_progress_kind") not in _FAILURE_ACCEPTED_PROGRESS_KINDS
+        or candidate.get("attempted_progress_kind") != _FAILURE_ATTEMPT_BY_ORIGIN.get(cast(str, origin))
+    ):
+        return None
+    for field in (
+        "last_completed_records",
+        "checkpoint_count",
+        "progress_signal_count",
+        "phase_wall_elapsed_ns",
+        "observed_progress_gap_ns",
+    ):
+        field_value = candidate.get(field)
+        if type(field_value) is not int or field_value < 0:
+            return None
+    if (
+        int(candidate["last_completed_records"]) > ENRON_SOURCE_ROWS
+        or int(candidate["checkpoint_count"]) > MAX_CHECKPOINTS_PER_PHASE
+        or int(candidate["observed_progress_gap_ns"]) <= MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS
+        or int(candidate["phase_wall_elapsed_ns"]) < int(candidate["observed_progress_gap_ns"])
+        or int(candidate["checkpoint_count"]) > int(candidate["progress_signal_count"])
+        or (int(candidate["checkpoint_count"]) == 0) != (int(candidate["last_completed_records"]) == 0)
+        or (candidate["last_accepted_progress_kind"] == "phase_start") != (int(candidate["progress_signal_count"]) == 0)
+    ):
+        return None
+    return dict(candidate)
+
 
 class EnronCapacityError(RuntimeError):
     """Raised when full-source capacity cannot be proved safely."""
 
-    def __init__(self, message: str = _ERROR_MESSAGES["capacity_failed"], *, code: str = "capacity_failed") -> None:
+    def __init__(
+        self,
+        message: str = _ERROR_MESSAGES["capacity_failed"],
+        *,
+        code: str = "capacity_failed",
+        diagnostic: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.diagnostic = _validated_failure_diagnostic(diagnostic) if code == "checkpoint_wall_gap" else None
 
 
 class _CapacityAbort(BaseException):
@@ -350,9 +435,9 @@ class _RuntimeDiskFloor(Exception):
         self.retry_count = retry_count
 
 
-def _error(code: str) -> EnronCapacityError:
+def _error(code: str, *, diagnostic: Mapping[str, Any] | None = None) -> EnronCapacityError:
     safe_code = code if code in _ERROR_MESSAGES else "capacity_failed"
-    return EnronCapacityError(_ERROR_MESSAGES[safe_code], code=safe_code)
+    return EnronCapacityError(_ERROR_MESSAGES[safe_code], code=safe_code, diagnostic=diagnostic)
 
 
 @dataclass(frozen=True, slots=True)
@@ -401,6 +486,7 @@ class EnronCapacityPhaseContext:
     """Private phase workspace and mandatory progress/resource hooks."""
 
     __slots__ = (
+        "_activity",
         "_checkpoint",
         "_cleanup_successor",
         "_declare_owned_root",
@@ -421,6 +507,7 @@ class EnronCapacityPhaseContext:
         checkpoint: Callable[[int], None],
         declare_owned_root: Callable[[Path], Path],
         heartbeat: Callable[[], None],
+        activity: Callable[[], None],
         *,
         runtime_environment: Mapping[str, str],
         scratch_dir: Path,
@@ -434,6 +521,7 @@ class EnronCapacityPhaseContext:
         self._checkpoint = checkpoint
         self._declare_owned_root = declare_owned_root
         self._heartbeat = heartbeat
+        self._activity = activity
         self._runtime_environment = dict(runtime_environment)
         self._scratch_dir = scratch_dir
         self._spool_dir = spool_dir
@@ -494,6 +582,11 @@ class EnronCapacityPhaseContext:
         """Prove liveness during bounded non-record work without inflating progress."""
 
         self._heartbeat()
+
+    def activity(self) -> None:
+        """Report genuine work while rate-limiting synchronous resource scans."""
+
+        self._activity()
 
     def declare_owned_root(self, path: Path) -> Path:
         """Register an additional existing root inside the transaction."""
@@ -1499,15 +1592,17 @@ class _PhaseMeasurements:
     last_sample: dict[str, Any] | None = None
     last_resource_wall_ns: int | None = None
     last_progress_wall_ns: int | None = None
+    last_progress_kind: str = "phase_start"
+    last_activity_observation_wall_ns: int | None = None
     maximum_resource_wall_gap_ns: int = 0
     maximum_progress_wall_gap_ns: int = 0
     checkpoints: list[dict[str, int]] | None = None
     progress_signals: list[dict[str, Any]] | None = None
-    heartbeat_samples: list[dict[str, Any]] | None = None
-    heartbeat_priorities: list[int] | None = None
+    liveness_samples: list[dict[str, Any]] | None = None
+    liveness_priorities: list[int] | None = None
     progress_signal_count: int = 0
     maximum_progress_signal: dict[str, Any] | None = None
-    last_heartbeat_signal: dict[str, Any] | None = None
+    last_liveness_signal: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.samples = []
@@ -1515,8 +1610,8 @@ class _PhaseMeasurements:
         self.cadence_samples = []
         self.checkpoints = []
         self.progress_signals = []
-        self.heartbeat_samples = []
-        self.heartbeat_priorities = []
+        self.liveness_samples = []
+        self.liveness_priorities = []
 
 
 class _Watchdog:
@@ -1596,6 +1691,7 @@ class _ContinuousResourceMonitor:
         self._current_phase: str | None = None
         self._states: dict[str, _PhaseMeasurements] = {}
         self._failure_code: str | None = None
+        self._failure_diagnostic: dict[str, Any] | None = None
         self._global_observations = 0
         self._global_resource_acquisition_retries = 0
         self._global_peak_rss = preflight.preflight_process_tree_rss_bytes
@@ -1703,6 +1799,7 @@ class _ContinuousResourceMonitor:
                     last_owned=owned,
                     owned_high_water=owned,
                     last_progress_wall_ns=wall_now,
+                    last_activity_observation_wall_ns=wall_now,
                 )
                 self._current_phase = phase
                 self._global_owned_high_water = max(self._global_owned_high_water, owned)
@@ -1710,14 +1807,18 @@ class _ContinuousResourceMonitor:
         self.raise_if_failed()
 
     def checkpoint(self, phase: str, completed_records: int) -> None:
-        if type(completed_records) is not int or completed_records <= 0:
-            raise _CapacityAbort("checkpoint_invalid")
+        with self._lock:
+            self._raise_if_failed_locked()
+            if type(completed_records) is not int or completed_records <= 0:
+                raise _CapacityAbort("checkpoint_invalid")
         try:
             owned = self.tree.logical_bytes()
         except EnronCapacityError:
             self._record_failure("private_tree_invalid")
+            self.raise_if_failed()
             raise _CapacityAbort("private_tree_invalid") from None
         with self._lock:
+            self._raise_if_failed_locked()
             state = self._states.get(phase)
             if state is None or self._current_phase != phase:
                 raise _CapacityAbort("checkpoint_invalid")
@@ -1733,11 +1834,19 @@ class _ContinuousResourceMonitor:
             wall_gap = wall_now - previous_progress_wall
             if wall_gap < 0:
                 raise _CapacityAbort("clock_invalid")
-            state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, wall_gap)
-            state.last_progress_wall_ns = wall_now
             if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                self._record_failure("checkpoint_wall_gap")
+                self._record_progress_failure(
+                    phase,
+                    state,
+                    origin="checkpoint_call",
+                    attempted_kind="checkpoint",
+                    wall_now=wall_now,
+                    wall_gap=wall_gap,
+                )
+                self._raise_if_failed_locked()
                 raise _CapacityAbort("checkpoint_wall_gap")
+            self._accept_progress(state, kind="checkpoint", wall_now=wall_now, wall_gap=wall_gap)
+            state.last_activity_observation_wall_ns = wall_now
             state.checkpoint_count += 1
             state.last_completed = completed_records
             state.maximum_checkpoint_gap = max(state.maximum_checkpoint_gap, gap)
@@ -1769,6 +1878,7 @@ class _ContinuousResourceMonitor:
 
     def heartbeat(self, phase: str) -> None:
         with self._lock:
+            self._raise_if_failed_locked()
             wall_now = self.wall_clock()
             state = self._states.get(phase)
             if state is None or self._current_phase != phase:
@@ -1777,8 +1887,18 @@ class _ContinuousResourceMonitor:
             wall_gap = wall_now - previous_progress_wall
             if wall_gap < 0:
                 raise _CapacityAbort("clock_invalid")
-            state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, wall_gap)
-            state.last_progress_wall_ns = wall_now
+            if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
+                self._record_progress_failure(
+                    phase,
+                    state,
+                    origin="heartbeat_call",
+                    attempted_kind="heartbeat",
+                    wall_now=wall_now,
+                    wall_gap=wall_gap,
+                )
+                self._raise_if_failed_locked()
+                raise _CapacityAbort("checkpoint_wall_gap")
+            self._accept_progress(state, kind="heartbeat", wall_now=wall_now, wall_gap=wall_gap)
             self._append_progress_signal(
                 state,
                 kind="heartbeat",
@@ -1786,10 +1906,49 @@ class _ContinuousResourceMonitor:
                 wall_now=wall_now,
                 wall_gap=wall_gap,
             )
-            if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                self._record_failure("checkpoint_wall_gap")
-                raise _CapacityAbort("checkpoint_wall_gap")
+            state.last_activity_observation_wall_ns = wall_now
         self._observe("heartbeat", completed_records=state.last_completed or None)
+        self.raise_if_failed()
+
+    def activity(self, phase: str) -> None:
+        observe_resources = False
+        completed_records = 0
+        with self._lock:
+            self._raise_if_failed_locked()
+            wall_now = self.wall_clock()
+            state = self._states.get(phase)
+            if state is None or self._current_phase != phase:
+                raise _CapacityAbort("checkpoint_invalid")
+            previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
+            wall_gap = wall_now - previous_progress_wall
+            if wall_gap < 0:
+                raise _CapacityAbort("clock_invalid")
+            if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
+                self._record_progress_failure(
+                    phase,
+                    state,
+                    origin="activity_call",
+                    attempted_kind="activity",
+                    wall_now=wall_now,
+                    wall_gap=wall_gap,
+                )
+                self._raise_if_failed_locked()
+                raise _CapacityAbort("checkpoint_wall_gap")
+            self._accept_progress(state, kind="activity", wall_now=wall_now, wall_gap=wall_gap)
+            self._append_progress_signal(
+                state,
+                kind="activity",
+                completed_records=state.last_completed,
+                wall_now=wall_now,
+                wall_gap=wall_gap,
+            )
+            last_observation = state.last_activity_observation_wall_ns or state.started_wall_ns
+            if wall_now - last_observation >= ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS:
+                state.last_activity_observation_wall_ns = wall_now
+                observe_resources = True
+                completed_records = state.last_completed
+        if observe_resources:
+            self._observe("activity", completed_records=completed_records or None)
         self.raise_if_failed()
 
     def finish_phase(self, phase: str, records: int) -> dict[str, Any]:
@@ -1808,10 +1967,19 @@ class _ContinuousResourceMonitor:
                 wall_now = self.wall_clock()
                 previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
                 final_wall_gap = wall_now - previous_progress_wall
-                if final_wall_gap < 0 or final_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                    raise _error("checkpoint_wall_gap")
-                state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, final_wall_gap)
-                state.last_progress_wall_ns = wall_now
+                if final_wall_gap < 0:
+                    raise _error("clock_invalid")
+                if final_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
+                    self._record_progress_failure(
+                        phase,
+                        state,
+                        origin="phase_finish",
+                        attempted_kind="phase_finish",
+                        wall_now=wall_now,
+                        wall_gap=final_wall_gap,
+                    )
+                    raise _error("checkpoint_wall_gap", diagnostic=self.failure_diagnostic())
+                self._accept_progress(state, kind="phase_finish", wall_now=wall_now, wall_gap=final_wall_gap)
                 self._append_progress_signal(
                     state,
                     kind="phase_boundary",
@@ -1846,6 +2014,10 @@ class _ContinuousResourceMonitor:
                 "maximum_resource_observation_wall_gap_ns": self._global_maximum_resource_wall_gap_ns,
             }
 
+    def failure_diagnostic(self) -> dict[str, Any] | None:
+        with self._lock:
+            return None if self._failure_diagnostic is None else dict(self._failure_diagnostic)
+
     def _retain_partial_resource_extrema(
         self,
         *,
@@ -1872,9 +2044,11 @@ class _ContinuousResourceMonitor:
 
     def raise_if_failed(self) -> None:
         with self._lock:
-            code = self._failure_code
-        if code is not None:
-            raise _CapacityAbort(code)
+            self._raise_if_failed_locked()
+
+    def _raise_if_failed_locked(self) -> None:
+        if self._failure_code is not None:
+            raise _CapacityAbort(self._failure_code)
 
     def _loop(self) -> None:
         interval = self.interval_ns / 1_000_000_000
@@ -2021,7 +2195,14 @@ class _ContinuousResourceMonitor:
                 if resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
                     self._record_failure("resource_observation_gap")
                 if progress_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                    self._record_failure("checkpoint_wall_gap")
+                    self._record_progress_failure(
+                        phase,
+                        state,
+                        origin="continuous_observation",
+                        attempted_kind="continuous_observation",
+                        wall_now=wall_now,
+                        wall_gap=progress_wall_gap,
+                    )
             if rss > self.preflight.maximum_peak_rss_bytes:
                 self._record_failure("rss_limit")
             if minimum_free < MIN_RUNTIME_FREE_DISK_BYTES:
@@ -2046,8 +2227,8 @@ class _ContinuousResourceMonitor:
                 retained.append(sample)
         retained.sort(key=lambda item: int(item["sequence"]))
         progress_signals = list(cast(list[dict[str, Any]], state.progress_signals))
-        progress_signals.extend(cast(list[dict[str, Any]], state.heartbeat_samples))
-        for progress_signal in (state.maximum_progress_signal, state.last_heartbeat_signal):
+        progress_signals.extend(cast(list[dict[str, Any]], state.liveness_samples))
+        for progress_signal in (state.maximum_progress_signal, state.last_liveness_signal):
             if progress_signal is not None and all(
                 item["sequence"] != progress_signal["sequence"] for item in progress_signals
             ):
@@ -2072,11 +2253,40 @@ class _ContinuousResourceMonitor:
             "progress_signals": progress_signals,
         }
 
-    def _record_failure(self, code: str) -> None:
+    def _accept_progress(self, state: _PhaseMeasurements, *, kind: str, wall_now: int, wall_gap: int) -> None:
+        state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, wall_gap)
+        state.last_progress_wall_ns = wall_now
+        state.last_progress_kind = kind
+
+    def _record_progress_failure(
+        self,
+        phase: str,
+        state: _PhaseMeasurements,
+        *,
+        origin: str,
+        attempted_kind: str,
+        wall_now: int,
+        wall_gap: int,
+    ) -> None:
+        diagnostic = {
+            "phase": phase,
+            "origin": origin,
+            "last_accepted_progress_kind": state.last_progress_kind,
+            "attempted_progress_kind": attempted_kind,
+            "last_completed_records": state.last_completed,
+            "checkpoint_count": state.checkpoint_count,
+            "progress_signal_count": state.progress_signal_count,
+            "phase_wall_elapsed_ns": wall_now - state.started_wall_ns,
+            "observed_progress_gap_ns": wall_gap,
+        }
+        self._record_failure("checkpoint_wall_gap", diagnostic=diagnostic)
+
+    def _record_failure(self, code: str, *, diagnostic: Mapping[str, Any] | None = None) -> None:
         newly_recorded = False
         with self._lock:
             if self._failure_code is None:
                 self._failure_code = code if code in _ERROR_MESSAGES else "resource_measurement_failed"
+                self._failure_diagnostic = _validated_failure_diagnostic(diagnostic)
                 newly_recorded = True
         if newly_recorded:
             self._watchdog.trigger()
@@ -2132,19 +2342,19 @@ class _ContinuousResourceMonitor:
             state.maximum_progress_signal["progress_wall_gap_ns"]
         ):
             state.maximum_progress_signal = signal
-        if kind != "heartbeat":
+        if kind not in {"heartbeat", "activity"}:
             signals = cast(list[dict[str, Any]], state.progress_signals)
             signals.append(signal)
             return
-        state.last_heartbeat_signal = signal
-        samples = cast(list[dict[str, Any]], state.heartbeat_samples)
-        priorities = cast(list[int], state.heartbeat_priorities)
-        heartbeat_capacity = MAX_PROGRESS_SIGNALS_PER_PHASE - MAX_CHECKPOINTS_PER_PHASE - 3
-        if heartbeat_capacity <= 0:
+        state.last_liveness_signal = signal
+        samples = cast(list[dict[str, Any]], state.liveness_samples)
+        priorities = cast(list[int], state.liveness_priorities)
+        liveness_capacity = MAX_PROGRESS_SIGNALS_PER_PHASE - MAX_CHECKPOINTS_PER_PHASE - 3
+        if liveness_capacity <= 0:
             raise _CapacityAbort("checkpoint_limit")
         sequence = state.progress_signal_count
-        priority = int.from_bytes(hashlib.sha256(f"heartbeat:{sequence}".encode("ascii")).digest()[:8], "big")
-        if len(samples) < heartbeat_capacity:
+        priority = int.from_bytes(hashlib.sha256(f"{kind}:{sequence}".encode("ascii")).digest()[:8], "big")
+        if len(samples) < liveness_capacity:
             samples.append(signal)
             priorities.append(priority)
             return
@@ -2180,7 +2390,7 @@ def capacity_policy() -> dict[str, Any]:
         "maximum_checkpoint_record_gap": MAX_CHECKPOINT_RECORD_GAP,
         "maximum_checkpoints_per_phase": MAX_CHECKPOINTS_PER_PHASE,
         "maximum_retained_progress_signals_per_phase": MAX_PROGRESS_SIGNALS_PER_PHASE,
-        "unbounded_heartbeat_enforcement_with_bounded_retained_evidence": True,
+        "unbounded_liveness_enforcement_with_bounded_retained_evidence": True,
         "maximum_retained_resource_samples_per_phase": MAX_RESOURCE_SAMPLES_PER_PHASE,
         "production_monitor_interval_ns": PRODUCTION_MONITOR_INTERVAL_NS,
         "maximum_resource_observation_wall_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
@@ -2190,6 +2400,11 @@ def capacity_policy() -> dict[str, Any]:
         "darwin_process_tree_rss_timeout_ns": int(_DARWIN_PS_TIMEOUT_SECONDS * 1_000_000_000),
         "resource_acquisition_retry_count_required": True,
         "maximum_progress_checkpoint_wall_gap_ns": MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS,
+        "activity_record_interval": ACTIVITY_RECORD_INTERVAL,
+        "activity_interval_at_minimum_throughput_ns": (
+            ACTIVITY_RECORD_INTERVAL * 1_000_000_000 // MIN_PHASE_RECORDS_PER_SECOND
+        ),
+        "activity_resource_observation_interval_ns": ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS,
         "maximum_capacity_report_bytes": MAX_CAPACITY_REPORT_BYTES,
         "maximum_capacity_report_structural_bound_bytes": _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES,
         "maximum_portable_decision_bytes": MAX_PORTABLE_DECISION_BYTES,
@@ -2207,6 +2422,8 @@ def capacity_policy() -> dict[str, Any]:
         "reader_cache_lock_files_owner_only_required": True,
         "reader_cache_lock_mode": _READER_OWNER_ONLY_CACHE_LOCK_MODE,
         "reader_cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
+        "reader_network_activity_required": True,
+        "reader_network_activity_adapter_sha256": _reader_network_activity_adapter_sha256(),
         "processed_bytes_measurement_boundary": _PROCESSED_BYTES_MEASUREMENT_BOUNDARY,
         "processed_bytes_by_phase": {
             "preparation": "prepared_records_artifact_bytes_plus_rejections_artifact_bytes",
@@ -2408,13 +2625,24 @@ def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
         response = json.loads(completed.stdout.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeError, ValueError):
         raise _error("production_worker_failed") from None
-    if not isinstance(response, Mapping) or set(response) != {"ok", "code", "report"}:
+    if not isinstance(response, Mapping) or set(response) != {"ok", "code", "diagnostic", "report"}:
         raise _error("production_worker_failed")
     if response.get("ok") is not True:
         code = response.get("code")
-        raise _error(code if isinstance(code, str) else "production_worker_failed")
+        diagnostic = response.get("diagnostic")
+        if (
+            not isinstance(code, str)
+            or code not in _ERROR_MESSAGES
+            or (code == "checkpoint_wall_gap") != (diagnostic is not None)
+            or (diagnostic is not None and _validated_failure_diagnostic(diagnostic) is None)
+        ):
+            raise _error("production_worker_failed")
+        raise _error(
+            code,
+            diagnostic=cast(Mapping[str, Any] | None, diagnostic),
+        )
     report = response.get("report")
-    if response.get("code") is not None or not isinstance(report, Mapping):
+    if response.get("code") is not None or response.get("diagnostic") is not None or not isinstance(report, Mapping):
         raise _error("production_worker_failed")
     return dict(report)
 
@@ -2477,14 +2705,23 @@ def _production_worker_main() -> int:
             monitor_interval_ns=PRODUCTION_MONITOR_INTERVAL_NS,
             wall_clock=time.monotonic_ns,
         )
-        response = {"ok": True, "code": None, "report": report}
+        response = {"ok": True, "code": None, "diagnostic": None, "report": report}
     except BaseException as exc:
         code = (
             exc.code
             if isinstance(exc, EnronCapacityError) and exc.code in _ERROR_MESSAGES
             else "production_worker_failed"
         )
-        response = {"ok": False, "code": code, "report": None}
+        diagnostic = exc.diagnostic if isinstance(exc, EnronCapacityError) else None
+        if (code == "checkpoint_wall_gap") != (diagnostic is not None):
+            code = "production_worker_failed"
+            diagnostic = None
+        response = {
+            "ok": False,
+            "code": code,
+            "diagnostic": diagnostic,
+            "report": None,
+        }
     sys.stdout.buffer.write(_canonical_json_bytes(response))
     sys.stdout.buffer.flush()
     return 0
@@ -2722,7 +2959,7 @@ def _execute_capacity_preparation(
         huggingface_anonymous=config.input_jsonl is None,
         allow_unignored_output=True,
         progress_callback=context.checkpoint,
-        activity_callback=context.heartbeat,
+        activity_callback=context.activity,
         cleanup_successor=context.cleanup_successor,
     )
     if config.input_jsonl is None and (
@@ -2737,21 +2974,22 @@ def _execute_capacity_preparation(
         if initial_runtime_environment_sha256 is None:
             raise _CapacityAbort("production_identity_invalid")
         with _owner_only_reader_cache_locks(context.runtime_environment):
-            reader_isolation_before = _reader_isolation_snapshot(
-                context,
-                datasets_module,
-                stage="before_source_read",
-            )
-            if initial_runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
-                raise _CapacityAbort("production_identity_invalid")
-            summary = preparation.prepare_enron_source(options)
-            reader_isolation_after = _reader_isolation_snapshot(
-                context,
-                datasets_module,
-                stage="after_source_read",
-            )
-            if initial_runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
-                raise _CapacityAbort("production_identity_invalid")
+            with _reader_network_activity(context.activity):
+                reader_isolation_before = _reader_isolation_snapshot(
+                    context,
+                    datasets_module,
+                    stage="before_source_read",
+                )
+                if initial_runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
+                    raise _CapacityAbort("production_identity_invalid")
+                summary = preparation.prepare_enron_source(options)
+                reader_isolation_after = _reader_isolation_snapshot(
+                    context,
+                    datasets_module,
+                    stage="after_source_read",
+                )
+                if initial_runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
+                    raise _CapacityAbort("production_identity_invalid")
         isolation_descriptor = {
             "schema": "enron_capacity_remote_reader_isolation",
             "mode": "phase_owned_anonymous_official",
@@ -2776,12 +3014,14 @@ def _execute_capacity_preparation(
             "cache_lock_files_owner_only": True,
             "cache_lock_mode": _READER_OWNER_ONLY_CACHE_LOCK_MODE,
             "cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
+            "network_activity_observed": True,
+            "network_activity_adapter_sha256": _reader_network_activity_adapter_sha256(),
             "sha256": isolation_sha256,
         }
     verified = preparation.load_enron_preparation_run(
         paths.preparation,
         scratch_dir=context.scratch_dir,
-        activity_callback=context.heartbeat,
+        activity_callback=context.activity,
     )
     profile = _adapter_mapping(verified.get("profile"))
     source = _adapter_mapping(profile.get("source"))
@@ -2830,6 +3070,8 @@ def _execute_capacity_preparation(
         "source_reader_cache_lock_files_owner_only": reader_isolation["cache_lock_files_owner_only"],
         "source_reader_cache_lock_mode": reader_isolation["cache_lock_mode"],
         "source_reader_cache_lock_adapter_sha256": reader_isolation["cache_lock_adapter_sha256"],
+        "source_reader_network_activity_observed": reader_isolation["network_activity_observed"],
+        "source_reader_network_activity_adapter_sha256": reader_isolation["network_activity_adapter_sha256"],
         "source_row_multiset_sha256": source.get("canonical_row_multiset_sha256"),
         "source_conservation_sha256": "",
         "sealed_test_accessed": False,
@@ -2867,14 +3109,14 @@ def _execute_capacity_split(
             fixture_mode=config.fixture_mode,
             allow_unignored_output=True,
             progress_callback=context.checkpoint,
-            activity_callback=context.heartbeat,
+            activity_callback=context.activity,
             cleanup_successor=context.cleanup_successor,
         )
     )
     verified = splitting.verify_enron_splits(
         paths.development,
         paths.sealed,
-        activity_callback=context.heartbeat,
+        activity_callback=context.activity,
     )
     contract = _adapter_mapping(verified.get("contract_splits"))
     roles = _adapter_mapping(contract.get("roles"))
@@ -2944,7 +3186,7 @@ def _execute_capacity_build(
             cmu_catalog_bindings_path=None,
             allow_unignored_output=True,
             progress_callback=context.checkpoint,
-            activity_callback=context.heartbeat,
+            activity_callback=context.activity,
             cleanup_successor=context.cleanup_successor,
         )
     )
@@ -3011,7 +3253,7 @@ def _execute_capacity_streaming_validation(
         development_run=paths.development,
         scratch_root=context.scratch_dir,
         progress_callback=context.checkpoint,
-        activity_callback=context.heartbeat,
+        activity_callback=context.activity,
     )
     if (
         summary.get("validation_records") != prior.get("validation_records")
@@ -3053,7 +3295,7 @@ def _execute_capacity_deep_replay(
         scratch_root=context.scratch_dir,
         annotation_run=None,
         progress_callback=context.checkpoint,
-        activity_callback=context.heartbeat,
+        activity_callback=context.activity,
     )
     replay_bank = replay.get("bank_sha256")
     replay_validation = replay.get("selected_validation_run_sha256")
@@ -3140,7 +3382,7 @@ def _verify_sealed_unbound(
     verified = splitting.verify_enron_splits(
         paths.development,
         paths.sealed,
-        activity_callback=context.heartbeat,
+        activity_callback=context.activity,
     )
     access = _sealed_unbound_access(verified)
     if (
@@ -3237,6 +3479,7 @@ def _run_capacity_entry(
     completed_run: _CompletedCapacityRun | None = None
     inflight: _InflightAttempt | None = None
     failure_code: str | None = None
+    failure_diagnostic: dict[str, Any] | None = None
     outcome = "passed"
     deferred_finalization_control: KeyboardInterrupt | SystemExit | None = None
     receipt_failure_cleanup_started = False
@@ -3308,6 +3551,7 @@ def _run_capacity_entry(
                 effective_error = effective_error.__context__
             if isinstance(effective_error, EnronCapacityError) and effective_error.code in _ERROR_MESSAGES:
                 failure_code = effective_error.code
+                failure_diagnostic = effective_error.diagnostic
             elif isinstance(effective_error, (KeyboardInterrupt, SystemExit)):
                 failure_code = "phase_interrupted"
             else:
@@ -3360,7 +3604,7 @@ def _run_capacity_entry(
             raise _error("promotion_failed" if cleanup_failed else "attempt_ledger_write_failed") from None
 
         if failure_code is not None:
-            raise _error(failure_code) from None
+            raise _error(failure_code, diagnostic=failure_diagnostic) from None
         if report is None:
             raise _error("capacity_failed")
         if completed_run is not None:
@@ -3390,6 +3634,7 @@ def _run_capacity_entry(
                     and outer_effective_error.code in _ERROR_MESSAGES
                 ):
                     failure_code = outer_effective_error.code
+                    failure_diagnostic = outer_effective_error.diagnostic
                 elif isinstance(outer_effective_error, (KeyboardInterrupt, SystemExit)):
                     failure_code = "phase_interrupted"
                 else:
@@ -3407,7 +3652,7 @@ def _run_capacity_entry(
                 )
             except BaseException:
                 raise _error("attempt_ledger_write_failed") from None
-            raise _error(failure_code) from None
+            raise _error(failure_code, diagnostic=failure_diagnostic) from None
         raise
     finally:
         active_error = sys.exc_info()[1]
@@ -3687,6 +3932,9 @@ def _execute_capacity_transaction(
                 def heartbeat(*, current_phase: str = phase) -> None:
                     monitor.heartbeat(current_phase)
 
+                def activity(*, current_phase: str = phase) -> None:
+                    monitor.activity(current_phase)
+
                 runtime_environment, scratch_dir, spool_dir, owned_root_count = _provision_phase_runtime_roots(
                     private_run, active_tree, phase
                 )
@@ -3696,6 +3944,7 @@ def _execute_capacity_transaction(
                     checkpoint,
                     declare_owned_root,
                     heartbeat,
+                    activity,
                     runtime_environment=runtime_environment,
                     scratch_dir=scratch_dir,
                     spool_dir=spool_dir,
@@ -3707,11 +3956,17 @@ def _execute_capacity_transaction(
                 )
                 with _applied_phase_runtime_environment(runtime_environment):
                     result, runner_failure = _invoke_phase_runner(runner, context)
+                _raise_recorded_monitor_failure(monitor)
                 if runner_failure is not None:
                     raise _error(runner_failure)
                 if result is None:
+                    _raise_recorded_monitor_failure(monitor)
                     raise _error("phase_result_invalid")
-                basic = _validate_phase_result(result)
+                try:
+                    basic = _validate_phase_result(result)
+                except BaseException:
+                    _raise_recorded_monitor_failure(monitor)
+                    raise
                 measurements = monitor.finish_phase(phase, basic.records)
                 try:
                     private_run.pin_cleanup_tree(Path("phases") / phase)
@@ -3858,7 +4113,14 @@ def _execute_capacity_transaction(
             except (EnronPrivateIOError, OSError):
                 raise _error("promotion_failed") from None
         if isinstance(effective_error, _CapacityAbort):
-            raise _error(effective_error.code) from None
+            raise _error(
+                effective_error.code,
+                diagnostic=None if monitor is None else monitor.failure_diagnostic(),
+            ) from None
+        if isinstance(effective_error, EnronCapacityError) and monitor is not None:
+            diagnostic = monitor.failure_diagnostic()
+            if diagnostic is not None and effective_error.diagnostic is None:
+                raise _error(effective_error.code, diagnostic=diagnostic) from None
         raise effective_error
     finally:
         final_error = sys.exc_info()[1]
@@ -3921,7 +4183,10 @@ def _execute_capacity_transaction(
                 preserved_error = preserved_error.__context__
             if preserved_error is not None and preserved_error is not final_error:
                 if isinstance(preserved_error, _CapacityAbort):
-                    raise _error(preserved_error.code) from None
+                    raise _error(
+                        preserved_error.code,
+                        diagnostic=None if monitor is None else monitor.failure_diagnostic(),
+                    ) from None
                 raise preserved_error
         if final_error is None and tree_close_error is not None:
             raise tree_close_error
@@ -3940,6 +4205,15 @@ def _invoke_phase_runner(
     except BaseException as exc:
         failure = "phase_interrupted" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "phase_execution_failed"
     return result, failure
+
+
+def _raise_recorded_monitor_failure(monitor: _ContinuousResourceMonitor) -> None:
+    """Translate a stored monitor failure before interpreting a runner response."""
+
+    try:
+        monitor.raise_if_failed()
+    except _CapacityAbort as exc:
+        raise _error(exc.code, diagnostic=monitor.failure_diagnostic()) from None
 
 
 def _provision_phase_runtime_roots(
@@ -4085,6 +4359,8 @@ _COMMON_COMMITMENT_FIELDS = {
     "source_reader_cache_lock_files_owner_only",
     "source_reader_cache_lock_mode",
     "source_reader_cache_lock_adapter_sha256",
+    "source_reader_network_activity_observed",
+    "source_reader_network_activity_adapter_sha256",
     "source_row_multiset_sha256",
     "source_conservation_sha256",
     "privacy_scan_sha256",
@@ -4230,6 +4506,7 @@ def _verify_phase_commitment_chain(
                 "source_reader_restrictive_umask",
                 "source_reader_cache_symlinks_disabled",
                 "source_reader_cache_lock_files_owner_only",
+                "source_reader_network_activity_observed",
             )
         }
         cache_lock_mode = value.get("source_reader_cache_lock_mode")
@@ -4249,6 +4526,7 @@ def _verify_phase_commitment_chain(
             or any(item is not True for item in isolation_booleans.values())
             or cache_lock_mode != _READER_OWNER_ONLY_CACHE_LOCK_MODE
             or value.get("source_reader_cache_lock_adapter_sha256") != _reader_cache_lock_adapter_sha256()
+            or value.get("source_reader_network_activity_adapter_sha256") != _reader_network_activity_adapter_sha256()
             or value.get("source_reader_endpoint_sha256") != _hash_bytes(_READER_OFFICIAL_ENDPOINT.encode("utf-8"))
             or value.get("source_reader_isolation_sha256") != _expected_remote_reader_isolation_sha256()
         ):
@@ -4261,6 +4539,8 @@ def _verify_phase_commitment_chain(
             or cache_lock_mode != 0
             or value.get("source_reader_cache_lock_adapter_sha256")
             != _hash_bytes(b"nerb/local-reader-cache-lock-adapter-not-applicable")
+            or value.get("source_reader_network_activity_adapter_sha256")
+            != _hash_bytes(b"nerb/local-reader-network-activity-adapter-not-applicable")
             or value.get("source_reader_endpoint_sha256") != _hash_bytes(b"local-reader-no-remote-endpoint")
             or value.get("source_reader_isolation_sha256") != _local_reader_isolation()["sha256"]
             or any(
@@ -4273,10 +4553,12 @@ def _verify_phase_commitment_chain(
                     "source_reader_explicit_anonymous_load",
                     "source_reader_restrictive_umask",
                     "source_reader_cache_lock_files_owner_only",
+                    "source_reader_network_activity_observed",
                 }
             )
             or isolation_booleans["source_reader_explicit_cache_dir"] is not False
             or isolation_booleans["source_reader_explicit_anonymous_load"] is not False
+            or isolation_booleans["source_reader_network_activity_observed"] is not False
         ):
             raise _error("phase_commitment_invalid")
         for field, item in value.items():
@@ -4943,6 +5225,7 @@ def _verify_phase_report(
             "continuous",
             "checkpoint",
             "heartbeat",
+            "activity",
             "boundary",
         }:
             raise _error("report_invalid")
@@ -5037,7 +5320,7 @@ def _verify_phase_report(
         if (
             sequence <= previous_signal_sequence
             or sequence > progress_signal_count
-            or kind not in {"checkpoint", "heartbeat", "phase_boundary"}
+            or kind not in {"checkpoint", "heartbeat", "activity", "phase_boundary"}
             or completed < previous_signal_records
             or completed > records
             or wall_elapsed < previous_signal_wall
@@ -5828,6 +6111,7 @@ def _reader_phase_environment_policy_sha256() -> str:
             "removed_credential_environment_keys": sorted(_READER_CREDENTIAL_ENVIRONMENT_KEYS),
             "effective_path_labels": list(_READER_EFFECTIVE_PATH_LABELS),
             "cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
+            "network_activity_adapter_sha256": _reader_network_activity_adapter_sha256(),
         }
     )
 
@@ -5843,6 +6127,28 @@ def _reader_cache_lock_adapter_sha256() -> str:
             "phase_owned_paths_only": True,
             "scope": "remote_preparation_source_consumption",
             "exact_binding_restoration_required": True,
+        }
+    )
+
+
+def _reader_network_activity_adapter_sha256() -> str:
+    return _canonical_hash(
+        {
+            "schema": "enron_capacity_reader_network_activity_adapter",
+            "upstream_factory": "huggingface_hub.utils._http.default_client_factory",
+            "activity_events": ["response_headers", "nonempty_response_chunks"],
+            "same_thread": True,
+            "request_metadata_captured": False,
+            "response_metadata_captured": False,
+            "response_bytes_captured": False,
+            "tracked_stream_close_success_required": True,
+            "tracked_client_close_success_required": True,
+            "successful_stream_close_drops_underlying_reference": True,
+            "client_descriptor_and_hooks_restored": True,
+            "adapter_reference_cycles_cleared": True,
+            "any_close_exception_is_terminal": True,
+            "cleanup_precedes_factory_restoration": True,
+            "exact_factory_and_session_restoration_required": True,
         }
     )
 
@@ -6029,6 +6335,410 @@ def _owner_only_reader_cache_locks(environment: Mapping[str, str]) -> Iterator[N
             raise _CapacityAbort("production_identity_invalid")
 
 
+@dataclass(slots=True)
+class _ReaderNetworkClientClose:
+    client: Any
+    original_close: Callable[[], None]
+    original_close_function: Callable[..., Any]
+    close_wrapper: Callable[[], None] | None = None
+    close_succeeded: bool = False
+    close_failed: bool = False
+
+
+@dataclass(slots=True)
+class _ReaderNetworkActivityAdapter:
+    http_module: Any
+    original_factory: Callable[[], Any]
+    client_factory: Callable[[], Any]
+    response_hook: Callable[[Any], None]
+    clients: list[Any]
+    client_closures: list[_ReaderNetworkClientClose]
+    streams: list[Any]
+    activity_observed: bool = False
+    cleanup_failed: bool = False
+
+
+def _reader_activity_stream_init(
+    wrapper: Any,
+    stream: Any,
+    pulse: Callable[[], None],
+    mark_cleanup_failed: Callable[[], None],
+) -> None:
+    wrapper._stream = stream
+    wrapper._pulse = pulse
+    wrapper._mark_cleanup_failed = mark_cleanup_failed
+    wrapper._closed = False
+    wrapper._close_failed = False
+
+
+def _reader_activity_stream_iter(wrapper: Any) -> Iterator[bytes]:
+    stream = wrapper._stream
+    if stream is None:
+        return
+    for chunk in stream:
+        if chunk:
+            pulse = wrapper._pulse
+            if not callable(pulse):
+                raise _CapacityAbort("production_identity_invalid")
+            pulse()
+        yield chunk
+
+
+def _reader_activity_stream_close(wrapper: Any) -> None:
+    if wrapper._closed:
+        return
+    stream = wrapper._stream
+    if stream is None:
+        raise _CapacityAbort("production_identity_invalid")
+    try:
+        stream.close()
+    except BaseException:
+        wrapper._close_failed = True
+        mark_cleanup_failed = wrapper._mark_cleanup_failed
+        if callable(mark_cleanup_failed):
+            mark_cleanup_failed()
+        raise
+    wrapper._closed = True
+    wrapper._stream = None
+    wrapper._pulse = None
+    wrapper._mark_cleanup_failed = None
+
+
+def _inactive_reader_response_hook(_response: Any) -> None:
+    raise _CapacityAbort("production_identity_invalid")
+
+
+def _reader_network_activity_adapter_is_active() -> bool:
+    state = _ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER
+    if state is None:
+        return False
+    try:
+        http_module = importlib.import_module("huggingface_hub.utils._http")
+        global_client = getattr(http_module, "_GLOBAL_CLIENT")
+    except (AttributeError, ImportError):
+        return False
+    if len(state.clients) != len(state.client_closures):
+        return False
+    clients_valid = True
+    for client, closure in zip(state.clients, state.client_closures, strict=True):
+        hooks = getattr(client, "event_hooks", None)
+        if (
+            closure.client is not client
+            or closure.close_wrapper is None
+            or getattr(client, "close", None) is not closure.close_wrapper
+            or closure.close_failed
+            or not isinstance(hooks, dict)
+            or set(hooks) != {"request", "response"}
+            or hooks["request"] != [getattr(http_module, "hf_request_event_hook", None)]
+            or len(hooks["response"]) != 1
+            or hooks["response"][0] is not state.response_hook
+        ):
+            clients_valid = False
+            break
+        is_closed = bool(getattr(client, "is_closed", True))
+        if client is global_client:
+            clients_valid = not is_closed and not closure.close_succeeded
+        else:
+            clients_valid = is_closed and closure.close_succeeded
+        if not clients_valid:
+            break
+    return (
+        not state.cleanup_failed
+        and state.http_module is http_module
+        and getattr(http_module, "_GLOBAL_CLIENT_FACTORY", None) is state.client_factory
+        and (global_client is None or any(global_client is client for client in state.clients))
+        and all(not bool(getattr(stream, "_close_failed", True)) for stream in state.streams)
+        and clients_valid
+    )
+
+
+def _reader_network_activity_observed() -> bool:
+    state = _ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER
+    return state is not None and state.activity_observed
+
+
+@contextmanager
+def _reader_network_activity(activity: Callable[[], None]) -> Iterator[None]:
+    """Translate exact Hub response/chunk I/O into payload-free liveness."""
+
+    global _ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER
+    if _ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER is not None or not callable(activity):
+        raise _CapacityAbort("production_identity_invalid")
+    try:
+        hub = importlib.import_module("huggingface_hub")
+        http_module = importlib.import_module("huggingface_hub.utils._http")
+        httpx = importlib.import_module("httpx")
+        original_factory = getattr(http_module, "_GLOBAL_CLIENT_FACTORY")
+        default_factory = getattr(http_module, "default_client_factory")
+        set_client_factory = getattr(hub, "set_client_factory")
+        sync_byte_stream = getattr(httpx, "SyncByteStream")
+        client_type = getattr(httpx, "Client")
+    except (AttributeError, ImportError, TypeError):
+        raise _CapacityAbort("production_identity_invalid") from None
+    if (
+        original_factory is not default_factory
+        or getattr(http_module, "_GLOBAL_CLIENT", None) is not None
+        or set_client_factory is not getattr(http_module, "set_client_factory", None)
+        or not isinstance(sync_byte_stream, type)
+        or not isinstance(client_type, type)
+    ):
+        raise _CapacityAbort("production_identity_invalid")
+
+    clients: list[Any] = []
+    client_closures: list[_ReaderNetworkClientClose] = []
+    streams: list[Any] = []
+    last_created_client: Any | None = None
+    state: _ReaderNetworkActivityAdapter
+
+    def pulse() -> None:
+        state.activity_observed = True
+        activity()
+
+    def mark_cleanup_failed() -> None:
+        state.cleanup_failed = True
+
+    ActivityByteStream = type(
+        "_CapacityActivityByteStream",
+        (sync_byte_stream,),
+        {
+            "__init__": _reader_activity_stream_init,
+            "__iter__": _reader_activity_stream_iter,
+            "close": _reader_activity_stream_close,
+        },
+    )
+
+    def response_activity(response: Any) -> None:
+        stream = getattr(response, "stream", None)
+        if not isinstance(stream, sync_byte_stream) or isinstance(stream, ActivityByteStream):
+            raise _CapacityAbort("production_identity_invalid")
+        wrapped = ActivityByteStream(stream, pulse, mark_cleanup_failed)
+        streams.append(wrapped)
+        response.stream = wrapped
+        try:
+            pulse()
+        except BaseException:
+            try:
+                response.close()
+            except BaseException:
+                state.cleanup_failed = True
+            raise
+
+    def client_factory() -> Any:
+        nonlocal last_created_client
+        client: Any | None = None
+        try:
+            client = original_factory()
+            last_created_client = client
+            clients.append(client)
+            if isinstance(client, client_type):
+                client_namespace = vars(client)
+                original_close = getattr(client, "close", None)
+                original_close_function = getattr(original_close, "__func__", None)
+                if (
+                    "close" in client_namespace
+                    or not callable(original_close)
+                    or getattr(original_close, "__self__", None) is not client
+                    or not callable(original_close_function)
+                ):
+                    raise _CapacityAbort("production_identity_invalid")
+                closure = _ReaderNetworkClientClose(
+                    client=client,
+                    original_close=original_close,
+                    original_close_function=original_close_function,
+                )
+                client_closures.append(closure)
+
+                def tracked_close(*, current: _ReaderNetworkClientClose = closure) -> None:
+                    try:
+                        current.original_close()
+                    except BaseException:
+                        current.close_failed = True
+                        state.cleanup_failed = True
+                        raise
+                    current.close_succeeded = True
+
+                closure.close_wrapper = tracked_close
+                setattr(client, "close", tracked_close)
+            hooks = getattr(client, "event_hooks", None)
+            if (
+                not isinstance(client, client_type)
+                or not isinstance(hooks, dict)
+                or set(hooks) != {"request", "response"}
+                or len(hooks["request"]) != 1
+                or hooks["request"][0] is not getattr(http_module, "hf_request_event_hook", None)
+                or hooks["response"]
+                or bool(getattr(client, "is_closed", True))
+            ):
+                raise _CapacityAbort("production_identity_invalid")
+            hooks["response"].append(response_activity)
+            return client
+        except BaseException:
+            raise
+
+    state = _ReaderNetworkActivityAdapter(
+        http_module=http_module,
+        original_factory=original_factory,
+        client_factory=client_factory,
+        response_hook=response_activity,
+        clients=clients,
+        client_closures=client_closures,
+        streams=streams,
+    )
+    install_attempted = False
+    state_published = False
+    primary_error: BaseException | None = None
+    deferred_control: KeyboardInterrupt | SystemExit | _CapacityAbort | None = None
+    try:
+        install_attempted = True
+        set_client_factory(client_factory)
+        _ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER = state
+        state_published = True
+        if not _reader_network_activity_adapter_is_active():
+            raise _CapacityAbort("production_identity_invalid")
+        yield
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        drifted = state_published and not _reader_network_activity_adapter_is_active()
+        _ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER = None
+        cleanup_failed = drifted or state.cleanup_failed
+
+        for stream in streams:
+            if not bool(getattr(stream, "_closed", False)):
+                for _attempt in range(3):
+                    try:
+                        stream.close()
+                    except BaseException:
+                        cleanup_failed = True
+                        continue
+                    break
+            if bool(getattr(stream, "_close_failed", False)) or not bool(getattr(stream, "_closed", False)):
+                cleanup_failed = True
+
+        tracked_clients = [*clients]
+        if last_created_client is not None:
+            tracked_clients.append(last_created_client)
+        current_global_client = getattr(http_module, "_GLOBAL_CLIENT", None)
+        if current_global_client is not None:
+            tracked_clients.append(current_global_client)
+        unique_clients = tuple({id(client): client for client in tracked_clients}.values())
+        closure_by_client = {id(closure.client): closure for closure in client_closures}
+        for client in unique_clients:
+            closure = closure_by_client.get(id(client))
+            if closure is None or closure.client is not client or closure.close_wrapper is None:
+                cleanup_failed = True
+                close = getattr(client, "close", None)
+                if callable(close):
+                    for _attempt in range(3):
+                        try:
+                            close()
+                        except BaseException:
+                            cleanup_failed = True
+                            continue
+                        break
+                continue
+            hooks = getattr(client, "event_hooks", None)
+            if (
+                not isinstance(hooks, dict)
+                or set(hooks) != {"request", "response"}
+                or hooks.get("request") != [getattr(http_module, "hf_request_event_hook", None)]
+                or hooks.get("response") != [state.response_hook]
+            ):
+                cleanup_failed = True
+            if isinstance(hooks, dict):
+                hooks.clear()
+                hooks.update(
+                    {
+                        "request": [getattr(http_module, "hf_request_event_hook", None)],
+                        "response": [],
+                    }
+                )
+            if getattr(client, "close", None) is not closure.close_wrapper:
+                cleanup_failed = True
+            if not closure.close_succeeded:
+                for _attempt in range(3):
+                    try:
+                        closure.close_wrapper()
+                    except BaseException:
+                        cleanup_failed = True
+                        continue
+                    break
+            if closure.close_failed or not closure.close_succeeded or not bool(getattr(client, "is_closed", False)):
+                cleanup_failed = True
+            try:
+                delattr(client, "close")
+            except BaseException:
+                cleanup_failed = True
+            restored_close = getattr(client, "close", None)
+            if (
+                "close" in vars(client)
+                or getattr(restored_close, "__self__", None) is not client
+                or getattr(restored_close, "__func__", None) is not closure.original_close_function
+            ):
+                cleanup_failed = True
+
+        if install_attempted:
+            restored = False
+            for _attempt in range(3):
+                if (
+                    getattr(http_module, "_GLOBAL_CLIENT_FACTORY", None) is original_factory
+                    and getattr(http_module, "_GLOBAL_CLIENT", None) is None
+                ):
+                    restored = True
+                    break
+                try:
+                    set_client_factory(original_factory)
+                except (KeyboardInterrupt, SystemExit, _CapacityAbort) as exc:
+                    if deferred_control is None:
+                        deferred_control = exc
+                except BaseException:
+                    cleanup_failed = True
+                    continue
+            restored = (
+                getattr(http_module, "_GLOBAL_CLIENT_FACTORY", None) is original_factory
+                and getattr(http_module, "_GLOBAL_CLIENT", None) is None
+            )
+            cleanup_failed = cleanup_failed or not restored
+
+        if (
+            getattr(http_module, "_GLOBAL_CLIENT_FACTORY", None) is not original_factory
+            or getattr(http_module, "_GLOBAL_CLIENT", None) is not None
+            or any(
+                closure.close_failed
+                or not closure.close_succeeded
+                or not bool(getattr(closure.client, "is_closed", False))
+                for closure in client_closures
+            )
+            or any(
+                bool(getattr(stream, "_close_failed", False)) or not bool(getattr(stream, "_closed", False))
+                for stream in streams
+            )
+            or any(
+                "close" in vars(closure.client)
+                or getattr(getattr(closure.client, "close", None), "__self__", None) is not closure.client
+                or getattr(getattr(closure.client, "close", None), "__func__", None)
+                is not closure.original_close_function
+                or getattr(closure.client, "event_hooks", {}).get("response") != []
+                or getattr(closure.client, "event_hooks", {}).get("request")
+                != [getattr(http_module, "hf_request_event_hook", None)]
+                for closure in client_closures
+            )
+        ):
+            cleanup_failed = True
+        for closure in client_closures:
+            closure.close_wrapper = None
+        clients.clear()
+        client_closures.clear()
+        streams.clear()
+        state.client_factory = original_factory
+        state.response_hook = _inactive_reader_response_hook
+        if cleanup_failed:
+            raise _CapacityAbort("production_identity_invalid")
+        if primary_error is None and deferred_control is not None:
+            raise deferred_control
+
+
 def _expected_reader_effective_paths(environment: Mapping[str, str]) -> dict[str, Path]:
     hf_home = Path(environment["HF_HOME"])
     token_path = Path(environment["HF_TOKEN_PATH"])
@@ -6158,7 +6868,10 @@ def _reader_isolation_snapshot(
         or not token_files_absent
         or _current_process_umask() != 0o077
         or not _reader_cache_lock_adapter_is_active(environment)
+        or not _reader_network_activity_adapter_is_active()
     ):
+        raise _CapacityAbort("production_identity_invalid")
+    if _reader_network_activity_observed() is not (stage == "after_source_read"):
         raise _CapacityAbort("production_identity_invalid")
     return _expected_reader_isolation_snapshot(stage)
 
@@ -6186,6 +6899,8 @@ def _expected_reader_isolation_snapshot(stage: str) -> dict[str, Any]:
         "cache_lock_files_owner_only": True,
         "cache_lock_mode": _READER_OWNER_ONLY_CACHE_LOCK_MODE,
         "cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
+        "network_activity_observed": stage == "after_source_read",
+        "network_activity_adapter_sha256": _reader_network_activity_adapter_sha256(),
     }
 
 
@@ -6237,6 +6952,8 @@ def _local_reader_isolation() -> dict[str, Any]:
         "cache_lock_files_owner_only": False,
         "cache_lock_mode": 0,
         "cache_lock_adapter_sha256": _hash_bytes(b"nerb/local-reader-cache-lock-adapter-not-applicable"),
+        "network_activity_observed": False,
+        "network_activity_adapter_sha256": _hash_bytes(b"nerb/local-reader-network-activity-adapter-not-applicable"),
     }
     return {**descriptor, "sha256": _canonical_hash(descriptor)}
 

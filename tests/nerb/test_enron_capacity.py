@@ -247,6 +247,10 @@ def _commitments() -> dict[str, dict[str, Any]]:
         "source_reader_cache_lock_files_owner_only": False,
         "source_reader_cache_lock_mode": 0,
         "source_reader_cache_lock_adapter_sha256": _hash("nerb/local-reader-cache-lock-adapter-not-applicable"),
+        "source_reader_network_activity_observed": False,
+        "source_reader_network_activity_adapter_sha256": _hash(
+            "nerb/local-reader-network-activity-adapter-not-applicable"
+        ),
         "source_row_multiset_sha256": _hash("source-row-multiset"),
         "source_conservation_sha256": "",
         "sealed_test_accessed": False,
@@ -2803,6 +2807,26 @@ def test_verifier_rejects_rehashed_commitment_identity_privacy_and_replay_tamper
     _rehash_report(evidence_bound)
     with pytest.raises(EnronCapacityError):
         verify_capacity_report(evidence_bound, require_production=False)
+
+    local_network = copy.deepcopy(report)
+    for phase in local_network["phases"]:
+        commitments = phase["commitments"]
+        commitments["source_reader_network_activity_observed"] = True
+        commitments["privacy_scan_sha256"] = enron_capacity._privacy_scan_sha256(phase["phase"], commitments)
+        phase["commitments_sha256"] = _canonical_hash(commitments)
+    _rehash_report(local_network)
+    with pytest.raises(EnronCapacityError):
+        verify_capacity_report(local_network, require_production=False)
+
+    network_adapter = copy.deepcopy(report)
+    for phase in network_adapter["phases"]:
+        commitments = phase["commitments"]
+        commitments["source_reader_network_activity_adapter_sha256"] = _hash("different-network-adapter")
+        commitments["privacy_scan_sha256"] = enron_capacity._privacy_scan_sha256(phase["phase"], commitments)
+        phase["commitments_sha256"] = _canonical_hash(commitments)
+    _rehash_report(network_adapter)
+    with pytest.raises(EnronCapacityError):
+        verify_capacity_report(network_adapter, require_production=False)
 
     private = copy.deepcopy(report)
     private["phases"][0]["private_path"] = "/private/source"
@@ -5655,6 +5679,236 @@ def test_watchdog_interrupts_resource_and_progress_wall_gap_at_production_interv
     assert progress_sleep_completed is False
 
 
+def _wall_gap_diagnostic() -> dict[str, Any]:
+    gap = enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS + 1
+    return {
+        "phase": "build",
+        "origin": "continuous_observation",
+        "last_accepted_progress_kind": "activity",
+        "attempted_progress_kind": "continuous_observation",
+        "last_completed_records": 10_000,
+        "checkpoint_count": 1,
+        "progress_signal_count": 2,
+        "phase_wall_elapsed_ns": gap + 10,
+        "observed_progress_gap_ns": gap,
+    }
+
+
+def test_wall_gap_diagnostic_schema_rejects_impossible_or_sensitive_payloads() -> None:
+    valid = _wall_gap_diagnostic()
+    assert enron_capacity._validated_failure_diagnostic(valid) == valid
+
+    invalid: list[dict[str, Any]] = []
+    with_private_path = {**valid, "private_path": "/private/sensitive@example.invalid"}
+    invalid.append(with_private_path)
+    invalid.append({**valid, "origin": "checkpoint_call", "attempted_progress_kind": "activity"})
+    invalid.append({**valid, "last_accepted_progress_kind": "phase_finish"})
+    invalid.append({**valid, "attempted_progress_kind": "phase_start"})
+    invalid.append({**valid, "phase_wall_elapsed_ns": valid["observed_progress_gap_ns"] - 1})
+    invalid.append({**valid, "checkpoint_count": 3, "progress_signal_count": 2})
+    invalid.append({**valid, "checkpoint_count": 0, "last_completed_records": 10_000})
+    invalid.append({**valid, "last_accepted_progress_kind": "phase_start", "progress_signal_count": 2})
+    invalid.append(
+        {
+            **valid,
+            "observed_progress_gap_ns": enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS,
+        }
+    )
+    assert all(enron_capacity._validated_failure_diagnostic(item) is None for item in invalid)
+    assert enron_capacity._error("rss_limit", diagnostic=valid).diagnostic is None
+
+
+@pytest.mark.parametrize(
+    ("origin", "attempted_kind"),
+    [
+        ("checkpoint_call", "checkpoint"),
+        ("heartbeat_call", "heartbeat"),
+        ("activity_call", "activity"),
+        ("continuous_observation", "continuous_observation"),
+        ("phase_finish", "phase_finish"),
+    ],
+)
+def test_monitor_preserves_last_accepted_progress_in_first_wall_gap_diagnostic(
+    tmp_path: Path,
+    origin: str,
+    attempted_kind: str,
+) -> None:
+    probe = _Probe()
+    wall_now = 1
+    monitor = enron_capacity._ContinuousResourceMonitor(
+        tree=cast(Any, _StaticTree()),
+        probe=probe,
+        preflight=_runtime_preflight(tmp_path),
+        run_started_ns=1,
+        interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+        wall_clock=lambda: wall_now,
+    )
+    monitor.begin_phase("build", 1)
+    monitor.checkpoint("build", 10_000)
+    state = monitor._states["build"]
+    accepted_wall = state.last_progress_wall_ns
+    accepted_count = state.progress_signal_count
+    wall_now += enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS + 1
+
+    if origin == "checkpoint_call":
+        with pytest.raises(enron_capacity._CapacityAbort):
+            monitor.checkpoint("build", 20_000)
+    elif origin == "heartbeat_call":
+        with pytest.raises(enron_capacity._CapacityAbort):
+            monitor.heartbeat("build")
+    elif origin == "activity_call":
+        with pytest.raises(enron_capacity._CapacityAbort):
+            monitor.activity("build")
+    elif origin == "continuous_observation":
+        monitor._global_last_resource_wall_ns = wall_now
+        state.last_resource_wall_ns = wall_now
+        monitor._observe("continuous")
+    else:
+        monitor._observe_serialized = lambda _kind, **_kwargs: None  # ty: ignore[invalid-assignment]
+        with pytest.raises(EnronCapacityError):
+            monitor.finish_phase("build", 10_000)
+
+    diagnostic = monitor.failure_diagnostic()
+    assert diagnostic is not None
+    assert diagnostic["phase"] == "build"
+    assert diagnostic["origin"] == origin
+    assert diagnostic["last_accepted_progress_kind"] == "checkpoint"
+    assert diagnostic["attempted_progress_kind"] == attempted_kind
+    assert diagnostic["last_completed_records"] == 10_000
+    assert diagnostic["checkpoint_count"] == 1
+    assert diagnostic["progress_signal_count"] == accepted_count
+    assert state.last_progress_wall_ns == accepted_wall
+    assert state.progress_signal_count == accepted_count
+
+    first = dict(diagnostic)
+    monitor._record_progress_failure(
+        "build",
+        state,
+        origin="activity_call",
+        attempted_kind="activity",
+        wall_now=wall_now + 1,
+        wall_gap=diagnostic["observed_progress_gap_ns"] + 1,
+    )
+    assert monitor.failure_diagnostic() == first
+
+
+@pytest.mark.parametrize("callback_kind", ["checkpoint", "heartbeat", "activity"])
+def test_progress_callbacks_preserve_the_first_recorded_monitor_failure(
+    tmp_path: Path,
+    callback_kind: str,
+) -> None:
+    probe = _Probe()
+    wall_now = 1
+    monitor = enron_capacity._ContinuousResourceMonitor(
+        tree=cast(Any, _StaticTree()),
+        probe=probe,
+        preflight=_runtime_preflight(tmp_path),
+        run_started_ns=1,
+        interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+        wall_clock=lambda: wall_now,
+    )
+    monitor.begin_phase("build", 1)
+    state = monitor._states["build"]
+    monitor._record_failure("rss_limit")
+    wall_now += enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS + 1
+
+    with pytest.raises(enron_capacity._CapacityAbort) as raised:
+        if callback_kind == "checkpoint":
+            monitor.checkpoint("build", 10_000)
+        elif callback_kind == "heartbeat":
+            monitor.heartbeat("build")
+        else:
+            monitor.activity("build")
+
+    assert raised.value.code == "rss_limit"
+    assert monitor._failure_code == "rss_limit"
+    assert monitor.failure_diagnostic() is None
+    assert state.last_progress_kind == "phase_start"
+    assert state.progress_signal_count == 0
+    assert state.checkpoint_count == 0
+
+
+@pytest.mark.parametrize("failure_kind", ["wall_gap", "rss_limit"])
+@pytest.mark.parametrize("translated_outcome", ["exception", "none", "malformed"])
+def test_translated_phase_error_preserves_the_monitor_failure_and_receipt(
+    tmp_path: Path,
+    failure_kind: str,
+    translated_outcome: str,
+) -> None:
+    probe = _Probe()
+    wall_now = 1
+
+    def wall_clock() -> int:
+        return wall_now
+
+    def translated(context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
+        nonlocal wall_now
+        if failure_kind == "wall_gap":
+            wall_now += enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS + 1
+        else:
+            probe.set_rss(enron_capacity.MAX_ABSOLUTE_RSS_BYTES + 1)
+        try:
+            context.checkpoint(10_000)
+        except BaseException:
+            if translated_outcome == "exception":
+                raise RuntimeError("translated phase callback failure") from None
+            if translated_outcome == "none":
+                return cast(Any, None)
+            return cast(Any, object())
+        raise AssertionError("capacity callback unexpectedly succeeded")
+
+    with pytest.raises(EnronCapacityError) as raised:
+        _run(
+            tmp_path,
+            probe,
+            replacements={"preparation": translated},
+            wall_clock=wall_clock,
+        )
+
+    expected = "checkpoint_wall_gap" if failure_kind == "wall_gap" else "rss_limit"
+    assert raised.value.code == expected
+    if failure_kind == "wall_gap":
+        assert raised.value.diagnostic is not None
+        assert raised.value.diagnostic["origin"] == "checkpoint_call"
+    else:
+        assert raised.value.diagnostic is None
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["failure_code"] == expected
+
+
+def test_activity_signals_are_cheap_and_keep_the_frozen_ten_second_margin(tmp_path: Path) -> None:
+    assert enron_capacity.ACTIVITY_RECORD_INTERVAL == 1_000
+    assert enron_capacity.MAX_CHECKPOINT_RECORD_GAP == 10_000
+    interval_at_floor = (
+        enron_capacity.ACTIVITY_RECORD_INTERVAL * 1_000_000_000 // enron_capacity.MIN_PHASE_RECORDS_PER_SECOND
+    )
+    assert interval_at_floor == 10_000_000_000
+    assert interval_at_floor < enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS
+
+    probe = _Probe()
+    wall_now = 1
+    monitor = enron_capacity._ContinuousResourceMonitor(
+        tree=cast(Any, _StaticTree()),
+        probe=probe,
+        preflight=_runtime_preflight(tmp_path),
+        run_started_ns=1,
+        interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+        wall_clock=lambda: wall_now,
+    )
+    monitor.begin_phase("preparation", 1)
+    observations: list[tuple[str, int | None]] = []
+    monitor._observe = lambda kind, *, completed_records=None: observations.append(  # ty: ignore[invalid-assignment]
+        (kind, completed_records)
+    )
+    for _ in range(4):
+        wall_now += 1_000_000_000
+        monitor.activity("preparation")
+    assert observations == []
+    wall_now += 1_000_000_000
+    monitor.activity("preparation")
+    assert observations == [("activity", None)]
+
+
 def test_private_tree_guard_registration_and_scanning_are_thread_safe(tmp_path: Path) -> None:
     root = tmp_path / "guarded-tree"
     root.mkdir(mode=0o700)
@@ -5949,6 +6203,31 @@ def test_legitimate_non_record_heartbeats_do_not_inflate_record_progress(
     assert phase["maximum_progress_checkpoint_wall_gap_ns"] <= test_wall_gap_ns
 
 
+def test_verified_work_activity_is_distinct_from_explicit_heartbeat_evidence(tmp_path: Path) -> None:
+    probe = _Probe()
+
+    def finalization(context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
+        _checkpoint_all(context, probe, _VALIDATION_RECORDS)
+        context.activity()
+        context.activity()
+        context.heartbeat()
+        return _result("streaming_validation")
+
+    report, _ = _run(
+        tmp_path,
+        probe,
+        replacements={"streaming_validation": finalization},
+    )
+    phase = report["phases"][3]
+    assert sum(signal["kind"] == "activity" for signal in phase["progress_signals"]) == 2
+    assert sum(signal["kind"] == "heartbeat" for signal in phase["progress_signals"]) == 1
+    assert all(
+        signal["completed_records"] == _VALIDATION_RECORDS
+        for signal in phase["progress_signals"]
+        if signal["kind"] in {"activity", "heartbeat"}
+    )
+
+
 def test_heartbeat_enforcement_is_unbounded_while_report_evidence_is_deterministically_bounded(
     tmp_path: Path,
 ) -> None:
@@ -6086,7 +6365,7 @@ def test_worker_discards_benign_dependency_stderr_and_validates_only_canonical_s
     def fake_run(*args: Any, **kwargs: Any) -> Any:
         observed["command"] = args[0]
         observed.update(kwargs)
-        response = {"ok": False, "code": "production_identity_invalid", "report": None}
+        response = {"ok": False, "code": "production_identity_invalid", "diagnostic": None, "report": None}
         return subprocess.CompletedProcess(
             args[0], 0, stdout=enron_capacity._canonical_json_bytes(response), stderr=b"benign"
         )
@@ -6101,6 +6380,49 @@ def test_worker_discards_benign_dependency_stderr_and_validates_only_canonical_s
     assert observed["env"]["TQDM_DISABLE"] == "1"
     assert "PYTHONHASHSEED" not in observed["env"]
     assert observed["command"][1:4] == ["-I", "-S", "-B"]
+
+
+def test_worker_response_binds_wall_gap_diagnostic_and_rejects_every_other_pairing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: Path.cwd())
+    monkeypatch.setattr(
+        enron_capacity,
+        "_validated_capacity_bootstrap",
+        lambda: (Path.cwd() / "src", (), ()),
+    )
+    diagnostic = _wall_gap_diagnostic()
+    response: dict[str, Any] = {
+        "ok": False,
+        "code": "checkpoint_wall_gap",
+        "diagnostic": diagnostic,
+        "report": None,
+    }
+
+    def fake_run(*args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(args[0], 0, stdout=enron_capacity._canonical_json_bytes(response))
+
+    monkeypatch.setattr(enron_capacity.subprocess, "run", fake_run)
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._spawn_production_worker(_options(tmp_path, "valid-diagnostic"))
+    assert raised.value.code == "checkpoint_wall_gap"
+    assert raised.value.diagnostic == diagnostic
+
+    invalid_responses = (
+        {**response, "diagnostic": None},
+        {**response, "code": "rss_limit"},
+        {**response, "diagnostic": {**diagnostic, "path": "/private/sensitive@example.invalid"}},
+        {"ok": True, "code": None, "diagnostic": diagnostic, "report": {}},
+    )
+    for index, invalid in enumerate(invalid_responses):
+        response.clear()
+        response.update(invalid)
+        with pytest.raises(EnronCapacityError) as rejected:
+            enron_capacity._spawn_production_worker(_options(tmp_path, f"invalid-diagnostic-{index}"))
+        assert rejected.value.code == "production_worker_failed"
+        assert rejected.value.diagnostic is None
+        assert "sensitive@example.invalid" not in str(rejected.value)
 
 
 @pytest.mark.parametrize(
@@ -6139,7 +6461,7 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     source_payload = (
         "import fractions, json\n"
         "def _production_worker_main():\n"
-        '    print(json.dumps({"ok":False,"code":"options_invalid","report":None},'
+        '    print(json.dumps({"ok":False,"code":"options_invalid","diagnostic":None,"report":None},'
         'sort_keys=True,separators=(",",":")))\n'
         "    return 0\n"
     )
@@ -6739,6 +7061,12 @@ def test_production_preloads_core_modules_and_rejects_midrun_source_drift(
     imported: list[str] = []
     original_import = enron_capacity.importlib.import_module
 
+    # This unit test shares an interpreter with tests that exercise the pinned
+    # HTTP client.  The real-worker subprocess test below proves the reader set
+    # is empty before and after preload; model that fresh-worker precondition
+    # here so this test can focus on the closed core-module inventory.
+    monkeypatch.setattr(enron_capacity, "_loaded_reader_modules", lambda: ())
+
     def record_import(name: str, *args: Any, **kwargs: Any) -> Any:
         imported.append(name)
         return original_import(name, *args, **kwargs)
@@ -6826,6 +7154,7 @@ def test_capacity_reader_dependency_is_exact_locked_and_documented() -> None:
     for distribution, version in {
         "datasets": "5.0.0",
         "huggingface-hub": "1.23.0",
+        "httpx": "0.28.1",
         "fsspec": "2026.4.0",
         "pyarrow": "25.0.0",
     }.items():
@@ -6836,10 +7165,324 @@ def test_capacity_reader_dependency_is_exact_locked_and_documented() -> None:
     assert "private-tree scanner continues to reject every" in documentation
 
 
+def test_reader_network_activity_uses_only_headers_and_nonempty_chunks_and_restores_exactly() -> None:
+    httpx = cast(Any, importlib.import_module("httpx"))
+    hub = cast(Any, importlib.import_module("huggingface_hub"))
+    http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
+    hub.set_client_factory(http_module.default_client_factory)
+    original_default = http_module.default_client_factory
+    original_factory = http_module._GLOBAL_CLIENT_FACTORY
+    pulses = 0
+    close_calls = 0
+
+    class Chunks(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"alpha"
+            yield b""
+            yield b"omega"
+
+        def close(self) -> None:
+            nonlocal close_calls
+            close_calls += 1
+
+    def handler(_request: Any) -> Any:
+        return httpx.Response(200, stream=Chunks(), headers={"x-private": "not-retained"})
+
+    def factory() -> Any:
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            event_hooks={"request": [http_module.hf_request_event_hook], "response": []},
+        )
+
+    def activity() -> None:
+        nonlocal pulses
+        pulses += 1
+
+    http_module.default_client_factory = factory
+    http_module._GLOBAL_CLIENT_FACTORY = factory
+    try:
+        with enron_capacity._reader_network_activity(activity):
+            assert enron_capacity._reader_network_activity_observed() is False
+            client = http_module.get_session()
+            response = client.get("https://example.invalid/private-path?email=sensitive")
+            assert response.content == b"alphaomega"
+            response.close()
+            assert enron_capacity._reader_network_activity_observed() is True
+            assert enron_capacity._reader_network_activity_adapter_is_active() is True
+            adapter = enron_capacity._ACTIVE_READER_NETWORK_ACTIVITY_ADAPTER
+            assert adapter is not None
+            assert len(adapter.streams) == 1
+            assert adapter.streams[0]._closed is True
+            assert adapter.streams[0]._stream is None
+        assert pulses == 3
+        assert close_calls == 1
+        assert "close" not in vars(client)
+        assert client.event_hooks["request"] == [http_module.hf_request_event_hook]
+        assert client.event_hooks["response"] == []
+        assert adapter.clients == []
+        assert adapter.client_closures == []
+        assert adapter.streams == []
+        assert http_module._GLOBAL_CLIENT_FACTORY is factory
+        assert http_module._GLOBAL_CLIENT is None
+        assert enron_capacity._reader_network_activity_adapter_is_active() is False
+    finally:
+        hub.set_client_factory(original_factory)
+        http_module.default_client_factory = original_default
+        http_module._GLOBAL_CLIENT_FACTORY = original_factory
+
+
+@pytest.mark.parametrize("hook_name", ["request", "response"])
+def test_reader_network_activity_fails_closed_on_hook_drift_after_restoring_globals(hook_name: str) -> None:
+    httpx = cast(Any, importlib.import_module("httpx"))
+    hub = cast(Any, importlib.import_module("huggingface_hub"))
+    http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
+    hub.set_client_factory(http_module.default_client_factory)
+    original_default = http_module.default_client_factory
+    original_factory = http_module._GLOBAL_CLIENT_FACTORY
+
+    def handler(_request: Any) -> Any:
+        return httpx.Response(200, content=b"bounded")
+
+    def factory() -> Any:
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            event_hooks={"request": [http_module.hf_request_event_hook], "response": []},
+        )
+
+    http_module.default_client_factory = factory
+    http_module._GLOBAL_CLIENT_FACTORY = factory
+    try:
+        with pytest.raises(enron_capacity._CapacityAbort) as raised:
+            with enron_capacity._reader_network_activity(lambda: None):
+                client = http_module.get_session()
+                assert client.get("https://example.invalid/").content == b"bounded"
+                client.event_hooks[hook_name].clear()
+                client.close()
+        assert raised.value.code == "production_identity_invalid"
+        assert http_module._GLOBAL_CLIENT_FACTORY is factory
+        assert http_module._GLOBAL_CLIENT is None
+        assert client.is_closed is True
+        assert enron_capacity._reader_network_activity_adapter_is_active() is False
+    finally:
+        hub.set_client_factory(original_factory)
+        http_module.default_client_factory = original_default
+        http_module._GLOBAL_CLIENT_FACTORY = original_factory
+
+
+@pytest.mark.parametrize("abort_at", [1, 2])
+def test_reader_network_activity_preserves_header_or_chunk_abort_and_closes_everything(abort_at: int) -> None:
+    httpx = cast(Any, importlib.import_module("httpx"))
+    hub = cast(Any, importlib.import_module("huggingface_hub"))
+    http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
+    hub.set_client_factory(http_module.default_client_factory)
+    original_default = http_module.default_client_factory
+    original_factory = http_module._GLOBAL_CLIENT_FACTORY
+    pulses = 0
+    closed = False
+
+    class Chunks(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"first"
+            yield b"second"
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    def factory() -> Any:
+        return httpx.Client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, stream=Chunks())),
+            event_hooks={"request": [http_module.hf_request_event_hook], "response": []},
+        )
+
+    def activity() -> None:
+        nonlocal pulses
+        pulses += 1
+        if pulses == abort_at:
+            raise enron_capacity._CapacityAbort("checkpoint_wall_gap")
+
+    http_module.default_client_factory = factory
+    http_module._GLOBAL_CLIENT_FACTORY = factory
+    try:
+        with pytest.raises(enron_capacity._CapacityAbort) as raised:
+            with enron_capacity._reader_network_activity(activity):
+                http_module.get_session().get("https://example.invalid/private?sensitive=email@example.invalid")
+        assert raised.value.code == "checkpoint_wall_gap"
+        assert pulses == abort_at
+        assert closed is True
+        assert http_module._GLOBAL_CLIENT_FACTORY is factory
+        assert http_module._GLOBAL_CLIENT is None
+        assert enron_capacity._reader_network_activity_adapter_is_active() is False
+    finally:
+        hub.set_client_factory(original_factory)
+        http_module.default_client_factory = original_default
+        http_module._GLOBAL_CLIENT_FACTORY = original_factory
+
+
+@pytest.mark.parametrize(
+    "control",
+    [KeyboardInterrupt("reader factory"), SystemExit("reader factory"), enron_capacity._CapacityAbort("runtime_limit")],
+)
+def test_reader_network_activity_preserves_factory_control_and_restores_exactly(control: BaseException) -> None:
+    hub = cast(Any, importlib.import_module("huggingface_hub"))
+    http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
+    hub.set_client_factory(http_module.default_client_factory)
+    installed_default = http_module.default_client_factory
+    installed_factory = http_module._GLOBAL_CLIENT_FACTORY
+
+    def controlled_factory() -> Any:
+        raise control
+
+    http_module.default_client_factory = controlled_factory
+    http_module._GLOBAL_CLIENT_FACTORY = controlled_factory
+    try:
+        with pytest.raises(type(control)) as raised:
+            with enron_capacity._reader_network_activity(lambda: None):
+                http_module.get_session()
+        assert raised.value is control
+        assert http_module._GLOBAL_CLIENT_FACTORY is controlled_factory
+        assert http_module._GLOBAL_CLIENT is None
+        assert enron_capacity._reader_network_activity_adapter_is_active() is False
+    finally:
+        hub.set_client_factory(installed_factory)
+        http_module.default_client_factory = installed_default
+        http_module._GLOBAL_CLIENT_FACTORY = installed_factory
+
+
+def test_reader_network_activity_tracks_rotated_clients_and_rejects_factory_drift() -> None:
+    httpx = cast(Any, importlib.import_module("httpx"))
+    hub = cast(Any, importlib.import_module("huggingface_hub"))
+    http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
+    hub.set_client_factory(http_module.default_client_factory)
+    installed_default = http_module.default_client_factory
+    installed_factory = http_module._GLOBAL_CLIENT_FACTORY
+    created: list[Any] = []
+
+    def factory() -> Any:
+        client = httpx.Client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=b"bounded")),
+            event_hooks={"request": [http_module.hf_request_event_hook], "response": []},
+        )
+        created.append(client)
+        return client
+
+    http_module.default_client_factory = factory
+    http_module._GLOBAL_CLIENT_FACTORY = factory
+
+    def drifted_factory() -> None:
+        return None
+
+    try:
+        with pytest.raises(enron_capacity._CapacityAbort) as raised:
+            with enron_capacity._reader_network_activity(lambda: None):
+                first = http_module.get_session()
+                assert first.get("https://example.invalid/first").content == b"bounded"
+                http_module.close_session()
+                second = http_module.get_session()
+                assert second is not first
+                assert second.get("https://example.invalid/second").content == b"bounded"
+                http_module._GLOBAL_CLIENT_FACTORY = drifted_factory
+        assert raised.value.code == "production_identity_invalid"
+        assert len(created) == 2
+        assert all(client.is_closed for client in created)
+        assert http_module._GLOBAL_CLIENT_FACTORY is factory
+        assert http_module._GLOBAL_CLIENT is None
+        assert enron_capacity._reader_network_activity_adapter_is_active() is False
+    finally:
+        hub.set_client_factory(installed_factory)
+        http_module.default_client_factory = installed_default
+        http_module._GLOBAL_CLIENT_FACTORY = installed_factory
+
+
+def test_reader_network_activity_rejects_a_transport_close_failure_hidden_by_hub() -> None:
+    httpx = cast(Any, importlib.import_module("httpx"))
+    hub = cast(Any, importlib.import_module("huggingface_hub"))
+    http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
+    hub.set_client_factory(http_module.default_client_factory)
+    installed_default = http_module.default_client_factory
+    installed_factory = http_module._GLOBAL_CLIENT_FACTORY
+    transport_close_calls = 0
+
+    class FailingTransport(httpx.MockTransport):
+        def close(self) -> None:
+            nonlocal transport_close_calls
+            transport_close_calls += 1
+            raise RuntimeError("injected transport close failure")
+
+    def factory() -> Any:
+        return httpx.Client(
+            transport=FailingTransport(lambda _request: httpx.Response(200, content=b"bounded")),
+            event_hooks={"request": [http_module.hf_request_event_hook], "response": []},
+        )
+
+    http_module.default_client_factory = factory
+    http_module._GLOBAL_CLIENT_FACTORY = factory
+    try:
+        with pytest.raises(enron_capacity._CapacityAbort) as raised:
+            with enron_capacity._reader_network_activity(lambda: None):
+                client = http_module.get_session()
+                assert client.get("https://example.invalid/").content == b"bounded"
+        assert raised.value.code == "production_identity_invalid"
+        assert transport_close_calls == 1
+        assert client.is_closed is True
+        assert http_module._GLOBAL_CLIENT_FACTORY is factory
+        assert http_module._GLOBAL_CLIENT is None
+        assert enron_capacity._reader_network_activity_adapter_is_active() is False
+    finally:
+        hub.set_client_factory(installed_factory)
+        http_module.default_client_factory = installed_default
+        http_module._GLOBAL_CLIENT_FACTORY = installed_factory
+
+
+def test_reader_network_activity_rejects_response_close_failure_without_masking_cleanup() -> None:
+    httpx = cast(Any, importlib.import_module("httpx"))
+    hub = cast(Any, importlib.import_module("huggingface_hub"))
+    http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
+    hub.set_client_factory(http_module.default_client_factory)
+    installed_default = http_module.default_client_factory
+    installed_factory = http_module._GLOBAL_CLIENT_FACTORY
+    stream_close_calls = 0
+
+    class FailingOnceStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"bounded"
+
+        def close(self) -> None:
+            nonlocal stream_close_calls
+            stream_close_calls += 1
+            if stream_close_calls == 1:
+                raise RuntimeError("injected response close failure")
+
+    def factory() -> Any:
+        return httpx.Client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200, stream=FailingOnceStream())),
+            event_hooks={"request": [http_module.hf_request_event_hook], "response": []},
+        )
+
+    def abort_on_headers() -> None:
+        raise enron_capacity._CapacityAbort("checkpoint_wall_gap")
+
+    http_module.default_client_factory = factory
+    http_module._GLOBAL_CLIENT_FACTORY = factory
+    try:
+        with pytest.raises(enron_capacity._CapacityAbort) as raised:
+            with enron_capacity._reader_network_activity(abort_on_headers):
+                http_module.get_session().get("https://example.invalid/")
+        assert raised.value.code == "production_identity_invalid"
+        assert stream_close_calls >= 2
+        assert http_module._GLOBAL_CLIENT_FACTORY is factory
+        assert http_module._GLOBAL_CLIENT is None
+        assert enron_capacity._reader_network_activity_adapter_is_active() is False
+    finally:
+        hub.set_client_factory(installed_factory)
+        http_module.default_client_factory = installed_default
+        http_module._GLOBAL_CLIENT_FACTORY = installed_factory
+
+
 def test_reader_provenance_stays_unloaded_until_phase_owned_isolation(tmp_path: Path) -> None:
     if any(
         importlib.util.find_spec(module_name) is None
-        for module_name in ("datasets", "huggingface_hub", "fsspec", "pyarrow")
+        for module_name in ("datasets", "huggingface_hub", "httpx", "fsspec", "pyarrow")
     ):
         pytest.skip("The exact locked Enron capacity reader group is not installed.")
     root = Path(__file__).parents[2]
@@ -6960,6 +7603,7 @@ def test_reader_provenance_stays_unloaded_until_phase_owned_isolation(tmp_path: 
             lambda _records: None,
             lambda path: path,
             lambda: None,
+            lambda: None,
             runtime_environment=phase_environment,
             scratch_dir=roots["scratch"],
             spool_dir=roots["spool"],
@@ -6970,9 +7614,28 @@ def test_reader_provenance_stays_unloaded_until_phase_owned_isolation(tmp_path: 
             from huggingface_hub.file_download import are_symlinks_supported
             from huggingface_hub.file_download import WeakFileLock
             from huggingface_hub.utils import _fixes
+            from huggingface_hub.utils import _http
+            import httpx
             original_file_lock = _fixes.FileLock
             original_soft_file_lock = _fixes.SoftFileLock
-            with capacity._owner_only_reader_cache_locks(phase_environment):
+            installed_default_client_factory = _http.default_client_factory
+
+            def isolated_transport(_request):
+                return httpx.Response(200, content=b"bounded-reader-pulse")
+
+            def isolated_client_factory():
+                return httpx.Client(
+                    transport=httpx.MockTransport(isolated_transport),
+                    event_hooks={"request": [_http.hf_request_event_hook], "response": []},
+                )
+
+            _http.default_client_factory = isolated_client_factory
+            _http._GLOBAL_CLIENT_FACTORY = isolated_client_factory
+            original_client_factory = isolated_client_factory
+            with (
+                capacity._owner_only_reader_cache_locks(phase_environment),
+                capacity._reader_network_activity(lambda: None),
+            ):
                 before = capacity._reader_isolation_snapshot(context, module, stage="before_source_read")
                 mode_dir = roots["hf-hub"] / "mode-dir"
                 mode_dir.mkdir()
@@ -7021,6 +7684,7 @@ def test_reader_provenance_stays_unloaded_until_phase_owned_isolation(tmp_path: 
                 assert are_symlinks_supported(roots["hf-hub"]) is False
                 assert stat.S_IMODE(mode_dir.stat().st_mode) == 0o700
                 assert stat.S_IMODE(mode_file.stat().st_mode) == 0o600
+                assert _http.get_session().get("https://example.invalid/").content == b"bounded-reader-pulse"
                 after = capacity._reader_isolation_snapshot(context, module, stage="after_source_read")
                 assert before == capacity._expected_reader_isolation_snapshot("before_source_read")
                 assert after == capacity._expected_reader_isolation_snapshot("after_source_read")
@@ -7033,6 +7697,11 @@ def test_reader_provenance_stays_unloaded_until_phase_owned_isolation(tmp_path: 
             assert _fixes.FileLock is original_file_lock
             assert _fixes.SoftFileLock is original_soft_file_lock
             assert not capacity._reader_cache_lock_adapter_is_active(phase_environment)
+            assert not capacity._reader_network_activity_adapter_is_active()
+            assert _http._GLOBAL_CLIENT_FACTORY is original_client_factory
+            assert _http._GLOBAL_CLIENT is None
+            _http.set_client_factory(installed_default_client_factory)
+            _http.default_client_factory = installed_default_client_factory
             try:
                 with capacity._owner_only_reader_cache_locks(phase_environment):
                     raise KeyboardInterrupt

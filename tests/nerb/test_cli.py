@@ -982,6 +982,53 @@ def test_enron_capacity_commands_are_thin_and_use_only_explicit_paths(monkeypatc
     assert captured["portable"] == portable
 
 
+def test_enron_capacity_cli_emits_only_the_closed_wall_gap_diagnostic(monkeypatch, tmp_path):
+    from nerb import enron_capacity
+
+    monkeypatch.setattr(enron_capacity, "_validated_capacity_bootstrap", lambda: None)
+    gap = enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS + 1
+    diagnostic = {
+        "phase": "build",
+        "origin": "continuous_observation",
+        "last_accepted_progress_kind": "activity",
+        "attempted_progress_kind": "continuous_observation",
+        "last_completed_records": 10_000,
+        "checkpoint_count": 1,
+        "progress_signal_count": 2,
+        "phase_wall_elapsed_ns": gap + 1,
+        "observed_progress_gap_ns": gap,
+    }
+
+    def fail_with_diagnostic(_options):
+        raise enron_capacity._error("checkpoint_wall_gap", diagnostic=diagnostic)
+
+    monkeypatch.setattr(enron_capacity, "run_enron_capacity", fail_with_diagnostic)
+    output = tmp_path / "capacity"
+    ledger = tmp_path / "attempts"
+    result = runner.invoke(
+        app,
+        ["run-enron-capacity", "--output-dir", str(output), "--attempt-ledger-dir", str(ledger)],
+    )
+    assert result.exit_code == 1
+    assert "Diagnostic:" in result.output
+    assert '"phase":"build"' in result.output
+    assert '"origin":"continuous_observation"' in result.output
+
+    sensitive = "/private/person@example.invalid"
+
+    def fail_with_rejected_payload(_options):
+        raise enron_capacity._error("checkpoint_wall_gap", diagnostic={**diagnostic, "path": sensitive})
+
+    monkeypatch.setattr(enron_capacity, "run_enron_capacity", fail_with_rejected_payload)
+    rejected = runner.invoke(
+        app,
+        ["run-enron-capacity", "--output-dir", str(output), "--attempt-ledger-dir", str(ledger)],
+    )
+    assert rejected.exit_code == 1
+    assert "Diagnostic:" not in rejected.output
+    assert sensitive not in rejected.output
+
+
 def test_capacity_run_verify_and_export_cli_fail_closed_without_isolated_launcher(tmp_path: Path) -> None:
     output = tmp_path / "capacity"
     ledger = tmp_path / "attempts"

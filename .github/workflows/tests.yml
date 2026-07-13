@@ -75,12 +75,13 @@ jobs:
           assert first["datasets_total_bytes"] > 0
           assert first["installed_distribution_count"] > 0
           assert first["datasets_distribution_sha256"].startswith("sha256:")
-          assert first["critical_reader_distribution_count"] == 4
+          assert first["critical_reader_distribution_count"] == 5
           assert first["critical_reader_file_count"] > 0
           assert first["critical_reader_total_bytes"] > 0
           assert first["critical_reader_versions"] == {
               "datasets": "5.0.0",
               "huggingface-hub": "1.23.0",
+              "httpx": "0.28.1",
               "fsspec": "2026.4.0",
               "pyarrow": "25.0.0",
           }

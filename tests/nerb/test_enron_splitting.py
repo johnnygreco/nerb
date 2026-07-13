@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -20,6 +21,7 @@ import pytest
 
 import nerb.enron_contract as enron_contract
 import nerb.enron_splitting as enron_splitting
+from nerb.enron_activity import sqlite_activity
 from nerb.enron_preparation import EnronPreparationOptions, prepare_enron_source
 from nerb.enron_splitting import (
     EnronDevelopmentAdmissionError,
@@ -33,6 +35,76 @@ from nerb.enron_splitting import (
 )
 
 JsonObject = dict[str, Any]
+
+
+def test_sqlite_activity_reports_vm_work_and_preserves_control_errors() -> None:
+    connection = sqlite3.connect(":memory:")
+    activity_calls = 0
+
+    def activity() -> None:
+        nonlocal activity_calls
+        activity_calls += 1
+
+    query = (
+        "WITH RECURSIVE work(value) AS (VALUES(0) UNION ALL "
+        "SELECT value + 1 FROM work WHERE value < 100000) SELECT SUM(value) FROM work"
+    )
+    with sqlite_activity(connection, activity):
+        assert connection.execute(query).fetchone() == (5_000_050_000,)
+    assert activity_calls > 0
+
+    control = KeyboardInterrupt("sqlite activity control")
+
+    def interrupt() -> None:
+        raise control
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with sqlite_activity(connection, interrupt):
+            connection.execute(query).fetchone()
+    assert raised.value is control
+    assert connection.execute("SELECT 1").fetchone() == (1,)
+    connection.close()
+
+
+def test_sqlite_activity_retries_handler_removal_and_fails_closed_when_unproven() -> None:
+    class RemovalConnection(sqlite3.Connection):
+        removal_failures = 0
+        removal_attempts = 0
+
+        def set_progress_handler(self, progress_handler, n):
+            if progress_handler is None:
+                self.removal_attempts += 1
+                if self.removal_attempts <= self.removal_failures:
+                    raise RuntimeError("injected handler removal failure")
+            return super().set_progress_handler(progress_handler, n)
+
+    query = (
+        "WITH RECURSIVE work(value) AS (VALUES(0) UNION ALL "
+        "SELECT value + 1 FROM work WHERE value < 100000) SELECT SUM(value) FROM work"
+    )
+    preserved = KeyboardInterrupt("preserve sqlite control")
+    recovered = sqlite3.connect(":memory:", factory=RemovalConnection)
+    recovered.removal_failures = 2
+
+    def interrupt() -> None:
+        raise preserved
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        with sqlite_activity(recovered, interrupt):
+            recovered.execute(query).fetchone()
+    assert raised.value is preserved
+    assert recovered.removal_attempts == 3
+    assert recovered.execute("SELECT 1").fetchone() == (1,)
+    recovered.close()
+
+    unproven = sqlite3.connect(":memory:", factory=RemovalConnection)
+    unproven.removal_failures = 3
+    with pytest.raises(RuntimeError, match="handler could not be removed safely") as cleanup:
+        with sqlite_activity(unproven, interrupt):
+            unproven.execute(query).fetchone()
+    assert cleanup.value is not preserved
+    assert unproven.removal_attempts == 3
+    unproven.close()
 
 
 @dataclass(frozen=True)

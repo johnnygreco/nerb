@@ -24,6 +24,7 @@ from urllib.parse import quote
 from . import enron_bank_builder as _bank_builder_module
 from . import enron_contract as _enron_contract_module
 from .bank import bank_stats, hash_bank
+from .enron_activity import ACTIVITY_RECORD_INTERVAL, sqlite_activity
 from .enron_annotations import EnronAnnotationError
 from .enron_bank_builder import (
     BANK_BUILD_ITERATION_SCHEMA_VERSION,
@@ -654,9 +655,9 @@ class _ActivityReporter:
 
     def worked(self, units: int = 1) -> None:
         self.pending_work += units
-        while self.pending_work >= _PROGRESS_INTERVAL_RECORDS:
+        while self.pending_work >= ACTIVITY_RECORD_INTERVAL:
             self._report()
-            self.pending_work -= _PROGRESS_INTERVAL_RECORDS
+            self.pending_work -= ACTIVITY_RECORD_INTERVAL
 
     def boundary(self) -> None:
         self._report()
@@ -781,6 +782,7 @@ def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, A
                 policy=options.policy,
                 max_spool_bytes=_MAX_PRIVATE_SQLITE_BYTES,
                 resource_checkpoint=mining_checkpoint,
+                activity_callback=activity.boundary,
             )
             progress.finish()
             implementation_sha256 = _builder_implementation_sha256()
@@ -3175,6 +3177,7 @@ def _verify_enron_bank_build_snapshot_in_scratch(
         max_scratch_bytes=max_scratch_bytes,
         progress=progress,
         resource_checkpoint=replay_checkpoint,
+        activity_reporter=activity,
     )
     rebuilt_identity = _candidate_pool_identity(rebuilt_pool)
     del rebuilt_pool
@@ -3872,6 +3875,7 @@ def _rebuild_candidate_pool_from_development(
     max_scratch_bytes: int,
     progress: _ProgressReporter,
     resource_checkpoint: Callable[[], int],
+    activity_reporter: _ActivityReporter,
 ) -> CandidatePool:
     """Re-mine the verified train stream into sequential accounted scratch."""
 
@@ -3891,6 +3895,7 @@ def _rebuild_candidate_pool_from_development(
             policy=policy,
             max_spool_bytes=max_scratch_bytes,
             resource_checkpoint=resource_checkpoint,
+            activity_callback=activity_reporter.boundary,
         )
         _require_private_scratch_file_current(sqlite_path, expected_scratch_identity)
         resource_checkpoint()
@@ -3911,6 +3916,34 @@ def _replay_candidate_pool_snapshot(
         connection = sqlite3.connect(uri, uri=True)
     except sqlite3.Error:
         raise EnronBankBuildError("Private mining spool could not be opened read-only.") from None
+    try:
+        with sqlite_activity(
+            connection,
+            None if activity_reporter is None else activity_reporter.boundary,
+        ):
+            return _replay_candidate_pool_snapshot_connection(
+                connection,
+                train_artifact_sha256=train_artifact_sha256,
+                policy=policy,
+                activity_reporter=activity_reporter,
+            )
+    except EnronBankBuildError:
+        raise
+    except (OverflowError, sqlite3.Error, TypeError, UnicodeError, ValueError):
+        raise EnronBankBuildError("Private mining spool could not be replayed safely.") from None
+    finally:
+        connection.close()
+
+
+def _replay_candidate_pool_snapshot_connection(
+    connection: sqlite3.Connection,
+    *,
+    train_artifact_sha256: str,
+    policy: EnronBankPolicy,
+    activity_reporter: _ActivityReporter | None,
+) -> CandidatePool:
+    """Replay one open snapshot while its caller owns liveness instrumentation."""
+
     try:
         _set_mining_sqlite_length_limit(connection)
         connection.execute("PRAGMA query_only=ON")
@@ -4104,8 +4137,6 @@ def _replay_candidate_pool_snapshot(
         raise
     except (OverflowError, sqlite3.Error, TypeError, UnicodeError, ValueError):
         raise EnronBankBuildError("Private mining spool could not be replayed safely.") from None
-    finally:
-        connection.close()
 
 
 def _preflight_mining_sqlite_cells(connection: sqlite3.Connection, policy: EnronBankPolicy) -> None:

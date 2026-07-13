@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import nerb.enron_activity as enron_activity_module
 import nerb.enron_bank_workflow as bank_workflow
 import nerb.enron_quality as quality_module
 from nerb.engines import compile_bank
@@ -1264,6 +1265,67 @@ def test_private_sqlite_projection_reader_rejects_oversized_integer(tmp_path: Pa
         )
 
 
+def test_mining_replay_reports_sqlite_vm_work_and_removes_handler_before_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _pool, source_binding = _mine(tmp_path, _development_bundle(tmp_path)[0])
+    spool = tmp_path / "spool.sqlite3"
+    opened: list[TrackingConnection] = []
+
+    class TrackingConnection(sqlite3.Connection):
+        handler_removed = False
+        closed_after_removal = False
+
+        def set_progress_handler(self, progress_handler, n):
+            if progress_handler is None:
+                self.handler_removed = True
+            return super().set_progress_handler(progress_handler, n)
+
+        def close(self) -> None:
+            self.closed_after_removal = self.handler_removed
+            super().close()
+
+    original_connect = sqlite3.connect
+
+    def tracked_connect(*args: Any, **kwargs: Any) -> TrackingConnection:
+        kwargs["factory"] = TrackingConnection
+        connection = original_connect(*args, **kwargs)
+        assert isinstance(connection, TrackingConnection)
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(bank_workflow.sqlite3, "connect", tracked_connect)
+    monkeypatch.setattr(enron_activity_module, "SQLITE_ACTIVITY_VM_STEP_INTERVAL", 1)
+
+    control = KeyboardInterrupt("stop replay after verified SQLite work")
+    activity_calls = 0
+
+    def activity() -> None:
+        nonlocal activity_calls
+        activity_calls += 1
+        raise control
+
+    def unexpected_projection_iteration(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("SQLite liveness must fire before Python row iteration")
+
+    monkeypatch.setattr(bank_workflow, "_iter_mining_source_projections", unexpected_projection_iteration)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        bank_workflow._replay_candidate_pool_snapshot(
+            spool,
+            train_artifact_sha256=source_binding["train_artifact_sha256"],
+            policy=EnronBankPolicy(),
+            activity_reporter=bank_workflow._ActivityReporter(activity),
+        )
+
+    assert raised.value is control
+    assert activity_calls == 1
+    assert len(opened) == 1
+    assert opened[0].handler_removed is True
+    assert opened[0].closed_after_removal is True
+
+
 def test_verifier_rejects_oversized_descriptor_before_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1471,6 +1533,7 @@ def test_fresh_mining_rebuild_move_out_wipes_pinned_payload_and_replacement(
 ) -> None:
     scratch = _private_scratch_root(tmp_path, "rebuild-scratch")
     parked = tmp_path / "parked-mining-rebuild.sqlite3"
+    activity_calls = 0
 
     class EmptyDevelopment:
         def iter_train_records(self) -> tuple[()]:
@@ -1480,6 +1543,9 @@ def test_fresh_mining_rebuild_move_out_wipes_pinned_payload_and_replacement(
             return ()
 
     def mine_then_substitute(*_args: Any, **kwargs: Any) -> object:
+        activity_callback = kwargs["activity_callback"]
+        assert callable(activity_callback)
+        activity_callback()
         path = Path(kwargs["sqlite_path"])
         path.write_bytes(b"private fresh mining rebuild")
         path.replace(parked)
@@ -1488,6 +1554,10 @@ def test_fresh_mining_rebuild_move_out_wipes_pinned_payload_and_replacement(
         return object()
 
     monkeypatch.setattr(bank_workflow, "mine_enron_candidates", mine_then_substitute)
+
+    def activity() -> None:
+        nonlocal activity_calls
+        activity_calls += 1
 
     with pytest.raises(EnronBankBuildError, match="scratch file changed"):
         bank_workflow._rebuild_candidate_pool_from_development(
@@ -1498,8 +1568,10 @@ def test_fresh_mining_rebuild_move_out_wipes_pinned_payload_and_replacement(
             max_scratch_bytes=bank_workflow.MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES,
             progress=bank_workflow._ProgressReporter(None),
             resource_checkpoint=lambda: 0,
+            activity_reporter=bank_workflow._ActivityReporter(activity),
         )
 
+    assert activity_calls == 1
     assert parked.read_bytes() == b""
     _assert_cleanup_tombstones(scratch, count=1)
 

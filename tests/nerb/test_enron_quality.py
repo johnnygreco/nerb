@@ -198,7 +198,7 @@ def _run(
 def test_quality_finalization_heartbeats_inside_each_full_spool_scan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(quality_module, "_QUALITY_ACTIVITY_INTERVAL", 1)
+    monkeypatch.setattr(quality_module, "ACTIVITY_RECORD_INTERVAL", 1)
     callbacks = 0
 
     def heartbeat() -> None:

@@ -29,6 +29,7 @@ _SOURCE_MODULES = frozenset(
         "diff",
         "engine",
         "engines",
+        "enron_activity",
         "enron_annotations",
         "enron_bank_builder",
         "enron_bank_workflow",

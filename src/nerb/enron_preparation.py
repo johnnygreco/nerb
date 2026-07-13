@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
 from . import __version__
+from .enron_activity import ACTIVITY_RECORD_INTERVAL, sqlite_activity
 from .enron_cleaning import (
     CLEANING_COUNTER_NAMES,
     CLEANING_POLICY_SHA256,
@@ -357,9 +358,9 @@ class _ActivityReporter:
 
     def worked(self, units: int = 1) -> None:
         self.pending_work += units
-        while self.pending_work >= PROGRESS_RECORD_INTERVAL:
+        while self.pending_work >= ACTIVITY_RECORD_INTERVAL:
             self._report()
-            self.pending_work -= PROGRESS_RECORD_INTERVAL
+            self.pending_work -= ACTIVITY_RECORD_INTERVAL
 
     def boundary(self) -> None:
         self._report()
@@ -400,7 +401,7 @@ def prepare_enron_source(options: EnronPreparationOptions) -> dict[str, Any]:
             allow_unignored_output=options.allow_unignored_output,
         ) as run:
             spool_stack = ExitStack()
-            connection = spool_stack.enter_context(_private_preparation_spool())
+            connection = spool_stack.enter_context(_private_preparation_spool(activity.boundary))
             try:
                 source = _source_context(options)
                 activity.boundary()
@@ -585,18 +586,19 @@ def load_enron_preparation_run(
                     proof_fd=scratch.descriptor,
                 )
                 try:
-                    verification = _verify_prepared_jsonl(
-                        root / _PREPARED_FILENAME,
-                        profile["source"],
-                        max_line_bytes=prepared_line_limit,
-                        duplicate_connection=duplicate_connection,
-                        progress_callback=progress_callback,
-                        activity_reporter=activity,
-                        source_file=handles[_PREPARED_FILENAME],
-                        expected_snapshot=snapshots[_PREPARED_FILENAME],
-                    )
-                    activity.boundary()
-                    verified_duplicates = _duplicate_aggregates(duplicate_connection, activity_reporter=activity)
+                    with sqlite_activity(duplicate_connection, activity.boundary):
+                        verification = _verify_prepared_jsonl(
+                            root / _PREPARED_FILENAME,
+                            profile["source"],
+                            max_line_bytes=prepared_line_limit,
+                            duplicate_connection=duplicate_connection,
+                            progress_callback=progress_callback,
+                            activity_reporter=activity,
+                            source_file=handles[_PREPARED_FILENAME],
+                            expected_snapshot=snapshots[_PREPARED_FILENAME],
+                        )
+                        activity.boundary()
+                        verified_duplicates = _duplicate_aggregates(duplicate_connection, activity_reporter=activity)
                 finally:
                     duplicate_connection.close()
             if verification.records != expected_records or verification.occurrences != expected_occurrences:
@@ -1754,7 +1756,9 @@ def _validate_transport_receipt(receipt: Mapping[str, Any], source: Mapping[str,
 
 
 @contextmanager
-def _private_preparation_spool() -> Iterator[sqlite3.Connection]:
+def _private_preparation_spool(
+    activity_callback: Callable[[], None] | None = None,
+) -> Iterator[sqlite3.Connection]:
     """Own the construction database in a pinned wipe-to-tombstone transaction."""
 
     temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
@@ -1767,7 +1771,8 @@ def _private_preparation_spool() -> Iterator[sqlite3.Connection]:
                 spool_path = run.create_external_file("records.sqlite3")
                 connection = _open_spool(spool_path, precreated=True)
                 run.pin_cleanup_file("records.sqlite3")
-                yield connection
+                with sqlite_activity(connection, activity_callback):
+                    yield connection
             except BaseException as exc:
                 operation_error = exc
                 raise

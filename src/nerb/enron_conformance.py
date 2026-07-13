@@ -21,6 +21,7 @@ from typing import Any, Literal, TextIO, cast
 from . import enron_contract
 from .bank import bank_stats, hash_bank
 from .engines import CompiledBank, compile_bank, extraction_execution_sha256
+from .enron_activity import ACTIVITY_RECORD_INTERVAL
 from .enron_contract import validate_enron_conformance_output
 from .enron_private_io import EnronPrivateIOError, PrivateRun, iter_strict_jsonl
 
@@ -138,7 +139,7 @@ class _ActivityReporter:
 
     def worked(self) -> None:
         self.pending += 1
-        if self.pending == 10_000:
+        if self.pending == ACTIVITY_RECORD_INTERVAL:
             self.boundary()
 
     def boundary(self) -> None:

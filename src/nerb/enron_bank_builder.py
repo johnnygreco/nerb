@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from .bank import bank_stats, hash_bank
+from .enron_activity import ACTIVITY_RECORD_INTERVAL
 from .enron_quality import DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL
 
 BANK_BUILD_POLICY_VERSION = "nerb.enron_bank_build_policy.v2"
@@ -33,7 +34,7 @@ DEFAULT_MAX_CANDIDATE_SPOOL_BYTES = 12 * 1024**3
 MIN_CANDIDATE_SPOOL_BYTES = 64 * 1024
 
 _SHA256_PREFIX = "sha256:"
-_BUILDER_ACTIVITY_INTERVAL = 10_000
+_RESOURCE_CHECKPOINT_INTERVAL = 10_000
 _EMAIL_RE = re.compile(
     r"^[a-z0-9_][a-z0-9.!#$%&'*+/=?^_`{|}~-]*@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$",
@@ -333,6 +334,7 @@ def mine_enron_candidates(
     policy: EnronBankPolicy,
     max_spool_bytes: int = DEFAULT_MAX_CANDIDATE_SPOOL_BYTES,
     resource_checkpoint: Callable[[], object] | None = None,
+    activity_callback: Callable[[], None] | None = None,
 ) -> CandidatePool:
     """Stream verified train records into a bounded private SQLite spool."""
 
@@ -341,6 +343,8 @@ def mine_enron_candidates(
         raise EnronBankBuildError("Candidate mining spool byte limit is invalid.")
     if resource_checkpoint is not None and not callable(resource_checkpoint):
         raise EnronBankBuildError("Candidate mining resource checkpoint is invalid.")
+    if activity_callback is not None and not callable(activity_callback):
+        raise EnronBankBuildError("Candidate mining activity callback is invalid.")
     sqlite_path = Path(sqlite_path)
     try:
         connection = sqlite3.connect(sqlite_path)
@@ -400,6 +404,7 @@ def mine_enron_candidates(
         connection.execute("BEGIN IMMEDIATE")
         if resource_checkpoint is not None:
             resource_checkpoint()
+        ingest_activity = _BuilderActivityReporter(activity_callback)
         for record, membership in records_and_memberships:
             records += 1
             if records > policy.max_train_records:
@@ -483,34 +488,47 @@ def mine_enron_candidates(
                     """,
                     (kind, normalized_value, surface, related, source_type, document_id, group_id, observed_at),
                 )
+            ingest_activity.worked()
             if records % 10_000 == 0:
                 connection.commit()
                 if resource_checkpoint is not None:
                     resource_checkpoint()
                 connection.execute("BEGIN IMMEDIATE")
         connection.commit()
+        ingest_activity.boundary()
         if resource_checkpoint is not None:
             resource_checkpoint()
         if records == 0:
             raise EnronBankBuildError("Train split is empty.")
 
-        candidates = _read_candidate_evidence(connection, resource_checkpoint=resource_checkpoint)
+        candidates = _read_candidate_evidence(
+            connection,
+            activity_callback=activity_callback,
+            resource_checkpoint=resource_checkpoint,
+        )
+        source_activity = _BuilderActivityReporter(activity_callback)
         resource_activity = _ResourceCheckpointReporter(resource_checkpoint)
         source_digest = hashlib.sha256(b"nerb/enron/bank-mining-source/v2\0")
         for (payload,) in connection.execute("SELECT payload FROM source_projections ORDER BY document_id"):
             source_digest.update(bytes(payload))
+            source_activity.worked()
             resource_activity.worked()
+        source_activity.boundary()
         resource_activity.boundary()
         ledger_sha256 = _candidate_pool_hash(
             candidates,
             train_artifact_sha256,
             policy.sha256,
+            activity_callback=activity_callback,
             resource_checkpoint=resource_checkpoint,
         )
         by_kind: dict[str, list[CandidateEvidence]] = defaultdict(list)
+        grouping_activity = _BuilderActivityReporter(activity_callback)
         for candidate in candidates:
             by_kind[candidate.kind].append(candidate)
+            grouping_activity.worked()
             resource_activity.worked()
+        grouping_activity.boundary()
         resource_activity.boundary()
         return CandidatePool(
             contacts=tuple(by_kind["contact"]),
@@ -745,7 +763,7 @@ class _BuilderActivityReporter:
 
     def worked(self) -> None:
         self.pending_work += 1
-        if self.pending_work == _BUILDER_ACTIVITY_INTERVAL:
+        if self.pending_work == ACTIVITY_RECORD_INTERVAL:
             self.boundary()
 
     def boundary(self) -> None:
@@ -766,7 +784,7 @@ class _ResourceCheckpointReporter:
 
     def worked(self) -> None:
         self.pending_work += 1
-        if self.pending_work == _BUILDER_ACTIVITY_INTERVAL:
+        if self.pending_work == _RESOURCE_CHECKPOINT_INTERVAL:
             self.boundary()
 
     def boundary(self) -> None:
