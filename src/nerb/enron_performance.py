@@ -142,6 +142,10 @@ MAX_SOURCE_SNAPSHOT_BYTES = 16 * 1024 * 1024 * 1024
 MAX_SOURCE_BUILD_SECONDS = 24 * 60 * 60
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_CPU_CLOCK_SUFFIX_RE = re.compile(
+    r"\s+@\s+[0-9]+(?:\.[0-9]+)?\s*(?:KHz|MHz|GHz)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _derive_exact_block_assignment() -> tuple[str, ...]:
@@ -608,7 +612,7 @@ def _environment() -> dict[str, Any]:
         "architecture": platform.machine() or "unknown",
         "python": platform.python_version(),
         "cpu_count": cpu_count,
-        "cpu_model": _cpu_model(),
+        "cpu_model": _privacy_safe_cpu_model(_cpu_model()),
         "memory_bytes": memory_bytes,
     }
 
@@ -647,6 +651,29 @@ def _cpu_model() -> str:
         except (EnronPrivateIOError, OSError):
             pass
     return platform.processor()[:256] or "unknown"
+
+
+def _well_formed_cpu_model(model: str) -> bool:
+    try:
+        encoded = model.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return bool(encoded) and len(encoded) <= 256 and model.isprintable()
+
+
+def _privacy_safe_cpu_model(model: str) -> str:
+    if not _well_formed_cpu_model(model):
+        return "unknown"
+    if not _public_serialization_diagnostics({"cpu_model": model}):
+        return model
+    canonical = _CPU_CLOCK_SUFFIX_RE.sub("", model).rstrip()
+    if (
+        canonical != model
+        and _well_formed_cpu_model(canonical)
+        and not _public_serialization_diagnostics({"cpu_model": canonical})
+    ):
+        return canonical
+    return "unknown"
 
 
 def _software() -> dict[str, Any]:

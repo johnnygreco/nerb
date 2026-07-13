@@ -1758,6 +1758,8 @@ def test_measured_bundle_rejects_file_substitution_during_descriptor_read(
 def test_privacy_safe_smoke_routes_real_requests_through_worker_subprocesses(
     tmp_path: Path, test_data_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    cpu_model = "Intel(R) Xeon(R) Platinum 8272CL CPU @ 2.60GHz"
+    monkeypatch.setattr(performance_module, "_cpu_model", lambda: cpu_model)
     prepared = _prepare_run(
         tmp_path,
         test_data_path,
@@ -1776,6 +1778,7 @@ def test_privacy_safe_smoke_routes_real_requests_through_worker_subprocesses(
     )
 
     assert report["decision_grade"] == {"passed": False, "failure_codes": ["smoke_profile_nonpromotable"]}
+    assert report["environment"]["cpu_model"] == "Intel(R) Xeon(R) Platinum 8272CL CPU"
     assert verify_enron_performance_run(output)["valid"] is True
 
 
@@ -2872,6 +2875,45 @@ def test_public_privacy_scanner_accepts_plan_and_rejects_private_paths_and_ident
     codes = {item["code"] for item in diagnostics}
     assert "contract.public_private_path" in codes
     assert "contract.public_direct_identifier" in codes
+
+
+@pytest.mark.parametrize(
+    ("cpu_model", "expected"),
+    [
+        ("Safe Test CPU", "Safe Test CPU"),
+        (
+            "Intel(R) Xeon(R) Platinum 8272CL CPU @ 2.60GHz",
+            "Intel(R) Xeon(R) Platinum 8272CL CPU",
+        ),
+        ("Intel(R) Xeon(R) CPU E5-2673 v4 @ 2300 MHz", "Intel(R) Xeon(R) CPU E5-2673 v4"),
+        ("Intel CPU @ 2125550100GHz", "Intel CPU"),
+        ("synthetic.person@example.invalid", "unknown"),
+        ("synthetic.person@example.invalid @ 2.60GHz", "unknown"),
+        ("/private/host/cpu-model", "unknown"),
+        ("+1 212 555 0100", "unknown"),
+        ("\ud800", "unknown"),
+        ("Safe\nCPU", "unknown"),
+        ("Phone 212\x85555\x850100", "unknown"),
+        ("Safe\u202eCPU", "unknown"),
+        ("", "unknown"),
+        ("x" * 257, "unknown"),
+        (
+            "x" * (256 - len(" @ 2.60GHz")) + " @ 2.60GHz",
+            "x" * (256 - len(" @ 2.60GHz")),
+        ),
+    ],
+)
+def test_environment_closes_cpu_models_rejected_by_the_public_privacy_scanner(
+    cpu_model: str,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(performance_module, "_cpu_model", lambda: cpu_model)
+
+    environment = performance_module._environment()
+
+    assert environment["cpu_model"] == expected
+    assert performance_module._public_serialization_diagnostics({"environment": environment}) == []
 
 
 @pytest.mark.parametrize(
