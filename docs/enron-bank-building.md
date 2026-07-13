@@ -330,6 +330,7 @@ The capacity decision uses these frozen resource gates:
 | Effective RSS cap | `min(8 GiB, 75% of physical memory)` |
 | Passing observed RSS | At most 75% of the effective RSS cap |
 | Resource-observation wall gap | At most 500 ms through report write, promotion, and the promoted final-tree scan |
+| Verified-work liveness gap | At most 30 seconds during every phase |
 
 Reported RSS is the maximum, under the enforced cadence, of sampled current live-process-tree RSS and a conservative
 kernel high-water bound formed from the root process maximum plus the reaped-child maximum. Those two kernel maxima may
@@ -338,17 +339,17 @@ to capture every transient live-tree peak. The report freezes its resource total
 terminal attempt receipt strictly extends that envelope through report fsync, final staging inspection, atomic promotion,
 and the promoted final-tree observation.
 
-The run requires the exact locked reader set (`datasets==5.0.0`, `huggingface-hub==1.23.0`, `fsspec==2026.4.0`, and
-`pyarrow==25.0.0`). It records a path-free hash of the complete installed name/version inventory and hashes every regular
-in-root package or `.dist-info` file listed by those four distributions, excluding bytecode caches and external `..`
-entries such as installed console scripts. It proves each required top-level reader module originates below its hashed
+The run requires the exact locked reader set (`datasets==5.0.0`, `huggingface-hub==1.23.0`, `httpx==0.28.1`,
+`fsspec==2026.4.0`, and `pyarrow==25.0.0`). It records a path-free hash of the complete installed name/version inventory
+and hashes every regular in-root package or `.dist-info` file listed by those five distributions, excluding bytecode
+caches and external `..` entries such as installed console scripts. It proves each required top-level reader module originates below its hashed
 distribution root; the distribution inventory covers submodule source files but does not separately attest every loaded
 submodule origin. It also binds the checked-in `pyproject.toml` plus `uv.lock`.
 
 Those hashes identify the bytes that were observed; they do not compare them with a precommitted wheel attestation. A
 production run therefore requires a trusted, access-controlled host and a fresh uv-managed install from the checked-in
 lock. A locally modified package that retains its version metadata produces a different observed hash but is not rejected
-against a known-good package digest. Lower HTTP dependencies remain lock-and-version bound rather than individually
+against a known-good package digest. Dependencies below `httpx` remain lock-and-version bound rather than individually
 byte-attested. Both limitations are explicit in portable evidence.
 
 Reader provenance is metadata-only before the preparation phase: neither `datasets` nor its Hub, filesystem, or Arrow
@@ -363,6 +364,25 @@ soft-lock fallback. Lock paths are restricted to the phase-owned reader roots, t
 source exhaustion, and the original dependency bindings must be restored exactly. The reader-isolation commitment binds
 the adapter policy, effective lock mode, and owner-only result; the private-tree scanner continues to reject every
 group- or other-accessible file without a lock-file exception.
+
+Semantic record checkpoints remain every 10,000 records. Separate liveness activity is tied to genuine work every 1,000
+records, which is at most 10 seconds at the 100-record/second acceptance floor. During the remote read, the exact pinned
+Hub client also emits payload-free activity on response headers and nonempty response chunks; it captures no URL, header,
+response metadata, or content. A successful wrapper close immediately drops its underlying stream reference. Every
+wrapped response stream and client must prove a successful delegated close before the Hub factory and session are
+restored; cleanup then removes the installed hooks and instance close wrapper and clears adapter-owned client/stream
+references. Any close exception fails the run even if the dependency already marks the object closed. Those activity
+calls can refresh liveness frequently while synchronous resource scans remain rate-limited
+to once every 5 seconds. Production phases do not use a timer-only heartbeat, so an operation with no verified work
+signal still fails the 30-second watchdog. Long SQLite work uses the connection's VM progress handler, so index
+construction and sorted joins report executed database work without a timer thread or an inferred filesystem signal.
+The handler must be removed successfully before its connection owner closes the spool; an unproven removal fails closed.
+
+When that liveness gate fails, the CLI appends one closed aggregate diagnostic to stderr: phase, fixed failure origin,
+last accepted progress kind, rejected progress kind, last completed-record count, checkpoint and progress-signal counts,
+phase wall time, and rejected gap. It cannot contain paths, exception text, identifiers, or document-derived values.
+Attempt receipts intentionally remain code-only; capture the one-time CLI stderr diagnostic when investigating a failed
+production attempt.
 
 The full run has one cleanup owner for its complete lifetime. Preparation, split, and bank-build transactions transfer
 their retained payload descriptors to that outer transaction before their own commit handles close. After every phase
@@ -382,7 +402,7 @@ exceeding either bound fails closed before promotion.
 arithmetic, the full attempt hash chain, terminal cross-bindings, the measured Git commit and root tree, tracked source
 blobs, reader lock, and native build-source commitment. It does not independently re-read the original private payload,
 re-attest the promoted inode, prove recorded timing/RSS/disk observations, or reproduce/authenticate the native binary
-bytes. It also does not independently byte-attest HTTP dependencies below the four critical reader distributions.
+bytes. It also does not independently byte-attest HTTP dependencies below the five critical reader distributions.
 Those limits are included and hash-bound in the exported artifact itself.
 
 Export pins the report, commit marker, and complete attempt-chain snapshot while holding the ledger's shared lock through

@@ -75,12 +75,13 @@ jobs:
           assert first["datasets_total_bytes"] > 0
           assert first["installed_distribution_count"] > 0
           assert first["datasets_distribution_sha256"].startswith("sha256:")
-          assert first["critical_reader_distribution_count"] == 4
+          assert first["critical_reader_distribution_count"] == 5
           assert first["critical_reader_file_count"] > 0
           assert first["critical_reader_total_bytes"] > 0
           assert first["critical_reader_versions"] == {
               "datasets": "5.0.0",
               "huggingface-hub": "1.23.0",
+              "httpx": "0.28.1",
               "fsspec": "2026.4.0",
               "pyarrow": "25.0.0",
           }
@@ -104,6 +105,13 @@ jobs:
           NERB_TEST_LOCKED_CAPACITY_LAUNCHER=1 \
             uv run --locked --no-default-groups --group dev --group enron-capacity --no-sync --python 3.13 \
             pytest -q \
+            tests/nerb/test_enron_capacity.py::test_reader_network_activity_uses_only_headers_and_nonempty_chunks_and_restores_exactly \
+            tests/nerb/test_enron_capacity.py::test_reader_network_activity_fails_closed_on_hook_drift_after_restoring_globals \
+            tests/nerb/test_enron_capacity.py::test_reader_network_activity_preserves_header_or_chunk_abort_and_closes_everything \
+            tests/nerb/test_enron_capacity.py::test_reader_network_activity_preserves_factory_control_and_restores_exactly \
+            tests/nerb/test_enron_capacity.py::test_reader_network_activity_tracks_rotated_clients_and_rejects_factory_drift \
+            tests/nerb/test_enron_capacity.py::test_reader_network_activity_rejects_a_transport_close_failure_hidden_by_hub \
+            tests/nerb/test_enron_capacity.py::test_reader_network_activity_rejects_response_close_failure_without_masking_cleanup \
             tests/nerb/test_enron_capacity.py::test_reader_provenance_stays_unloaded_until_phase_owned_isolation \
             tests/nerb/test_enron_capacity.py::test_isolated_production_worker_reaches_a_post_identity_gate
 

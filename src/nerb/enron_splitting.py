@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
+from .enron_activity import ACTIVITY_RECORD_INTERVAL, sqlite_activity
 from .enron_preparation import (
     _normalize_message_id,
     _participant_values,
@@ -263,9 +264,9 @@ class _ActivityReporter:
 
     def worked(self, units: int = 1) -> None:
         self.pending_work += units
-        while self.pending_work >= 10_000:
+        while self.pending_work >= ACTIVITY_RECORD_INTERVAL:
             self._report()
-            self.pending_work -= 10_000
+            self.pending_work -= ACTIVITY_RECORD_INTERVAL
 
     def boundary(self) -> None:
         self._report()
@@ -892,7 +893,7 @@ def _build_leakage_graph(
     )
     near_candidate_pairs = 0
     for pair_index in range(len(_NEAR_BAND_PAIRS)):
-        for first_node in range(0, records, 10_000):
+        for first_node in range(0, records, ACTIVITY_RECORD_INTERVAL):
             try:
                 connection.execute(
                     """
@@ -903,7 +904,7 @@ def _build_leakage_graph(
                      AND left_band.node < right_band.node
                     WHERE left_band.band = ? AND left_band.node >= ? AND left_band.node < ?
                     """,
-                    (pair_index, first_node, min(first_node + 10_000, records)),
+                    (pair_index, first_node, min(first_node + ACTIVITY_RECORD_INTERVAL, records)),
                 )
             except sqlite3.IntegrityError as exc:
                 if "near candidate budget exceeded" in str(exc):
@@ -2082,6 +2083,7 @@ def _private_split_spool(
     *,
     purpose: str,
     allow_unignored_output: bool,
+    activity_callback: Callable[[], None] | None = None,
 ) -> Iterator[sqlite3.Connection]:
     """Own one SQLite spool in a pinned transaction that wipes to a tombstone."""
 
@@ -2096,7 +2098,8 @@ def _private_split_spool(
                 spool_path = run.create_external_file("split.sqlite3")
                 connection = _open_spool(spool_path, precreated=True)
                 run.pin_cleanup_file("split.sqlite3")
-                yield connection
+                with sqlite_activity(connection, activity_callback):
+                    yield connection
             except BaseException as exc:
                 operation_error = exc
                 raise
@@ -2118,6 +2121,7 @@ def _preseal_replay_connection(
     scratch_root: Path,
     *,
     allow_unignored_output: bool,
+    activity_callback: Callable[[], None] | None = None,
 ) -> Iterator[sqlite3.Connection]:
     """Own the independent replay spool outside either committed split run."""
 
@@ -2125,6 +2129,7 @@ def _preseal_replay_connection(
         scratch_root,
         purpose="preseal-replay",
         allow_unignored_output=allow_unignored_output,
+        activity_callback=activity_callback,
     ) as connection:
         yield connection
 
@@ -2161,6 +2166,7 @@ def _rebuild_preseal_state(
     with _preseal_replay_connection(
         replay_root,
         allow_unignored_output=options.allow_unignored_output,
+        activity_callback=None if activity_reporter is None else activity_reporter.boundary,
     ) as connection:
         try:
             role_counts: dict[str, int] = {}
@@ -2316,7 +2322,9 @@ def _rebuild_preseal_state(
                 raise EnronSplitError("Pre-seal manifests differ from deterministic replay.")
             return state
         finally:
-            connection.close()
+            # The replay spool context owns the connection and must remove its
+            # SQLite progress handler before closing it.
+            connection.rollback()
 
 
 def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
@@ -2354,6 +2362,7 @@ def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
                     options.scratch_dir,
                     purpose="construction",
                     allow_unignored_output=options.allow_unignored_output,
+                    activity_callback=activity.boundary,
                 )
             )
             try:

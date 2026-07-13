@@ -2798,7 +2798,11 @@ def run_enron_capacity_command(
             )
         )
     except capacity.EnronCapacityError as exc:
-        _exit_error(str(exc))
+        diagnostic = getattr(exc, "diagnostic", None)
+        message = str(exc)
+        if diagnostic is not None:
+            message += " Diagnostic: " + json.dumps(diagnostic, sort_keys=True, separators=(",", ":"))
+        _exit_error(message)
     _echo_json(payload)
 
 

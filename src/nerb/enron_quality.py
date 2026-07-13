@@ -29,6 +29,7 @@ from . import enron_contract
 from .bank import hash_bank
 from .engine import DEFAULT_MAX_SCAN_INPUT_BYTES
 from .engines import compile_bank, extraction_semantics_sha256
+from .enron_activity import ACTIVITY_RECORD_INTERVAL
 from .enron_contract import CHARACTER_POSITION_SEMANTICS, MATCHING_SEMANTICS, validate_enron_quality_output
 from .enron_private_io import (
     EnronPrivateIOError,
@@ -64,7 +65,6 @@ DEFAULT_MAX_QUALITY_SLICES = 256
 DEFAULT_MAX_QUALITY_DIAGNOSTICS = 100
 DEFAULT_MAX_QUALITY_SPOOL_BYTES = 2 * 1024**3
 _METADATA_COMMITMENT_MODULUS = 1 << 512
-_QUALITY_ACTIVITY_INTERVAL = 10_000
 
 _DOCUMENT_FIELDS = frozenset({"document_id", "text", "text_view", "split_role"})
 _GOLD_FIELDS = frozenset({"document_id", "entity_class", "start", "end", "catalog_identity"})
@@ -1153,7 +1153,7 @@ def evaluate_enron_quality(
             for index, record in enumerate(records):
                 _require_closed_mapping(record, _STREAM_RECORD_FIELDS, "quality stream record", index)
                 session.consume(record["document"], record["gold_spans"], record["slice_ids"])
-                if (index + 1) % 10_000 == 0:
+                if (index + 1) % ACTIVITY_RECORD_INTERVAL == 0:
                     _report_quality_activity(activity_callback)
             _report_quality_activity(activity_callback)
             result = session.finish()
@@ -1365,7 +1365,7 @@ class _QualityActivityReporter:
 
     def worked(self) -> None:
         self.pending_work += 1
-        if self.pending_work == _QUALITY_ACTIVITY_INTERVAL:
+        if self.pending_work == ACTIVITY_RECORD_INTERVAL:
             self.boundary()
 
     def boundary(self) -> None:

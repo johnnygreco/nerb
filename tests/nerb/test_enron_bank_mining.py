@@ -196,7 +196,7 @@ def test_candidate_mining_heartbeats_through_every_post_ingest_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(bank_builder_module, "_BUILDER_ACTIVITY_INTERVAL", 1)
+    monkeypatch.setattr(bank_builder_module, "ACTIVITY_RECORD_INTERVAL", 1)
     rows = [
         _sender_record(
             index,
@@ -208,10 +208,15 @@ def test_candidate_mining_heartbeats_through_every_post_ingest_pass(
     spool = tmp_path / "heartbeat.sqlite3"
     spool.touch()
     checkpoints = 0
+    activities = 0
 
     def checkpoint() -> None:
         nonlocal checkpoints
         checkpoints += 1
+
+    def activity() -> None:
+        nonlocal activities
+        activities += 1
 
     mine_enron_candidates(
         rows,
@@ -219,11 +224,52 @@ def test_candidate_mining_heartbeats_through_every_post_ingest_pass(
         train_artifact_sha256="sha256:" + "e" * 64,
         policy=EnronBankPolicy(),
         resource_checkpoint=checkpoint,
+        activity_callback=activity,
     )
 
     # The callback fires during evidence materialization, source hashing,
     # candidate-ledger hashing, and class grouping, not only around ingestion.
-    assert checkpoints >= 12
+    assert activities >= 12
+    assert checkpoints >= 3
+
+
+def test_candidate_mining_reports_ingest_activity_independently_of_commit_cadence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bank_builder_module, "ACTIVITY_RECORD_INTERVAL", 1)
+    rows = [
+        _sender_record(
+            index,
+            address=f"ingest.{index}@example.invalid",
+            current_body=f"Synthetic ingest record {index}.",
+        )
+        for index in (1, 2)
+    ]
+    spool = tmp_path / "ingest-activity.sqlite3"
+    spool.touch()
+    activity_calls = 0
+    resource_calls = 0
+
+    def activity() -> None:
+        nonlocal activity_calls
+        activity_calls += 1
+
+    def resource() -> None:
+        nonlocal resource_calls
+        resource_calls += 1
+
+    mine_enron_candidates(
+        rows,
+        sqlite_path=spool,
+        train_artifact_sha256="sha256:" + "a" * 64,
+        policy=EnronBankPolicy(),
+        resource_checkpoint=resource,
+        activity_callback=activity,
+    )
+
+    assert activity_calls >= len(rows) + 1
+    assert resource_calls >= 3
 
 
 def test_candidate_mining_hard_page_cap_fails_before_main_spool_exceeds_budget(tmp_path: Path) -> None:
