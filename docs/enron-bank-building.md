@@ -357,7 +357,12 @@ dataset/module/download/extraction, Hub/assets/Xet, transformer, and credential 
 private roots. The run fixes the official Hub endpoint, disables offline mode, ambient credentials, implicit tokens,
 Xet, telemetry, and cache symlinks, passes `token=False` plus the phase cache explicitly, and uses umask `077`. It
 validates the effective library constants before and after source consumption without publishing an absolute path or
-credential value.
+credential value. The pinned Hub reader explicitly requests group-shared cache locks, so the remote-preparation boundary
+also validates that exact dependency binding and substitutes owner-only mode `0600` for both its file-lock path and
+soft-lock fallback. Lock paths are restricted to the phase-owned reader roots, the adapter remains active through lazy
+source exhaustion, and the original dependency bindings must be restored exactly. The reader-isolation commitment binds
+the adapter policy, effective lock mode, and owner-only result; the private-tree scanner continues to reject every
+group- or other-accessible file without a lock-file exception.
 
 The full run has one cleanup owner for its complete lifetime. Preparation, split, and bank-build transactions transfer
 their retained payload descriptors to that outer transaction before their own commit handles close. After every phase
