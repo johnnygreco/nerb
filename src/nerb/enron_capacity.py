@@ -38,6 +38,7 @@ from importlib import util as importlib_util
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from . import _capacity_bootstrap as _capacity_import_guard
 from . import enron_private_io as _private_io
 from .enron_private_io import (
     EnronPrivateIOError,
@@ -160,20 +161,26 @@ _BOOTSTRAP_ATTRIBUTE = "_nerb_capacity_bootstrap"
 _BOOTSTRAP_SCHEMA = "nerb.enron_capacity.bootstrap.v1"
 _CAPACITY_LAUNCHER_PATH = "scripts/run_enron_capacity.py"
 _PRODUCTION_WORKER_BOOTSTRAP = (
-    "import importlib,sys;"
+    "import importlib.machinery,importlib.util,os,sys;"
     "source=sys.argv.pop(1);count=int(sys.argv.pop(1));"
     "roots=[sys.argv.pop(1) for _ in range(count)];"
-    "baseline=list(sys.path);sys.path[:0]=[source,*roots];"
+    "baseline=list(sys.path);"
+    "path=os.path.join(source,'nerb','_capacity_bootstrap.py');"
+    "loader=importlib.machinery.SourceFileLoader('_nerb_capacity_bootstrap_impl',path);"
+    "spec=importlib.util.spec_from_file_location('_nerb_capacity_bootstrap_impl',path,loader=loader);"
+    "module=importlib.util.module_from_spec(spec);sys.modules['_nerb_capacity_bootstrap_impl']=module;"
+    "loader.exec_module(module);module.install(source);"
+    "sys.path[:]=[*baseline,*roots,source];"
     "setattr(sys,'_nerb_capacity_bootstrap',"
     "{'schema':'nerb.enron_capacity.bootstrap.v1','source_root':source,'dependency_roots':roots,"
     "'baseline_path':baseline,'pycache_root':sys.pycache_prefix});"
-    "module=importlib.import_module('nerb.enron_capacity');"
-    "sys.exit(module._production_worker_main() "
+    "sys.exit(module.run(source) "
     "if sys.argv==[sys.argv[0],'--nerb-capacity-production-worker'] else 2)"
 )
 _FRESH_PRODUCTION_WORKER = False
 _PHASE_SCOPED_READER_LOADED = False
 _PRODUCTION_CORE_SOURCE_NAMES = (
+    "_capacity_bootstrap.py",
     "engine.py",
     "engines.py",
     "enron_bank_builder.py",
@@ -2183,6 +2190,10 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
         raise _error("production_identity_invalid")
 
     source_root = _stable_bootstrap_directory(Path(cast(str, marker["source_root"])))
+    try:
+        _capacity_import_guard.assert_installed(source_root)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        raise _error("production_identity_invalid") from None
     dependencies = tuple(_stable_bootstrap_directory(Path(value)) for value in cast(list[str], raw_dependencies))
     if len(set(dependencies)) != len(dependencies):
         raise _error("production_identity_invalid")
@@ -2226,7 +2237,7 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
         raise _error("production_identity_invalid") from None
     if pycache_info.st_uid != os.geteuid() or stat.S_IMODE(pycache_info.st_mode) & 0o077:
         raise _error("production_identity_invalid")
-    expected_path = [os.fspath(source_root), *(os.fspath(path) for path in dependencies), *raw_baseline]
+    expected_path = [*raw_baseline, *(os.fspath(path) for path in dependencies), os.fspath(source_root)]
     if sys.path != expected_path:
         raise _error("production_identity_invalid")
     layouts = tuple(allowed_dependencies[path] for path in dependencies)
@@ -2460,6 +2471,10 @@ def _reassert_production_execution_current(execution: Mapping[str, Any]) -> None
     git_commit = execution.get("executable_git_commit")
     if not isinstance(git_commit, str) or _GIT_COMMIT_RE.fullmatch(git_commit) is None:
         raise _error("production_identity_invalid")
+    try:
+        _capacity_import_guard.assert_installed(Path(__file__).parent.parent)
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        raise _error("production_identity_invalid") from None
     if not _PHASE_SCOPED_READER_LOADED:
         _assert_reader_modules_unloaded()
     elif any(import_name not in sys.modules for _name, import_name, _init, _version in _CRITICAL_READER_DISTRIBUTIONS):
@@ -4513,6 +4528,8 @@ def _verify_capacity_report(report: Mapping[str, Any], *, require_production: bo
             or bootstrap.get("private_pycache_prefix") is not True
             or bootstrap.get("dependency_root_count") not in {1, 2}
             or bootstrap.get("launcher_source_sha256") != relevant.get(_CAPACITY_LAUNCHER_PATH)
+            or bootstrap.get("source_import_guard_sha256")
+            != cast(Mapping[str, Any], execution["core_source_sha256"]).get("_capacity_bootstrap")
             or reader_environment.get("datasets_version") != _PINNED_DATASETS_VERSION
             or int(cast(int, reader_environment.get("datasets_file_count"))) <= 0
             or int(cast(int, reader_environment.get("datasets_total_bytes"))) <= 0
@@ -5953,7 +5970,12 @@ def _capacity_bootstrap_identity() -> dict[str, Any]:
             "dependency_root_layouts": [],
             "private_pycache_prefix": False,
             "launcher_source_sha256": _hash_bytes(b"nerb/capacity-launcher-unavailable"),
+            "source_import_guard_sha256": _hash_bytes(b"nerb/capacity-import-guard-unavailable"),
         }
+    try:
+        import_guard_sha256 = _hash_bytes((_source_root / "nerb" / "_capacity_bootstrap.py").read_bytes())
+    except OSError:
+        raise _error("production_identity_invalid") from None
     return {
         "schema": _BOOTSTRAP_SCHEMA,
         "mode": "isolated_site_disabled",
@@ -5966,6 +5988,7 @@ def _capacity_bootstrap_identity() -> dict[str, Any]:
         "dependency_root_layouts": list(layouts),
         "private_pycache_prefix": True,
         "launcher_source_sha256": launcher_sha256,
+        "source_import_guard_sha256": import_guard_sha256,
     }
 
 
@@ -6063,6 +6086,7 @@ def _verify_runtime_environment_shape(runtime: Mapping[str, Any]) -> None:
             "dependency_root_layouts",
             "private_pycache_prefix",
             "launcher_source_sha256",
+            "source_import_guard_sha256",
         },
         "capacity bootstrap",
     )
@@ -6076,7 +6100,9 @@ def _verify_runtime_environment_shape(runtime: Mapping[str, Any]) -> None:
         or bootstrap.get("pth_processing") is not False
         or type(bootstrap.get("private_pycache_prefix")) is not bool
         or not isinstance(bootstrap.get("launcher_source_sha256"), str)
+        or not isinstance(bootstrap.get("source_import_guard_sha256"), str)
         or _HASH_RE.fullmatch(cast(str, bootstrap.get("launcher_source_sha256"))) is None
+        or _HASH_RE.fullmatch(cast(str, bootstrap.get("source_import_guard_sha256"))) is None
     ):
         raise _error("report_invalid")
     _bounded_int(bootstrap.get("dependency_root_count"), "dependency root count", minimum=0)
