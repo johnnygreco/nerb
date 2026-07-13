@@ -5253,10 +5253,11 @@ def test_watchdog_install_interruption_restores_handler_before_private_cleanup(
             return None
 
         def __eq__(self, _other: object) -> bool:
-            return True
+            return callable(_other)
 
     previous = EqualHandler()
     real_signal(signal.SIGUSR1, previous)
+    assert signal.getsignal(signal.SIGUSR1) is previous
     interrupted = False
     restoration_attempts = 0
     cleanup_handlers: list[Any] = []
