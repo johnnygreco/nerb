@@ -5718,6 +5718,36 @@ def test_recorded_production_identity_verifier_does_not_require_current_head(
     enron_capacity._verify_recorded_production_execution(execution)
 
 
+def test_execution_identity_accepts_the_matching_fresh_production_worker_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    runners = enron_capacity._validated_phase_runners(_successful_runners(probe))
+    expected = enron_capacity._execution_identity(
+        runners,
+        probe,
+        production_evidence=False,
+        monitor_interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+    )
+    expected.update(
+        {
+            "production_evidence": True,
+            "fresh_worker": True,
+            "git_tree_clean": True,
+        }
+    )
+    monkeypatch.setattr(enron_capacity, "_production_execution_identity", lambda: expected)
+
+    execution = enron_capacity._execution_identity(
+        runners,
+        probe,
+        production_evidence=True,
+        monitor_interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+    )
+
+    assert execution == expected
+
+
 def test_production_identity_rejects_a_native_extension_built_from_other_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

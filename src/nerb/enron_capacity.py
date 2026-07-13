@@ -5068,7 +5068,7 @@ def _execution_identity(
     }
     if production_evidence:
         expected = _production_execution_identity()
-        if execution | {"git_tree_clean": True} != expected:
+        if execution | {"fresh_worker": True, "git_tree_clean": True} != expected:
             raise _error("production_identity_invalid")
         execution = expected
     return execution
