@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import importlib
 import json
 import math
 import os
@@ -21,6 +22,8 @@ import threading
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO, TypeVar, cast
+
+_native_engine = importlib.import_module("nerb._engine")
 
 _COMMIT_MARKER = "COMMITTED"
 _COMMIT_PAYLOAD = b"nerb.enron.private-run.v2\n"
@@ -191,11 +194,15 @@ class PrivateRun:
         self._stage_name: str | None = None
         self._parent_fd: int | None = None
         self._stage_fd: int | None = None
+        self._directory_close_states: dict[str, tuple[int, bytearray]] = {}
         self._stage_identity: tuple[int, int] | None = None
         self._open_handles: list[BinaryIO | TextIO] = []
+        self._cleanup_barriers: list[tuple[Callable[[], None], Callable[[], bool]]] = []
         self._cleanup_file_fds: dict[tuple[int, int], int] = {}
         self._cleanup_authority_retained = False
+        self._cleanup_authority_wiped = False
         self._entered = False
+        self._owner_thread_id: int | None = None
         self._committed = False
         self._sealing = False
         self._promoted = False
@@ -208,8 +215,15 @@ class PrivateRun:
 
         try:
             if getattr(self, "_committed", False):
-                while getattr(self, "_cleanup_file_fds", {}):
+                while (
+                    getattr(self, "_stage_fd", None) is not None
+                    or getattr(self, "_parent_fd", None) is not None
+                    or getattr(self, "_directory_close_states", {})
+                    or getattr(self, "_cleanup_file_fds", {})
+                ):
                     try:
+                        self._close_owned_directory_descriptor_to_completion("_stage_fd")
+                        self._close_owned_directory_descriptor_to_completion("_parent_fd")
                         self._close_cleanup_descriptors()
                     except BaseException:
                         continue
@@ -264,11 +278,24 @@ class PrivateRun:
 
         return self._cleanup_authority_retained
 
+    @property
+    def cleanup_authority_wiped(self) -> bool:
+        """Whether retained post-commit payload authority was proven wiped."""
+
+        return self._cleanup_authority_wiped
+
+    @property
+    def promoted(self) -> bool:
+        """Whether the staging directory was atomically promoted."""
+
+        return self._promoted
+
     def __enter__(self) -> PrivateRun:
         if self._entered:
             raise EnronPrivateIOError("Private run cannot be entered more than once.")
         _retry_unresolved_cleanup_descriptors()
         self._entered = True
+        self._owner_thread_id = threading.get_ident()
         try:
             _require_transaction_capabilities()
             _require_cleanup_fd_headroom(additional_descriptors=_PRIVATE_RUN_PERSISTENT_FDS)
@@ -332,12 +359,35 @@ class PrivateRun:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         if not self._committed:
             try:
-                self._cleanup()
-            except BaseException:
+                self._cleanup(preserve_active_error=isinstance(exc, BaseException))
+            except BaseException as cleanup_exc:
+                if not isinstance(exc, BaseException) and isinstance(
+                    cleanup_exc,
+                    (KeyboardInterrupt, SystemExit, MemoryError),
+                ):
+                    raise
                 cleanup_error = EnronPrivateIOError("Private staging data could not be cleaned up safely.")
                 if isinstance(exc, BaseException):
                     raise cleanup_error from exc
                 raise cleanup_error from None
+
+    def register_cleanup_barrier(
+        self,
+        settle: Callable[[], None],
+        settled: Callable[[], bool],
+    ) -> None:
+        """Require an owned activity to quiesce before destructive cleanup."""
+
+        self._require_active()
+        if (
+            self._committed
+            or self._sealing
+            or self._owner_thread_id != threading.get_ident()
+            or not callable(settle)
+            or not callable(settled)
+        ):
+            raise EnronPrivateIOError("Private cleanup barrier is invalid.")
+        self._cleanup_barriers.append((settle, settled))
 
     def open_binary(self, relative: Path | str) -> BinaryIO:
         """Create a new private binary file below the staging directory."""
@@ -501,6 +551,9 @@ class PrivateRun:
             raise EnronPrivateIOError("Private pre-promotion callback is invalid.")
         self._sealing = True
         try:
+            barrier_error = self._settle_cleanup_barriers()
+            if barrier_error is not None:
+                raise barrier_error
             if any(not handle.closed for handle in self._open_handles):
                 raise EnronPrivateIOError("All private output files must be closed before commit.")
             assert self._stage_fd is not None
@@ -567,42 +620,71 @@ class PrivateRun:
                 raise EnronPrivateIOError("Private staging directory changed during promotion.") from None
             if cleanup_successor is not None:
                 self._transfer_cleanup_ownership(cleanup_successor)
-            stage_fd = self._stage_fd
-            parent_fd = self._parent_fd
-            self._stage_fd = None
-            self._parent_fd = None
+            self._cleanup_authority_retained = retain_cleanup_authority
+            self._cleanup_authority_wiped = False
+            stage_close_error = self._close_owned_directory_descriptor_to_completion("_stage_fd")
+            parent_close_error = self._close_owned_directory_descriptor_to_completion("_parent_fd")
             self._stage_identity = None
-            try:
-                os.close(stage_fd)
-            except OSError:
-                pass
-            try:
-                os.close(parent_fd)
-            except OSError:
-                pass
             if cleanup_successor is None and not retain_cleanup_authority:
                 self._close_cleanup_descriptors()
-            self._cleanup_authority_retained = retain_cleanup_authority
+            close_error = stage_close_error if stage_close_error is not None else parent_close_error
+            if close_error is not None:
+                raise close_error
             self._committed = True
             return self._final_dir
         except BaseException as exc:
-            self._cleanup()
+            self._cleanup(preserve_active_error=True)
             if isinstance(exc, (EnronPrivateIOError, KeyboardInterrupt, SystemExit)):
                 raise
             raise EnronPrivateIOError("Private run could not be committed safely.") from None
 
+    def _close_owned_directory_descriptor_to_completion(
+        self,
+        attribute: str,
+    ) -> BaseException | None:
+        """Retire one published directory fd through a native close commit."""
+
+        first_error: BaseException | None = None
+        state = self._directory_close_states.get(attribute)
+        if state is None:
+            descriptor = getattr(self, attribute)
+            if descriptor is None:
+                return None
+            state = descriptor, bytearray(1)
+            self._directory_close_states[attribute] = state
+        descriptor, attempted = state
+        if getattr(self, attribute) == descriptor:
+            setattr(self, attribute, None)
+        elif getattr(self, attribute) is not None:
+            return EnronPrivateIOError("Private directory descriptor ownership changed during close.")
+        while attempted == bytearray(b"\x00"):
+            try:
+                close_errno = _native_engine._close_fd_once(attempted, descriptor)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            if attempted != bytearray(b"\x01"):
+                return EnronPrivateIOError("Private directory descriptor close state is invalid.")
+            if close_errno and first_error is None:
+                first_error = OSError(close_errno, os.strerror(close_errno))
+        if self._directory_close_states.get(attribute) is state:
+            self._directory_close_states.pop(attribute)
+        return first_error
+
     def release_cleanup_authority(self) -> None:
         """Release explicitly retained post-commit cleanup authority."""
 
-        if not self._committed or not self._cleanup_authority_retained:
+        if not (self._committed or self._promoted) or not self._cleanup_authority_retained:
             raise EnronPrivateIOError("Private cleanup authority is not retained.")
         self._close_cleanup_descriptors()
         self._cleanup_authority_retained = False
+        self._cleanup_authority_wiped = False
 
     def wipe_retained_cleanup_authority(self) -> bool:
         """Wipe retained post-commit inodes, releasing only proven-empty descriptors."""
 
-        if not self._committed or not self._cleanup_authority_retained:
+        if not (self._committed or self._promoted) or not self._cleanup_authority_retained:
             raise EnronPrivateIOError("Private cleanup authority is not retained.")
         succeeded = True
         for identity, descriptor in tuple(self._cleanup_file_fds.items()):
@@ -615,12 +697,13 @@ class PrivateRun:
                 succeeded = False
         if not self._cleanup_file_fds:
             self._cleanup_authority_retained = False
+            self._cleanup_authority_wiped = succeeded
         return succeeded
 
     def park_unresolved_cleanup_authority(self) -> None:
         """Transfer failed cleanup authority to the bounded process retry registry."""
 
-        if not self._committed or not self._cleanup_authority_retained:
+        if not (self._committed or self._promoted) or not self._cleanup_authority_retained:
             raise EnronPrivateIOError("Private cleanup authority is not retained.")
         _park_run_cleanup_descriptors(self)
 
@@ -789,11 +872,11 @@ class PrivateRun:
         if not self._entered or self._stage_fd is None or self._parent_fd is None:
             raise EnronPrivateIOError("Private run is not active.")
 
-    def _cleanup(self) -> None:
+    def _cleanup(self, *, preserve_active_error: bool = True) -> None:
         """Run cleanup behind an outer boundary that cannot skip settlement."""
 
         try:
-            self._cleanup_once()
+            self._cleanup_once(preserve_active_error=preserve_active_error)
         finally:
             # If control escaped at any loop/assignment seam in the first
             # attempt, Python enters this finally before unwinding the owner.
@@ -801,7 +884,7 @@ class PrivateRun:
             # remains; the original exception is then restored automatically.
             while not self._cleanup_is_settled():
                 try:
-                    self._cleanup_once()
+                    self._cleanup_once(preserve_active_error=preserve_active_error)
                 except BaseException:
                     continue
 
@@ -812,14 +895,22 @@ class PrivateRun:
             return False
         return (
             writers_closed
+            and not getattr(self, "_cleanup_barriers", ())
             and not getattr(self, "_cleanup_file_fds", {})
+            and not getattr(self, "_directory_close_states", {})
             and getattr(self, "_stage_fd", None) is None
             and getattr(self, "_parent_fd", None) is None
         )
 
-    def _cleanup_once(self) -> None:
+    def _cleanup_once(self, *, preserve_active_error: bool) -> None:
+        self._sealing = True
         cleanup_failed = False
-        cleanup_control_error: BaseException | None = None
+        # A barrier may report a one-shot control exception after it has
+        # nevertheless proven settlement.  Cleanup is already unwinding an
+        # owning operation here, so preserve that active error and proceed
+        # only after the barrier list is empty.
+        barrier_error = self._settle_cleanup_barriers()
+        cleanup_control_error = None if preserve_active_error else barrier_error
         for handle in self._open_handles:
             while not handle.closed:
                 try:
@@ -935,10 +1026,8 @@ class PrivateRun:
             if cleanup_failed:
                 content_wiped = False
 
-            for descriptor in (stage_fd, parent_fd):
-                if descriptor is None:
-                    continue
-                close_error = _close_unaccounted_descriptor_to_completion(descriptor)
+            for attribute in ("_stage_fd", "_parent_fd"):
+                close_error = self._close_owned_directory_descriptor_to_completion(attribute)
                 if close_error is not None:
                     if cleanup_control_error is None:
                         cleanup_control_error = close_error
@@ -958,6 +1047,26 @@ class PrivateRun:
             raise cleanup_control_error
         if cleanup_failed:
             raise EnronPrivateIOError("Private staging data could not be cleaned up safely.") from None
+
+    def _settle_cleanup_barriers(self) -> BaseException | None:
+        first_error: BaseException | None = None
+        while self._cleanup_barriers:
+            settle, settled = self._cleanup_barriers[0]
+            while True:
+                try:
+                    if settled():
+                        break
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                try:
+                    settle()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                    continue
+            del self._cleanup_barriers[0]
+        return first_error
 
 
 def iter_strict_jsonl(path: Path, max_line_bytes: int) -> Iterator[tuple[int, bytes, Mapping[str, Any]]]:
@@ -1999,6 +2108,7 @@ def _park_run_cleanup_descriptors(run: PrivateRun) -> None:
     finally:
         if not run._cleanup_file_fds:
             run._cleanup_authority_retained = False
+            run._cleanup_authority_wiped = False
     if control_error is not None:
         raise control_error
 

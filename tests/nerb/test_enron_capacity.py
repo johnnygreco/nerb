@@ -2263,20 +2263,804 @@ def test_attempt_ledger_tampering_and_report_symlink_substitution_fail_closed(tm
         verify_capacity_run(root, tmp_path / "attempts", require_production=False)
 
 
-def test_wrong_source_conservation_and_rehashed_arbitrary_aggregate_cannot_promote(tmp_path: Path) -> None:
+def test_wrong_source_conservation_and_rehashed_arbitrary_aggregate_cannot_promote(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     probe = _Probe()
     bad = _commitments()["preparation"]
     bad["prepared_source_rows"] -= 1
     bad["source_conservation_sha256"] = _hash("attacker-chosen-conservation")
+    monitors: list[enron_capacity._ContinuousResourceMonitor] = []
+    monitor_threads: list[threading.Thread] = []
+    stop_events: list[InterruptedStopEvent] = []
+    cleanup_states: list[tuple[bool, bool, bool, bool]] = []
+    original_start = enron_capacity._ContinuousResourceMonitor.start
+    original_clear = enron_capacity._private_io._clear_pinned_private_directory
+    stop_code = enron_capacity._ContinuousResourceMonitor.stop.__code__
+    trace_injected = False
+
+    class InterruptedStopEvent(threading.Event):
+        def __init__(self, inner: threading.Event) -> None:
+            super().__init__()
+            self.inner = inner
+            self.set_calls = 0
+
+        def set(self) -> None:
+            self.set_calls += 1
+            if self.set_calls == 1:
+                raise KeyboardInterrupt
+            self.inner.set()
+
+        def wait(self, timeout: float | None = None) -> bool:
+            return self.inner.wait(timeout)
+
+    def capture_start(monitor: enron_capacity._ContinuousResourceMonitor) -> None:
+        original_start(monitor)
+        thread = monitor._thread
+        assert thread is not None
+        stop_event = InterruptedStopEvent(monitor._stop)
+        monitor._stop = stop_event
+        monitor_threads.append(thread)
+        stop_events.append(stop_event)
+        monitors.append(monitor)
+
+    def capture_cleanup(_directory_fd: int, directory_path: Path) -> bool:
+        if monitors and not cleanup_states:
+            monitor = monitors[-1]
+            cleanup_states.append(
+                (
+                    monitor._thread is None,
+                    not monitor_threads[-1].is_alive(),
+                    not monitor._watchdog._installed,
+                    monitor._stopped,
+                )
+            )
+        return original_clear(_directory_fd, directory_path)
+
+    def interrupt_stop_entry(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if not trace_injected and event == "line" and frame.f_code is stop_code:
+            trace_injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt
+        return interrupt_stop_entry
+
+    monkeypatch.setattr(enron_capacity._ContinuousResourceMonitor, "start", capture_start)
+    monkeypatch.setattr(enron_capacity._private_io, "_clear_pinned_private_directory", capture_cleanup)
 
     def truncated(context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
         _checkpoint_all(context, probe, ENRON_SOURCE_ROWS)
         return _result("preparation", commitments=bad)
 
-    with pytest.raises(EnronCapacityError) as raised:
-        _run(tmp_path, probe, replacements={"preparation": truncated})
+    sys.settrace(interrupt_stop_entry)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path, probe, replacements={"preparation": truncated})
+    finally:
+        sys.settrace(None)
+    assert trace_injected is True
     assert raised.value.code == "phase_commitment_invalid"
     assert not (tmp_path / "capacity-run").exists()
+    assert [event.set_calls for event in stop_events] == [2]
+    assert cleanup_states == [(True, True, True, True)]
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["outcome"] == "failed"
+    assert receipt["failure_code"] == "phase_commitment_invalid"
+    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["retained_private_tombstone_count"] == 1
+    tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
+    for path in (tombstone, *tombstone.rglob("*")):
+        info = path.lstat()
+        assert not stat.S_ISLNK(info.st_mode)
+        if stat.S_ISREG(info.st_mode):
+            assert info.st_size == 0
+
+
+def test_private_run_exit_entry_interruption_retries_cleanup_before_failure_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    bad = _commitments()["preparation"]
+    bad["prepared_source_rows"] -= 1
+    bad["source_conservation_sha256"] = _hash("invalid-conservation")
+    runs: list[enron_capacity.PrivateRun] = []
+    original_enter = enron_capacity.PrivateRun.__enter__
+    exit_code = enron_capacity.PrivateRun.__exit__.__code__
+    trace_injected = False
+
+    def capture_enter(run: enron_capacity.PrivateRun) -> enron_capacity.PrivateRun:
+        entered = original_enter(run)
+        runs.append(entered)
+        return entered
+
+    def interrupt_exit_entry(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if not trace_injected and event == "line" and frame.f_code is exit_code:
+            trace_injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt("private exit interrupted")
+        return interrupt_exit_entry
+
+    monkeypatch.setattr(enron_capacity.PrivateRun, "__enter__", capture_enter)
+
+    def truncated(context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
+        _checkpoint_all(context, probe, ENRON_SOURCE_ROWS)
+        return _result("preparation", commitments=bad)
+
+    sys.settrace(interrupt_exit_entry)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path, probe, replacements={"preparation": truncated})
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert raised.value.code == "phase_commitment_invalid"
+    assert len(runs) == 1
+    run = runs[0]
+    assert run._cleanup_is_settled() is True  # noqa: SLF001
+    assert run.cleanup_sensitive_content_wiped is True
+    assert not (tmp_path / "capacity-run").exists()
+    _assert_no_stage(tmp_path, "capacity-run")
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["outcome"] == "failed"
+    assert receipt["failure_code"] == "phase_commitment_invalid"
+    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["retained_private_tombstone_count"] == 1
+    tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
+    for path in (tombstone, *tombstone.rglob("*")):
+        if stat.S_ISREG(path.lstat().st_mode):
+            assert path.stat().st_size == 0
+
+
+def test_private_run_exit_boundary_entry_interruption_falls_back_before_failure_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    bad = _commitments()["preparation"]
+    bad["prepared_source_rows"] -= 1
+    bad["source_conservation_sha256"] = _hash("invalid-boundary-conservation")
+    runs: list[enron_capacity.PrivateRun] = []
+    original_enter = enron_capacity.PrivateRun.__enter__
+    source_lines, source_start = inspect.getsourcelines(enron_capacity._execute_capacity_transaction)
+    boundary_line = next(
+        source_start + offset
+        for offset, line in enumerate(source_lines)
+        if "_settle_private_run_exit(private_run, transaction_error, exit_state)" in line
+    )
+    trace_injected = False
+
+    def capture_enter(run: enron_capacity.PrivateRun) -> enron_capacity.PrivateRun:
+        entered = original_enter(run)
+        runs.append(entered)
+        return entered
+
+    def interrupt_exit_boundary(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if (
+            not trace_injected
+            and event == "line"
+            and frame.f_code is enron_capacity._execute_capacity_transaction.__code__
+            and frame.f_lineno == boundary_line
+        ):
+            trace_injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt("private exit boundary interrupted")
+        return interrupt_exit_boundary
+
+    monkeypatch.setattr(enron_capacity.PrivateRun, "__enter__", capture_enter)
+
+    def truncated(context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
+        _checkpoint_all(context, probe, ENRON_SOURCE_ROWS)
+        return _result("preparation", commitments=bad)
+
+    sys.settrace(interrupt_exit_boundary)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path, probe, replacements={"preparation": truncated})
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert raised.value.code == "phase_commitment_invalid"
+    assert len(runs) == 1
+    run = runs[0]
+    assert run._cleanup_is_settled() is True  # noqa: SLF001
+    assert run.cleanup_sensitive_content_wiped is True
+    assert not (tmp_path / "capacity-run").exists()
+    _assert_no_stage(tmp_path, "capacity-run")
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["outcome"] == "failed"
+    assert receipt["failure_code"] == "phase_commitment_invalid"
+    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["retained_private_tombstone_count"] == 1
+
+
+@pytest.mark.parametrize("interruption", ["post_helper", "post_record", "pre_record"])
+def test_private_run_exit_failure_survives_post_settlement_control_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    probe = _Probe()
+    bad = _commitments()["preparation"]
+    bad["prepared_source_rows"] -= 1
+    bad["source_conservation_sha256"] = _hash("invalid-exit-failure-conservation")
+    runs: list[enron_capacity.PrivateRun] = []
+    original_enter = enron_capacity.PrivateRun.__enter__
+    original_exit = enron_capacity.PrivateRun.__exit__
+    original_remember = enron_capacity._PrivateRunExitState.remember
+    exit_failed = False
+    source_lines, source_start = inspect.getsourcelines(enron_capacity._execute_capacity_transaction)
+    post_settlement_line = next(
+        source_start + offset
+        for offset, line in enumerate(source_lines)
+        if "if exit_state.failure is not None:" in line
+    )
+    remember_lines, remember_start = inspect.getsourcelines(original_remember)
+    pre_record_line = next(
+        remember_start + offset for offset, line in enumerate(remember_lines) if "elif self.failure is None:" in line
+    )
+    trace_injected = False
+
+    def capture_enter(run: enron_capacity.PrivateRun) -> enron_capacity.PrivateRun:
+        entered = original_enter(run)
+        runs.append(entered)
+        return entered
+
+    def settle_then_fail(
+        run: enron_capacity.PrivateRun,
+        exc_type: object,
+        exc: object,
+        traceback: object,
+    ) -> None:
+        nonlocal exit_failed
+        original_exit(run, exc_type, exc, traceback)
+        if not exit_failed:
+            exit_failed = True
+            raise enron_capacity.EnronPrivateIOError("injected private exit failure")
+
+    def interrupt_post_settlement(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if not trace_injected and event == "line":
+            if (
+                interruption == "post_helper"
+                and frame.f_code is enron_capacity._execute_capacity_transaction.__code__
+                and frame.f_lineno == post_settlement_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("post-settlement boundary interrupted")
+            if (
+                interruption == "pre_record"
+                and frame.f_code is original_remember.__code__
+                and frame.f_lineno == pre_record_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("pre-record exit state interrupted")
+        return interrupt_post_settlement
+
+    def remember_then_interrupt(state: Any, exc: BaseException) -> None:
+        nonlocal trace_injected
+        original_remember(state, exc)
+        if (
+            interruption == "post_record"
+            and not trace_injected
+            and not isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError))
+        ):
+            trace_injected = True
+            raise KeyboardInterrupt("post-record exit state interrupted")
+
+    monkeypatch.setattr(enron_capacity.PrivateRun, "__enter__", capture_enter)
+    monkeypatch.setattr(enron_capacity.PrivateRun, "__exit__", settle_then_fail)
+    if interruption == "post_record":
+        monkeypatch.setattr(enron_capacity._PrivateRunExitState, "remember", remember_then_interrupt)
+
+    def truncated(context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
+        _checkpoint_all(context, probe, ENRON_SOURCE_ROWS)
+        return _result("preparation", commitments=bad)
+
+    if interruption in {"post_helper", "pre_record"}:
+        sys.settrace(interrupt_post_settlement)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path, probe, replacements={"preparation": truncated})
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert exit_failed is True
+    assert raised.value.code == "capacity_failed"
+    assert len(runs) == 1
+    run = runs[0]
+    assert run._cleanup_is_settled() is True  # noqa: SLF001
+    assert run.cleanup_sensitive_content_wiped is True
+    assert not (tmp_path / "capacity-run").exists()
+    _assert_no_stage(tmp_path, "capacity-run")
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["outcome"] == "failed"
+    assert receipt["failure_code"] == "capacity_failed"
+    assert receipt["sensitive_content_wiped"] is True
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        "outer_handler",
+        "promoted_wipe_entry",
+        "after_authority_wipe",
+        "after_promoted_wipe_return",
+        "cleanup_metrics_publication",
+        "tree_close_settled",
+        "final_fallback_entry",
+    ],
+)
+def test_post_promotion_control_uses_final_cleanup_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    source_lines, source_start = inspect.getsourcelines(enron_capacity._execute_capacity_transaction)
+    outer_handler_line = next(
+        source_start + offset
+        for offset, line in enumerate(source_lines)
+        if "effective_error = exit_state.failure if exit_state.failure is not None else exc" in line
+    )
+    wipe_lines, wipe_start = inspect.getsourcelines(enron_capacity._wipe_promoted_capacity_run)
+    wipe_entry_line = next(
+        wipe_start + offset for offset, line in enumerate(wipe_lines) if "authority_wiped = False" in line
+    )
+    after_authority_wipe_line = next(
+        wipe_start + offset
+        for offset, line in enumerate(wipe_lines)
+        if "tree_cleanup = _remove_pinned_directory(" in line
+    )
+    after_promoted_wipe_return_line = next(
+        source_start + offset for offset, line in enumerate(source_lines) if "promoted_cleanup_complete = True" in line
+    )
+    cleanup_metrics_publication_line = next(
+        source_start + offset
+        for offset, line in enumerate(source_lines)
+        if "_publish_promoted_cleanup_metrics(metrics, promoted_cleanup_result)" in line
+    )
+    final_fallback_entry_line = next(
+        source_start + offset for offset, line in enumerate(source_lines) if "final_error = sys.exc_info()[1]" in line
+    )
+    trace_injected = False
+    original_tree_close = enron_capacity._PrivateTreeGuard.close
+
+    def fail_after_promotion(*_args: Any, **_kwargs: Any) -> None:
+        raise enron_capacity._error("runtime_disk_floor")
+
+    def interrupt_recovery(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if not trace_injected and event == "line":
+            if (
+                interruption == "outer_handler"
+                and frame.f_code is enron_capacity._execute_capacity_transaction.__code__
+                and frame.f_lineno == outer_handler_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("outer recovery interrupted")
+            if (
+                interruption == "promoted_wipe_entry"
+                and frame.f_code is enron_capacity._wipe_promoted_capacity_run.__code__
+                and frame.f_lineno == wipe_entry_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("promoted wipe interrupted")
+            if (
+                interruption == "after_authority_wipe"
+                and frame.f_code is enron_capacity._wipe_promoted_capacity_run.__code__
+                and frame.f_lineno == after_authority_wipe_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("promoted tree removal interrupted")
+            if (
+                interruption == "after_promoted_wipe_return"
+                and frame.f_code is enron_capacity._execute_capacity_transaction.__code__
+                and frame.f_lineno == after_promoted_wipe_return_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("promoted cleanup publication interrupted")
+            if (
+                interruption == "cleanup_metrics_publication"
+                and frame.f_code is enron_capacity._execute_capacity_transaction.__code__
+                and frame.f_lineno == cleanup_metrics_publication_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("promoted cleanup metrics interrupted")
+            if (
+                interruption == "final_fallback_entry"
+                and frame.f_code is enron_capacity._execute_capacity_transaction.__code__
+                and frame.f_lineno == final_fallback_entry_line
+            ):
+                trace_injected = True
+                sys.settrace(None)
+                raise KeyboardInterrupt("final fallback entry interrupted")
+        return interrupt_recovery
+
+    def close_then_interrupt(tree: Any) -> None:
+        nonlocal trace_injected
+        original_tree_close(tree)
+        if not trace_injected:
+            trace_injected = True
+            raise KeyboardInterrupt("private tree close interrupted")
+
+    monkeypatch.setattr(enron_capacity, "_post_promotion_enforce", fail_after_promotion)
+    if interruption == "tree_close_settled":
+        monkeypatch.setattr(enron_capacity._PrivateTreeGuard, "close", close_then_interrupt)
+    else:
+        sys.settrace(interrupt_recovery)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path)
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert raised.value.code == "runtime_disk_floor"
+    assert not (tmp_path / "capacity-run").exists()
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["outcome"] == "failed"
+    assert receipt["failure_code"] == "runtime_disk_floor"
+    assert receipt["sensitive_content_wiped"] is True
+
+
+def test_success_tree_close_control_wipes_promoted_run_before_interrupt_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_tree_close = enron_capacity._PrivateTreeGuard.close
+    interrupted = False
+
+    def close_then_interrupt(tree: Any) -> None:
+        nonlocal interrupted
+        original_tree_close(tree)
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("successful tree close interrupted")
+
+    monkeypatch.setattr(enron_capacity._PrivateTreeGuard, "close", close_then_interrupt)
+    with pytest.raises(EnronCapacityError) as raised:
+        _run(tmp_path)
+
+    assert interrupted is True
+    assert raised.value.code == "phase_interrupted"
+    assert not (tmp_path / "capacity-run").exists()
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["outcome"] == "interrupted"
+    assert receipt["failure_code"] == "phase_interrupted"
+    assert receipt["sensitive_content_wiped"] is True
+
+
+def test_success_final_fallback_entry_control_uses_caller_owned_recovery(
+    tmp_path: Path,
+) -> None:
+    source_lines, source_start = inspect.getsourcelines(enron_capacity._execute_capacity_transaction)
+    final_entry_line = next(
+        source_start + offset for offset, line in enumerate(source_lines) if "final_error = sys.exc_info()[1]" in line
+    )
+    trace_injected = False
+
+    def interrupt_final_entry(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if (
+            not trace_injected
+            and event == "line"
+            and frame.f_code is enron_capacity._execute_capacity_transaction.__code__
+            and frame.f_lineno == final_entry_line
+        ):
+            trace_injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt("final transaction cleanup interrupted")
+        return interrupt_final_entry
+
+    sys.settrace(interrupt_final_entry)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path)
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert raised.value.code == "phase_interrupted"
+    assert not (tmp_path / "capacity-run").exists()
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["outcome"] == "interrupted"
+    assert receipt["failure_code"] == "phase_interrupted"
+    assert receipt["sensitive_content_wiped"] is True
+
+
+def test_post_return_control_invalidates_recovered_completed_run_before_receipt(
+    tmp_path: Path,
+) -> None:
+    source_lines, source_start = inspect.getsourcelines(enron_capacity._run_capacity_entry)
+    post_return_line = next(
+        source_start + offset for offset, line in enumerate(source_lines) if "report = completed_run.report" in line
+    )
+    trace_injected = False
+
+    def interrupt_post_return(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if (
+            not trace_injected
+            and event == "line"
+            and frame.f_code is enron_capacity._run_capacity_entry.__code__
+            and frame.f_lineno == post_return_line
+        ):
+            trace_injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt("post-return handoff interrupted")
+        return interrupt_post_return
+
+    sys.settrace(interrupt_post_return)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path)
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert raised.value.code == "phase_interrupted"
+    assert not (tmp_path / "capacity-run").exists()
+    receipts = verify_capacity_attempt_ledger(tmp_path / "attempts")
+    assert len(receipts) == 1
+    assert receipts[0]["outcome"] == "interrupted"
+    assert receipts[0]["failure_code"] == "phase_interrupted"
+    assert receipts[0]["sensitive_content_wiped"] is True
+
+
+def test_pre_receipt_control_uses_outer_caller_recovery_boundary(
+    tmp_path: Path,
+) -> None:
+    source_lines, source_start = inspect.getsourcelines(enron_capacity._run_capacity_entry)
+    pre_receipt_line = next(
+        source_start + offset for offset, line in enumerate(source_lines) if "if failure_code is not None:" in line
+    )
+    trace_injected = False
+
+    def interrupt_pre_receipt(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if (
+            not trace_injected
+            and event == "line"
+            and frame.f_code is enron_capacity._run_capacity_entry.__code__
+            and frame.f_lineno == pre_receipt_line
+        ):
+            trace_injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt("pre-receipt handoff interrupted")
+        return interrupt_pre_receipt
+
+    sys.settrace(interrupt_pre_receipt)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path)
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert raised.value.code == "phase_interrupted"
+    assert not (tmp_path / "capacity-run").exists()
+    receipts = verify_capacity_attempt_ledger(tmp_path / "attempts")
+    assert len(receipts) == 1
+    assert receipts[0]["outcome"] == "interrupted"
+    assert receipts[0]["failure_code"] == "phase_interrupted"
+    assert receipts[0]["sensitive_content_wiped"] is True
+
+
+def test_failed_transaction_pre_receipt_control_preserves_semantic_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_lines, source_start = inspect.getsourcelines(enron_capacity._run_capacity_entry)
+    pre_receipt_line = next(
+        source_start + offset for offset, line in enumerate(source_lines) if "if failure_code is not None:" in line
+    )
+    trace_injected = False
+
+    def fail_commitment_chain(*_args: Any, **_kwargs: Any) -> None:
+        raise enron_capacity._CapacityAbort("phase_commitment_invalid")  # noqa: SLF001
+
+    def interrupt_pre_receipt(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal trace_injected
+        if (
+            not trace_injected
+            and event == "line"
+            and frame.f_code is enron_capacity._run_capacity_entry.__code__
+            and frame.f_lineno == pre_receipt_line
+        ):
+            trace_injected = True
+            sys.settrace(None)
+            raise KeyboardInterrupt("failed transaction pre-receipt handoff interrupted")
+        return interrupt_pre_receipt
+
+    monkeypatch.setattr(enron_capacity, "_verify_phase_commitment_chain", fail_commitment_chain)
+    sys.settrace(interrupt_pre_receipt)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path)
+    finally:
+        sys.settrace(None)
+
+    assert trace_injected is True
+    assert raised.value.code == "phase_commitment_invalid"
+    assert not (tmp_path / "capacity-run").exists()
+    receipts = verify_capacity_attempt_ledger(tmp_path / "attempts")
+    assert len(receipts) == 1
+    assert receipts[0]["outcome"] == "failed"
+    assert receipts[0]["failure_code"] == "phase_commitment_invalid"
+    assert receipts[0]["sensitive_content_wiped"] is True
+
+
+@pytest.mark.parametrize("reuse_kind", ["different_inode", "same_inode"])
+@pytest.mark.parametrize("handoff", ["stage", "parent"])
+def test_commit_descriptor_handoff_control_leaks_no_owner_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    handoff: str,
+    reuse_kind: str,
+) -> None:
+    original_commit = enron_capacity.PrivateRun.commit
+    original_native_close = enron_capacity._private_io._native_engine._close_fd_once  # noqa: SLF001
+    close_injected = False
+    sentinel_path = tmp_path / f"{handoff}-descriptor-sentinel"
+    sentinel_path.write_bytes(b"sentinel")
+    before_descriptors = _process_descriptor_inventory()
+    target_descriptor: int | None = None
+    same_inode_path: Path | None = None
+    sentinel_descriptor: int | None = None
+    sentinel_descriptors: list[int] = []
+
+    def capture_commit_target(
+        run: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Path:
+        nonlocal same_inode_path, target_descriptor
+        target_descriptor = getattr(run, f"_{handoff}_fd")
+        same_inode_path = run.final_dir if handoff == "stage" else run.final_dir.parent
+        return original_commit(run, *args, **kwargs)
+
+    def close_then_reuse(attempted: bytearray, descriptor: int) -> int:
+        nonlocal close_injected, sentinel_descriptor
+        close_errno = original_native_close(attempted, descriptor)
+        if not close_injected and descriptor == target_descriptor:
+            close_injected = True
+            assert attempted == bytearray(b"\x01")
+            assert same_inode_path is not None
+            if reuse_kind == "same_inode":
+                source_descriptor = os.open(same_inode_path, os.O_RDONLY | os.O_DIRECTORY)
+            else:
+                source_descriptor = os.open(sentinel_path, os.O_RDONLY)
+            sentinel_descriptors.append(source_descriptor)
+            if source_descriptor != descriptor:
+                os.dup2(source_descriptor, descriptor)
+                sentinel_descriptors.append(descriptor)
+            sentinel_descriptor = descriptor
+            raise KeyboardInterrupt("commit descriptor handoff interrupted")
+        return close_errno
+
+    monkeypatch.setattr(enron_capacity.PrivateRun, "commit", capture_commit_target)
+    monkeypatch.setattr(enron_capacity._private_io._native_engine, "_close_fd_once", close_then_reuse)  # noqa: SLF001
+    try:
+        with pytest.raises(EnronCapacityError):
+            _run(tmp_path)
+        assert close_injected is True
+        assert sentinel_descriptor is not None
+        assert os.fstat(sentinel_descriptor)
+    finally:
+        monkeypatch.setattr(enron_capacity._private_io._native_engine, "_close_fd_once", original_native_close)  # noqa: SLF001
+        for descriptor in dict.fromkeys(sentinel_descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    assert not (tmp_path / "capacity-run").exists()
+    assert _process_descriptor_inventory() == before_descriptors
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["sensitive_content_wiped"] is True
+
+
+def test_post_commit_substitute_is_preserved_while_bound_payload_is_wiped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "capacity-run"
+    moved = tmp_path / "moved-capacity-run"
+    sentinel = output / "unrelated"
+    original_commit = enron_capacity.PrivateRun.commit
+
+    def substitute_after_commit(run: Any, *args: Any, **kwargs: Any) -> Path:
+        original_commit(run, *args, **kwargs)
+        output.rename(moved)
+        output.mkdir(mode=0o700)
+        sentinel.write_text("preserve", encoding="utf-8")
+        sentinel.chmod(0o600)
+        raise KeyboardInterrupt("post-commit substitute interruption")
+
+    monkeypatch.setattr(enron_capacity.PrivateRun, "commit", substitute_after_commit)
+    with pytest.raises(EnronCapacityError) as raised:
+        _run(tmp_path)
+
+    assert raised.value.code == "promotion_failed"
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+    assert (moved / "capacity-report.json").read_bytes() == b""
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["failure_code"] == "promotion_failed"
+    assert receipt["sensitive_content_wiped"] is True
+
+
+def test_post_commit_moved_output_wipes_payload_before_path_recovery_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "capacity-run"
+    moved = tmp_path / "moved-capacity-run"
+    original_commit = enron_capacity.PrivateRun.commit
+
+    def move_after_commit(run: Any, *args: Any, **kwargs: Any) -> Path:
+        original_commit(run, *args, **kwargs)
+        output.rename(moved)
+        raise KeyboardInterrupt("post-commit moved output interruption")
+
+    monkeypatch.setattr(enron_capacity.PrivateRun, "commit", move_after_commit)
+    with pytest.raises(EnronCapacityError) as raised:
+        _run(tmp_path)
+
+    assert raised.value.code == "promotion_failed"
+    assert not output.exists()
+    assert (moved / "capacity-report.json").read_bytes() == b""
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["failure_code"] == "promotion_failed"
+    assert receipt["sensitive_content_wiped"] is True
+
+
+def test_failed_moved_output_wipe_parks_authority_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "capacity-run"
+    moved = tmp_path / "moved-capacity-run"
+    original_commit = enron_capacity.PrivateRun.commit
+    original_wipe = enron_capacity._private_io._wipe_authenticated_cleanup_descriptor
+    fail_wipe = True
+
+    def move_after_commit(run: Any, *args: Any, **kwargs: Any) -> Path:
+        original_commit(run, *args, **kwargs)
+        output.rename(moved)
+        raise KeyboardInterrupt("post-commit failed moved wipe")
+
+    def conditional_wipe(identity: tuple[int, int], descriptor: int) -> bool:
+        if fail_wipe:
+            return False
+        return original_wipe(identity, descriptor)
+
+    monkeypatch.setattr(enron_capacity.PrivateRun, "commit", move_after_commit)
+    monkeypatch.setattr(enron_capacity._private_io, "_wipe_authenticated_cleanup_descriptor", conditional_wipe)
+    with pytest.raises(EnronCapacityError) as raised:
+        _run(tmp_path)
+
+    assert raised.value.code == "promotion_failed"
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["sensitive_content_wiped"] is False
+    assert (moved / "capacity-report.json").stat().st_size > 0
+    assert enron_capacity._private_io._UNRESOLVED_CLEANUP_FDS  # noqa: SLF001
+
+    fail_wipe = False
+    enron_capacity._private_io._retry_unresolved_cleanup_descriptors()  # noqa: SLF001
+    assert (moved / "capacity-report.json").read_bytes() == b""
+    assert not enron_capacity._private_io._UNRESOLVED_CLEANUP_FDS  # noqa: SLF001
 
 
 def test_target_created_during_run_is_preserved_and_capacity_stage_is_removed(tmp_path: Path) -> None:
@@ -3126,6 +3910,86 @@ def test_receipt_cleanup_error_preserves_passed_output_for_same_process_recovery
     assert receipts[0]["outcome"] == "passed"
     assert options.output_dir.is_dir()
     _assert_attempt_ledger_files(options.attempt_ledger_dir)
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_receipt_postpublication_control_reconciles_passed_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_error: type[BaseException],
+) -> None:
+    original_write = enron_capacity._write_attempt_receipt_locked
+    interrupted = False
+
+    def write_then_interrupt(
+        descriptor: int,
+        receipt: Mapping[str, Any],
+        durable_commit: bytearray,
+    ) -> None:
+        nonlocal interrupted
+        original_write(descriptor, receipt, durable_commit)
+        if not interrupted:
+            interrupted = True
+            raise control_error("injected receipt postpublication control")
+
+    monkeypatch.setattr(enron_capacity, "_write_attempt_receipt_locked", write_then_interrupt)
+    with pytest.raises(EnronCapacityError) as raised:
+        _run(tmp_path)
+
+    assert raised.value.code == "attempt_ledger_write_failed"
+    assert interrupted is True
+    options = _options(tmp_path, "capacity-run")
+    receipts = verify_capacity_attempt_ledger(options.attempt_ledger_dir)
+    assert len(receipts) == 1
+    assert receipts[0]["outcome"] == "passed"
+    assert options.output_dir.is_dir()
+    assert (
+        verify_capacity_run(options.output_dir, options.attempt_ledger_dir, require_production=False)[
+            "terminal_attempt"
+        ]
+        == receipts[0]
+    )
+    _assert_attempt_ledger_files(options.attempt_ledger_dir)
+
+
+def test_visible_receipt_without_directory_durability_cannot_retain_private_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_wipe = enron_capacity._wipe_and_quarantine_private_file_at
+    fsync_failed = False
+
+    def fail_directory_fsync(committed: bytearray, _descriptor: int) -> int:
+        nonlocal fsync_failed
+        assert committed == bytearray(1)
+        fsync_failed = True
+        return errno.EIO
+
+    def leave_receipt_visible(
+        directory_fd: int,
+        name: str,
+        descriptor: int,
+        expected_identity: tuple[int, int],
+    ) -> None:
+        if name == "attempt-00000001.json" or name.startswith(".attempt-stage-"):
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS))
+        original_wipe(directory_fd, name, descriptor, expected_identity)
+
+    monkeypatch.setattr(enron_capacity._native_engine, "_fsync_fd_commit", fail_directory_fsync)
+    monkeypatch.setattr(enron_capacity, "_wipe_and_quarantine_private_file_at", leave_receipt_visible)
+
+    with pytest.raises(EnronCapacityError) as raised:
+        _run(tmp_path)
+
+    assert raised.value.code == "attempt_ledger_write_failed"
+    assert fsync_failed is True
+    options = _options(tmp_path, "capacity-run")
+    assert not options.output_dir.exists()
+    assert (options.attempt_ledger_dir / "attempt-00000001.json").is_file()
+    assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    with pytest.raises(EnronCapacityError) as invalid:
+        verify_capacity_attempt_ledger(options.attempt_ledger_dir)
+    assert invalid.value.code == "attempt_ledger_invalid"
 
 
 @pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
@@ -4333,6 +5197,104 @@ def test_concurrent_heartbeats_serialize_wall_clock_reads_with_progress_state() 
     assert clock_calls == 2
     assert second_clock_called.is_set()
     assert monitor._states["phase"].last_progress_wall_ns == 200
+
+
+def test_monitor_stop_restores_watchdog_and_is_idempotent_after_observation_error() -> None:
+    class Watchdog:
+        def __init__(self) -> None:
+            self._installed = True
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self._installed = False
+
+    watchdog = Watchdog()
+    monitor = enron_capacity._ContinuousResourceMonitor.__new__(enron_capacity._ContinuousResourceMonitor)
+    monitor.interval_ns = enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS
+    monitor._stop = threading.Event()
+    monitor._thread = None
+    monitor._stopped = False
+    monitor._watchdog = watchdog
+    observations = 0
+
+    def interrupted_observation(_kind: str) -> None:
+        nonlocal observations
+        observations += 1
+        raise RuntimeError("boundary observation interrupted")
+
+    monitor._observe = interrupted_observation
+
+    with pytest.raises(RuntimeError, match="boundary observation interrupted"):
+        monitor.stop()
+    assert monitor._stopped is True
+    assert watchdog._installed is False
+    assert watchdog.close_calls == 1
+    assert observations == 1
+
+    monitor.stop()
+    assert watchdog.close_calls == 1
+    assert observations == 1
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not hasattr(signal, "SIGUSR1"),
+    reason="POSIX watchdog assertion",
+)
+def test_watchdog_install_interruption_restores_handler_before_private_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_signal = signal.signal
+    original_handler = signal.getsignal(signal.SIGUSR1)
+
+    class EqualHandler:
+        def __call__(self, _signum: int, _frame: Any) -> None:
+            return None
+
+        def __eq__(self, _other: object) -> bool:
+            return True
+
+    previous = EqualHandler()
+    real_signal(signal.SIGUSR1, previous)
+    interrupted = False
+    restoration_attempts = 0
+    cleanup_handlers: list[Any] = []
+    original_clear = enron_capacity._private_io._clear_pinned_private_directory
+
+    def interrupt_after_install(signum: int, handler: Any) -> Any:
+        nonlocal interrupted, restoration_attempts
+        if signum == signal.SIGUSR1 and not interrupted:
+            real_signal(signum, handler)
+            interrupted = True
+            raise KeyboardInterrupt("watchdog install interrupted")
+        restoration_attempts += 1
+        if restoration_attempts == 1:
+            raise OSError("watchdog restoration interrupted")
+        return real_signal(signum, handler)
+
+    def observe_cleanup(directory_fd: int, directory_path: Path) -> bool:
+        cleanup_handlers.append(signal.getsignal(signal.SIGUSR1))
+        return original_clear(directory_fd, directory_path)
+
+    try:
+        monkeypatch.setattr(enron_capacity.signal, "signal", interrupt_after_install)
+        monkeypatch.setattr(enron_capacity._private_io, "_clear_pinned_private_directory", observe_cleanup)
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path)
+
+        assert interrupted is True
+        assert restoration_attempts == 2
+        assert raised.value.code == "phase_interrupted"
+        assert signal.getsignal(signal.SIGUSR1) is previous
+        assert cleanup_handlers and all(handler is previous for handler in cleanup_handlers)
+        assert not (tmp_path / "capacity-run").exists()
+        _assert_no_stage(tmp_path, "capacity-run")
+        receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+        assert receipt["sensitive_content_wiped"] is True
+        assert receipt["retained_private_tombstone_count"] == 1
+    finally:
+        real_signal(signal.SIGUSR1, original_handler)
 
 
 def test_legitimate_non_record_heartbeats_do_not_inflate_record_progress(

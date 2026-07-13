@@ -226,6 +226,81 @@ def test_private_run_commits_private_tree_despite_umask(tmp_path: Path) -> None:
     assert not list(final.parent.glob(f".{final.name}.stage-*"))
 
 
+def test_private_run_settles_cleanup_barrier_before_commit_promotion(tmp_path: Path) -> None:
+    final = _resolved(tmp_path) / "run"
+    settled = False
+    observations: list[tuple[bool, bool]] = []
+
+    with PrivateRun(final) as run:
+        with run.open_text("private.txt") as handle:
+            handle.write("private")
+
+        def settle() -> None:
+            nonlocal settled
+            observations.append((run.stage_dir.is_dir(), final.exists()))
+            settled = True
+
+        run.register_cleanup_barrier(settle, lambda: settled)
+        run.commit()
+
+    assert observations == [(True, False)]
+    assert (final / "private.txt").read_text(encoding="utf-8") == "private"
+
+
+def test_private_run_normal_exit_cleans_before_propagating_barrier_control(tmp_path: Path) -> None:
+    final = _resolved(tmp_path) / "run"
+    settled = False
+
+    with pytest.raises(KeyboardInterrupt, match="barrier interrupted"):
+        with PrivateRun(final) as run:
+            with run.open_text("private.txt") as handle:
+                handle.write("private")
+
+            def settle() -> None:
+                nonlocal settled
+                settled = True
+                raise KeyboardInterrupt("barrier interrupted")
+
+            run.register_cleanup_barrier(settle, lambda: settled)
+
+    assert settled is True
+    assert not final.exists()
+    assert not list(final.parent.glob(f".{final.name}.stage-*"))
+    tombstone = next(final.parent.glob(".nerb-cleanup-*"))
+    assert (tombstone / "private.txt").read_bytes() == b""
+
+
+def test_private_run_rejects_nested_barrier_registration_before_cleanup(tmp_path: Path) -> None:
+    final = _resolved(tmp_path) / "run"
+    settled = False
+    nested_settled = False
+    nested_errors: list[EnronPrivateIOError] = []
+
+    with PrivateRun(final) as run:
+        with run.open_text("private.txt") as handle:
+            handle.write("private")
+
+        def settle() -> None:
+            nonlocal settled
+            try:
+                run.register_cleanup_barrier(
+                    lambda: None,
+                    lambda: nested_settled,
+                )
+            except EnronPrivateIOError as exc:
+                nested_errors.append(exc)
+            settled = True
+
+        run.register_cleanup_barrier(settle, lambda: settled)
+
+    assert len(nested_errors) == 1
+    assert "barrier is invalid" in str(nested_errors[0])
+    assert not final.exists()
+    assert not list(final.parent.glob(f".{final.name}.stage-*"))
+    tombstone = next(final.parent.glob(".nerb-cleanup-*"))
+    assert (tombstone / "private.txt").read_bytes() == b""
+
+
 def test_private_run_uses_strict_precommitted_stage_token(tmp_path: Path) -> None:
     final = _resolved(tmp_path) / "run"
     token = "0123456789abcdef01234567"
@@ -1518,16 +1593,17 @@ def test_private_run_cleanup_settles_moved_payload_after_post_close_control(
                 handle.close()
                 target_descriptor = run._stage_fd if boundary == "stage" else run._parent_fd  # noqa: SLF001
                 assert target_descriptor is not None
-                real_close = enron_private_io.os.close
+                real_close = enron_private_io._native_engine._close_fd_once  # noqa: SLF001
 
-                def close_then_interrupt(descriptor: int) -> None:
+                def close_then_interrupt(attempted: bytearray, descriptor: int) -> int:
                     nonlocal interrupted
-                    real_close(descriptor)
+                    close_errno = real_close(attempted, descriptor)
                     if descriptor == target_descriptor and not interrupted:
                         interrupted = True
                         raise control_error(f"injected {boundary} post-close control")
+                    return close_errno
 
-                patch.setattr(enron_private_io.os, "close", close_then_interrupt)
+                patch.setattr(enron_private_io._native_engine, "_close_fd_once", close_then_interrupt)  # noqa: SLF001
 
             with pytest.raises(control_error, match=f"{boundary} post-close control"):
                 run._cleanup()  # noqa: SLF001

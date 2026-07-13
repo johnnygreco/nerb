@@ -1327,6 +1327,9 @@ class _InflightAttempt:
     cleanup_inventory: dict[str, Any] | None = None
     receipt_appended: bool = False
     terminalized: bool = False
+    transaction_owner: PrivateRun | None = None
+    transaction_pin: _PinnedDirectory | None = None
+    transaction_tree: _PrivateTreeGuard | None = None
 
     @property
     def closed(self) -> bool:
@@ -1386,6 +1389,7 @@ def _wipe_promoted_capacity_run(
     *,
     workspace_root: Path | None,
     allow_unignored_output: bool,
+    expected_identity: tuple[int, int] | None = None,
 ) -> tuple[bool, bool, int]:
     """Wipe retained inodes across tree cleanup, parking failures for retry."""
 
@@ -1393,11 +1397,25 @@ def _wipe_promoted_capacity_run(
     tree_cleanup = (False, False, 0)
     first_error: BaseException | None = None
     try:
+        if cleanup_owner.cleanup_authority_retained:
+            try:
+                authority_wiped = cleanup_owner.wipe_retained_cleanup_authority()
+            except BaseException as exc:
+                first_error = exc
+        elif cleanup_owner.cleanup_authority_wiped:
+            authority_wiped = True
+        else:
+            first_error = EnronPrivateIOError("Private cleanup authority was released without a proven wipe.")
         try:
-            authority_wiped = cleanup_owner.wipe_retained_cleanup_authority()
-        except BaseException as exc:
-            first_error = exc
-        try:
+            if (
+                expected_identity is not None
+                and (
+                    pinned.identity.device,
+                    pinned.identity.inode,
+                )
+                != expected_identity
+            ):
+                raise _error("promotion_failed")
             tree_cleanup = _remove_pinned_directory(
                 pinned,
                 workspace_root=workspace_root,
@@ -1421,6 +1439,8 @@ def _wipe_promoted_capacity_run(
                 if first_error is None:
                     first_error = exc
             authority_wiped = False
+        if not pinned.closed:
+            pinned.close()
     if first_error is not None:
         raise first_error
     return authority_wiped and tree_cleanup[0], tree_cleanup[1], tree_cleanup[2]
@@ -1484,17 +1504,26 @@ class _Watchdog:
             raise _error("watchdog_unsupported")
         try:
             self._previous = signal.getsignal(signal.SIGUSR1)
+            # Publish restoration authority before installing the handler.
+            # If control arrives after signal.signal changes process state,
+            # cleanup must already know that the previous handler is owed.
+            self._installed = True
             signal.signal(signal.SIGUSR1, self._handle)
         except (OSError, RuntimeError, ValueError):
+            self.close()
             raise _error("watchdog_unsupported") from None
-        self._installed = True
 
     def close(self) -> None:
         if self._installed:
             try:
                 signal.signal(signal.SIGUSR1, self._previous)
             except (OSError, RuntimeError, ValueError):
-                pass
+                try:
+                    restored = signal.getsignal(signal.SIGUSR1) is self._previous
+                except (OSError, RuntimeError, ValueError):
+                    raise
+                if not restored:
+                    raise
             self._installed = False
 
     def trigger(self) -> None:
@@ -1533,6 +1562,7 @@ class _ContinuousResourceMonitor:
         self._observation_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._stopped = False
         self._current_phase: str | None = None
         self._states: dict[str, _PhaseMeasurements] = {}
         self._failure_code: str | None = None
@@ -1555,15 +1585,75 @@ class _ContinuousResourceMonitor:
         thread.start()
 
     def stop(self) -> None:
+        first_error: BaseException | None = None
+
+        def remember(exc: BaseException) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = exc
+
+        try:
+            self._stop_once()
+        except BaseException as exc:
+            remember(exc)
+        finally:
+            while not self._shutdown_is_settled():
+                try:
+                    self._stop_once()
+                except BaseException as exc:
+                    remember(exc)
+                    continue
+        if first_error is not None:
+            raise first_error
+
+    def _shutdown_is_settled(self) -> bool:
+        return self._stopped and self._thread is None and not self._watchdog._installed
+
+    def _stop_once(self) -> None:
+        first_error: BaseException | None = None
+
+        def remember(exc: BaseException) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = exc
+
+        if self._shutdown_is_settled():
+            return
         self._stop.set()
         thread = self._thread
         if thread is not None:
-            thread.join(max(1.0, self.interval_ns / 1_000_000_000 * 4))
-            if thread.is_alive():
-                self._record_failure("resource_measurement_failed")
-        self._thread = None
-        self._observe("boundary")
-        self._watchdog.close()
+            join_timeout = max(1.0, self.interval_ns / 1_000_000_000 * 4)
+            # Cleanup cannot safely race a monitor that still holds tree
+            # descriptors or can fire the watchdog.  Do not abandon this
+            # join: the public production run is already bounded by its
+            # parent worker timeout/recovery path, while a local hard exit
+            # would discard authority for sensitive inodes moved outside
+            # the stage before that parent can recover them.
+            while thread.is_alive():
+                try:
+                    thread.join(join_timeout)
+                except BaseException as exc:
+                    remember(exc)
+                    continue
+                if thread.is_alive():
+                    try:
+                        self._record_failure("resource_measurement_failed")
+                    except BaseException as exc:
+                        remember(exc)
+            self._thread = None
+        try:
+            self._observe("boundary")
+        except BaseException as exc:
+            remember(exc)
+        finally:
+            while self._watchdog._installed:
+                try:
+                    self._watchdog.close()
+                except BaseException as exc:
+                    remember(exc)
+            self._stopped = True
+        if first_error is not None:
+            raise first_error
 
     def begin_phase(self, phase: str, started_ns: int) -> None:
         owned = self.tree.logical_bytes()
@@ -3018,6 +3108,7 @@ def _run_capacity_entry(
     failure_code: str | None = None
     outcome = "passed"
     deferred_finalization_control: KeyboardInterrupt | SystemExit | None = None
+    receipt_failure_cleanup_started = False
 
     def remember_finalization_control(exc: KeyboardInterrupt | SystemExit) -> None:
         nonlocal deferred_finalization_control
@@ -3071,9 +3162,22 @@ def _run_capacity_entry(
             )
             report = completed_run.report
         except BaseException as exc:
-            if isinstance(exc, EnronCapacityError) and exc.code in _ERROR_MESSAGES:
-                failure_code = exc.code
-            elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            effective_error = exc
+            if inflight is not None:
+                recovery_owned_transaction = inflight.transaction_owner is not None
+                recovery_error = _recover_inflight_transaction(options, inflight, metrics, effective_error)
+                if recovery_error is not None:
+                    effective_error = recovery_error
+                if recovery_owned_transaction and inflight.transaction_owner is None:
+                    completed_run = None
+                    report = None
+            if isinstance(effective_error, (KeyboardInterrupt, SystemExit, MemoryError)) and isinstance(
+                effective_error.__context__, BaseException
+            ):
+                effective_error = effective_error.__context__
+            if isinstance(effective_error, EnronCapacityError) and effective_error.code in _ERROR_MESSAGES:
+                failure_code = effective_error.code
+            elif isinstance(effective_error, (KeyboardInterrupt, SystemExit)):
                 failure_code = "phase_interrupted"
             else:
                 failure_code = "capacity_failed"
@@ -3097,7 +3201,12 @@ def _run_capacity_entry(
             if completed_run is not None:
                 completed_run.pinned.assert_current(code="promotion_failed")
                 release_cleanup_authority_to_completion(completed_run.cleanup_owner)
+                if inflight is not None:
+                    inflight.transaction_owner = None
+                    inflight.transaction_pin = None
+                    inflight.transaction_tree = None
         except BaseException as exc:
+            receipt_failure_cleanup_started = True
             cleanup_failed = False
             if completed_run is not None:
                 if inflight is not None and inflight.receipt_appended:
@@ -3126,6 +3235,49 @@ def _run_capacity_entry(
         if completed_run is not None:
             completed_run.pinned.close()
         return report
+    except BaseException as exc:
+        if (
+            isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError))
+            and inflight is not None
+            and not inflight.receipt_appended
+            and not receipt_failure_cleanup_started
+            and (inflight.transaction_owner is not None or failure_code is not None)
+        ):
+            outer_effective_error: BaseException = exc
+            if inflight.transaction_owner is not None:
+                recovery_error = _recover_inflight_transaction(options, inflight, metrics, outer_effective_error)
+                if recovery_error is not None:
+                    outer_effective_error = recovery_error
+                    failure_code = None
+                elif failure_code is None and isinstance(outer_effective_error.__context__, BaseException):
+                    outer_effective_error = outer_effective_error.__context__
+            completed_run = None
+            report = None
+            if failure_code is None:
+                if (
+                    isinstance(outer_effective_error, EnronCapacityError)
+                    and outer_effective_error.code in _ERROR_MESSAGES
+                ):
+                    failure_code = outer_effective_error.code
+                elif isinstance(outer_effective_error, (KeyboardInterrupt, SystemExit)):
+                    failure_code = "phase_interrupted"
+                else:
+                    failure_code = "capacity_failed"
+            outcome = "interrupted" if failure_code == "phase_interrupted" else "failed"
+            _finish_attempt_metrics(metrics, resource_probe)
+            try:
+                _append_attempt_receipt(
+                    ledger,
+                    inflight=inflight,
+                    outcome=outcome,
+                    failure_code=failure_code,
+                    execution=execution,
+                    metrics=metrics,
+                )
+            except BaseException:
+                raise _error("attempt_ledger_write_failed") from None
+            raise _error(failure_code) from None
+        raise
     finally:
         active_error = sys.exc_info()[1]
         if isinstance(active_error, (KeyboardInterrupt, SystemExit)):
@@ -3163,6 +3315,164 @@ def _run_capacity_entry(
             raise deferred_finalization_control
 
 
+def _private_run_exit_is_settled(private_run: PrivateRun) -> bool:
+    return private_run._committed or private_run._cleanup_is_settled()  # noqa: SLF001
+
+
+@dataclass(slots=True)
+class _PrivateRunExitState:
+    failure: BaseException | None = None
+    control_error: BaseException | None = None
+
+    def remember(self, exc: BaseException) -> None:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+            if self.control_error is None:
+                self.control_error = exc
+        elif self.failure is None:
+            self.failure = exc
+
+
+def _settle_private_run_exit(
+    private_run: PrivateRun,
+    active_error: BaseException | None,
+    state: _PrivateRunExitState,
+) -> None:
+    """Exit an owned private run without letting one-shot control skip cleanup."""
+
+    exception_info: tuple[object, object, object]
+    if active_error is None:
+        exception_info = (None, None, None)
+    else:
+        exception_info = (type(active_error), active_error, active_error.__traceback__)
+
+    try:
+        private_run.__exit__(*exception_info)
+    except BaseException as exc:
+        state.remember(exc)
+    finally:
+        while not _private_run_exit_is_settled(private_run):
+            try:
+                private_run.__exit__(*exception_info)
+            except BaseException as exc:
+                state.remember(exc)
+                continue
+
+
+def _publish_promoted_cleanup_metrics(
+    metrics: _AttemptMetrics,
+    result: tuple[bool, bool, int],
+) -> None:
+    metrics.sensitive_content_wiped = result[0]
+    metrics.path_tree_removed = result[1]
+    metrics.retained_private_tombstone_count = result[2]
+
+
+def _inflight_promoted_identity(inflight: _InflightAttempt) -> tuple[int, int]:
+    binding = inflight.stage_binding
+    if binding is None:
+        raise _error("promotion_failed")
+    return cast(int, binding["stage_device"]), cast(int, binding["stage_inode"])
+
+
+def _inflight_output_absent(inflight: _InflightAttempt) -> bool:
+    inflight.output_parent.assert_current(code="promotion_failed")
+    try:
+        os.stat(inflight.output_name, dir_fd=inflight.output_parent.fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        raise _error("promotion_failed") from None
+    return False
+
+
+def _recover_inflight_transaction(
+    options: EnronCapacityOptions,
+    inflight: _InflightAttempt,
+    metrics: _AttemptMetrics,
+    active_error: BaseException,
+) -> BaseException | None:
+    """Settle caller-visible transaction ownership after an escaped boundary."""
+
+    owner = inflight.transaction_owner
+    if owner is None:
+        return None
+    exit_state = _PrivateRunExitState()
+    recovery_error: BaseException | None = None
+    recovered = False
+    try:
+        if not _private_run_exit_is_settled(owner):
+            _settle_private_run_exit(owner, active_error, exit_state)
+        if exit_state.failure is not None:
+            recovery_error = exit_state.failure
+        tree = inflight.transaction_tree
+        if tree is not None:
+            try:
+                tree.close()
+            except BaseException as exc:
+                if recovery_error is None and not isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+                    recovery_error = exc
+        inflight.transaction_tree = None
+        if owner.promoted or owner.cleanup_authority_retained:
+            if owner.cleanup_authority_retained:
+                authority_wiped = owner.wipe_retained_cleanup_authority()
+                metrics.sensitive_content_wiped = authority_wiped
+                if not authority_wiped and recovery_error is None:
+                    recovery_error = _error("promotion_failed")
+            if owner.cleanup_authority_wiped and _inflight_output_absent(inflight):
+                cleanup_result_was_published = metrics.path_tree_removed is not None
+                metrics.sensitive_content_wiped = True
+                if not cleanup_result_was_published:
+                    metrics.path_tree_removed = False
+                recovered = True
+                if not cleanup_result_was_published and recovery_error is None:
+                    recovery_error = _error("promotion_failed")
+            else:
+                pin = inflight.transaction_pin
+                if pin is None or pin.closed:
+                    pin = _PinnedDirectory(inflight.output_parent.path / inflight.output_name)
+                    inflight.transaction_pin = pin
+                result = _wipe_promoted_capacity_run(
+                    owner,
+                    pin,
+                    workspace_root=options.workspace_root,
+                    allow_unignored_output=options.allow_unignored_output,
+                    expected_identity=_inflight_promoted_identity(inflight),
+                )
+                inflight.transaction_pin = None
+                _publish_promoted_cleanup_metrics(metrics, result)
+                recovered = result[0]
+                if not result[0] and recovery_error is None:
+                    recovery_error = _error("promotion_failed")
+        else:
+            metrics.sensitive_content_wiped = owner.cleanup_sensitive_content_wiped
+            metrics.path_tree_removed = owner.cleanup_path_tree_removed
+            metrics.retained_private_tombstone_count = owner.cleanup_tombstone_count
+            recovered = _private_run_exit_is_settled(owner)
+    except BaseException as exc:
+        if recovery_error is None:
+            recovery_error = exc
+    finally:
+        if owner.cleanup_authority_wiped:
+            metrics.sensitive_content_wiped = True
+        if recovery_error is not None and owner.cleanup_authority_retained:
+            try:
+                owner.park_unresolved_cleanup_authority()
+            except BaseException as exc:
+                if recovery_error is None:
+                    recovery_error = exc
+        pin = inflight.transaction_pin
+        if pin is not None and not pin.closed:
+            try:
+                pin.close()
+            except BaseException as exc:
+                if recovery_error is None and not isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+                    recovery_error = exc
+        inflight.transaction_pin = None
+        if recovered:
+            inflight.transaction_owner = None
+    return recovery_error
+
+
 def _execute_capacity_transaction(
     options: EnronCapacityOptions,
     *,
@@ -3193,7 +3503,11 @@ def _execute_capacity_transaction(
     tree: _PrivateTreeGuard | None = None
     monitor: _ContinuousResourceMonitor | None = None
     private_run: PrivateRun | None = None
+    transaction_error: BaseException | None = None
+    exit_state = _PrivateRunExitState()
     promoted = False
+    promoted_cleanup_complete = False
+    promoted_cleanup_result: tuple[bool, bool, int] | None = None
     promoted_pin: _PinnedDirectory | None = None
     try:
         private_run = PrivateRun(
@@ -3206,11 +3520,14 @@ def _execute_capacity_transaction(
                 inflight.output_parent.identity.inode,
             ),
         )
+        inflight.transaction_owner = private_run
         assert private_run is not None
-        with private_run:
+        private_run.__enter__()
+        try:
             inflight.output_parent.assert_current(code="private_transaction_failed")
             _bind_inflight_stage(inflight, private_run.stage_dir)
             tree = _PrivateTreeGuard(private_run.stage_dir)
+            inflight.transaction_tree = tree
             active_tree = tree
             monitor = _ContinuousResourceMonitor(
                 tree=active_tree,
@@ -3220,6 +3537,7 @@ def _execute_capacity_transaction(
                 interval_ns=monitor_interval_ns,
                 wall_clock=wall_clock,
             )
+            private_run.register_cleanup_barrier(monitor.stop, monitor._shutdown_is_settled)
             monitor.start()
             phase_reports: list[dict[str, Any]] = []
             for phase, runner in runners:
@@ -3321,6 +3639,7 @@ def _execute_capacity_transaction(
             promoted = True
             tree.rebind(final_dir)
             promoted_pin = _PinnedDirectory(final_dir)
+            inflight.transaction_pin = promoted_pin
             promoted_pin.assert_current(code="promotion_failed")
             metrics.promoted_root_device = promoted_pin.identity.device
             metrics.promoted_root_inode = promoted_pin.identity.inode
@@ -3339,10 +3658,41 @@ def _execute_capacity_transaction(
             )
             if final_owned != report["totals"]["final_owned_disk_bytes"]:
                 raise _error("report_invalid")
+        except BaseException as exc:
+            transaction_error = exc
+            if monitor is not None:
+                try:
+                    monitor.stop()
+                except BaseException:
+                    pass
+                try:
+                    _merge_monitor_metrics(metrics, monitor.global_snapshot())
+                except BaseException:
+                    pass
+            raise
+        finally:
+            _settle_private_run_exit(private_run, transaction_error, exit_state)
+            if exit_state.failure is not None:
+                raise exit_state.failure
+            if transaction_error is None and exit_state.control_error is not None:
+                raise exit_state.control_error
         if report is None or promoted_pin is None:
             raise _error("promotion_failed")
         return _CompletedCapacityRun(report=report, pinned=promoted_pin, cleanup_owner=private_run)
     except BaseException as exc:
+        effective_error = exit_state.failure if exit_state.failure is not None else exc
+        if exit_state.failure is None and isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+            contextual_error = exc.__context__ if isinstance(exc.__context__, BaseException) else transaction_error
+            while isinstance(contextual_error, (KeyboardInterrupt, SystemExit, MemoryError)) and isinstance(
+                contextual_error.__context__, BaseException
+            ):
+                contextual_error = contextual_error.__context__
+            if contextual_error is not None:
+                effective_error = contextual_error
+        if private_run is not None and not _private_run_exit_is_settled(private_run):
+            _settle_private_run_exit(private_run, effective_error, exit_state)
+        if exit_state.failure is not None:
+            effective_error = exit_state.failure
         if private_run is not None:
             metrics.sensitive_content_wiped = private_run.cleanup_sensitive_content_wiped
             metrics.path_tree_removed = private_run.cleanup_path_tree_removed
@@ -3353,34 +3703,97 @@ def _execute_capacity_transaction(
                 _merge_monitor_metrics(metrics, monitor.global_snapshot())
             except BaseException:
                 pass
-        if promoted or (private_run is not None and private_run.cleanup_authority_retained):
+        if promoted or (private_run is not None and (private_run.promoted or private_run.cleanup_authority_retained)):
             try:
-                if private_run is None or not private_run.cleanup_authority_retained:
+                if private_run is None:
                     raise _error("promotion_failed")
                 if promoted_pin is None:
                     promoted_pin = _PinnedDirectory(final_dir)
-                tree_cleanup = _wipe_promoted_capacity_run(
+                promoted_cleanup_result = _wipe_promoted_capacity_run(
                     private_run,
                     promoted_pin,
                     workspace_root=options.workspace_root,
                     allow_unignored_output=options.allow_unignored_output,
+                    expected_identity=_inflight_promoted_identity(inflight),
                 )
+                promoted_cleanup_complete = True
+                promoted = False
                 promoted_pin = None
-                metrics.sensitive_content_wiped = tree_cleanup[0]
-                metrics.path_tree_removed = tree_cleanup[1]
-                metrics.retained_private_tombstone_count = tree_cleanup[2]
+                _publish_promoted_cleanup_metrics(metrics, promoted_cleanup_result)
                 if not metrics.sensitive_content_wiped:
                     raise _error("promotion_failed")
             except EnronCapacityError:
                 raise
             except (EnronPrivateIOError, OSError):
                 raise _error("promotion_failed") from None
-        if isinstance(exc, _CapacityAbort):
-            raise _error(exc.code) from None
-        raise
+        if isinstance(effective_error, _CapacityAbort):
+            raise _error(effective_error.code) from None
+        raise effective_error
     finally:
+        final_error = sys.exc_info()[1]
+        tree_close_error: BaseException | None = None
         if tree is not None:
-            tree.close()
+            try:
+                tree.close()
+            except BaseException as exc:
+                tree_close_error = exc
+        cleanup_trigger_error = tree_close_error if final_error is None else final_error
+        fallback_error: BaseException | None = None
+        if promoted_cleanup_result is not None:
+            promoted_cleanup_complete = True
+            promoted = False
+            promoted_pin = None
+            _publish_promoted_cleanup_metrics(metrics, promoted_cleanup_result)
+        if (
+            cleanup_trigger_error is not None
+            and not promoted_cleanup_complete
+            and private_run is not None
+            and (promoted or private_run.promoted or private_run.cleanup_authority_retained)
+        ):
+            try:
+                if promoted_pin is None or promoted_pin.closed:
+                    promoted_pin = _PinnedDirectory(final_dir)
+                promoted_cleanup_result = _wipe_promoted_capacity_run(
+                    private_run,
+                    promoted_pin,
+                    workspace_root=options.workspace_root,
+                    allow_unignored_output=options.allow_unignored_output,
+                    expected_identity=_inflight_promoted_identity(inflight),
+                )
+                promoted_pin = None
+                promoted_cleanup_complete = True
+                promoted = False
+                _publish_promoted_cleanup_metrics(metrics, promoted_cleanup_result)
+                if not metrics.sensitive_content_wiped:
+                    raise _error("promotion_failed")
+            except BaseException as exc:
+                fallback_error = exc
+        if fallback_error is not None:
+            if isinstance(fallback_error, EnronCapacityError):
+                raise fallback_error
+            raise _error("promotion_failed") from None
+        if tree_close_error is not None and not isinstance(
+            tree_close_error, (KeyboardInterrupt, SystemExit, MemoryError)
+        ):
+            raise tree_close_error
+        if isinstance(final_error, (KeyboardInterrupt, SystemExit, MemoryError)):
+            preserved_error = exit_state.failure
+            if preserved_error is None:
+                preserved_error = (
+                    final_error.__context__ if isinstance(final_error.__context__, BaseException) else None
+                )
+            if preserved_error is None:
+                preserved_error = transaction_error
+            while isinstance(preserved_error, (KeyboardInterrupt, SystemExit, MemoryError)) and isinstance(
+                preserved_error.__context__, BaseException
+            ):
+                preserved_error = preserved_error.__context__
+            if preserved_error is not None and preserved_error is not final_error:
+                if isinstance(preserved_error, _CapacityAbort):
+                    raise _error(preserved_error.code) from None
+                raise preserved_error
+        if final_error is None and tree_close_error is not None:
+            raise tree_close_error
 
 
 def _invoke_phase_runner(
@@ -6268,6 +6681,7 @@ def _write_locked_atomic_file_at(
     temporary_name: str,
     final_name: str,
     payload: bytes,
+    durable_commit: bytearray | None = None,
 ) -> _OwnedDescriptor:
     owner: _OwnedDescriptor | None = None
     descriptor: int | None = None
@@ -6307,7 +6721,16 @@ def _write_locked_atomic_file_at(
             _restore_mismatched_publication_at(directory_fd, final_name, temporary_name)
             published = False
             raise
-        os.fsync(directory_fd)
+        if durable_commit is None:
+            os.fsync(directory_fd)
+        else:
+            if durable_commit != bytearray(1):
+                raise ValueError("Durability status must contain one zero byte.")
+            fsync_errno = _native_engine._fsync_fd_commit(durable_commit, directory_fd)
+            if fsync_errno:
+                raise OSError(fsync_errno, os.strerror(fsync_errno))
+            if durable_commit != bytearray(b"\x01"):
+                raise OSError("Directory fsync returned without committing durability status.")
         try:
             _require_pinned_private_file_at(
                 directory_fd,
@@ -6511,6 +6934,7 @@ def _write_atomic_private_file_at(
     temporary_name: str,
     final_name: str,
     payload: bytes,
+    durable_commit: bytearray | None = None,
 ) -> None:
     owner: _OwnedDescriptor | None = None
     try:
@@ -6519,6 +6943,7 @@ def _write_atomic_private_file_at(
             temporary_name=temporary_name,
             final_name=final_name,
             payload=payload,
+            durable_commit=durable_commit,
         )
         descriptor = owner.fd
         fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -6685,6 +7110,8 @@ def _append_attempt_receipt(
     metrics: _AttemptMetrics,
 ) -> dict[str, Any]:
     descriptor = ledger.fd
+    receipt: dict[str, Any] | None = None
+    durable_commit = bytearray(1)
     try:
         ledger.assert_current()
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -6710,24 +7137,65 @@ def _append_attempt_receipt(
             execution=execution,
             metrics=metrics,
         )
-        _write_attempt_receipt_locked(descriptor, receipt)
+        _write_attempt_receipt_locked(descriptor, receipt, durable_commit)
         if inflight is not None:
-            inflight.receipt_appended = True
-            if outcome != "passed":
-                _assert_owned_attempt_output_absent(inflight)
-            _remove_inflight_files_locked(inflight)
-            inflight.terminalized = True
+            if not _reconcile_published_attempt_receipt_locked(
+                descriptor,
+                inflight,
+                receipt,
+                durable_commit,
+            ):
+                raise _error("attempt_ledger_write_failed")
         ledger.assert_current()
         return receipt
-    except EnronCapacityError:
-        raise
-    except BaseException:
+    except BaseException as exc:
+        if receipt is not None and inflight is not None and not inflight.terminalized:
+            try:
+                _reconcile_published_attempt_receipt_locked(
+                    descriptor,
+                    inflight,
+                    receipt,
+                    durable_commit,
+                )
+            except BaseException:
+                pass
+        if isinstance(exc, EnronCapacityError):
+            raise
         raise _error("attempt_ledger_write_failed") from None
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         except OSError:
             pass
+
+
+def _reconcile_published_attempt_receipt_locked(
+    descriptor: int,
+    inflight: _InflightAttempt,
+    receipt: Mapping[str, Any],
+    durable_commit: bytearray,
+) -> bool:
+    """Make a durably published receipt authoritative before cleanup can branch."""
+
+    if durable_commit != bytearray(b"\x01"):
+        return False
+    receipts = _read_attempt_receipts_locked(descriptor)
+    if not receipts or receipts[-1] != receipt:
+        return False
+    if receipt.get("outcome") == "passed":
+        _verify_recovered_promoted_output(
+            inflight.output_parent.path / inflight.output_name,
+            inflight.output_parent,
+            inflight.record,
+            receipt,
+            inflight.stage_binding,
+        )
+    else:
+        _assert_owned_attempt_output_absent(inflight)
+    inflight.receipt_appended = True
+    _remove_inflight_files_locked(inflight)
+    inflight.terminalized = True
+    return True
 
 
 def _next_attempt_sequence(
@@ -6829,7 +7297,11 @@ def _make_attempt_receipt(
     return receipt
 
 
-def _write_attempt_receipt_locked(descriptor: int, receipt: Mapping[str, Any]) -> None:
+def _write_attempt_receipt_locked(
+    descriptor: int,
+    receipt: Mapping[str, Any],
+    durable_commit: bytearray,
+) -> None:
     payload = _pretty_json_bytes(receipt)
     if len(payload) > MAX_ATTEMPT_RECEIPT_BYTES:
         raise _error("attempt_ledger_write_failed")
@@ -6841,6 +7313,7 @@ def _write_attempt_receipt_locked(descriptor: int, receipt: Mapping[str, Any]) -
         temporary_name=temporary_name,
         final_name=final_name,
         payload=payload,
+        durable_commit=durable_commit,
     )
 
 
@@ -6984,11 +7457,15 @@ def _open_pinned_private_file_at(
 
 
 def _remove_inflight_files_locked(inflight: _InflightAttempt) -> None:
+    names = set(os.listdir(inflight.ledger.fd))
+    if inflight.marker_name not in names:
+        if not inflight.receipt_appended or inflight.binding_name in names or inflight.cleanup_inventory_name in names:
+            raise _error("attempt_ledger_invalid")
+        return
     _assert_inflight_marker_current(inflight)
     marker_fd = inflight.marker_fd
     if marker_fd is None:
         raise _error("attempt_ledger_invalid")
-    names = set(os.listdir(inflight.ledger.fd))
     if inflight.cleanup_inventory_name in names:
         if inflight.stage_binding is None:
             raise _error("attempt_ledger_invalid")
@@ -7014,7 +7491,7 @@ def _remove_inflight_files_locked(inflight: _InflightAttempt) -> None:
             except OSError:
                 pass
             os.close(inventory_fd)
-    elif inflight.cleanup_inventory is not None:
+    elif inflight.cleanup_inventory is not None and not inflight.receipt_appended:
         raise _error("attempt_ledger_invalid")
     if inflight.binding_name in names:
         binding_fd, payload, binding_identity = _open_pinned_private_file_at(
@@ -7039,7 +7516,7 @@ def _remove_inflight_files_locked(inflight: _InflightAttempt) -> None:
             except OSError:
                 pass
             os.close(binding_fd)
-    elif inflight.stage_binding is not None:
+    elif inflight.stage_binding is not None and not inflight.receipt_appended:
         raise _error("attempt_ledger_invalid")
     _wipe_and_quarantine_private_file_at(
         inflight.ledger.fd,
@@ -7559,7 +8036,10 @@ def _recover_stale_inflight_attempts_locked(ledger: _AttemptLedger, options: Enr
                     execution=None,
                     metrics=metrics,
                 )
-                _write_attempt_receipt_locked(descriptor, recovered)
+                durable_commit = bytearray(1)
+                _write_attempt_receipt_locked(descriptor, recovered, durable_commit)
+                if durable_commit != bytearray(b"\x01"):
+                    raise _error("attempt_ledger_write_failed")
                 receipts.append(recovered)
             recovered_attempt = _InflightAttempt(
                 ledger=ledger,

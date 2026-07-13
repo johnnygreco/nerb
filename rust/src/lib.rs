@@ -92,6 +92,41 @@ fn _close_fd_once(_attempted: &Bound<'_, PyByteArray>, _descriptor: i32) -> PyRe
 
 #[pyfunction]
 #[cfg(unix)]
+fn _fsync_fd_commit(committed: &Bound<'_, PyByteArray>, descriptor: i32) -> PyResult<i32> {
+    ffi_boundary(|| {
+        if committed.len() != 1 || committed.to_vec() != [0] {
+            return Err(PyValueError::new_err(
+                "Native fsync-commit status buffer must contain one zero byte",
+            ));
+        }
+        // Retaining the interpreter lock across both the syscall and status
+        // mutation makes the successful durability boundary caller-visible
+        // without a Python control-flow gap.
+        let result = unsafe { libc::fsync(descriptor) };
+        let errno = if result == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        if result == 0 {
+            write_status_bytes(committed, &[1])?;
+        }
+        Ok(errno)
+    })
+}
+
+#[pyfunction]
+#[cfg(not(unix))]
+fn _fsync_fd_commit(_committed: &Bound<'_, PyByteArray>, _descriptor: i32) -> PyResult<i32> {
+    Err(PyOSError::new_err(
+        "Native descriptor transactions require a Unix platform",
+    ))
+}
+
+#[pyfunction]
+#[cfg(unix)]
 #[pyo3(signature = (opened_fd, path, dir_fd=None))]
 fn _open_directory_fd_once(
     opened_fd: &Bound<'_, PyByteArray>,
@@ -718,6 +753,7 @@ fn _engine(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyBank>()?;
     module.add_class::<PyMatchBuffer>()?;
     module.add_function(wrap_pyfunction!(_close_fd_once, module)?)?;
+    module.add_function(wrap_pyfunction!(_fsync_fd_commit, module)?)?;
     module.add_function(wrap_pyfunction!(_open_directory_fd_once, module)?)?;
     module.add_function(wrap_pyfunction!(_open_private_file_fd_once, module)?)?;
     module.add_function(wrap_pyfunction!(
