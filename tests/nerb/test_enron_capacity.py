@@ -65,6 +65,10 @@ _ALLOWED_ZERO_PAYLOAD_TOMBSTONE_FILES = {
     "mining-snapshot.sqlite3",
     "mining-rebuild.sqlite3",
 }
+_REQUIRES_LOCKED_CAPACITY_READER = pytest.mark.skipif(
+    any(importlib.util.find_spec(module_name) is None for module_name in ("huggingface_hub", "httpx")),
+    reason="requires the exact locked Enron capacity reader group",
+)
 
 
 class _Probe:
@@ -7165,6 +7169,7 @@ def test_capacity_reader_dependency_is_exact_locked_and_documented() -> None:
     assert "private-tree scanner continues to reject every" in documentation
 
 
+@_REQUIRES_LOCKED_CAPACITY_READER
 def test_reader_network_activity_uses_only_headers_and_nonempty_chunks_and_restores_exactly() -> None:
     httpx = cast(Any, importlib.import_module("httpx"))
     hub = cast(Any, importlib.import_module("huggingface_hub"))
@@ -7232,6 +7237,7 @@ def test_reader_network_activity_uses_only_headers_and_nonempty_chunks_and_resto
 
 
 @pytest.mark.parametrize("hook_name", ["request", "response"])
+@_REQUIRES_LOCKED_CAPACITY_READER
 def test_reader_network_activity_fails_closed_on_hook_drift_after_restoring_globals(hook_name: str) -> None:
     httpx = cast(Any, importlib.import_module("httpx"))
     hub = cast(Any, importlib.import_module("huggingface_hub"))
@@ -7270,6 +7276,7 @@ def test_reader_network_activity_fails_closed_on_hook_drift_after_restoring_glob
 
 
 @pytest.mark.parametrize("abort_at", [1, 2])
+@_REQUIRES_LOCKED_CAPACITY_READER
 def test_reader_network_activity_preserves_header_or_chunk_abort_and_closes_everything(abort_at: int) -> None:
     httpx = cast(Any, importlib.import_module("httpx"))
     hub = cast(Any, importlib.import_module("huggingface_hub"))
@@ -7323,6 +7330,7 @@ def test_reader_network_activity_preserves_header_or_chunk_abort_and_closes_ever
     "control",
     [KeyboardInterrupt("reader factory"), SystemExit("reader factory"), enron_capacity._CapacityAbort("runtime_limit")],
 )
+@_REQUIRES_LOCKED_CAPACITY_READER
 def test_reader_network_activity_preserves_factory_control_and_restores_exactly(control: BaseException) -> None:
     hub = cast(Any, importlib.import_module("huggingface_hub"))
     http_module = cast(Any, importlib.import_module("huggingface_hub.utils._http"))
@@ -7349,6 +7357,7 @@ def test_reader_network_activity_preserves_factory_control_and_restores_exactly(
         http_module._GLOBAL_CLIENT_FACTORY = installed_factory
 
 
+@_REQUIRES_LOCKED_CAPACITY_READER
 def test_reader_network_activity_tracks_rotated_clients_and_rejects_factory_drift() -> None:
     httpx = cast(Any, importlib.import_module("httpx"))
     hub = cast(Any, importlib.import_module("huggingface_hub"))
@@ -7394,6 +7403,7 @@ def test_reader_network_activity_tracks_rotated_clients_and_rejects_factory_drif
         http_module._GLOBAL_CLIENT_FACTORY = installed_factory
 
 
+@_REQUIRES_LOCKED_CAPACITY_READER
 def test_reader_network_activity_rejects_a_transport_close_failure_hidden_by_hub() -> None:
     httpx = cast(Any, importlib.import_module("httpx"))
     hub = cast(Any, importlib.import_module("huggingface_hub"))
@@ -7434,6 +7444,7 @@ def test_reader_network_activity_rejects_a_transport_close_failure_hidden_by_hub
         http_module._GLOBAL_CLIENT_FACTORY = installed_factory
 
 
+@_REQUIRES_LOCKED_CAPACITY_READER
 def test_reader_network_activity_rejects_response_close_failure_without_masking_cleanup() -> None:
     httpx = cast(Any, importlib.import_module("httpx"))
     hub = cast(Any, importlib.import_module("huggingface_hub"))
