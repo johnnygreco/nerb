@@ -5505,8 +5505,11 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     (package / "__init__.py").write_text("", encoding="utf-8")
     module = package / "enron_capacity.py"
     source_payload = (
-        'import json\nprint(json.dumps({"ok":False,"code":"options_invalid","report":None},'
+        "import json\n"
+        "def _production_worker_main():\n"
+        '    print(json.dumps({"ok":False,"code":"options_invalid","report":None},'
         'sort_keys=True,separators=(",",":")))\n'
+        "    return 0\n"
     )
     divergent_payload = source_payload.replace("options_invalid", "capacity_failed")
     assert len(source_payload.encode("utf-8")) == len(divergent_payload.encode("utf-8"))
@@ -5564,6 +5567,45 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     with pytest.raises(EnronCapacityError) as raised:
         enron_capacity._spawn_production_worker(_options(tmp_path, f"isolated-{invalidation_mode.name.lower()}"))
     assert raised.value.code == "options_invalid"
+
+
+@pytest.mark.skipif(
+    os.environ.get("NERB_TEST_LOCKED_CAPACITY_LAUNCHER") != "1",
+    reason="requires the clean, locked Python 3.13 capacity-reader environment",
+)
+def test_isolated_production_worker_reaches_a_post_identity_gate(tmp_path: Path) -> None:
+    output = tmp_path / "preexisting-output"
+    ledger = tmp_path / "attempts"
+    output.mkdir(mode=0o700)
+    os.chmod(tmp_path, 0o700)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            os.fspath(Path.cwd() / "scripts" / "run_enron_capacity.py"),
+            "run-enron-capacity",
+            "--output-dir",
+            os.fspath(output),
+            "--attempt-ledger-dir",
+            os.fspath(ledger),
+            "--allow-unignored-output",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 1
+    receipts = sorted(ledger.glob("attempt-*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["failure_code"] == "private_transaction_failed"
+    assert receipt["production_evidence"] is True
+    assert receipt["executable_git_commit"] == enron_capacity._git_head()
 
 
 @pytest.mark.parametrize(

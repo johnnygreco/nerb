@@ -100,9 +100,12 @@ jobs:
           --reinstall-package nerb
 
       - name: Exercise phase-owned reader isolation
-        run: >-
-          uv run --locked --no-default-groups --group dev --group enron-capacity --no-sync --python 3.13
-          pytest -q tests/nerb/test_enron_capacity.py::test_reader_provenance_stays_unloaded_until_phase_owned_isolation
+        run: |
+          NERB_TEST_LOCKED_CAPACITY_LAUNCHER=1 \
+            uv run --locked --no-default-groups --group dev --group enron-capacity --no-sync --python 3.13 \
+            pytest -q \
+            tests/nerb/test_enron_capacity.py::test_reader_provenance_stays_unloaded_until_phase_owned_isolation \
+            tests/nerb/test_enron_capacity.py::test_isolated_production_worker_reaches_a_post_identity_gate
 
   checks:
     name: Checks (Python ${{ matrix.python-version }})

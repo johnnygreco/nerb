@@ -160,14 +160,16 @@ _BOOTSTRAP_ATTRIBUTE = "_nerb_capacity_bootstrap"
 _BOOTSTRAP_SCHEMA = "nerb.enron_capacity.bootstrap.v1"
 _CAPACITY_LAUNCHER_PATH = "scripts/run_enron_capacity.py"
 _PRODUCTION_WORKER_BOOTSTRAP = (
-    "import runpy,sys;"
+    "import importlib,sys;"
     "source=sys.argv.pop(1);count=int(sys.argv.pop(1));"
     "roots=[sys.argv.pop(1) for _ in range(count)];"
     "baseline=list(sys.path);sys.path[:0]=[source,*roots];"
     "setattr(sys,'_nerb_capacity_bootstrap',"
     "{'schema':'nerb.enron_capacity.bootstrap.v1','source_root':source,'dependency_roots':roots,"
     "'baseline_path':baseline,'pycache_root':sys.pycache_prefix});"
-    "runpy.run_module('nerb.enron_capacity',run_name='__main__')"
+    "module=importlib.import_module('nerb.enron_capacity');"
+    "sys.exit(module._production_worker_main() "
+    "if sys.argv==[sys.argv[0],'--nerb-capacity-production-worker'] else 2)"
 )
 _FRESH_PRODUCTION_WORKER = False
 _PHASE_SCOPED_READER_LOADED = False
