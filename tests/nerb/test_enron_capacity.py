@@ -4,6 +4,7 @@ import copy
 import errno
 import gc
 import hashlib
+import importlib.machinery
 import importlib.util
 import inspect
 import json
@@ -5503,10 +5504,30 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     package = source_root / "nerb"
     package.mkdir(parents=True)
     (package / "__init__.py").write_text("", encoding="utf-8")
+    helper = package / "_capacity_bootstrap.py"
+    shutil.copy2(Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py", helper)
+    helper_marker = repository / "hostile-helper-pyc-ran"
+    divergent_helper = repository / "divergent_helper.py"
+    divergent_helper.write_text(
+        f"from pathlib import Path\nPath({os.fspath(helper_marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    helper_pyc_path = Path(importlib.util.cache_from_source(os.fspath(helper)))
+    helper_pyc_path.parent.mkdir()
+    py_compile.compile(
+        os.fspath(divergent_helper),
+        cfile=os.fspath(helper_pyc_path),
+        dfile=os.fspath(helper),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
     module = package / "enron_capacity.py"
     source_payload = (
-        'import json\nprint(json.dumps({"ok":False,"code":"options_invalid","report":None},'
+        "import fractions, json\n"
+        "def _production_worker_main():\n"
+        '    print(json.dumps({"ok":False,"code":"options_invalid","report":None},'
         'sort_keys=True,separators=(",",":")))\n'
+        "    return 0\n"
     )
     divergent_payload = source_payload.replace("options_invalid", "capacity_failed")
     assert len(source_payload.encode("utf-8")) == len(divergent_payload.encode("utf-8"))
@@ -5520,7 +5541,7 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     assert divergent_stat.st_size == source_stat.st_size
     assert int(divergent_stat.st_mtime) == int(source_stat.st_mtime)
     pyc_path = Path(importlib.util.cache_from_source(os.fspath(module)))
-    pyc_path.parent.mkdir()
+    pyc_path.parent.mkdir(exist_ok=True)
     py_compile.compile(
         os.fspath(divergent),
         cfile=os.fspath(pyc_path),
@@ -5530,10 +5551,13 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     )
     dependency_root = repository / "dependency-root"
     dependency_root.mkdir()
+    pycache_root = repository / "pycache"
+    pycache_root.mkdir(mode=0o700)
     hostile_marker = repository / "hostile-site-hook-ran"
     hostile_statement = f"import pathlib; pathlib.Path({os.fspath(hostile_marker)!r}).write_text('ran')\n"
     (dependency_root / "hostile.pth").write_text(hostile_statement, encoding="utf-8")
     (dependency_root / "sitecustomize.py").write_text(hostile_statement, encoding="utf-8")
+    (dependency_root / "fractions.py").write_text(hostile_statement, encoding="utf-8")
 
     control = subprocess.run(
         [
@@ -5541,6 +5565,8 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
             "-I",
             "-S",
             "-B",
+            "-X",
+            f"pycache_prefix={pycache_root}",
             "-c",
             enron_capacity._PRODUCTION_WORKER_BOOTSTRAP,
             os.fspath(source_root),
@@ -5552,8 +5578,9 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
         capture_output=True,
         timeout=30,
     )
-    assert json.loads(control.stdout)["code"] == "capacity_failed"
+    assert json.loads(control.stdout)["code"] == "options_invalid"
     assert not hostile_marker.exists()
+    assert not helper_marker.exists()
 
     monkeypatch.setattr(enron_capacity, "_git_root", lambda: repository)
     monkeypatch.setattr(
@@ -5564,6 +5591,282 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     with pytest.raises(EnronCapacityError) as raised:
         enron_capacity._spawn_production_worker(_options(tmp_path, f"isolated-{invalidation_mode.name.lower()}"))
     assert raised.value.code == "options_invalid"
+
+
+def test_worker_import_guard_rejects_native_and_package_shadows_of_tracked_sources(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    package = source_root / "nerb"
+    package.mkdir(parents=True)
+    marker = tmp_path / "shadow-ran"
+    pycache_root = tmp_path / "pycache"
+    pycache_root.mkdir(mode=0o700)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py", package / "_capacity_bootstrap.py")
+    (package / "enron_capacity.py").write_text(
+        textwrap.dedent(
+            """
+            import json
+            import os
+            import nerb._engine
+
+            def _production_worker_main():
+                print(json.dumps({
+                    "native": os.path.basename(nerb._engine.__file__),
+                    "result": "tracked-source",
+                }, sort_keys=True))
+                return 0
+            """
+        ),
+        encoding="utf-8",
+    )
+    extension_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    native_origin = getattr(enron_capacity._native_engine, "__file__", None)
+    assert isinstance(native_origin, str)
+    shutil.copy2(native_origin, package / f"_engine{extension_suffix}")
+    (tmp_path / f"source/nerb{extension_suffix}").write_bytes(b"invalid package extension shadow")
+    (package / f"enron_capacity{extension_suffix}").write_bytes(b"invalid module extension shadow")
+    (package / "_engine.py").write_text(
+        f"from pathlib import Path\nPath({os.fspath(marker)!r}).write_text('engine source ran')\n",
+        encoding="utf-8",
+    )
+    wrong_suffix = next(
+        (suffix for suffix in importlib.machinery.EXTENSION_SUFFIXES[1:] if suffix != extension_suffix),
+        ".wrong-extension.so",
+    )
+    (package / f"_engine{wrong_suffix}").write_bytes(b"invalid wrong-suffix native shadow")
+    shadow_package = package / "enron_capacity"
+    shadow_package.mkdir()
+    (shadow_package / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({os.fspath(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-X",
+            f"pycache_prefix={pycache_root}",
+            "-c",
+            enron_capacity._PRODUCTION_WORKER_BOOTSTRAP,
+            os.fspath(source_root),
+            "0",
+            enron_capacity._PRODUCTION_WORKER_ARGUMENT,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "native": f"_engine{extension_suffix}",
+        "result": "tracked-source",
+    }
+    assert not marker.exists()
+
+
+def test_worker_import_guard_never_falls_back_to_a_same_name_package(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    package = source_root / "nerb"
+    shadow_package = package / "enron_capacity"
+    shadow_package.mkdir(parents=True)
+    pycache_root = tmp_path / "pycache"
+    pycache_root.mkdir(mode=0o700)
+    marker = tmp_path / "package-fallback-ran"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py", package / "_capacity_bootstrap.py")
+    (shadow_package / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({os.fspath(marker)!r}).write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-X",
+            f"pycache_prefix={pycache_root}",
+            "-c",
+            enron_capacity._PRODUCTION_WORKER_BOOTSTRAP,
+            os.fspath(source_root),
+            "0",
+            enron_capacity._PRODUCTION_WORKER_ARGUMENT,
+        ],
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["missing-engine", "unlisted-module", "removed-guard", "worker-main-removed-guard"],
+)
+def test_worker_import_guard_fails_closed_on_disallowed_resolution_and_drift(tmp_path: Path, mode: str) -> None:
+    source_root = tmp_path / "source"
+    package = source_root / "nerb"
+    package.mkdir(parents=True)
+    pycache_root = tmp_path / "pycache"
+    pycache_root.mkdir(mode=0o700)
+    marker = tmp_path / "disallowed-code-ran"
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py", package / "_capacity_bootstrap.py")
+    if mode == "missing-engine":
+        import_statement = "import nerb._engine"
+        (package / "_engine.py").write_text(
+            f"from pathlib import Path\nPath({os.fspath(marker)!r}).write_text('engine source ran')\n",
+            encoding="utf-8",
+        )
+        (package / "_engine.wrong-extension.so").write_bytes(b"invalid wrong extension")
+    elif mode == "unlisted-module":
+        import_statement = "import nerb.unlisted"
+        (package / "unlisted.py").write_text(
+            f"from pathlib import Path\nPath({os.fspath(marker)!r}).write_text('unlisted ran')\n",
+            encoding="utf-8",
+        )
+    elif mode == "removed-guard":
+        import_statement = "import sys; sys.meta_path.pop(0)"
+    else:
+        import_statement = ""
+    worker_body = (
+        "import sys\nsys.meta_path.pop(0)\nreturn 0"
+        if mode == "worker-main-removed-guard"
+        else f'from pathlib import Path\nPath({os.fspath(marker)!r}).write_text("worker main ran")\nreturn 0'
+    )
+    (package / "enron_capacity.py").write_text(
+        f"{import_statement}\n\ndef _production_worker_main():\n{textwrap.indent(worker_body, '    ')}\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-X",
+            f"pycache_prefix={pycache_root}",
+            "-c",
+            enron_capacity._PRODUCTION_WORKER_BOOTSTRAP,
+            os.fspath(source_root),
+            "0",
+            enron_capacity._PRODUCTION_WORKER_ARGUMENT,
+        ],
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert completed.returncode != 0
+    assert not marker.exists()
+
+
+def test_capacity_import_guard_manifest_matches_the_flat_source_package() -> None:
+    source_modules = {path.stem for path in (Path.cwd() / "src" / "nerb").glob("*.py") if path.name != "__init__.py"}
+
+    assert enron_capacity._capacity_import_guard._SOURCE_MODULES == source_modules
+
+
+def test_capacity_import_guard_rejects_a_prepopulated_project_module(tmp_path: Path) -> None:
+    source_root = tmp_path / "source"
+    package = source_root / "nerb"
+    package.mkdir(parents=True)
+    pycache_root = tmp_path / "pycache"
+    pycache_root.mkdir(mode=0o700)
+    helper = package / "_capacity_bootstrap.py"
+    shutil.copy2(Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py", helper)
+    probe = textwrap.dedent(
+        """
+        import importlib.machinery
+        import importlib.util
+        import os
+        import sys
+        import types
+
+        source = sys.argv[1]
+        name = "_nerb_capacity_bootstrap_impl"
+        path = os.path.join(source, "nerb", "_capacity_bootstrap.py")
+        loader = importlib.machinery.SourceFileLoader(name, path)
+        spec = importlib.util.spec_from_file_location(name, path, loader=loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        loader.exec_module(module)
+        sys.modules["nerb"] = types.ModuleType("nerb")
+        try:
+            module.install(source)
+        except ImportError:
+            print("rejected")
+        else:
+            raise SystemExit("guard accepted a prepopulated project module")
+        """
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-X",
+            f"pycache_prefix={pycache_root}",
+            "-c",
+            probe,
+            os.fspath(source_root),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.stdout == "rejected\n"
+
+
+@pytest.mark.skipif(
+    os.environ.get("NERB_TEST_LOCKED_CAPACITY_LAUNCHER") != "1",
+    reason="requires the clean, locked Python 3.13 capacity-reader environment",
+)
+def test_isolated_production_worker_reaches_a_post_identity_gate(tmp_path: Path) -> None:
+    output = tmp_path / "preexisting-output"
+    ledger = tmp_path / "attempts"
+    output.mkdir(mode=0o700)
+    os.chmod(tmp_path, 0o700)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            os.fspath(Path.cwd() / "scripts" / "run_enron_capacity.py"),
+            "run-enron-capacity",
+            "--output-dir",
+            os.fspath(output),
+            "--attempt-ledger-dir",
+            os.fspath(ledger),
+            "--allow-unignored-output",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 1
+    receipts = sorted(ledger.glob("attempt-*.json"))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    assert receipt["failure_code"] == "private_transaction_failed"
+    assert receipt["production_evidence"] is True
+    assert receipt["executable_git_commit"] == enron_capacity._git_head()
 
 
 @pytest.mark.parametrize(
@@ -5582,6 +5885,7 @@ def test_tracked_launcher_ignores_site_hooks_and_valid_parent_bytecode(
     package.mkdir(parents=True)
     shutil.copy2(Path.cwd() / "scripts" / "run_enron_capacity.py", scripts / "run_enron_capacity.py")
     (package / "__init__.py").write_text("", encoding="utf-8")
+    shutil.copy2(Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py", package / "_capacity_bootstrap.py")
     (package / "enron_capacity.py").write_text("", encoding="utf-8")
     cli = package / "cli.py"
     source_payload = textwrap.dedent(
@@ -5589,6 +5893,7 @@ def test_tracked_launcher_ignores_site_hooks_and_valid_parent_bytecode(
         import json
         import os
         import sys
+        import sysconfig
 
         def main():
             print(json.dumps({
@@ -5600,6 +5905,7 @@ def test_tracked_launcher_ignores_site_hooks_and_valid_parent_bytecode(
                 "sitecustomize_loaded": "sitecustomize" in sys.modules,
                 "hostile_marker_exists": os.path.exists(os.environ["HOSTILE_MARKER"]),
                 "pycache_prefix": sys.pycache_prefix is not None,
+                "sysconfig_shadowed": getattr(sysconfig, "SHADOWED", False),
             }, sort_keys=True))
         """
     )
@@ -5632,20 +5938,32 @@ def test_tracked_launcher_ignores_site_hooks_and_valid_parent_bytecode(
     hostile_statement = f"import pathlib; pathlib.Path({os.fspath(hostile_marker)!r}).write_text('ran')\n"
     (dependency_root / "hostile.pth").write_text(hostile_statement, encoding="utf-8")
     (dependency_root / "sitecustomize.py").write_text(hostile_statement, encoding="utf-8")
+    (dependency_root / "sysconfig.py").write_text(
+        f"from pathlib import Path\nPath({os.fspath(hostile_marker)!r}).write_text('sysconfig ran')\nSHADOWED = True\n",
+        encoding="utf-8",
+    )
+    extension_suffix = importlib.machinery.EXTENSION_SUFFIXES[0]
+    (repository / f"src/nerb{extension_suffix}").write_bytes(b"invalid package native shadow")
+    (package / f"cli{extension_suffix}").write_bytes(b"invalid cli native shadow")
+    cli_shadow = package / "cli"
+    cli_shadow.mkdir()
+    (cli_shadow / "__init__.py").write_text(hostile_statement, encoding="utf-8")
 
+    command = [
+        os.fspath(binary),
+        "-I",
+        "-S",
+        "-B",
+        os.fspath(scripts / "run_enron_capacity.py"),
+        "verify-enron-capacity",
+    ]
+    environment_variables = {**os.environ, "HOSTILE_MARKER": os.fspath(hostile_marker)}
     completed = subprocess.run(
-        [
-            os.fspath(binary),
-            "-I",
-            "-S",
-            "-B",
-            os.fspath(scripts / "run_enron_capacity.py"),
-            "verify-enron-capacity",
-        ],
+        command,
         check=True,
         capture_output=True,
         text=True,
-        env={**os.environ, "HOSTILE_MARKER": os.fspath(hostile_marker)},
+        env=environment_variables,
         timeout=30,
     )
     payload = json.loads(completed.stdout)
@@ -5658,8 +5976,24 @@ def test_tracked_launcher_ignores_site_hooks_and_valid_parent_bytecode(
         "pycache_prefix": True,
         "result": "safe",
         "sitecustomize_loaded": False,
+        "sysconfig_shadowed": False,
     }
     assert not hostile_marker.exists()
+    for name, value in (
+        ("_PYTHON_SYSCONFIGDATA_NAME", "hostile_sysconfigdata"),
+        ("_PYTHON_SYSCONFIGDATA_PATH", os.fspath(dependency_root)),
+    ):
+        refused = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**environment_variables, name: value},
+            timeout=30,
+        )
+        assert refused.returncode != 0
+        assert "Python sysconfig overrides are not allowed" in refused.stderr
+        assert not hostile_marker.exists()
 
 
 def test_recorded_production_identity_verifier_does_not_require_current_head(
@@ -5718,6 +6052,36 @@ def test_recorded_production_identity_verifier_does_not_require_current_head(
     enron_capacity._verify_recorded_production_execution(execution)
 
 
+def test_execution_identity_accepts_the_matching_fresh_production_worker_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    runners = enron_capacity._validated_phase_runners(_successful_runners(probe))
+    expected = enron_capacity._execution_identity(
+        runners,
+        probe,
+        production_evidence=False,
+        monitor_interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+    )
+    expected.update(
+        {
+            "production_evidence": True,
+            "fresh_worker": True,
+            "git_tree_clean": True,
+        }
+    )
+    monkeypatch.setattr(enron_capacity, "_production_execution_identity", lambda: expected)
+
+    execution = enron_capacity._execution_identity(
+        runners,
+        probe,
+        production_evidence=True,
+        monitor_interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+    )
+
+    assert execution == expected
+
+
 def test_production_identity_rejects_a_native_extension_built_from_other_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5733,6 +6097,26 @@ def test_production_identity_rejects_a_native_extension_built_from_other_sources
 
     with pytest.raises(EnronCapacityError, match="production implementation identity"):
         enron_capacity._production_execution_identity()
+
+
+def test_production_reassert_rejects_import_guard_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: list[Path] = []
+
+    def reject(path: Path) -> None:
+        observed.append(path)
+        raise ImportError("injected guard drift")
+
+    monkeypatch.setattr(enron_capacity._capacity_import_guard, "assert_installed", reject)
+
+    with pytest.raises(EnronCapacityError, match="production implementation identity"):
+        enron_capacity._reassert_production_execution_current(
+            {
+                "production_evidence": True,
+                "executable_git_commit": "a" * 40,
+            }
+        )
+
+    assert observed == [Path(enron_capacity.__file__).parent.parent]
 
 
 def test_production_preloads_core_modules_and_rejects_midrun_source_drift(

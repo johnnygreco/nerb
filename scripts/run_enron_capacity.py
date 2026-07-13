@@ -8,15 +8,19 @@ installed.
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import os
 import stat
 import sys
 import tempfile
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 _BOOTSTRAP_ATTRIBUTE = "_nerb_capacity_bootstrap"
 _BOOTSTRAP_SCHEMA = "nerb.enron_capacity.bootstrap.v1"
+_IMPORT_GUARD_MODULE = "_nerb_capacity_bootstrap_impl"
+_SYSCONFIG_OVERRIDE_ENVIRONMENT = ("_PYTHON_SYSCONFIGDATA_NAME", "_PYTHON_SYSCONFIGDATA_PATH")
 
 
 def _fail(message: str) -> NoReturn:
@@ -50,11 +54,12 @@ def _validated_source_root() -> Path:
     source = _validated_directory(root / "src", label="source root")
     package = _validated_directory(source / "nerb", label="nerb package root")
     try:
+        bootstrap = (package / "_capacity_bootstrap.py").lstat()
         capacity = (package / "enron_capacity.py").lstat()
         cli = (package / "cli.py").lstat()
     except OSError:
         _fail("tracked capacity sources are unavailable")
-    if any(not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode) for item in (capacity, cli)):
+    if any(not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode) for item in (bootstrap, capacity, cli)):
         _fail("tracked capacity sources are not regular files")
     return source
 
@@ -95,9 +100,28 @@ def _validated_dependency_roots() -> tuple[Path, ...]:
     return tuple(roots)
 
 
+def _install_import_guard(source_root: Path) -> Any:
+    path = source_root / "nerb" / "_capacity_bootstrap.py"
+    loader = importlib.machinery.SourceFileLoader(_IMPORT_GUARD_MODULE, os.fspath(path))
+    spec = importlib.util.spec_from_file_location(_IMPORT_GUARD_MODULE, path, loader=loader)
+    if spec is None or _IMPORT_GUARD_MODULE in sys.modules:
+        _fail("the source import guard is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_IMPORT_GUARD_MODULE] = module
+    try:
+        loader.exec_module(module)
+        module.install(os.fspath(source_root))
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        sys.modules.pop(_IMPORT_GUARD_MODULE, None)
+        _fail("the source import guard is invalid")
+    return module
+
+
 def main() -> None:
     if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
         _fail("invoke with python -I -S -B")
+    if any(name in os.environ for name in _SYSCONFIG_OVERRIDE_ENVIRONMENT):
+        _fail("Python sysconfig overrides are not allowed")
     if _BOOTSTRAP_ATTRIBUTE in vars(sys):
         _fail("bootstrap state already exists")
 
@@ -111,8 +135,8 @@ def main() -> None:
         pycache_root = _validated_directory(Path(directory).resolve(strict=True), label="pycache root")
         os.chmod(pycache_root, 0o700)
         sys.pycache_prefix = os.fspath(pycache_root)
-        explicit_roots = (source_root, *dependency_roots)
-        sys.path[:] = [*(os.fspath(path) for path in explicit_roots), *baseline_path]
+        import_guard = _install_import_guard(source_root)
+        sys.path[:] = [*baseline_path, *(os.fspath(path) for path in dependency_roots), os.fspath(source_root)]
         setattr(
             sys,
             _BOOTSTRAP_ATTRIBUTE,
@@ -129,7 +153,9 @@ def main() -> None:
             sys.argv[1:1] = ["run-enron-capacity"]
         from nerb.cli import main as cli_main
 
+        import_guard.assert_installed(source_root)
         cli_main()
+        import_guard.assert_installed(source_root)
 
 
 if __name__ == "__main__":
