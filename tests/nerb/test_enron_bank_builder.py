@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import stat
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -186,6 +187,40 @@ def test_deep_scratch_has_no_system_temp_fallback(monkeypatch: pytest.MonkeyPatc
     with pytest.raises(EnronBankBuildError, match="Scratch root is invalid"):
         with bank_workflow._deep_verify_scratch_root(None):  # ty: ignore[invalid-argument-type]
             raise AssertionError("invalid scratch root must fail before allocation")
+
+
+def test_implicit_build_scratch_accepts_pinned_sticky_shared_temp_base(tmp_path: Path) -> None:
+    shared = tmp_path / "shared-temp"
+    shared.mkdir(mode=0o700)
+    shared.chmod(0o1777)
+    sensitive = b"synthetic private scratch payload"
+
+    with bank_workflow._owned_private_scratch_directory(
+        shared,
+        prefix="nerb-linux-temp-test-",
+        allow_sticky_shared_base=True,
+    ) as scratch:
+        info = scratch.stat()
+        assert stat.S_IMODE(info.st_mode) == 0o700
+        payload = scratch / "quality.sqlite3"
+        payload.write_bytes(sensitive)
+        payload.chmod(0o600)
+
+    assert all(sensitive not in path.read_bytes() for path in shared.rglob("*") if path.is_file())
+
+
+def test_implicit_build_scratch_rejects_shared_temp_base_without_sticky_bit(tmp_path: Path) -> None:
+    shared = tmp_path / "unsafe-shared-temp"
+    shared.mkdir(mode=0o700)
+    shared.chmod(0o777)
+
+    with pytest.raises(EnronBankBuildError, match="non-private entry"):
+        with bank_workflow._owned_private_scratch_directory(
+            shared,
+            prefix="nerb-unsafe-temp-test-",
+            allow_sticky_shared_base=True,
+        ):
+            raise AssertionError("unsafe shared base must fail before allocation")
 
 
 def test_scratch_budget_accounts_main_file_and_sidecars_together(tmp_path: Path) -> None:

@@ -802,7 +802,11 @@ def build_enron_intelligence_bank(options: EnronBankBuildOptions) -> dict[str, A
                 for iteration in ITERATION_POLICIES
             )
             build_scratch_root = Path(tempfile.gettempdir()).resolve(strict=True)
-            with _owned_private_scratch_directory(build_scratch_root, prefix="nerb-enron-bank-build-") as scratch_dir:
+            with _owned_private_scratch_directory(
+                build_scratch_root,
+                prefix="nerb-enron-bank-build-",
+                allow_sticky_shared_base=True,
+            ) as scratch_dir:
                 scratch_budget = _ScratchDirectoryBudget(scratch_dir, _BUILD_SCRATCH_BYTES)
                 evaluated_items: list[dict[str, Any]] = []
                 for index, item in enumerate(curated, start=1):
@@ -2834,9 +2838,15 @@ def _validate_deep_verify_scratch_budget(value: Any) -> int:
 
 
 @contextmanager
-def _owned_private_scratch_directory(base_root: Path, *, prefix: str) -> Iterator[Path]:
+def _owned_private_scratch_directory(
+    base_root: Path,
+    *,
+    prefix: str,
+    allow_sticky_shared_base: bool = False,
+) -> Iterator[Path]:
     """Yield a pinned private child and retain only a payload-empty tombstone."""
 
+    base_identity: tuple[int, int] | None = None
     try:
         base = Path(base_root).expanduser()
         if any(part == os.pardir for part in base.parts):
@@ -2845,8 +2855,13 @@ def _owned_private_scratch_directory(base_root: Path, *, prefix: str) -> Iterato
             base = Path.cwd() / base
         root_fd = _open_private_directory(base)
         try:
-            identity = _private_entry_identity(os.fstat(root_fd), kind="directory")
-            _require_private_entry(identity)
+            base_info = os.fstat(root_fd)
+            identity = _private_entry_identity(base_info, kind="directory")
+            if allow_sticky_shared_base and _is_safe_sticky_shared_scratch_base(base_info):
+                pass
+            else:
+                _require_private_entry(identity)
+            base_identity = int(base_info.st_dev), int(base_info.st_ino)
         finally:
             os.close(root_fd)
     except EnronBankBuildError:
@@ -2855,12 +2870,31 @@ def _owned_private_scratch_directory(base_root: Path, *, prefix: str) -> Iterato
         raise EnronBankBuildError("Scratch root is invalid.") from None
     try:
         final = base / f".{prefix}{secrets.token_hex(16)}"
-        with PrivateRun(final, allow_unignored_output=True) as run:
+        with PrivateRun(
+            final,
+            allow_unignored_output=True,
+            expected_parent_identity=base_identity,
+        ) as run:
             yield run.stage_dir
     except EnronBankBuildError:
         raise
     except (EnronPrivateIOError, OSError, TypeError, ValueError):
         raise EnronBankBuildError("Scratch directory failed safely.") from None
+
+
+def _is_safe_sticky_shared_scratch_base(info: os.stat_result) -> bool:
+    """Accept the canonical shared-temp shape without weakening child privacy."""
+
+    owner = os.geteuid() if hasattr(os, "geteuid") else info.st_uid
+    mode = stat.S_IMODE(info.st_mode)
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid in {0, owner}
+        and mode & stat.S_ISVTX != 0
+        and mode & stat.S_IWOTH != 0
+        and mode & stat.S_IXOTH != 0
+    )
 
 
 @contextmanager

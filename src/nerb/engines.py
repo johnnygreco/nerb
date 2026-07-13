@@ -35,6 +35,7 @@ __all__ = [
     "ExtractionError",
     "compile_bank_with_report",
     "extraction_execution_sha256",
+    "extraction_semantics_sha256",
     "resolve_extraction_options",
 ]
 
@@ -95,6 +96,68 @@ def extraction_execution_sha256() -> str:
             ).encode("utf-8")
         ).hexdigest()
     )
+
+
+@lru_cache(maxsize=1)
+def extraction_semantics_sha256() -> str:
+    """Fingerprint platform-neutral Python and native extraction semantics."""
+
+    from . import bank as bank_module
+    from . import engine as engine_module
+    from . import records as records_module
+
+    native_module = importlib.import_module("nerb._engine")
+    native_build_source_sha256 = getattr(native_module, "BUILD_SOURCE_SHA256", None)
+    if (
+        not isinstance(native_build_source_sha256, str)
+        or not native_build_source_sha256.startswith("sha256:")
+        or len(native_build_source_sha256) != 71
+    ):
+        raise ExtractionError("Native extraction build-source identity is unavailable.")
+    sources = (
+        ("bank.py", bank_module.__file__),
+        ("engine.py", engine_module.__file__),
+        ("engines.py", __file__),
+        ("records.py", records_module.__file__),
+    )
+    payloads: dict[str, bytes] = {}
+    try:
+        for logical_id, source_path in sources:
+            if not isinstance(source_path, str) or not source_path:
+                raise OSError
+            payloads[logical_id] = Path(source_path).read_bytes()
+    except OSError:
+        raise ExtractionError("Extraction semantic sources could not be fingerprinted safely.") from None
+    return _extraction_semantics_hash(payloads, native_build_source_sha256)
+
+
+def _extraction_semantics_hash(source_payloads: Mapping[str, bytes], native_build_source_sha256: str) -> str:
+    descriptors = []
+    for logical_id in sorted(source_payloads):
+        normalized = _normalized_lf_source(source_payloads[logical_id])
+        descriptors.append(
+            {
+                "id": logical_id,
+                "bytes": len(normalized),
+                "sha256": "sha256:" + hashlib.sha256(normalized).hexdigest(),
+            }
+        )
+    payload = {
+        "schema_version": "nerb.extraction_semantics.v1",
+        "python_sources": descriptors,
+        "native_build_source_sha256": native_build_source_sha256,
+    }
+    return (
+        "sha256:"
+        + hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    )
+
+
+def _normalized_lf_source(payload: bytes) -> bytes:
+    normalized = payload.replace(b"\r\n", b"\n")
+    if b"\r" in normalized:
+        raise ExtractionError("Extraction semantic source contains a bare carriage return.")
+    return normalized
 
 
 @dataclass(frozen=True)

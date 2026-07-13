@@ -15,7 +15,14 @@ from nerb import (
     extract_file,
     extract_text,
 )
-from nerb.engines import compile_bank, compile_bank_with_report
+from nerb.engines import (
+    _extraction_semantics_hash,
+    _normalized_lf_source,
+    compile_bank,
+    compile_bank_with_report,
+    extraction_execution_sha256,
+    extraction_semantics_sha256,
+)
 
 
 @pytest.fixture
@@ -64,6 +71,21 @@ def _customer_patterns(bank: dict[str, Any]) -> dict[str, Any]:
 def _set_customer_patterns(bank: dict[str, Any], patterns: dict[str, Any]) -> None:
     _customer_patterns(bank).clear()
     _customer_patterns(bank).update(patterns)
+
+
+def test_extraction_semantics_fingerprint_is_platform_neutral_and_source_bound() -> None:
+    native_source = "sha256:" + "1" * 64
+    lf_sources = {"engine.py": b"first\nsecond\n", "records.py": b"records\n"}
+    crlf_sources = {key: value.replace(b"\n", b"\r\n") for key, value in lf_sources.items()}
+
+    first = _extraction_semantics_hash(lf_sources, native_source)
+    assert _extraction_semantics_hash(crlf_sources, native_source) == first
+    assert _extraction_semantics_hash(lf_sources, "sha256:" + "2" * 64) != first
+    assert extraction_semantics_sha256().startswith("sha256:")
+    assert extraction_execution_sha256().startswith("sha256:")
+
+    with pytest.raises(ExtractionError, match="bare carriage return"):
+        _normalized_lf_source(b"unsafe\rsource")
 
 
 def test_extract_text_returns_literal_records_with_response_metadata(minimal_bank):

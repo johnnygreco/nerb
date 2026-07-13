@@ -28,7 +28,7 @@ from typing import Any, NoReturn
 from . import enron_contract
 from .bank import hash_bank
 from .engine import DEFAULT_MAX_SCAN_INPUT_BYTES
-from .engines import compile_bank, extraction_execution_sha256
+from .engines import compile_bank, extraction_semantics_sha256
 from .enron_contract import CHARACTER_POSITION_SEMANTICS, MATCHING_SEMANTICS, validate_enron_quality_output
 from .enron_private_io import (
     EnronPrivateIOError,
@@ -2512,9 +2512,9 @@ def _spool_identity(path: Path) -> _SpoolIdentity:
 
 def _evaluator_identity() -> dict[str, str]:
     try:
-        source_sha256 = _hash_bytes(Path(__file__).read_bytes())
-        contract_validator_source_sha256 = _hash_bytes(Path(enron_contract.__file__).read_bytes())
-        execution_adapter_sha256 = extraction_execution_sha256()
+        source_sha256 = _normalized_source_sha256(Path(__file__))
+        contract_validator_source_sha256 = _normalized_source_sha256(Path(enron_contract.__file__))
+        execution_semantics_sha256 = extraction_semantics_sha256()
     except (OSError, RuntimeError, ValueError):
         raise EnronQualityError("Quality evaluator source could not be fingerprinted.") from None
     return {
@@ -2524,8 +2524,15 @@ def _evaluator_identity() -> dict[str, str]:
         "label_schema_sha256": _canonical_hash(_LABEL_SCHEMA_DESCRIPTOR),
         "contract_validator_source_sha256": contract_validator_source_sha256,
         "contract_schema_sha256": _canonical_hash(enron_contract.ENRON_QUALITY_OUTPUT_SCHEMA),
-        "execution_adapter_sha256": execution_adapter_sha256,
+        "execution_semantics_sha256": execution_semantics_sha256,
     }
+
+
+def _normalized_source_sha256(path: Path) -> str:
+    payload = path.read_bytes().replace(b"\r\n", b"\n")
+    if b"\r" in payload:
+        raise ValueError("source contains a bare carriage return")
+    return _hash_bytes(payload)
 
 
 def _canonical_hash(value: Any) -> str:

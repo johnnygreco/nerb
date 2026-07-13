@@ -625,6 +625,7 @@ def test_same_five_adapters_complete_a_private_synthetic_capacity_run(
     monkeypatch.setattr(enron_capacity, "ENRON_DATASET_ID", dataset_id)
     monkeypatch.setattr(enron_capacity, "ENRON_DATASET_REVISION", dataset_revision)
     monkeypatch.setattr(enron_capacity, "ENRON_SOURCE_ROWS", source_rows)
+    monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 30_000_000_000)
 
     config = enron_capacity._IntegratedCapacityConfig(
         dataset_id=dataset_id,
@@ -668,7 +669,7 @@ def test_same_five_adapters_complete_a_private_synthetic_capacity_run(
         options,
         phase_runners={phase: run_phase for phase in CAPACITY_PHASES},
         resource_probe=TickingProbe(),
-        monitor_interval_ns=1_000_000_000,
+        monitor_interval_ns=enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
     )
 
     assert verify_capacity_report(report, require_production=False) == report
@@ -3328,6 +3329,7 @@ def test_capacity_close_never_closes_a_reused_descriptor_after_post_close_contro
             captured["same_inode_source_fd"] = same_inode_source_fd
             sentinel_fds.append(same_inode_source_fd)
         armed = True
+        sys.settrace(trace_close_return)
 
     def trace_close_return(frame: Any, event: str, _argument: Any) -> Any:
         nonlocal first_control, injected
@@ -3367,7 +3369,6 @@ def test_capacity_close_never_closes_a_reused_descriptor_after_post_close_contro
     before_descriptors = _process_descriptor_inventory()
 
     try:
-        sys.settrace(trace_close_return)
         with pytest.raises(control_error, match="post-close reuse control") as raised:
             _run(tmp_path)
 
@@ -3445,6 +3446,7 @@ def test_native_close_commit_retries_control_before_the_syscall_is_entered(
         original_append(*args, **kwargs)
         assert inflight.receipt_appended is True
         armed = True
+        sys.settrace(trace_pre_native_close)
 
     def trace_pre_native_close(frame: Any, event: str, _argument: Any) -> Any:
         nonlocal first_control, injected
@@ -3466,7 +3468,6 @@ def test_native_close_commit_retries_control_before_the_syscall_is_entered(
     monkeypatch.setattr(enron_capacity, "_append_attempt_receipt", arm_after_receipt)
     before_descriptors = _process_descriptor_inventory()
     try:
-        sys.settrace(trace_pre_native_close)
         with pytest.raises(control_error, match="pre-native-close control") as raised:
             _run(tmp_path)
     finally:
@@ -4278,7 +4279,9 @@ def test_legitimate_non_record_heartbeats_do_not_inflate_record_progress(
 
 def test_heartbeat_enforcement_is_unbounded_while_report_evidence_is_deterministically_bounded(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 30_000_000_000)
     probe = _Probe()
     heartbeat_count = enron_capacity.MAX_PROGRESS_SIGNALS_PER_PHASE + 257
 
