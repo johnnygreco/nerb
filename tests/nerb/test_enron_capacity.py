@@ -244,6 +244,9 @@ def _commitments() -> dict[str, dict[str, Any]]:
         "source_reader_token_files_absent": True,
         "source_reader_restrictive_umask": False,
         "source_reader_cache_symlinks_disabled": True,
+        "source_reader_cache_lock_files_owner_only": False,
+        "source_reader_cache_lock_mode": 0,
+        "source_reader_cache_lock_adapter_sha256": _hash("nerb/local-reader-cache-lock-adapter-not-applicable"),
         "source_row_multiset_sha256": _hash("source-row-multiset"),
         "source_conservation_sha256": "",
         "sealed_test_accessed": False,
@@ -5656,6 +5659,23 @@ def test_private_tree_guard_registration_and_scanning_are_thread_safe(tmp_path: 
     assert errors == []
 
 
+def test_private_tree_guard_still_rejects_a_group_shared_cache_lock(tmp_path: Path) -> None:
+    root = tmp_path / "guarded-lock-tree"
+    root.mkdir(mode=0o700)
+    lock_file = root / "probe.lock"
+    lock_file.touch(mode=0o600)
+    lock_file.chmod(0o664)
+    guard = enron_capacity._PrivateTreeGuard(root)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            guard.logical_bytes()
+    finally:
+        guard.close()
+
+    assert raised.value.code == "private_tree_invalid"
+
+
 def test_private_tree_guard_concurrent_scans_use_independent_directory_offsets(tmp_path: Path) -> None:
     root = tmp_path / "static-guarded-tree"
     root.mkdir(mode=0o700)
@@ -6784,6 +6804,8 @@ def test_capacity_reader_dependency_is_exact_locked_and_documented() -> None:
         assert f"{distribution}=={version}" in documentation
     assert "passes `token=False` plus the phase cache explicitly" in documentation
     assert "uses umask `077`" in documentation
+    assert "substitutes owner-only mode `0600`" in documentation
+    assert "private-tree scanner continues to reject every" in documentation
 
 
 def test_reader_provenance_stays_unloaded_until_phase_owned_isolation(tmp_path: Path) -> None:
@@ -6916,22 +6938,89 @@ def test_reader_provenance_stays_unloaded_until_phase_owned_isolation(tmp_path: 
             owned_root_count=16,
         )
         with capacity._applied_phase_runtime_environment(phase_environment):
-            module, before, runtime_sha256 = capacity._load_phase_scoped_datasets_reader(context)
-            mode_dir = roots["hf-hub"] / "mode-dir"
-            mode_dir.mkdir()
-            mode_file = roots["hf-datasets"] / "mode-file"
-            mode_file.write_bytes(b"bounded-cache-probe")
+            module, runtime_sha256 = capacity._load_phase_scoped_datasets_reader(context)
             from huggingface_hub.file_download import are_symlinks_supported
-            assert are_symlinks_supported(roots["hf-hub"]) is False
-            assert stat.S_IMODE(mode_dir.stat().st_mode) == 0o700
-            assert stat.S_IMODE(mode_file.stat().st_mode) == 0o600
-            after = capacity._reader_isolation_snapshot(context, module, stage="after_source_read")
-            assert before == capacity._expected_reader_isolation_snapshot("before_source_read")
-            assert after == capacity._expected_reader_isolation_snapshot("after_source_read")
-            assert runtime_sha256 == capacity._canonical_hash(capacity._runtime_environment_identity())
-            assert before["cache_symlinks_disabled"] is True
-            assert after["ambient_credentials_disabled"] is True
-            assert not any(path.is_symlink() for path in work_dir.rglob("*"))
+            from huggingface_hub.file_download import WeakFileLock
+            from huggingface_hub.utils import _fixes
+            original_file_lock = _fixes.FileLock
+            original_soft_file_lock = _fixes.SoftFileLock
+            with capacity._owner_only_reader_cache_locks(phase_environment):
+                before = capacity._reader_isolation_snapshot(context, module, stage="before_source_read")
+                mode_dir = roots["hf-hub"] / "mode-dir"
+                mode_dir.mkdir()
+                mode_file = roots["hf-datasets"] / "mode-file"
+                mode_file.write_bytes(b"bounded-cache-probe")
+                lock_file = roots["hf-hub"] / "probe.lock"
+                guard = capacity._PrivateTreeGuard(isolated)
+                try:
+                    for _ in range(2):
+                        with WeakFileLock(lock_file, timeout=1):
+                            assert stat.S_IMODE(lock_file.stat().st_mode) == 0o600
+                            guard.logical_bytes()
+                    assert stat.S_IMODE(lock_file.stat().st_mode) == 0o600
+                    original_acquire = original_file_lock.acquire
+
+                    def unsupported_file_lock(*_args, **_kwargs):
+                        raise NotImplementedError("use SoftFileLock instead")
+
+                    original_file_lock.acquire = unsupported_file_lock
+                    try:
+                        fallback_lock_file = roots["hf-hub"] / "fallback-probe.lock"
+                        with WeakFileLock(fallback_lock_file, timeout=1):
+                            assert stat.S_IMODE(fallback_lock_file.stat().st_mode) == 0o600
+                            guard.logical_bytes()
+                    finally:
+                        original_file_lock.acquire = original_acquire
+                    assert original_file_lock.acquire is original_acquire
+                    soft_lock_file = roots["hf-hub"] / "soft-probe.lock"
+                    with _fixes.SoftFileLock(soft_lock_file, timeout=1):
+                        assert stat.S_IMODE(soft_lock_file.stat().st_mode) == 0o600
+                        guard.logical_bytes()
+                finally:
+                    guard.close()
+                try:
+                    _fixes.FileLock(poison / "outside.lock", timeout=1, mode=0o664)
+                except capacity._CapacityAbort as exc:
+                    assert exc.code == "production_identity_invalid"
+                else:
+                    raise AssertionError("outside-root reader lock was accepted")
+                try:
+                    _fixes.FileLock(roots["hf-hub"] / "unexpected.lock", timeout=1, mode=0o600)
+                except capacity._CapacityAbort as exc:
+                    assert exc.code == "production_identity_invalid"
+                else:
+                    raise AssertionError("unexpected reader lock mode was accepted")
+                assert are_symlinks_supported(roots["hf-hub"]) is False
+                assert stat.S_IMODE(mode_dir.stat().st_mode) == 0o700
+                assert stat.S_IMODE(mode_file.stat().st_mode) == 0o600
+                after = capacity._reader_isolation_snapshot(context, module, stage="after_source_read")
+                assert before == capacity._expected_reader_isolation_snapshot("before_source_read")
+                assert after == capacity._expected_reader_isolation_snapshot("after_source_read")
+                assert runtime_sha256 == capacity._canonical_hash(capacity._runtime_environment_identity())
+                assert before["cache_symlinks_disabled"] is True
+                assert before["cache_lock_files_owner_only"] is True
+                assert before["cache_lock_mode"] == 0o600
+                assert after["ambient_credentials_disabled"] is True
+                assert not any(path.is_symlink() for path in work_dir.rglob("*"))
+            assert _fixes.FileLock is original_file_lock
+            assert _fixes.SoftFileLock is original_soft_file_lock
+            assert not capacity._reader_cache_lock_adapter_is_active(phase_environment)
+            try:
+                with capacity._owner_only_reader_cache_locks(phase_environment):
+                    raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                pass
+            assert _fixes.FileLock is original_file_lock
+            assert _fixes.SoftFileLock is original_soft_file_lock
+            try:
+                with capacity._owner_only_reader_cache_locks(phase_environment):
+                    _fixes.FileLock = object()
+            except capacity._CapacityAbort as exc:
+                assert exc.code == "production_identity_invalid"
+            else:
+                raise AssertionError("reader lock adapter drift was accepted")
+            assert _fixes.FileLock is original_file_lock
+            assert _fixes.SoftFileLock is original_soft_file_lock
         assert os.environ["HOME"] == os.fspath(poison / "home")
         assert os.environ["HF_TOKEN"] == "hf_private_environment_sentinel"
         assert tree_snapshot(poison) == poison_before

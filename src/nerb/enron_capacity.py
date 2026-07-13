@@ -258,6 +258,9 @@ _CRITICAL_READER_DISTRIBUTIONS = (
     ("fsspec", "fsspec", "fsspec/__init__.py", "2026.4.0"),
     ("pyarrow", "pyarrow", "pyarrow/__init__.py", "25.0.0"),
 )
+_READER_UPSTREAM_CACHE_LOCK_MODE = 0o664
+_READER_OWNER_ONLY_CACHE_LOCK_MODE = 0o600
+_ACTIVE_READER_CACHE_LOCK_ADAPTER: _ReaderCacheLockAdapter | None = None
 _NATIVE_BUILD_SOURCE_DOMAIN = b"nerb-native-build-source-v1\0"
 _NATIVE_BUILD_SOURCE_FILES = (
     "Cargo.lock",
@@ -2201,6 +2204,9 @@ def capacity_policy() -> dict[str, Any]:
         "reader_explicit_anonymous_load_required": True,
         "reader_restrictive_umask_required": True,
         "reader_cache_symlinks_disabled_required": True,
+        "reader_cache_lock_files_owner_only_required": True,
+        "reader_cache_lock_mode": _READER_OWNER_ONLY_CACHE_LOCK_MODE,
+        "reader_cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
         "processed_bytes_measurement_boundary": _PROCESSED_BYTES_MEASUREMENT_BOUNDARY,
         "processed_bytes_by_phase": {
             "preparation": "prepared_records_artifact_bytes_plus_rejections_artifact_bytes",
@@ -2701,9 +2707,7 @@ def _execute_capacity_preparation(
         if distribution_version != _PINNED_DATASETS_VERSION or file_count <= 0 or total_bytes <= 0:
             raise _CapacityAbort("production_identity_invalid")
     if config.input_jsonl is None:
-        datasets_module, reader_isolation_before, initial_runtime_environment_sha256 = (
-            _load_phase_scoped_datasets_reader(context)
-        )
+        datasets_module, initial_runtime_environment_sha256 = _load_phase_scoped_datasets_reader(context)
 
     options = preparation.EnronPreparationOptions(
         output_dir=paths.preparation,
@@ -2726,19 +2730,28 @@ def _execute_capacity_preparation(
         or options.huggingface_anonymous is not True
     ):
         raise _CapacityAbort("production_identity_invalid")
-    summary = preparation.prepare_enron_source(options)
     if datasets_module is None:
+        summary = preparation.prepare_enron_source(options)
         reader_isolation = _local_reader_isolation()
     else:
-        if reader_isolation_before is None or initial_runtime_environment_sha256 is None:
+        if initial_runtime_environment_sha256 is None:
             raise _CapacityAbort("production_identity_invalid")
-        reader_isolation_after = _reader_isolation_snapshot(
-            context,
-            datasets_module,
-            stage="after_source_read",
-        )
-        if initial_runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
-            raise _CapacityAbort("production_identity_invalid")
+        with _owner_only_reader_cache_locks(context.runtime_environment):
+            reader_isolation_before = _reader_isolation_snapshot(
+                context,
+                datasets_module,
+                stage="before_source_read",
+            )
+            if initial_runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
+                raise _CapacityAbort("production_identity_invalid")
+            summary = preparation.prepare_enron_source(options)
+            reader_isolation_after = _reader_isolation_snapshot(
+                context,
+                datasets_module,
+                stage="after_source_read",
+            )
+            if initial_runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
+                raise _CapacityAbort("production_identity_invalid")
         isolation_descriptor = {
             "schema": "enron_capacity_remote_reader_isolation",
             "mode": "phase_owned_anonymous_official",
@@ -2760,6 +2773,9 @@ def _execute_capacity_preparation(
             "token_files_absent": True,
             "restrictive_umask": True,
             "cache_symlinks_disabled": True,
+            "cache_lock_files_owner_only": True,
+            "cache_lock_mode": _READER_OWNER_ONLY_CACHE_LOCK_MODE,
+            "cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
             "sha256": isolation_sha256,
         }
     verified = preparation.load_enron_preparation_run(
@@ -2811,6 +2827,9 @@ def _execute_capacity_preparation(
         "source_reader_token_files_absent": reader_isolation["token_files_absent"],
         "source_reader_restrictive_umask": reader_isolation["restrictive_umask"],
         "source_reader_cache_symlinks_disabled": reader_isolation["cache_symlinks_disabled"],
+        "source_reader_cache_lock_files_owner_only": reader_isolation["cache_lock_files_owner_only"],
+        "source_reader_cache_lock_mode": reader_isolation["cache_lock_mode"],
+        "source_reader_cache_lock_adapter_sha256": reader_isolation["cache_lock_adapter_sha256"],
         "source_row_multiset_sha256": source.get("canonical_row_multiset_sha256"),
         "source_conservation_sha256": "",
         "sealed_test_accessed": False,
@@ -4063,6 +4082,9 @@ _COMMON_COMMITMENT_FIELDS = {
     "source_reader_token_files_absent",
     "source_reader_restrictive_umask",
     "source_reader_cache_symlinks_disabled",
+    "source_reader_cache_lock_files_owner_only",
+    "source_reader_cache_lock_mode",
+    "source_reader_cache_lock_adapter_sha256",
     "source_row_multiset_sha256",
     "source_conservation_sha256",
     "privacy_scan_sha256",
@@ -4207,19 +4229,26 @@ def _verify_phase_commitment_chain(
                 "source_reader_token_files_absent",
                 "source_reader_restrictive_umask",
                 "source_reader_cache_symlinks_disabled",
+                "source_reader_cache_lock_files_owner_only",
             )
         }
+        cache_lock_mode = value.get("source_reader_cache_lock_mode")
         if (
             isolation_mode not in {"phase_owned_anonymous_official", "local_fixture_no_remote_reader"}
             or type(effective_path_count) is not int
             or effective_path_count < 0
             or any(type(item) is not bool for item in isolation_booleans.values())
+            or type(cache_lock_mode) is not int
+            or cache_lock_mode < 0
+            or cache_lock_mode > 0o777
         ):
             raise _error("phase_commitment_invalid")
         if require_production_source and (
             isolation_mode != "phase_owned_anonymous_official"
             or effective_path_count != len(_READER_EFFECTIVE_PATH_LABELS)
             or any(item is not True for item in isolation_booleans.values())
+            or cache_lock_mode != _READER_OWNER_ONLY_CACHE_LOCK_MODE
+            or value.get("source_reader_cache_lock_adapter_sha256") != _reader_cache_lock_adapter_sha256()
             or value.get("source_reader_endpoint_sha256") != _hash_bytes(_READER_OFFICIAL_ENDPOINT.encode("utf-8"))
             or value.get("source_reader_isolation_sha256") != _expected_remote_reader_isolation_sha256()
         ):
@@ -4228,6 +4257,10 @@ def _verify_phase_commitment_chain(
             effective_path_count != 0
             or isolation_booleans["source_reader_official_endpoint"] is not False
             or isolation_booleans["source_reader_restrictive_umask"] is not False
+            or isolation_booleans["source_reader_cache_lock_files_owner_only"] is not False
+            or cache_lock_mode != 0
+            or value.get("source_reader_cache_lock_adapter_sha256")
+            != _hash_bytes(b"nerb/local-reader-cache-lock-adapter-not-applicable")
             or value.get("source_reader_endpoint_sha256") != _hash_bytes(b"local-reader-no-remote-endpoint")
             or value.get("source_reader_isolation_sha256") != _local_reader_isolation()["sha256"]
             or any(
@@ -4239,6 +4272,7 @@ def _verify_phase_commitment_chain(
                     "source_reader_explicit_cache_dir",
                     "source_reader_explicit_anonymous_load",
                     "source_reader_restrictive_umask",
+                    "source_reader_cache_lock_files_owner_only",
                 }
             )
             or isolation_booleans["source_reader_explicit_cache_dir"] is not False
@@ -5793,6 +5827,22 @@ def _reader_phase_environment_policy_sha256() -> str:
             "policy_environment": _READER_POLICY_ENVIRONMENT,
             "removed_credential_environment_keys": sorted(_READER_CREDENTIAL_ENVIRONMENT_KEYS),
             "effective_path_labels": list(_READER_EFFECTIVE_PATH_LABELS),
+            "cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
+        }
+    )
+
+
+def _reader_cache_lock_adapter_sha256() -> str:
+    return _canonical_hash(
+        {
+            "schema": "enron_capacity_reader_cache_lock_adapter",
+            "upstream_binding": "huggingface_hub.utils._fixes.FileLock",
+            "fallback_binding": "huggingface_hub.utils._fixes.SoftFileLock",
+            "upstream_requested_mode": _READER_UPSTREAM_CACHE_LOCK_MODE,
+            "effective_mode": _READER_OWNER_ONLY_CACHE_LOCK_MODE,
+            "phase_owned_paths_only": True,
+            "scope": "remote_preparation_source_consumption",
+            "exact_binding_restoration_required": True,
         }
     )
 
@@ -5837,6 +5887,146 @@ def _reader_owned_roots(environment: Mapping[str, str]) -> tuple[Path, ...]:
     }
     roots.add(Path(environment["HF_TOKEN_PATH"]).parent)
     return tuple(sorted(roots, key=lambda path: os.fspath(path)))
+
+
+@dataclass(frozen=True, slots=True)
+class _ReaderCacheLockAdapter:
+    fixes_module: Any
+    original_file_lock: Any
+    original_soft_file_lock: Any
+    file_lock_factory: Callable[..., Any]
+    soft_file_lock_factory: Callable[..., Any]
+    owned_roots: tuple[Path, ...]
+
+
+def _reader_cache_lock_path_is_owned(value: object, roots: Sequence[Path]) -> bool:
+    try:
+        if not isinstance(value, (str, Path)):
+            return False
+        candidate = Path(value)
+        return (
+            candidate.is_absolute()
+            and os.pardir not in candidate.parts
+            and any(_is_within(candidate, root) for root in roots)
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _reader_cache_lock_adapter_is_active(environment: Mapping[str, str]) -> bool:
+    state = _ACTIVE_READER_CACHE_LOCK_ADAPTER
+    if state is None:
+        return False
+    try:
+        fixes = importlib.import_module("huggingface_hub.utils._fixes")
+        hub_utils = importlib.import_module("huggingface_hub.utils")
+        file_download = importlib.import_module("huggingface_hub.file_download")
+        filelock = importlib.import_module("filelock")
+        weak_file_lock = getattr(fixes, "WeakFileLock")
+        weak_file_lock_body = getattr(weak_file_lock, "__wrapped__")
+        weak_globals = getattr(weak_file_lock_body, "__globals__")
+        expected_roots = _reader_owned_roots(environment)
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return False
+    return (
+        state.fixes_module is fixes
+        and state.original_file_lock is getattr(filelock, "FileLock", None)
+        and state.original_soft_file_lock is getattr(filelock, "SoftFileLock", None)
+        and state.owned_roots == expected_roots
+        and getattr(fixes, "FileLock", None) is state.file_lock_factory
+        and getattr(fixes, "SoftFileLock", None) is state.soft_file_lock_factory
+        and weak_globals.get("FileLock") is state.file_lock_factory
+        and weak_globals.get("SoftFileLock") is state.soft_file_lock_factory
+        and getattr(hub_utils, "WeakFileLock", None) is weak_file_lock
+        and getattr(file_download, "WeakFileLock", None) is weak_file_lock
+    )
+
+
+@contextmanager
+def _owner_only_reader_cache_locks(environment: Mapping[str, str]) -> Iterator[None]:
+    """Preserve Hub lock semantics while creating phase-owned locks as 0600."""
+
+    global _ACTIVE_READER_CACHE_LOCK_ADAPTER
+    if _ACTIVE_READER_CACHE_LOCK_ADAPTER is not None or set(environment) != _PHASE_RUNTIME_PATH_ENVIRONMENT_KEYS:
+        raise _CapacityAbort("production_identity_invalid")
+    try:
+        fixes = importlib.import_module("huggingface_hub.utils._fixes")
+        hub_utils = importlib.import_module("huggingface_hub.utils")
+        file_download = importlib.import_module("huggingface_hub.file_download")
+        filelock = importlib.import_module("filelock")
+        original_file_lock = getattr(fixes, "FileLock")
+        original_soft_file_lock = getattr(fixes, "SoftFileLock")
+        weak_file_lock = getattr(fixes, "WeakFileLock")
+        weak_file_lock_body = getattr(weak_file_lock, "__wrapped__")
+        weak_globals = getattr(weak_file_lock_body, "__globals__")
+        owned_roots = _reader_owned_roots(environment)
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        raise _CapacityAbort("production_identity_invalid") from None
+    if (
+        original_file_lock is not getattr(filelock, "FileLock", None)
+        or original_soft_file_lock is not getattr(filelock, "SoftFileLock", None)
+        or weak_globals.get("FileLock") is not original_file_lock
+        or weak_globals.get("SoftFileLock") is not original_soft_file_lock
+        or getattr(hub_utils, "WeakFileLock", None) is not weak_file_lock
+        or getattr(file_download, "WeakFileLock", None) is not weak_file_lock
+        or not owned_roots
+    ):
+        raise _CapacityAbort("production_identity_invalid")
+
+    def owner_only_file_lock(lock_file: object, *args: object, **kwargs: object) -> Any:
+        if (
+            args
+            or set(kwargs) != {"timeout", "mode"}
+            or kwargs.get("mode") != _READER_UPSTREAM_CACHE_LOCK_MODE
+            or not _reader_cache_lock_path_is_owned(lock_file, owned_roots)
+        ):
+            raise _CapacityAbort("production_identity_invalid")
+        return original_file_lock(
+            lock_file,
+            timeout=kwargs["timeout"],
+            mode=_READER_OWNER_ONLY_CACHE_LOCK_MODE,
+        )
+
+    def owner_only_soft_file_lock(lock_file: object, *args: object, **kwargs: object) -> Any:
+        if args or set(kwargs) != {"timeout"} or not _reader_cache_lock_path_is_owned(lock_file, owned_roots):
+            raise _CapacityAbort("production_identity_invalid")
+        return original_soft_file_lock(
+            lock_file,
+            timeout=kwargs["timeout"],
+            mode=_READER_OWNER_ONLY_CACHE_LOCK_MODE,
+        )
+
+    state = _ReaderCacheLockAdapter(
+        fixes_module=fixes,
+        original_file_lock=original_file_lock,
+        original_soft_file_lock=original_soft_file_lock,
+        file_lock_factory=owner_only_file_lock,
+        soft_file_lock_factory=owner_only_soft_file_lock,
+        owned_roots=owned_roots,
+    )
+    setattr(fixes, "FileLock", owner_only_file_lock)
+    setattr(fixes, "SoftFileLock", owner_only_soft_file_lock)
+    _ACTIVE_READER_CACHE_LOCK_ADAPTER = state
+    if not _reader_cache_lock_adapter_is_active(environment):
+        setattr(fixes, "FileLock", original_file_lock)
+        setattr(fixes, "SoftFileLock", original_soft_file_lock)
+        _ACTIVE_READER_CACHE_LOCK_ADAPTER = None
+        raise _CapacityAbort("production_identity_invalid")
+    try:
+        yield
+    finally:
+        drifted = not _reader_cache_lock_adapter_is_active(environment)
+        setattr(fixes, "FileLock", original_file_lock)
+        setattr(fixes, "SoftFileLock", original_soft_file_lock)
+        _ACTIVE_READER_CACHE_LOCK_ADAPTER = None
+        if (
+            drifted
+            or getattr(fixes, "FileLock", None) is not original_file_lock
+            or getattr(fixes, "SoftFileLock", None) is not original_soft_file_lock
+            or weak_globals.get("FileLock") is not original_file_lock
+            or weak_globals.get("SoftFileLock") is not original_soft_file_lock
+        ):
+            raise _CapacityAbort("production_identity_invalid")
 
 
 def _expected_reader_effective_paths(environment: Mapping[str, str]) -> dict[str, Path]:
@@ -5967,6 +6157,7 @@ def _reader_isolation_snapshot(
         or any(str(key).lower() == "authorization" for key in headers)
         or not token_files_absent
         or _current_process_umask() != 0o077
+        or not _reader_cache_lock_adapter_is_active(environment)
     ):
         raise _CapacityAbort("production_identity_invalid")
     return _expected_reader_isolation_snapshot(stage)
@@ -5992,6 +6183,9 @@ def _expected_reader_isolation_snapshot(stage: str) -> dict[str, Any]:
         "token_files_absent": True,
         "restrictive_umask": True,
         "cache_symlinks_disabled": True,
+        "cache_lock_files_owner_only": True,
+        "cache_lock_mode": _READER_OWNER_ONLY_CACHE_LOCK_MODE,
+        "cache_lock_adapter_sha256": _reader_cache_lock_adapter_sha256(),
     }
 
 
@@ -6008,7 +6202,7 @@ def _expected_remote_reader_isolation_sha256() -> str:
 
 def _load_phase_scoped_datasets_reader(
     context: EnronCapacityPhaseContext,
-) -> tuple[Any, dict[str, Any], str]:
+) -> tuple[Any, str]:
     global _PHASE_SCOPED_READER_LOADED
     if _PHASE_SCOPED_READER_LOADED or context.phase != "preparation":
         raise _CapacityAbort("production_identity_invalid")
@@ -6019,11 +6213,10 @@ def _load_phase_scoped_datasets_reader(
         datasets_module = importlib.import_module("datasets")
     except ImportError:
         raise _CapacityAbort("production_identity_invalid") from None
-    before = _reader_isolation_snapshot(context, datasets_module, stage="before_source_read")
     if runtime_environment_sha256 != _canonical_hash(_runtime_environment_identity()):
         raise _CapacityAbort("production_identity_invalid")
     _PHASE_SCOPED_READER_LOADED = True
-    return datasets_module, before, runtime_environment_sha256
+    return datasets_module, runtime_environment_sha256
 
 
 def _local_reader_isolation() -> dict[str, Any]:
@@ -6041,6 +6234,9 @@ def _local_reader_isolation() -> dict[str, Any]:
         "token_files_absent": True,
         "restrictive_umask": False,
         "cache_symlinks_disabled": True,
+        "cache_lock_files_owner_only": False,
+        "cache_lock_mode": 0,
+        "cache_lock_adapter_sha256": _hash_bytes(b"nerb/local-reader-cache-lock-adapter-not-applicable"),
     }
     return {**descriptor, "sha256": _canonical_hash(descriptor)}
 
