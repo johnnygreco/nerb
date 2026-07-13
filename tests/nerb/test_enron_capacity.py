@@ -5588,32 +5588,59 @@ def test_watchdog_interrupts_resource_and_progress_wall_gap_at_production_interv
     assert enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS == 100_000_000
     resource_probe = _Probe()
     monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 50_000_000)
+    resource_interrupt_codes: list[str] = []
+    resource_sleep_completed = False
+    resource_watchdog_armed = threading.Event()
+    resource_wall_started = time.monotonic_ns()
+
+    def resource_wall_clock() -> int:
+        return time.monotonic_ns() if resource_watchdog_armed.is_set() else resource_wall_started
 
     def block_resource(_context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
-        time.sleep(1)
+        nonlocal resource_sleep_completed
+        try:
+            resource_watchdog_armed.set()
+            time.sleep(5)
+        except enron_capacity._CapacityAbort as exc:  # noqa: SLF001
+            resource_interrupt_codes.append(exc.code)
+            raise
+        resource_sleep_completed = True
         return _result("split")
 
-    started = time.monotonic()
     with pytest.raises(EnronCapacityError) as resource_error:
         _run(
             tmp_path,
             resource_probe,
             name="resource-gap",
             replacements={"split": block_resource},
-            wall_clock=time.monotonic_ns,
+            wall_clock=resource_wall_clock,
         )
     assert resource_error.value.code == "resource_observation_gap"
-    assert time.monotonic() - started < 0.8
+    assert resource_interrupt_codes == ["resource_observation_gap"]
+    assert resource_sleep_completed is False
 
-    monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 500_000_000)
+    monkeypatch.setattr(enron_capacity, "MAX_RESOURCE_OBSERVATION_WALL_GAP_NS", 60_000_000_000)
     monkeypatch.setattr(enron_capacity, "MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS", 50_000_000)
     progress_probe = _Probe()
+    progress_interrupt_codes: list[str] = []
+    progress_sleep_completed = False
+    progress_watchdog_armed = threading.Event()
+    progress_wall_started = time.monotonic_ns()
+
+    def progress_wall_clock() -> int:
+        return time.monotonic_ns() if progress_watchdog_armed.is_set() else progress_wall_started
 
     def block_progress(_context: EnronCapacityPhaseContext) -> EnronCapacityPhaseResult:
-        time.sleep(1)
+        nonlocal progress_sleep_completed
+        try:
+            progress_watchdog_armed.set()
+            time.sleep(5)
+        except enron_capacity._CapacityAbort as exc:  # noqa: SLF001
+            progress_interrupt_codes.append(exc.code)
+            raise
+        progress_sleep_completed = True
         return _result("build")
 
-    started = time.monotonic()
     with pytest.raises(EnronCapacityError) as progress_error:
         _run(
             tmp_path,
@@ -5621,10 +5648,11 @@ def test_watchdog_interrupts_resource_and_progress_wall_gap_at_production_interv
             name="progress-gap",
             ledger="progress-attempts",
             replacements={"build": block_progress},
-            wall_clock=time.monotonic_ns,
+            wall_clock=progress_wall_clock,
         )
     assert progress_error.value.code == "checkpoint_wall_gap"
-    assert time.monotonic() - started < 0.8
+    assert progress_interrupt_codes == ["checkpoint_wall_gap"]
+    assert progress_sleep_completed is False
 
 
 def test_private_tree_guard_registration_and_scanning_are_thread_safe(tmp_path: Path) -> None:
