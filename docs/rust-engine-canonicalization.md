@@ -1,7 +1,7 @@
 # Rust Engine Canonicalization
 
-This document records the Rust-owned source-bank canonicalization used by the current `Bank` layer. Historical issue #49
-introduced this path; it now parses source bytes, validates the supported source schema, assigns deterministic stable
+This document defines the Rust-owned source-bank canonicalization used by the `Bank` layer. It parses source bytes,
+validates the supported source schema, assigns deterministic stable
 IDs, emits canonical JSON, computes the bank hash, compiles detector indexes, scans UTF-8 text, and projects public
 records.
 
@@ -40,7 +40,7 @@ JSONL is the structured bulk-review form. Each non-empty line is one detector ro
 {"entity":"GENRE","canonical_name":"Jazz","surface_name":"Jazz","regex":"(?:smooth\\s)?jazz"}
 ```
 
-The existing JSON-bank object shape is accepted as a source input so current authoring helpers can feed the Rust
+The JSON-bank object shape is accepted as a source input so authoring helpers can feed the Rust
 canonicalizer. Rust maps bank-level, entity-level, and pattern-level flags into canonical per-pattern flags. Literal
 patterns are escaped into regex syntax, and `word` boundaries become explicit boundary wrappers. For current JSON-bank
 inputs, literal pattern `value` becomes the canonical `surface_name`; regex patterns use the source `pattern_id` as the
@@ -137,10 +137,9 @@ YAML support currently uses the `serde_yaml` parser, which is deprecated upstrea
 is isolated to source-bank canonicalization and remains in scope because YAML authoring is a supported input path. Track
 it as a dependency risk for any future deny-policy or parser-hardening work.
 
-## Deferred Fields
+## Control-plane fields
 
-The Rust-backed `Bank` API now implements scanner APIs, process-local compiled-bank caching, and public record
-projection. It does not preserve the removed Python regex-builder object model.
+The Rust-backed `Bank` API owns scanner APIs, process-local compiled-bank caching, and public record projection.
 
 The canonical JSON contains the engine-ready detector identity and regex fields. JSON-bank status, descriptions, eval
 references, metadata, and richer literal authoring settings remain Python control-plane fields unless Rust scanning needs

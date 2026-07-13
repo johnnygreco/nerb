@@ -74,17 +74,17 @@ generated test archives and is independently marked non-promotable.
 
 ## Quality execution
 
-`nerb.enron_quality.evaluate_enron_quality` accepts closed document, gold-span, and slice-plan mappings. It compiles the
-active bank once, reuses that compiled instance for every document, converts native UTF-8 byte offsets to Unicode-scalar
-indices, and returns aggregate-only evidence.
+`nerb.enron_quality.evaluate_enron_quality` has one `prepare → consume → finish` execution path. It compiles the active
+bank once, reduces each joined document/gold/slice envelope immediately, converts native UTF-8 byte offsets to
+Unicode-scalar indices, and returns aggregate-only evidence. It retains counters, bounded opaque diagnostics, and a
+private metadata-only commitment spool—not full documents, gold, or predictions.
 
 Run the generic executor over explicit private JSONL artifacts with:
 
 ```shell
 uv run nerb eval-enron-quality \
   --bank .nerb/banks/enron.json \
-  --documents .nerb/evals/documents.jsonl \
-  --gold-spans .nerb/evals/gold-spans.jsonl \
+  --records .nerb/evals/quality-records.jsonl \
   --slice-plan .nerb/evals/quality-slices.jsonl \
   --unsupported-slices .nerb/evals/unsupported-slices.jsonl
 ```
@@ -119,10 +119,11 @@ commitments into the run fingerprints. It remains auxiliary, non-promotable evid
 ### Closed quality input contracts
 
 Every input is strict UTF-8 JSONL: one object per line, no duplicate keys, non-finite values, unknown fields, symlinks,
-or unbounded lines. Documents use Unicode text but carry no labels:
+or unbounded lines. Each streamed record joins one Unicode document with all of its gold spans and declared slice
+memberships:
 
 ```json
-{"document_id":"opaque-doc","text":"Sanitized example text","text_view":"natural_body","split_role":"validation"}
+{"document":{"document_id":"opaque-doc","text":"Sanitized example text","text_view":"natural_body","split_role":"validation"},"gold_spans":[{"document_id":"opaque-doc","entity_class":"person","start":0,"end":9,"catalog_identity":null}],"slice_ids":["person_all_validation"]}
 ```
 
 `split_role` is `train`, `validation`, or `test`. Gold uses half-open Unicode-scalar offsets into the exact document
@@ -135,7 +136,7 @@ text. `catalog_identity` is either `null` or a separately adjudicated active pat
 Each slice freezes one exact document population and uses this closed shape:
 
 ```json
-{"id":"person_all_validation","label_artifact_id":"reviewed-person-labels","label_strength":"independent","annotation_scope":{"entity_classes":["person"],"document_regions":["natural_body"],"span_policy_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","exclusions":[]},"annotation_completeness":"exhaustive_within_scope","entity_class":"person","cohort":"all","split_role":"validation","text_view":"natural_body","text_view_descriptor":{"id":"natural_body","artifact_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","content_policy_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","document_regions":["natural_body"],"primary_for_quality":true,"answer_bearing_fields_included":false},"promotion_gate":false,"document_ids":["opaque-doc"]}
+{"id":"person_all_validation","label_artifact_id":"reviewed-person-labels","label_strength":"independent","annotation_scope":{"entity_classes":["person"],"document_regions":["natural_body"],"span_policy_sha256":"sha256:0000000000000000000000000000000000000000000000000000000000000000","exclusions":[]},"annotation_completeness":"exhaustive_within_scope","entity_class":"person","cohort":"all","split_role":"validation","text_view":"natural_body","text_view_descriptor":{"id":"natural_body","artifact_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111","content_policy_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","document_regions":["natural_body"],"primary_for_quality":true,"answer_bearing_fields_included":false},"promotion_gate":false}
 ```
 
 `label_strength` is `independent` or `structured_weak`; `annotation_completeness` is
@@ -150,8 +151,9 @@ and exact population coverage. Unavailable requested dimensions are separate JSO
 Logical IDs and reason codes are bounded privacy-safe identifiers. The public result contains aggregates plus evaluator,
 policy, protocol, catalog-binding, bank, execution-adapter, contract-validator, and run fingerprints—never document IDs,
 text, surfaces, or per-span outcomes. `eval-enron-quality` and `eval-enron-cmu-train` exit nonzero for an invalid bank,
-unevaluated evidence, unsafe input, or failed standalone contract validation. Native collection stops at 100,000
-predictions per document, and the executor rejects more than 500,000 predictions across one quality run.
+unevaluated evidence, unsafe input, or failed standalone contract validation. Each document is capped at 10 MiB of UTF-8
+text even though the enclosing strict JSONL line may be as large as 16 MiB. Native collection stops at 100,000 predictions
+per document, and the executor rejects more than 5,000,000 predictions across one quality run.
 
 The executor computes deterministic one-to-one exact-span/class counts and contract-compatible metrics:
 

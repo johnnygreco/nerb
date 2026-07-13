@@ -33,7 +33,6 @@ nav = [
     { "Rust Engine Gates" = "rust-engine-gates.md" },
     { "Rust Engine Canonicalization" = "rust-engine-canonicalization.md" },
     { "Rust Engine Semantics" = "decisions/0001-rust-engine-semantics.md" },
-    { "De-anonymization Plan" = "de-anonymization-plan.md" },
   ] },
   { "Release" = "releasing.md" },
   { "GitHub" = "https://github.com/johnnygreco/nerb" },

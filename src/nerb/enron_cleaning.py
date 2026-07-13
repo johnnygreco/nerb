@@ -204,12 +204,6 @@ class CleanedText:
     text: str
     counters: Mapping[str, int]
 
-    @property
-    def audit(self) -> Mapping[str, int]:
-        """Alias retained for callers that treat counters as an audit record."""
-
-        return self.counters
-
 
 @dataclass(frozen=True, slots=True)
 class CleanedBody:
@@ -219,12 +213,6 @@ class CleanedBody:
     current_body: str
     current_body_core: str
     counters: Mapping[str, int]
-
-    @property
-    def audit(self) -> Mapping[str, int]:
-        """Alias retained for callers that treat counters as an audit record."""
-
-        return self.counters
 
 
 @dataclass(frozen=True, slots=True)

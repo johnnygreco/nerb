@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +18,29 @@ def _raw_tuples(buffer):
     return [buffer[index] for index in range(len(buffer))]
 
 
+def _native_build_source_sha256() -> str:
+    root = Path(__file__).parents[2] / "rust"
+    paths = [
+        "Cargo.lock",
+        "Cargo.toml",
+        "build.rs",
+        *(path.relative_to(root).as_posix() for path in root.glob("src/**/*.rs")),
+    ]
+    paths.sort()
+    digest = hashlib.sha256(b"nerb-native-build-source-v1\0")
+    for relative in paths:
+        payload = (root / relative).read_bytes()
+        if b"\r" in payload.replace(b"\r\n", b""):
+            raise AssertionError(f"bare carriage return in native source {relative}")
+        payload = payload.replace(b"\r\n", b"\n")
+        encoded = relative.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return "sha256:" + digest.hexdigest()
+
+
 def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
     bank = engine.Bank.from_source_bytes(
         b'{"CODE":{"Alpha":"A"},"ARTIST":{"Pink Floyd":"Pink\\\\s+Floyd"}}',
@@ -27,6 +52,7 @@ def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
 
     assert canonical["schema"] == 1
     assert metadata["engine"] == "nerb_engine"
+    assert metadata["build_source_sha256"] == engine.BUILD_SOURCE_SHA256 == _native_build_source_sha256()
     assert metadata["schema"] == 1
     assert metadata["entity_count"] == 2
     assert metadata["pattern_count"] == 2
@@ -39,6 +65,10 @@ def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
         "semantic_notes": (
             "reports raw cross-entity, within-entity, and within-pattern overlaps for prototype measurement"
         ),
+    }
+    assert metadata["scan_limits"] == {
+        "maximum_input_bytes": 10 * 1024 * 1024,
+        "maximum_concurrent_scans_per_bank": 8,
     }
     assert metadata["detectors"] == [
         {
@@ -59,6 +89,7 @@ def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
         },
     ]
     assert metadata["bank_hash"].startswith("sha256:")
+    assert "regex_resources" not in metadata
 
     round_tripped = engine.Bank.from_canonical_json_bytes(bank.to_canonical_json_bytes())
 
@@ -70,6 +101,44 @@ def test_native_bank_boundary_round_trips_canonical_json_and_metadata(engine):
             format_hint="canonical_json",
         ).metadata()["bank_hash"]
     )
+
+
+def test_production_metadata_exposes_scoped_regex_resource_profile(engine):
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Digits":"[0-9]+"}}', format_hint="json")
+    resources = bank.metadata()["regex_resources"]
+
+    assert resources["scope"] == "entity_independent_shards"
+    assert resources["physical_regex_layers"] == 1
+    assert resources["maximum_regex_layers_per_entity"] == 1
+    assert resources["compiled_regex_static_bytes"] > 0
+    assert resources["eager_cache_bytes_per_scan"] > 0
+    assert resources["pikevm_cache_projection_bytes_per_scan"] > 0
+    assert resources["pikevm_stack_growth_allowance_bytes_per_scan"] > 0
+    assert resources["lazy_dfa_growth_allowance_bytes_per_scan"] == 32 * 1024 * 3
+    assert (
+        resources["regex_cache_allowance_bytes"]
+        == (
+            resources["eager_cache_bytes_per_scan"]
+            + resources["pikevm_cache_projection_bytes_per_scan"]
+            + resources["pikevm_stack_growth_allowance_bytes_per_scan"]
+            + resources["lazy_dfa_growth_allowance_bytes_per_scan"]
+        )
+        * 8
+    )
+    assert resources["size_limit_bisections"] == 0
+    assert resources["resource_limit_bisections"] == 0
+    assert resources["accounted_bytes"] == (
+        resources["compiled_regex_static_bytes"] + resources["regex_cache_allowance_bytes"]
+    )
+    assert resources["cache_concurrency_budget"] == 8
+    assert resources["explicit_regex_cache_slots"] == 8
+    assert resources["internal_meta_cache_pool_used"] is False
+    assert resources["per_lazy_dfa_cache_capacity_bytes"] == 32 * 1024
+    assert resources["maximum_lazy_dfa_caches_per_regex"] == 3
+    assert resources["pikevm_stack_nfa_memory_multiplier"] == 16
+    assert resources["onepass_enabled"] is False
+    assert resources["bounded_backtracker_enabled"] is False
+    assert resources["maximum_patterns_per_regex_layer"] == 128
 
 
 def test_native_bank_projects_one_detector_metadata_record_by_index(engine):
@@ -328,6 +397,49 @@ def test_native_scan_bytes_rejects_invalid_utf8(engine):
 
     assert len(invalid_utf8_buffer) == 0
     assert invalid_utf8_buffer.capacity() >= 1
+
+
+def test_every_native_inline_scan_rejects_mapped_unicode_over_10_mib_and_clears_output(engine):
+    limit = 10 * 1024 * 1024
+    oversized = b"." * (limit - 2) + "K".encode()
+    assert len(oversized) == limit + 1
+    bank = engine.Bank.from_source_bytes(b'{"CODE":{"Kelvin":"k","_flags":"IGNORECASE"}}', format_hint="json")
+    buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+
+    with pytest.raises(ValueError, match=rf"configured limit of {limit} bytes"):
+        bank.scan_bytes(oversized, out=buffer)
+    assert len(buffer) == 0
+
+    with pytest.raises(ValueError, match=rf"configured limit of {limit} bytes"):
+        bank.scan_bytes_bounded(oversized, 1)
+
+    overlap_bank = engine.Bank.from_source_bytes(
+        b'{"CODE":{"Kelvin":"k","_flags":"IGNORECASE"}}',
+        format_hint="json",
+        compile_options_json='{"match_mode":"all_overlaps"}',
+    )
+    leftmost_buffer = engine.MatchBuffer.from_raw_matches([(99, 0, 0)])
+    with pytest.raises(ValueError, match=rf"configured limit of {limit} bytes"):
+        overlap_bank.scan_bytes_leftmost_from_all_overlaps(oversized, out=leftmost_buffer)
+    assert len(leftmost_buffer) == 0
+
+
+def test_native_inline_scan_accepts_exactly_10_mib_and_public_scan_text_uses_same_limit(engine):
+    from nerb import Bank
+
+    limit = 10 * 1024 * 1024
+    exact = b"." * limit
+    native_bank = engine.Bank.from_source_bytes(b'{"CODE":{"Never":"never"}}', format_hint="json")
+    assert _raw_tuples(native_bank.scan_bytes(exact)) == []
+
+    public_bank = Bank.from_source_bytes(b'{"CODE":{"Kelvin":"k","_flags":"IGNORECASE"}}', format_hint="json")
+    assert public_bank.scan_text("." * limit) == []
+    with pytest.raises(ValueError, match=rf"necessarily exceeds.*{limit} bytes"):
+        public_bank.scan_text("." * (limit + 1))
+    with pytest.raises(ValueError, match=rf"configured limit of {limit} bytes"):
+        public_bank.scan_text("." * (limit - 2) + "K")
+    with pytest.raises(ValueError, match=rf"configured limit of {limit} bytes"):
+        public_bank.scan_bytes(bytearray(limit + 1))
 
 
 def test_native_scan_path_scans_file_into_raw_match_buffer(engine, tmp_path):

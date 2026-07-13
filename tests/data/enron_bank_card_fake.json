@@ -1,6 +1,6 @@
 {
   "schema_version": "nerb.enron_bank_card.v2",
-  "benchmark_version": "enron-v2-synthetic-fixture",
+  "benchmark_version": "enron",
   "artifact_kind": "aggregate_private_bank_build",
   "fixture_mode": true,
   "promotable": false,
@@ -12,7 +12,7 @@
   ],
   "source": {
     "dataset_id": "synthetic_enron_fixture",
-    "dataset_revision": "fixture-v2",
+    "dataset_revision": "fixture",
     "dataset_split": "fixture",
     "development_manifest_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000001",
     "full_split_manifest_sha256": "sha256:1000000000000000000000000000000000000000000000000000000000000002",
@@ -28,7 +28,7 @@
     "sealed_test_accessed": false
   },
   "charter": {
-    "id": "privacy_first_enron_intelligence_v2",
+    "id": "privacy_first_enron_intelligence",
     "primary_user_value": "prevent_sensitive_contact_and_person_name_leakage",
     "recall_priority": true,
     "guarantee_boundary": "active_catalog_patterns_only",
@@ -60,8 +60,8 @@
     ]
   },
   "builder": {
-    "policy_sha256": "sha256:3fad0d147e231b2e885b513db264ae2bc27471fe16f9e7796343c26450f89826",
-    "source_sha256": "sha256:c40abc903d8340830d9540f4a6befde6df01ff09b6e4931330279b21124968d6",
+    "policy_sha256": "sha256:52d75e5c4a655fa659ade96456ba04ec540a7928e102aab8ff04fa222d88da41",
+    "source_sha256": "sha256:51a8225c5afb759ac2c2c1dd2efcd887cbe15d6bb34cc1d44abecb983dd3c7e2",
     "candidate_source_sha256": "sha256:2000000000000000000000000000000000000000000000000000000000000003",
     "candidate_ledger_sha256": "sha256:2000000000000000000000000000000000000000000000000000000000000004",
     "train_records": 16,
@@ -70,11 +70,11 @@
     "selected_iteration_id": "iteration_02_email_recall"
   },
   "bank": {
-    "id": "enron_intelligence_v2_fixture",
+    "id": "enron_intelligence_fixture",
     "version": "2026.07.10",
-    "canonical_sha256": "sha256:2dee9a05ad1be4ea7ebf9f73c921c213c350e512cec9e19f3f4443470ee86916",
-    "artifact_sha256": "sha256:ec2b186a654339023ccda3967c008995799f107fc8d1065604d6ef30053b5deb",
-    "canonical_json_bytes": 7817,
+    "canonical_sha256": "sha256:ff76b0e272a14a54b96a433587fbc4dc98342c0bd6c9e3a8ed4b39b451c80fb2",
+    "artifact_sha256": "sha256:6e485f431283c9f4b4fa89b85af4a235684d7a55688bd499dd0b2b03ceee9fc7",
+    "canonical_json_bytes": 7798,
     "stats": {
       "active_totals": {"entities": 2, "names": 3, "patterns": 3},
       "by_kind": {"literal": 3, "regex": 2},
@@ -138,12 +138,12 @@
       "id": "iteration_02_email_recall",
       "parent_id": "iteration_01_catalog",
       "policy_sha256": "sha256:547e0864dfef037c62ef0bc562bea4ca9d4f23a3be15d65d4056b0dcaccf41bf",
-      "bank_sha256": "sha256:2dee9a05ad1be4ea7ebf9f73c921c213c350e512cec9e19f3f4443470ee86916",
+      "bank_sha256": "sha256:ff76b0e272a14a54b96a433587fbc4dc98342c0bd6c9e3a8ed4b39b451c80fb2",
       "validation_protocol_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000001",
       "catalog_binding_sha256": "sha256:5200000000000000000000000000000000000000000000000000000000000002",
       "quality_run_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000002",
       "active_patterns": 3,
-      "canonical_json_bytes": 7817,
+      "canonical_json_bytes": 7798,
       "contact_labeled_spans": 12,
       "contact_labeled_true_positive": 12,
       "contact_labeled_false_negative": 0,
@@ -190,6 +190,7 @@
     "label_strength": "structured_weak",
     "protocol_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000001",
     "quality_run_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000002",
+    "evaluator_sha256": "sha256:82ce7e0562fb78f296085d59be09ecbf0b2fa47210bfc1997497a9be8042388a",
     "contact": {
       "documents": 2,
       "documents_with_sensitive_gold": 2,
@@ -247,12 +248,12 @@
     "unexpected_negative_matches": 0,
     "positive_cases_artifact": {
       "id": "enron_catalog_conformance_positive_cases",
-      "sha256": "sha256:f442a72bf5374127fcca153c2c280d88a06a22b3c748a42511b8dc6713473b01",
+      "sha256": "sha256:22302ac39e6893986ebbe0a92f0df85094f7028f2fa7e4bbdb4c47ccb3aeb34b",
       "bytes": 3687
     },
     "negative_cases_artifact": {
       "id": "enron_catalog_conformance_negative_cases",
-      "sha256": "sha256:6ef75f41614d4b81da8485636e0bf57226f5e0663d6609ca4acaa1f0e220521f",
+      "sha256": "sha256:cbfed20930a96bd0bde2e2c84e27004264a92ed53ea88dcf62bbf056fc2b072b",
       "bytes": 2203
     },
     "policy_sha256": "sha256:000104818195133cf270e3151ddf684418b55ced452d4f4adf3102287f14cf45"
@@ -267,9 +268,9 @@
     "direct_identifiers_included": false,
     "private_paths_included": false,
     "scanner": "nerb.enron_bank_workflow.public_card_scan.v2",
-    "scanner_source_sha256": "sha256:4fd3b726cc8a26eb8462ce7c0cdab772fcdfb024c5cc2d5aa97a51d8ab4009f8",
+    "scanner_source_sha256": "sha256:20e42af9e003f59d27fa3b0ddc34a87c5f740a921b5aedc78bd35ecf65a4e561",
     "violation_count": 0,
-    "report_sha256": "sha256:a7d347f72f559fca33761e36ac2d4ec0a716b48ad020610a15f6aa5d620c6656"
+    "report_sha256": "sha256:755e93e3efd067b794617f5e37c161b98e58b75c5aba1c44806aea3554147782"
   },
-  "run_sha256": "sha256:d18972e682f584a318ebe56f106004479995e666b9e0ffcda71c8d62c9ce0097"
+  "run_sha256": "sha256:f1849b19c8ba263a00f4abf98def346b5bbf92694c9d7a499ca9429341e56acd"
 }

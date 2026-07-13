@@ -24,6 +24,7 @@ __all__ = ["Bank", "BankCacheKey", "bank_cache_info", "clear_bank_cache"]
 DEFAULT_BANK_CACHE_MAX_ENTRIES = 128
 DEFAULT_BANK_SOURCE_CACHE_MAX_ENTRIES = DEFAULT_BANK_CACHE_MAX_ENTRIES * 2
 DEFAULT_MAX_BANK_SOURCE_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_SCAN_INPUT_BYTES = 10 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -376,7 +377,30 @@ class Bank:
         *,
         max_matches: int | None = None,
     ) -> list[dict[str, Any]]:
-        text_bytes = bytes(haystack)
+        if not isinstance(haystack, (bytes, bytearray, memoryview)):
+            raise TypeError("Bank.scan_bytes haystack must be bytes-like.")
+        if isinstance(haystack, bytes):
+            input_bytes = len(haystack)
+            if input_bytes > DEFAULT_MAX_SCAN_INPUT_BYTES:
+                raise ValueError(
+                    f"Bank scan input size {input_bytes} exceeds the configured limit of "
+                    f"{DEFAULT_MAX_SCAN_INPUT_BYTES} bytes"
+                )
+            text_bytes = haystack
+        else:
+            view = memoryview(haystack)
+            try:
+                input_bytes = view.nbytes
+                if input_bytes > DEFAULT_MAX_SCAN_INPUT_BYTES:
+                    raise ValueError(
+                        f"Bank scan input size {input_bytes} exceeds the configured limit of "
+                        f"{DEFAULT_MAX_SCAN_INPUT_BYTES} bytes"
+                    )
+                # Keep the export alive through the snapshot so a mutable
+                # bytearray cannot be resized between admission and copying.
+                text_bytes = view.tobytes()
+            finally:
+                view.release()
         raw = self._scan_native_bytes(text_bytes, max_matches=max_matches)
         return _project_raw_matches(
             self._detector_projection,
@@ -397,6 +421,11 @@ class Bank:
             raise TypeError("Bank.scan_text text must be a string.")
         if offsets not in {"byte", "char"}:
             raise ValueError('Bank.scan_text offsets must be "byte" or "char".')
+        if len(text) > DEFAULT_MAX_SCAN_INPUT_BYTES:
+            raise ValueError(
+                f"Bank scan input has {len(text)} code points, which necessarily exceeds the configured limit of "
+                f"{DEFAULT_MAX_SCAN_INPUT_BYTES} bytes"
+            )
 
         text_bytes = text.encode("utf-8")
         raw = self._scan_native_bytes(text_bytes, max_matches=max_matches)

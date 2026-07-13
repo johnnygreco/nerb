@@ -86,10 +86,12 @@ After a verified train/validation bank build, freeze and smoke-test the private 
 decision profile:
 
 ```shell
+install -d -m 700 .nerb/enron-scratch
 nerb prepare-enron-performance \
   --bank-build-run .nerb/enron/bank-build \
   --development-run .nerb/enron/development \
-  --output-dir .nerb/enron/performance-plan
+  --output-dir .nerb/enron/performance-plan \
+  --scratch-root .nerb/enron-scratch
 nerb run-enron-performance \
   --prepared-run .nerb/enron/performance-plan \
   --output-dir .nerb/enron/performance-smoke \

@@ -49,10 +49,11 @@ so privacy evidence must report open-world recall and misses separately from cat
 !!! warning "Enron evidence is not yet promotable"
 
     The privacy-first Enron contract, private preparation, immutable splits, independent quality executor, train-only
-    [bank construction](enron-bank-building.md), catalog-conformance gate, and deep-verified
-    [decision performance result](performance.md#decision-grade-development-result) are implemented. The development
-    bank card remains non-promotable until the mandatory full-source streaming/resource proof, frozen one-shot sealed
-    evaluation, privacy verification, and final lineage gates are complete. See the [charter](enron-benchmark.md),
+    [bank construction](enron-bank-building.md), catalog-conformance gate, and deep-verified performance evidence
+    workflow are implemented. The [decision-grade performance benchmark standard](performance.md#decision-grade-performance-benchmark-standard)
+    requires a fresh production-capacity result. The bank card remains non-promotable until the mandatory full-source
+    streaming/resource proof, frozen one-shot sealed evaluation, privacy verification, and final lineage gates are
+    complete. See the [charter](enron-benchmark.md),
     [preparation guide](enron-preparation.md), [split guide](enron-splits.md), and [evaluation guide](enron-evaluation.md).
 
 ## Why Teams Use NERB

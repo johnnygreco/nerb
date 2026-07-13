@@ -69,3 +69,5 @@ Use these flags only when the caller is allowed to receive sensitive data:
 - De-anonymization restores redaction tokens by default.
 - Pseudonym restoration is opt-in because exact replacement can also affect naturally occurring pseudonym strings.
 - MCP writes are explicit: creating or reading a replacement DB does not imply an in-place save.
+- MCP overwrites use the destination's current hash in `options.expected_replacement_db_hash`; no alternate expected-hash
+  field is accepted.

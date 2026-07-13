@@ -276,6 +276,7 @@ def test_plan_freezes_exact_matrix_controls_comparisons_and_hashes(
 ) -> None:
     repeated = _make_plan(monkeypatch)
     assert repeated == performance_plan
+    assert performance_plan["suite"] == "enron_cache_value"
     assert performance_plan["scale_axis"] == "active_matcher_patterns"
     assert performance_plan["catalog_aliases_reported_separately"] is True
     assert performance_plan["plan_sha256"] == performance_module._canonical_hash(
@@ -1129,6 +1130,9 @@ def _prepare_run(
         },
         "privacy": {"status": "passed"},
     }
+    validation_documents = tuple(
+        {"document_id": f"doc_{index:03d}", "text": f"safe validation text {index}"} for index in range(100)
+    )
     development = SimpleNamespace(
         manifest={
             "development_roles": {
@@ -1143,6 +1147,10 @@ def _prepare_run(
             }
         },
         manifest_sha256=development_manifest_sha256,
+        iter_validation_records=lambda: iter(validation_documents),
+        iter_validation_memberships=lambda: iter(
+            {"document_id": row["document_id"], "role": "validation"} for row in validation_documents
+        ),
     )
 
     class _SafeNativeBank:
@@ -1167,17 +1175,27 @@ def _prepare_run(
         card=card,
         bank=bank,
         bank_payload=bank_payload if snapshot_bank_payload is None else snapshot_bank_payload,
-        validation_documents=tuple(
-            {"document_id": f"doc_{index:03d}", "text": f"safe validation text {index}"} for index in range(100)
-        ),
+        validation_plan=SimpleNamespace(),
+        policy=performance_module.EnronBankPolicy(),
         build_created_at="2026-07-11T00:00:00Z",
     )
+    verification_calls: list[dict[str, Any]] = []
+
+    def verify_snapshot(*_args: Any, **kwargs: Any) -> Any:
+        verification_calls.append(kwargs)
+        return bank_snapshot
+
     monkeypatch.setattr(
         performance_module,
         "_verify_enron_bank_build_snapshot",
-        lambda *_args, **_kwargs: bank_snapshot,
+        verify_snapshot,
     )
     monkeypatch.setattr(performance_module, "load_enron_development_split", lambda _path: development)
+    monkeypatch.setattr(
+        performance_module,
+        "_iter_validation_documents",
+        lambda *_args, **_kwargs: iter(validation_documents),
+    )
     monkeypatch.setattr(
         performance_module,
         "compile_bank_with_report",
@@ -1187,7 +1205,22 @@ def _prepare_run(
             {"source": {"extractable_json_bytes": 321}},
         ),
     )
-    if not real_fixtures:
+    if real_fixtures:
+        # This test exercises real artifact requests and worker isolation, not
+        # scale-topology extrapolation. The tiny committed fixture has one
+        # residual regex among only three active patterns; scaling that ratio
+        # would create tens of thousands of regex-heavy native shards and is
+        # intentionally rejected by the production resource envelope. Use the
+        # representative 628-pattern composition covered exhaustively by the
+        # fixture-generator tests while keeping the real generators here.
+        make_real_bank_fixtures = performance_module.make_enron_performance_bank_fixtures
+        representative = _evaluated_descriptor()
+        monkeypatch.setattr(
+            performance_module,
+            "make_enron_performance_bank_fixtures",
+            lambda *, evaluated_bank: make_real_bank_fixtures(evaluated_bank=representative),
+        )
+    else:
         bank_fixtures = _fake_bank_fixtures()
         monkeypatch.setattr(
             performance_module,
@@ -1201,11 +1234,14 @@ def _prepare_run(
         )
     monkeypatch.setattr(performance_module, "_source_sha256", lambda _paths: _HASH_1)
     output = tmp_path / f"{name}-prepared-output"
+    scratch_root = tmp_path / f"{name}-scratch"
+    scratch_root.mkdir(mode=0o700)
     summary = prepare_enron_performance_manifest(
         EnronPerformancePrepareOptions(
             bank_build_run=bank_run,
             development_run=development_run,
             output_dir=output,
+            scratch_root=scratch_root,
             concurrency=2,
             allow_unignored_output=True,
         )
@@ -1215,6 +1251,14 @@ def _prepare_run(
     assert summary["inputs"] == 11
     assert summary["decision_workloads"] == 42
     assert summary["sealed_test_accessed"] is False
+    assert verification_calls == [
+        {
+            "development_run": development_run,
+            "scratch_root": scratch_root,
+            "annotation_run": None,
+            "max_scratch_bytes": performance_module.DEFAULT_MAX_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+        }
+    ]
     return output
 
 
@@ -2840,6 +2884,13 @@ def test_public_privacy_scanner_accepts_plan_and_rejects_private_paths_and_ident
             Path("dev"),
             Path("prep"),
             Path("out"),
+            max_scratch_bytes=performance_module.MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES - 1,
+        ),
+        EnronPerformancePrepareOptions(
+            Path("bank"),
+            Path("dev"),
+            Path("prep"),
+            Path("out"),
             source_curation_seconds=float("nan"),
         ),
     ],
@@ -2877,3 +2928,25 @@ def test_phase_process_models_are_reflected_in_warmup_policy(performance_plan: d
         expected_model = PERFORMANCE_PHASE_PROCESS_MODELS[workload["phase"]]
         assert workload["process_model"] == expected_model
         assert workload["warmups"] == (3 if expected_model == "reused_process" else 0)
+
+
+def test_real_document_selection_consumes_one_shot_iterable_once() -> None:
+    class OneShotRows:
+        def __init__(self) -> None:
+            self.iterations = 0
+
+        def __iter__(self):
+            self.iterations += 1
+            if self.iterations != 1:
+                raise AssertionError("validation population was iterated more than once")
+            for index in range(10_000):
+                yield {
+                    "document_id": f"doc_{index:064x}",
+                    "text": f"bounded validation document {index}",
+                }
+
+    rows = OneShotRows()
+    selected = performance_module._select_real_documents(rows, count=100, seed="bounded-one-shot")
+
+    assert len(selected) == 100
+    assert rows.iterations == 1

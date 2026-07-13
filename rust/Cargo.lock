@@ -140,6 +140,7 @@ name = "nerb_engine"
 version = "0.0.11"
 dependencies = [
  "aho-corasick",
+ "libc",
  "pyo3",
  "regex-automata",
  "regex-syntax",

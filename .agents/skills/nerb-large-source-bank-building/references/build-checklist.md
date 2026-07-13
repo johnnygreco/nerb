@@ -17,7 +17,7 @@ sections that match the current corpus and goal.
 - Who will use this bank, and what should it help them cache or retrieve?
 - Which entity classes are high-value enough to justify eval work?
 - For each class, what counts as a true positive, acceptable alias, near miss, and false positive?
-- What precision/recall tradeoff is acceptable for this use case?
+- What harm does a miss cause, and what recall/leakage floors and over-redaction/runtime ceilings follow from that harm?
 - Which classes should remain out of scope until evidence supports them?
 
 ## Candidate Sources
@@ -43,7 +43,9 @@ sections that match the current corpus and goal.
 - Keep held-out documents separate from candidate discovery prompts and ad hoc debugging.
 - Include negative or no-match cases for ambiguous classes.
 - Ensure eval refs are local, deterministic, and safe to commit; otherwise store private eval artifacts under ignored paths.
-- Use standard held-out NER metrics for quality: exact-span precision, recall, and F1, plus per-entity breakdowns.
+- For privacy detection, lead with held-out open-world span recall, leaked-document rate, and sensitive-character recall
+  plus per-entity breakdowns. Report precision, false alarms, over-redaction, and F1 only where exhaustive labels make
+  them valid, and treat them as constraints rather than substitutes for missed-PII metrics.
 - Do not report an optimization win if the evaluator, split, or bank-generation rules changed in the same comparison.
 
 ## NERB Checks
@@ -64,17 +66,25 @@ transactional output:
 ```shell
 uv run nerb build-enron-bank \
   --development-run .nerb/enron-splits/development \
-  --output-dir .nerb/enron-bank-builds/run \
-  --benchmark-version enron-v2
+  --output-dir .nerb/enron-bank-builds/run
 
+install -d -m 700 .nerb/enron-scratch
 uv run nerb verify-enron-bank-build \
-  --run-dir .nerb/enron-bank-builds/run
+  --run-dir .nerb/enron-bank-builds/run \
+  --development-run .nerb/enron-splits/development \
+  --scratch-root .nerb/enron-scratch
 ```
 
 The builder has no sealed-test option. It mines train only, uses validation for three frozen policy iterations, and emits
 private artifacts plus an aggregate non-promotable card. Structured-weak labeled-span recall is not open-world recall;
 precision, false-alarm, and over-redaction metrics remain unsupported without independent exhaustive annotations. Never
 tune bank construction or policy selection on final-test quality.
+
+Generic `benchmark-bank`/`regress-bank` runs and builder verification are development evidence, not decision-grade
+full-source capacity evidence. For a full-source Enron capacity claim, freeze the corpus, gates, measured commit, reader
+lock, and run policy before execution. Then use the isolated `python -I -S -B scripts/run_enron_capacity.py` run,
+verification, and aggregate-only export commands documented in `docs/enron-bank-building.md`; keep both the capacity run
+and append-only attempt ledger under ignored private paths.
 
 ## Handoff Summary
 

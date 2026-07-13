@@ -199,6 +199,10 @@ def test_help_shows_command_structure():
         "verify-enron-annotations",
         "build-enron-bank",
         "verify-enron-bank-build",
+        "run-enron-capacity",
+        "verify-enron-capacity",
+        "export-enron-capacity",
+        "verify-portable-enron-capacity",
         "prepare-enron-performance",
         "run-enron-performance",
         "verify-enron-performance",
@@ -568,6 +572,8 @@ def test_json_bank_benchmark_and_regress_commands_return_json(tmp_path, test_dat
 
 def test_prepare_enron_command_writes_private_run_and_returns_aggregate_json(tmp_path, test_data_path):
     output_dir = tmp_path / "prepared-run"
+    scratch_dir = tmp_path / "verification-scratch"
+    scratch_dir.mkdir(mode=0o700)
     result = runner.invoke(
         app,
         [
@@ -605,7 +611,16 @@ def test_prepare_enron_command_writes_private_run_and_returns_aggregate_json(tmp
     assert str(output_dir) not in result.output
     assert (output_dir / "COMMITTED").is_file()
 
-    verify_result = runner.invoke(app, ["verify-enron-preparation", "--run-dir", str(output_dir)])
+    verify_result = runner.invoke(
+        app,
+        [
+            "verify-enron-preparation",
+            "--run-dir",
+            str(output_dir),
+            "--scratch-dir",
+            str(scratch_dir),
+        ],
+    )
     assert verify_result.exit_code == 0, verify_result.output
     verified = json.loads(verify_result.output)
     assert verified["valid"] is True
@@ -617,6 +632,8 @@ def test_split_enron_commands_create_and_verify_redacted_and_sealed_bundles(tmp_
     preparation_dir = tmp_path / "prepared-run"
     development_dir = tmp_path / "development-run"
     sealed_dir = tmp_path / "sealed-run"
+    scratch_dir = tmp_path / "split-scratch"
+    scratch_dir.mkdir(mode=0o700)
     prepare_result = runner.invoke(
         app,
         [
@@ -643,8 +660,8 @@ def test_split_enron_commands_create_and_verify_redacted_and_sealed_bundles(tmp_
             str(development_dir),
             "--sealed-output-dir",
             str(sealed_dir),
-            "--benchmark-version",
-            "enron-v2-cli-fixture",
+            "--scratch-dir",
+            str(scratch_dir),
             "--seed",
             "cli-split-seed",
             "--sample-per-role",
@@ -796,8 +813,6 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
             str(annotations),
             "--cmu-catalog-bindings",
             str(bindings),
-            "--benchmark-version",
-            "enron-v2-fixture",
             "--created-at",
             "2026-07-10T00:00:00Z",
             "--allow-unignored-output",
@@ -811,7 +826,6 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
     assert options.output_dir == output
     assert options.annotation_run == annotations
     assert options.cmu_catalog_bindings_path == bindings
-    assert options.benchmark_version == "enron-v2-fixture"
     assert options.allow_unignored_output is True
 
     verify_result = runner.invoke(
@@ -820,13 +834,27 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
             "verify-enron-bank-build",
             "--run-dir",
             str(output),
+            "--development-run",
+            str(development),
             "--annotation-run",
             str(annotations),
+            "--scratch-root",
+            str(tmp_path / "scratch"),
+            "--max-scratch-bytes",
+            str(cli_module.MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES),
         ],
     )
     assert verify_result.exit_code == 0, verify_result.output
     assert json.loads(verify_result.output)["valid"] is True
-    assert captured["verify"] == (output, {"annotation_run": annotations})
+    assert captured["verify"] == (
+        output,
+        {
+            "development_run": development,
+            "annotation_run": annotations,
+            "scratch_root": tmp_path / "scratch",
+            "max_scratch_bytes": cli_module.MIN_ENRON_BANK_VERIFY_SCRATCH_BYTES,
+        },
+    )
 
     monkeypatch.setattr(
         cli_module,
@@ -847,7 +875,18 @@ def test_enron_bank_build_commands_route_development_only_inputs_and_fail_closed
             cli_module.EnronBankBuildError("Auxiliary CMU quality evidence is invalid")
         ),
     )
-    failed_verify = runner.invoke(app, ["verify-enron-bank-build", "--run-dir", str(output)])
+    failed_verify = runner.invoke(
+        app,
+        [
+            "verify-enron-bank-build",
+            "--run-dir",
+            str(output),
+            "--development-run",
+            str(development),
+            "--scratch-root",
+            str(tmp_path / "scratch"),
+        ],
+    )
     assert failed_verify.exit_code == 1
     assert "Auxiliary CMU quality evidence is invalid" in failed_verify.output
     assert "Traceback" not in failed_verify.output
@@ -861,6 +900,141 @@ def test_enron_bank_build_cli_has_no_sealed_or_role_selector() -> None:
     assert "--cmu-catalog-bindings" in help_result.output
     assert "--sealed" not in help_result.output
     assert "--role" not in help_result.output
+
+
+def test_enron_capacity_commands_are_thin_and_use_only_explicit_paths(monkeypatch, tmp_path):
+    from nerb import enron_capacity
+
+    captured = {}
+
+    def fake_run(options):
+        captured["run"] = options
+        return {"run_sha256": "sha256:" + "1" * 64}
+
+    def fake_verify(run_dir, ledger_dir):
+        captured["verify"] = (run_dir, ledger_dir)
+        return {"decision_sha256": "sha256:" + "2" * 64}
+
+    def fake_export(run_dir, ledger_dir, output_path):
+        captured["export"] = (run_dir, ledger_dir, output_path)
+        return {"decision_sha256": "sha256:" + "3" * 64}
+
+    def fake_portable(path):
+        captured["portable"] = path
+        return {"decision_sha256": "sha256:" + "4" * 64}
+
+    monkeypatch.setattr(enron_capacity, "run_enron_capacity", fake_run)
+    monkeypatch.setattr(enron_capacity, "verify_capacity_run", fake_verify)
+    monkeypatch.setattr(enron_capacity, "export_capacity_decision", fake_export)
+    monkeypatch.setattr(enron_capacity, "verify_portable_capacity_decision", fake_portable)
+    monkeypatch.setattr(enron_capacity, "_validated_capacity_bootstrap", lambda: None)
+    output = tmp_path / "capacity"
+    ledger = tmp_path / "attempts"
+    workspace = tmp_path / "workspace"
+    portable = tmp_path / "portable.json"
+
+    run = runner.invoke(
+        app,
+        [
+            "run-enron-capacity",
+            "--output-dir",
+            str(output),
+            "--attempt-ledger-dir",
+            str(ledger),
+            "--workspace-root",
+            str(workspace),
+            "--allow-unignored-output",
+        ],
+    )
+    assert run.exit_code == 0, run.output
+    assert captured["run"].output_dir == output
+    assert captured["run"].attempt_ledger_dir == ledger
+    assert captured["run"].workspace_root == workspace
+    assert captured["run"].allow_unignored_output is True
+
+    verify = runner.invoke(
+        app,
+        ["verify-enron-capacity", "--run-dir", str(output), "--attempt-ledger-dir", str(ledger)],
+    )
+    assert verify.exit_code == 0, verify.output
+    assert captured["verify"] == (output, ledger)
+
+    export = runner.invoke(
+        app,
+        [
+            "export-enron-capacity",
+            "--run-dir",
+            str(output),
+            "--attempt-ledger-dir",
+            str(ledger),
+            "--output",
+            str(portable),
+        ],
+    )
+    assert export.exit_code == 0, export.output
+    assert captured["export"] == (output, ledger, portable)
+
+    portable_verify = runner.invoke(
+        app,
+        ["verify-portable-enron-capacity", "--artifact", str(portable)],
+    )
+    assert portable_verify.exit_code == 0, portable_verify.output
+    assert captured["portable"] == portable
+
+
+def test_capacity_run_verify_and_export_cli_fail_closed_without_isolated_launcher(tmp_path: Path) -> None:
+    output = tmp_path / "capacity"
+    ledger = tmp_path / "attempts"
+    portable = tmp_path / "portable.json"
+    commands = (
+        ["run-enron-capacity", "--output-dir", str(output), "--attempt-ledger-dir", str(ledger)],
+        ["verify-enron-capacity", "--run-dir", str(output), "--attempt-ledger-dir", str(ledger)],
+        [
+            "export-enron-capacity",
+            "--run-dir",
+            str(output),
+            "--attempt-ledger-dir",
+            str(ledger),
+            "--output",
+            str(portable),
+        ],
+    )
+
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 1
+        assert "Capacity production implementation identity is invalid" in result.output
+        assert "Traceback" not in result.output
+
+
+def test_enron_deep_workflows_require_explicit_scratch_roots(tmp_path: Path) -> None:
+    verify = runner.invoke(
+        app,
+        [
+            "verify-enron-bank-build",
+            "--run-dir",
+            str(tmp_path / "build"),
+            "--development-run",
+            str(tmp_path / "development"),
+        ],
+    )
+    prepare_performance = runner.invoke(
+        app,
+        [
+            "prepare-enron-performance",
+            "--bank-build-run",
+            str(tmp_path / "build"),
+            "--development-run",
+            str(tmp_path / "development"),
+            "--output-dir",
+            str(tmp_path / "performance"),
+        ],
+    )
+
+    assert verify.exit_code == 2
+    assert "--scratch-root" in verify.output
+    assert prepare_performance.exit_code == 2
+    assert "--scratch-root" in prepare_performance.output
 
 
 def test_enron_performance_commands_map_private_options_and_emit_json(monkeypatch, tmp_path) -> None:
@@ -886,6 +1060,7 @@ def test_enron_performance_commands_map_private_options_and_emit_json(monkeypatc
     annotations = tmp_path / "annotations"
     prepared_output = tmp_path / "performance-plan"
     measured_output = tmp_path / "performance-run"
+    scratch_root = tmp_path / "scratch"
 
     prepare_result = runner.invoke(
         app,
@@ -897,10 +1072,10 @@ def test_enron_performance_commands_map_private_options_and_emit_json(monkeypatc
             str(development),
             "--output-dir",
             str(prepared_output),
+            "--scratch-root",
+            str(scratch_root),
             "--annotation-run",
             str(annotations),
-            "--benchmark-version",
-            "enron-v2-fixture",
             "--real-input-documents",
             "100",
             "--concurrency",
@@ -920,12 +1095,15 @@ def test_enron_performance_commands_map_private_options_and_emit_json(monkeypatc
     assert prepare_options.bank_build_run == bank_build
     assert prepare_options.development_run == development
     assert prepare_options.output_dir == prepared_output
+    assert prepare_options.scratch_root == scratch_root
     assert prepare_options.annotation_run == annotations
-    assert prepare_options.benchmark_version == "enron-v2-fixture"
     assert prepare_options.real_input_documents == 100
     assert prepare_options.concurrency == 2
     assert prepare_options.source_curation_seconds == 45.5
     assert prepare_options.allow_unignored_output is True
+    prepare_help = runner.invoke(app, ["prepare-enron-performance", "--help"])
+    assert prepare_help.exit_code == 0
+    assert "--benchmark-version" not in prepare_help.output
 
     run_result = runner.invoke(
         app,
@@ -996,6 +1174,7 @@ def test_enron_performance_cli_defaults_follow_public_option_defaults(monkeypatc
     development = tmp_path / "development"
     prepared_output = tmp_path / "performance-plan"
     measured_output = tmp_path / "performance-run"
+    scratch_root = tmp_path / "scratch"
 
     prepare_result = runner.invoke(
         app,
@@ -1007,6 +1186,8 @@ def test_enron_performance_cli_defaults_follow_public_option_defaults(monkeypatc
             str(development),
             "--output-dir",
             str(prepared_output),
+            "--scratch-root",
+            str(scratch_root),
         ],
     )
     run_result = runner.invoke(
@@ -1026,6 +1207,7 @@ def test_enron_performance_cli_defaults_follow_public_option_defaults(monkeypatc
         bank_build_run=bank_build,
         development_run=development,
         output_dir=prepared_output,
+        scratch_root=scratch_root,
     )
     assert captured["run"] == cli_module.EnronPerformanceRunOptions(
         prepared_run=prepared_output,
@@ -1050,6 +1232,8 @@ def test_enron_performance_commands_sanitize_helper_errors_and_exclude_sealed_in
             str(tmp_path / "development"),
             "--output-dir",
             str(tmp_path / "performance-plan"),
+            "--scratch-root",
+            str(tmp_path / "scratch"),
         ],
     )
 
@@ -1091,8 +1275,7 @@ def test_enron_quality_commands_route_private_inputs_and_fail_closed(monkeypatch
 
     monkeypatch.setattr(cli_module, "evaluate_enron_quality_files", fake_quality)
     monkeypatch.setattr(cli_module, "evaluate_cmu_enron_training_quality_files", fake_cmu)
-    documents_path = tmp_path / "documents.jsonl"
-    gold_path = tmp_path / "gold.jsonl"
+    records_path = tmp_path / "records.jsonl"
     plan_path = tmp_path / "plan.jsonl"
     unsupported_path = tmp_path / "unsupported.jsonl"
     quality_result = runner.invoke(
@@ -1101,10 +1284,8 @@ def test_enron_quality_commands_route_private_inputs_and_fail_closed(monkeypatch
             "eval-enron-quality",
             "--bank",
             str(bank_path),
-            "--documents",
-            str(documents_path),
-            "--gold-spans",
-            str(gold_path),
+            "--records",
+            str(records_path),
             "--slice-plan",
             str(plan_path),
             "--unsupported-slices",
@@ -1115,8 +1296,7 @@ def test_enron_quality_commands_route_private_inputs_and_fail_closed(monkeypatch
     assert quality_result.exit_code == 0, quality_result.output
     assert json.loads(quality_result.output)["evaluated"] is True
     assert captured["quality"][1] == {
-        "documents_path": documents_path,
-        "gold_spans_path": gold_path,
+        "records_path": records_path,
         "slice_specs_path": plan_path,
         "unsupported_slice_specs_path": unsupported_path,
     }
@@ -1162,10 +1342,8 @@ def test_enron_quality_command_exits_nonzero_for_contract_invalid_output(monkeyp
             "eval-enron-quality",
             "--bank",
             str(bank_path),
-            "--documents",
-            str(tmp_path / "documents.jsonl"),
-            "--gold-spans",
-            str(tmp_path / "gold.jsonl"),
+            "--records",
+            str(tmp_path / "records.jsonl"),
             "--slice-plan",
             str(tmp_path / "plan.jsonl"),
         ],
@@ -1218,10 +1396,8 @@ def test_enron_conformance_command_commits_audit_and_exits_nonzero_on_gate_failu
     [
         [
             "eval-enron-quality",
-            "--documents",
-            "documents.jsonl",
-            "--gold-spans",
-            "gold.jsonl",
+            "--records",
+            "records.jsonl",
             "--slice-plan",
             "plan.jsonl",
         ],
@@ -2279,6 +2455,14 @@ def test_replacement_db_commands_manage_safe_summary(tmp_path):
         {"id": "person_names_0001", "value": "Mikey Law"},
         {"id": "person_names_0002", "value": "Nina Vale"},
     ]
+
+
+def test_replacement_db_init_has_one_reversible_option_without_store_originals_alias() -> None:
+    help_result = runner.invoke(app, ["replacement-db", "init", "--help"])
+
+    assert help_result.exit_code == 0
+    assert "--reversible" in help_result.output
+    assert "--store-originals" not in help_result.output
 
 
 def test_replacement_db_validate_sanitizes_assignment_diagnostics_by_default(tmp_path):

@@ -44,7 +44,7 @@ __all__ = [
 ]
 
 _GENERATOR_VERSION = "1.0.0"
-_GENERATOR_SEED = "nerb-enron-performance-v2"
+_GENERATOR_SEED = "nerb-enron-performance"
 _BANK_GENERATOR_ID = "nerb_enron_performance_scale_bank"
 _INPUT_GENERATOR_ID = "nerb_enron_performance_controlled_input"
 _EXPECTED_ENTITY_CLASSES = ("contact", "person")
@@ -477,10 +477,15 @@ def _scale_composition(active_patterns: int, evaluated: Sequence[_TaxonAllocatio
         )
         for index, item in enumerate(evaluated)
     )
-    if any(item.patterns and (item.names == 0 or item.names > item.patterns) for item in result):
+    if any(
+        (item.patterns == 0 and (item.entities != 0 or item.names != 0))
+        or (item.patterns > 0 and (item.entities == 0 or item.names == 0 or item.names > item.patterns))
+        for item in result
+    ):
         raise EnronPerformanceFixtureError("Scaled catalog names cannot be assigned truthfully to matcher rows.")
     if any(
-        item.entities > item.patterns or (item.patterns + item.entities - 1) // item.entities > _MAX_PATTERNS_PER_ENTITY
+        item.entities > item.patterns
+        or (item.entities > 0 and (item.patterns + item.entities - 1) // item.entities > _MAX_PATTERNS_PER_ENTITY)
         for item in result
     ):
         raise EnronPerformanceFixtureError("Scaled entity sharding exceeds the native per-entity pattern limit.")

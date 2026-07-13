@@ -43,7 +43,6 @@ def test_normalize_natural_text_is_lf_nfc_and_control_safe() -> None:
     assert result.counters["control_chars_replaced"] == 1
     assert result.counters["bidi_chars_removed"] == 1
     assert result.counters["zero_width_chars_removed"] == 1
-    assert result.audit is result.counters
 
 
 def test_clean_subject_stays_natural_and_becomes_one_line() -> None:

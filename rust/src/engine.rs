@@ -1,20 +1,34 @@
 use crate::bank::{CanonicalBank, CanonicalPattern, MatchMode};
-use crate::error::{validation, Result};
+use crate::error::{memory, validation, Result};
 use crate::match_buffer::{NativeMatchBuffer, RawMatch};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, Input as AhoInput, MatchKind as AhoMatchKind};
 use regex_automata::hybrid::dfa::{Cache as HybridCache, OverlappingState, DFA as HybridDfa};
-use regex_automata::meta::Regex;
+use regex_automata::meta::{BuildError as RegexBuildError, Cache as RegexCache, Regex};
 use regex_automata::nfa::thompson::{self, WhichCaptures};
-use regex_automata::{Anchored, Input, MatchKind as RegexMatchKind};
+use regex_automata::util::iter::Searcher;
+use regex_automata::{Anchored, Input, MatchError, MatchKind as RegexMatchKind};
 use regex_syntax::hir::{Hir, HirKind, Look};
 use regex_syntax::{is_word_character, ParserBuilder};
 use std::cmp::Ordering;
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 
 const ENTITY_INDEPENDENT_NFA_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT: usize = 2 * 1024 * 1024;
-const ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY: usize = 2 * 1024 * 1024;
+const INTERNAL_MODE_HYBRID_CACHE_CAPACITY: usize = 2 * 1024 * 1024;
+pub(crate) const ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY: usize = 32 * 1024;
+pub(crate) const MAX_LAZY_DFA_CACHES_PER_META_REGEX: usize = 3;
+pub(crate) const PIKEVM_STACK_NFA_MEMORY_MULTIPLIER: usize = 16;
+const PIKEVM_ACTIVE_STATE_ID_VECTORS: usize = 4;
+const PIKEVM_ACTIVE_STATE_SLOT_TABLES: usize = 2;
+const PIKEVM_STATE_ID_BYTES: usize = 4;
 const ENTITY_INDEPENDENT_DFA_SIZE_LIMIT: usize = 2 * 1024 * 1024;
 const ENTITY_INDEPENDENT_DFA_STATE_LIMIT: usize = 1_000;
+pub(crate) const MAX_CONCURRENT_SCANS_PER_ENGINE: usize = 8;
+pub(crate) const MAX_SCAN_INPUT_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_ENTITY_INDEPENDENT_REGEX_LAYERS_PER_ENTITY: usize = 128;
+pub(crate) const MAX_ENTITY_INDEPENDENT_REGEX_ACCOUNTED_BYTES: usize = 768 * 1024 * 1024;
+pub(crate) const MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER: usize = 128;
+const BOUNDED_REGEX_INITIAL_MAX_MINIMUM_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct NativeEngine {
@@ -23,6 +37,86 @@ pub struct NativeEngine {
     shards: Vec<MatcherShard>,
     all_overlaps: Option<AllOverlapsMatcher>,
     global_leftmost: Option<GlobalLeftmostMatcher>,
+    regex_resources: Option<RegexResourceProfile>,
+    scan_limiter: ScanLimiter,
+}
+
+#[derive(Debug, Default)]
+struct ScanLimiter {
+    state: Mutex<ScanLimiterState>,
+    available: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ScanLimiterState {
+    active: usize,
+    slots_in_use: [bool; MAX_CONCURRENT_SCANS_PER_ENGINE],
+    #[cfg(test)]
+    maximum_observed: usize,
+}
+
+#[derive(Debug)]
+struct ScanPermit<'a> {
+    limiter: &'a ScanLimiter,
+    slot: usize,
+}
+
+impl ScanLimiter {
+    fn acquire(&self) -> ScanPermit<'_> {
+        let mut state = self.lock_state();
+        while state.active >= MAX_CONCURRENT_SCANS_PER_ENGINE {
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        let slot = state
+            .slots_in_use
+            .iter()
+            .position(|in_use| !in_use)
+            .expect("active scan count guarantees an available cache slot");
+        state.slots_in_use[slot] = true;
+        state.active += 1;
+        #[cfg(test)]
+        {
+            state.maximum_observed = state.maximum_observed.max(state.active);
+        }
+        drop(state);
+        ScanPermit {
+            limiter: self,
+            slot,
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, ScanLimiterState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn observed_concurrency(&self) -> (usize, usize) {
+        let state = self.lock_state();
+        (state.active, state.maximum_observed)
+    }
+}
+
+impl ScanPermit<'_> {
+    fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+impl Drop for ScanPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self.limiter.lock_state();
+        if let Some(in_use) = state.slots_in_use.get_mut(self.slot) {
+            *in_use = false;
+        }
+        if state.active > 0 {
+            state.active -= 1;
+        }
+        drop(state);
+        self.limiter.available.notify_one();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -45,8 +139,18 @@ enum MatcherShard {
 #[derive(Debug)]
 struct RegexMatcherShard {
     entity: String,
-    regex: Regex,
-    local_to_detector: Vec<u32>,
+    matcher: RegexShardMatcher,
+}
+
+#[derive(Debug)]
+enum RegexShardMatcher {
+    Monolithic {
+        regex: CachedRegex,
+        local_to_detector: Vec<u32>,
+    },
+    Bounded {
+        layers: Vec<RegexMatcherLayer>,
+    },
 }
 
 #[derive(Debug)]
@@ -55,7 +159,6 @@ struct LiteralMatcherShard {
     matcher: AhoCorasick,
     case_insensitive: bool,
     local_to_detector: Vec<u32>,
-    unicode_fallback_regex: Option<Regex>,
 }
 
 #[derive(Debug)]
@@ -63,9 +166,50 @@ struct LayeredMatcherShard {
     entity: String,
     case_sensitive_literals: LiteralMatcherLayers,
     ascii_case_insensitive_literals: LiteralMatcherLayers,
-    residual_regex: Option<RegexMatcherLayer>,
-    fallback_local_to_detector: Option<Vec<u32>>,
-    unicode_fallback_regex: Option<Regex>,
+    normalized_case_sensitive_literals: LiteralMatcherLayers,
+    normalized_ascii_case_insensitive_literals: LiteralMatcherLayers,
+    residual_regex_layers: Vec<RegexMatcherLayer>,
+}
+
+#[derive(Debug)]
+struct MappedHaystack {
+    bytes: Vec<u8>,
+    checkpoints: Vec<(usize, usize)>,
+}
+
+impl MappedHaystack {
+    fn original_boundary(&self, mapped: usize) -> Option<usize> {
+        if mapped > self.bytes.len() {
+            return None;
+        }
+        let checkpoint_index = self
+            .checkpoints
+            .partition_point(|&(mapped_after, _)| mapped_after <= mapped);
+        let delta = checkpoint_index
+            .checked_sub(1)
+            .and_then(|index| self.checkpoints.get(index))
+            .map(|&(mapped_after, original_after)| original_after - mapped_after)
+            .unwrap_or(0);
+        mapped.checked_add(delta)
+    }
+
+    fn mapped_boundary_at_or_after(&self, original: usize) -> usize {
+        let mut low = 0;
+        let mut high = self.bytes.len();
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self
+                .original_boundary(middle)
+                .expect("mapped offset is within the haystack")
+                < original
+            {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        low
+    }
 }
 
 #[derive(Debug, Default)]
@@ -105,9 +249,294 @@ struct SameStartLookup {
 
 #[derive(Debug)]
 struct RegexMatcherLayer {
-    regex: Regex,
+    regex: CachedRegex,
     local_to_detector: Vec<u32>,
     local_to_pattern_order: Vec<usize>,
+}
+
+#[derive(Debug)]
+struct RegexResourceBudget {
+    entity_layers: usize,
+    total_layers: usize,
+    max_entity_layers: usize,
+    static_bytes: usize,
+    eager_cache_bytes_per_scan: usize,
+    pikevm_cache_projection_bytes_per_scan: usize,
+    pikevm_stack_growth_allowance_bytes_per_scan: usize,
+    lazy_dfa_growth_allowance_bytes_per_scan: usize,
+    regex_cache_allowance_bytes: usize,
+    size_limit_bisections: usize,
+    resource_limit_bisections: usize,
+    maximum_accounted_bytes: usize,
+}
+
+impl Default for RegexResourceBudget {
+    fn default() -> Self {
+        Self {
+            entity_layers: 0,
+            total_layers: 0,
+            max_entity_layers: 0,
+            static_bytes: 0,
+            eager_cache_bytes_per_scan: 0,
+            pikevm_cache_projection_bytes_per_scan: 0,
+            pikevm_stack_growth_allowance_bytes_per_scan: 0,
+            lazy_dfa_growth_allowance_bytes_per_scan: 0,
+            regex_cache_allowance_bytes: 0,
+            size_limit_bisections: 0,
+            resource_limit_bisections: 0,
+            maximum_accounted_bytes: MAX_ENTITY_INDEPENDENT_REGEX_ACCOUNTED_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegexResourceProfile {
+    pub physical_regex_layers: usize,
+    pub maximum_regex_layers_per_entity: usize,
+    pub compiled_regex_static_bytes: usize,
+    pub eager_cache_bytes_per_scan: usize,
+    pub pikevm_cache_projection_bytes_per_scan: usize,
+    pub pikevm_stack_growth_allowance_bytes_per_scan: usize,
+    pub lazy_dfa_growth_allowance_bytes_per_scan: usize,
+    pub regex_cache_allowance_bytes: usize,
+    pub size_limit_bisections: usize,
+    pub resource_limit_bisections: usize,
+}
+
+impl RegexResourceBudget {
+    fn start_entity(&mut self) {
+        self.entity_layers = 0;
+    }
+
+    fn record(
+        &mut self,
+        entity_name: &str,
+        regex: &Regex,
+        patterns: &[Hir],
+        cache_capacity: usize,
+    ) -> Result<()> {
+        let next_layers = self.entity_layers.checked_add(1).ok_or_else(|| {
+            memory(
+                format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                "compiled regex layer count overflowed",
+            )
+        })?;
+        let next_total_layers = self.total_layers.checked_add(1).ok_or_else(|| {
+            memory(
+                format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                "compiled regex total layer count overflowed",
+            )
+        })?;
+        let next_static_bytes = self
+            .static_bytes
+            .checked_add(regex.memory_usage())
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex static memory accounting overflowed",
+                )
+            })?;
+        let (eager_cache_bytes, pikevm_cache_projection_bytes, pikevm_stack_growth_allowance_bytes) =
+            regex_cache_components(entity_name, regex, patterns)?;
+        let lazy_dfa_growth_allowance_bytes = cache_capacity
+            .checked_mul(MAX_LAZY_DFA_CACHES_PER_META_REGEX)
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex lazy-DFA growth allowance overflowed",
+                )
+            })?;
+        let next_eager_cache_bytes_per_scan = self
+            .eager_cache_bytes_per_scan
+            .checked_add(eager_cache_bytes)
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex eager cache aggregate overflowed",
+                )
+            })?;
+        let next_pikevm_cache_projection_bytes_per_scan = self
+            .pikevm_cache_projection_bytes_per_scan
+            .checked_add(pikevm_cache_projection_bytes)
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex PikeVM cache aggregate overflowed",
+                )
+            })?;
+        let next_pikevm_stack_growth_allowance_bytes_per_scan = self
+            .pikevm_stack_growth_allowance_bytes_per_scan
+            .checked_add(pikevm_stack_growth_allowance_bytes)
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex PikeVM stack allowance aggregate overflowed",
+                )
+            })?;
+        let next_lazy_dfa_growth_allowance_bytes_per_scan = self
+            .lazy_dfa_growth_allowance_bytes_per_scan
+            .checked_add(lazy_dfa_growth_allowance_bytes)
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex lazy-DFA growth aggregate overflowed",
+                )
+            })?;
+        let next_regex_cache_allowance_bytes = next_eager_cache_bytes_per_scan
+            .checked_add(next_pikevm_cache_projection_bytes_per_scan)
+            .and_then(|bytes| bytes.checked_add(next_pikevm_stack_growth_allowance_bytes_per_scan))
+            .and_then(|bytes| bytes.checked_add(next_lazy_dfa_growth_allowance_bytes_per_scan))
+            .and_then(|bytes| bytes.checked_mul(MAX_CONCURRENT_SCANS_PER_ENGINE))
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex concurrent cache allowance overflowed",
+                )
+            })?;
+        let next_bytes = next_static_bytes
+            .checked_add(next_regex_cache_allowance_bytes)
+            .ok_or_else(|| {
+                memory(
+                    format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                    "compiled regex aggregate memory accounting overflowed",
+                )
+            })?;
+        if next_layers > MAX_ENTITY_INDEPENDENT_REGEX_LAYERS_PER_ENTITY
+            || next_bytes > self.maximum_accounted_bytes
+        {
+            return Err(memory(
+                format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                format!(
+                    "compiled regex resource budget exceeded: entity layers {next_layers}/{MAX_ENTITY_INDEPENDENT_REGEX_LAYERS_PER_ENTITY}, static bytes {next_static_bytes}, eager cache bytes per scan {next_eager_cache_bytes_per_scan}, PikeVM fixed cache projection bytes per scan {next_pikevm_cache_projection_bytes_per_scan}, PikeVM stack growth allowance bytes per scan {next_pikevm_stack_growth_allowance_bytes_per_scan}, lazy-DFA growth allowance bytes per scan {next_lazy_dfa_growth_allowance_bytes_per_scan}, concurrent cache allowance bytes {next_regex_cache_allowance_bytes}, accounted bytes {next_bytes}/{} across {MAX_CONCURRENT_SCANS_PER_ENGINE} scan slots",
+                    self.maximum_accounted_bytes,
+                ),
+            ));
+        }
+        self.entity_layers = next_layers;
+        self.total_layers = next_total_layers;
+        self.max_entity_layers = self.max_entity_layers.max(next_layers);
+        self.static_bytes = next_static_bytes;
+        self.eager_cache_bytes_per_scan = next_eager_cache_bytes_per_scan;
+        self.pikevm_cache_projection_bytes_per_scan = next_pikevm_cache_projection_bytes_per_scan;
+        self.pikevm_stack_growth_allowance_bytes_per_scan =
+            next_pikevm_stack_growth_allowance_bytes_per_scan;
+        self.lazy_dfa_growth_allowance_bytes_per_scan =
+            next_lazy_dfa_growth_allowance_bytes_per_scan;
+        self.regex_cache_allowance_bytes = next_regex_cache_allowance_bytes;
+        Ok(())
+    }
+
+    fn profile(&self) -> RegexResourceProfile {
+        RegexResourceProfile {
+            physical_regex_layers: self.total_layers,
+            maximum_regex_layers_per_entity: self.max_entity_layers,
+            compiled_regex_static_bytes: self.static_bytes,
+            eager_cache_bytes_per_scan: self.eager_cache_bytes_per_scan,
+            pikevm_cache_projection_bytes_per_scan: self.pikevm_cache_projection_bytes_per_scan,
+            pikevm_stack_growth_allowance_bytes_per_scan: self
+                .pikevm_stack_growth_allowance_bytes_per_scan,
+            lazy_dfa_growth_allowance_bytes_per_scan: self.lazy_dfa_growth_allowance_bytes_per_scan,
+            regex_cache_allowance_bytes: self.regex_cache_allowance_bytes,
+            size_limit_bisections: self.size_limit_bisections,
+            resource_limit_bisections: self.resource_limit_bisections,
+        }
+    }
+}
+
+fn regex_cache_components(
+    entity_name: &str,
+    regex: &Regex,
+    patterns: &[Hir],
+) -> Result<(usize, usize, usize)> {
+    let budget_path = || format!("/engine/shards/{entity_name}/regex_resource_budget");
+    let cache = regex.create_cache();
+    let capture_slot_bytes = regex
+        .group_info()
+        .slot_len()
+        .checked_mul(std::mem::size_of::<usize>())
+        .ok_or_else(|| {
+            memory(
+                budget_path(),
+                "compiled regex capture-slot accounting overflowed",
+            )
+        })?;
+    let eager_cache_bytes = cache
+        .memory_usage()
+        .checked_add(std::mem::size_of::<Mutex<RegexCache>>())
+        .and_then(|bytes| bytes.checked_add(capture_slot_bytes))
+        .ok_or_else(|| {
+            memory(
+                budget_path(),
+                "compiled regex eager cache accounting overflowed",
+            )
+        })?;
+
+    // regex-automata's meta cache creates its PikeVM cache lazily. Compile
+    // the equivalent implicit-capture NFA and project its fixed allocations
+    // with checked arithmetic before any potentially quadratic slot table is
+    // allocated.
+    let nfa = thompson::NFA::compiler()
+        .configure(
+            thompson::Config::new()
+                .which_captures(WhichCaptures::Implicit)
+                .nfa_size_limit(Some(ENTITY_INDEPENDENT_NFA_SIZE_LIMIT)),
+        )
+        .build_many_from_hir(patterns)
+        .map_err(|error| {
+            validation(
+                budget_path(),
+                format!("could not compile PikeVM cache-accounting NFA: {error}"),
+            )
+        })?;
+    let pikevm_cache_projection_bytes = project_pikevm_cache_bytes(&nfa)
+        .ok_or_else(|| memory(budget_path(), "PikeVM fixed cache projection overflowed"))?;
+
+    // PikeVM's epsilon-closure stack is empty at cache creation and grows at
+    // search time. In regex-automata 0.4.14, every pushed Explore frame is
+    // represented by a State or Union alternate in NFA::memory_usage, and
+    // every RestoreCapture frame is represented by a Capture state. A frame
+    // is at most four machine words, versus a four-byte StateID for the
+    // smallest backing edge. A 16x multiplier therefore covers that worst
+    // 8x representation ratio and Vec's at-most-2x geometric retained
+    // capacity.
+    let pikevm_stack_growth_allowance_bytes = nfa
+        .memory_usage()
+        .checked_mul(PIKEVM_STACK_NFA_MEMORY_MULTIPLIER)
+        .ok_or_else(|| memory(budget_path(), "PikeVM epsilon-stack allowance overflowed"))?;
+
+    Ok((
+        eager_cache_bytes,
+        pikevm_cache_projection_bytes,
+        pikevm_stack_growth_allowance_bytes,
+    ))
+}
+
+fn project_pikevm_cache_bytes(nfa: &thompson::NFA) -> Option<usize> {
+    project_pikevm_cache_bytes_from_counts(
+        nfa.states().len(),
+        nfa.group_info().slot_len(),
+        nfa.pattern_len(),
+    )
+}
+
+fn project_pikevm_cache_bytes_from_counts(
+    states: usize,
+    slots_per_state: usize,
+    patterns: usize,
+) -> Option<usize> {
+    let implicit_slots = patterns.checked_mul(2)?;
+    let scratch_slots = slots_per_state.max(implicit_slots);
+
+    let active_state_id_bytes = states
+        .checked_mul(PIKEVM_ACTIVE_STATE_ID_VECTORS)?
+        .checked_mul(PIKEVM_STATE_ID_BYTES)?;
+    let slots_per_table = states
+        .checked_mul(slots_per_state)?
+        .checked_add(scratch_slots)?;
+    let slot_table_bytes = slots_per_table
+        .checked_mul(PIKEVM_ACTIVE_STATE_SLOT_TABLES)?
+        .checked_mul(std::mem::size_of::<usize>())?;
+    active_state_id_bytes.checked_add(slot_table_bytes)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,22 +562,54 @@ struct AllOverlapsMatcher {
     local_to_detector: Vec<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct GlobalLeftmostMatcher {
-    regex: Regex,
+    regex: CachedRegex,
     local_to_detector: Vec<u32>,
+}
+
+#[derive(Debug)]
+struct CachedRegex {
+    regex: Regex,
+    caches: Vec<Mutex<RegexCache>>,
+}
+
+impl CachedRegex {
+    fn new(regex: Regex) -> CachedRegex {
+        let caches = (0..MAX_CONCURRENT_SCANS_PER_ENGINE)
+            .map(|_| Mutex::new(regex.create_cache()))
+            .collect();
+        CachedRegex { regex, caches }
+    }
+
+    fn cache(&self, scan_slot: usize) -> MutexGuard<'_, RegexCache> {
+        let cache_mutex = self
+            .caches
+            .get(scan_slot)
+            .expect("scan limiter returned an invalid cache slot");
+        match cache_mutex.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => {
+                let mut cache = poisoned.into_inner();
+                cache.reset(&self.regex);
+                cache_mutex.clear_poison();
+                cache
+            }
+        }
+    }
 }
 
 impl NativeEngine {
     pub fn compile(canonical: &CanonicalBank, match_mode: MatchMode) -> Result<Self> {
         let detectors = detector_metadata(canonical)?;
-        let shards = if matches!(
+        let (shards, regex_resources) = if matches!(
             match_mode,
             MatchMode::EntityIndependent | MatchMode::AllOverlaps
         ) {
-            compile_entity_independent(canonical)?
+            let (shards, resources) = compile_entity_independent(canonical)?;
+            (shards, Some(resources))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let all_overlaps = if match_mode == MatchMode::AllOverlaps {
             Some(compile_all_overlaps(canonical)?)
@@ -166,6 +627,8 @@ impl NativeEngine {
             shards,
             all_overlaps,
             global_leftmost,
+            regex_resources,
+            scan_limiter: ScanLimiter::default(),
         })
     }
 
@@ -175,6 +638,10 @@ impl NativeEngine {
 
     pub fn match_mode(&self) -> MatchMode {
         self.match_mode
+    }
+
+    pub fn regex_resource_profile(&self) -> Option<&RegexResourceProfile> {
+        self.regex_resources.as_ref()
     }
 
     pub fn scan_bytes(&self, haystack: &[u8]) -> Result<NativeMatchBuffer> {
@@ -188,6 +655,7 @@ impl NativeEngine {
         haystack: &[u8],
         max_matches: usize,
     ) -> Result<NativeMatchBuffer> {
+        validate_scan_input_size(haystack)?;
         let mut buffer = NativeMatchBuffer::with_match_limit(max_matches)?;
         self.scan_bytes_into(haystack, &mut buffer)?;
         Ok(buffer)
@@ -195,15 +663,20 @@ impl NativeEngine {
 
     pub fn scan_bytes_into(&self, haystack: &[u8], buffer: &mut NativeMatchBuffer) -> Result<()> {
         buffer.clear();
+        validate_scan_input_size(haystack)?;
         std::str::from_utf8(haystack).map_err(|error| {
             validation(
                 "/scan_bytes/haystack",
                 format!("Bank.scan_bytes requires valid UTF-8 input: {error}"),
             )
         })?;
+        let permit = self.scan_limiter.acquire();
+        let scan_slot = permit.slot();
 
         let result = match self.match_mode {
-            MatchMode::EntityIndependent => scan_entity_independent(&self.shards, haystack, buffer),
+            MatchMode::EntityIndependent => {
+                scan_entity_independent(&self.shards, haystack, buffer, scan_slot)
+            }
             MatchMode::AllOverlaps => scan_all_overlaps(
                 self.all_overlaps
                     .as_ref()
@@ -217,6 +690,7 @@ impl NativeEngine {
                     .expect("global_leftmost matcher must exist for global_leftmost mode"),
                 haystack,
                 buffer,
+                scan_slot,
             ),
         };
         if result.is_err() {
@@ -231,6 +705,7 @@ impl NativeEngine {
         buffer: &mut NativeMatchBuffer,
     ) -> Result<()> {
         buffer.clear();
+        validate_scan_input_size(haystack)?;
         if self.match_mode != MatchMode::AllOverlaps {
             return Err(validation(
                 "/compile_options/match_mode",
@@ -247,6 +722,8 @@ impl NativeEngine {
                 format!("Bank.scan_bytes_leftmost_from_all_overlaps requires valid UTF-8 input: {error}"),
             )
         })?;
+        let permit = self.scan_limiter.acquire();
+        let scan_slot = permit.slot();
 
         let mut raw = NativeMatchBuffer::new();
         let result = scan_all_overlaps(
@@ -261,7 +738,7 @@ impl NativeEngine {
             // detector, so exact leftmost reconstruction currently reuses the
             // entity-independent shards after measuring raw overlap scan cost.
             buffer.clear();
-            scan_entity_independent(&self.shards, haystack, buffer)
+            scan_entity_independent(&self.shards, haystack, buffer, scan_slot)
         });
         if result.is_err() {
             buffer.clear();
@@ -270,16 +747,30 @@ impl NativeEngine {
     }
 }
 
+pub(crate) fn validate_scan_input_size(haystack: &[u8]) -> Result<()> {
+    if haystack.len() > MAX_SCAN_INPUT_BYTES {
+        return Err(validation(
+            "/scan_bytes/haystack",
+            format!(
+                "Bank scan input size {} exceeds the configured limit of {MAX_SCAN_INPUT_BYTES} bytes",
+                haystack.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn scan_entity_independent(
     shards: &[MatcherShard],
     haystack: &[u8],
     buffer: &mut NativeMatchBuffer,
+    scan_slot: usize,
 ) -> Result<()> {
     for shard in shards {
         match shard {
-            MatcherShard::Regex(shard) => scan_regex_shard(shard, haystack, buffer)?,
+            MatcherShard::Regex(shard) => scan_regex_shard(shard, haystack, buffer, scan_slot)?,
             MatcherShard::Literal(shard) => scan_literal_shard(shard, haystack, buffer)?,
-            MatcherShard::Layered(shard) => scan_layered_shard(shard, haystack, buffer)?,
+            MatcherShard::Layered(shard) => scan_layered_shard(shard, haystack, buffer, scan_slot)?,
         }
     }
     buffer.sort();
@@ -290,14 +781,24 @@ fn scan_regex_shard(
     shard: &RegexMatcherShard,
     haystack: &[u8],
     buffer: &mut NativeMatchBuffer,
+    scan_slot: usize,
 ) -> Result<()> {
-    scan_regex_matches(
-        &shard.entity,
-        &shard.regex,
-        &shard.local_to_detector,
-        haystack,
-        buffer,
-    )
+    match &shard.matcher {
+        RegexShardMatcher::Monolithic {
+            regex,
+            local_to_detector,
+        } => scan_regex_matches(
+            &shard.entity,
+            regex,
+            local_to_detector,
+            haystack,
+            buffer,
+            scan_slot,
+        ),
+        RegexShardMatcher::Bounded { layers } => {
+            scan_regex_layers_leftmost(&shard.entity, layers, haystack, buffer, scan_slot)
+        }
+    }
 }
 
 fn scan_literal_shard(
@@ -305,21 +806,16 @@ fn scan_literal_shard(
     haystack: &[u8],
     buffer: &mut NativeMatchBuffer,
 ) -> Result<()> {
-    if shard.case_insensitive && !haystack.is_ascii() {
-        let regex = shard
-            .unicode_fallback_regex
-            .as_ref()
-            .expect("case-insensitive literal shards compile their Unicode fallback");
-        return scan_regex_matches(
-            &shard.entity,
-            regex,
-            &shard.local_to_detector,
-            haystack,
-            buffer,
-        );
-    }
+    let haystack_text = std::str::from_utf8(haystack)
+        .expect("scan_bytes_into validates UTF-8 before literal dispatch");
+    let mapped = (shard.case_insensitive && requires_ascii_casefold_mapping(haystack_text))
+        .then(|| map_haystack(haystack_text, false, true));
+    let matcher_haystack = mapped
+        .as_ref()
+        .map(|mapped| mapped.bytes.as_slice())
+        .unwrap_or(haystack);
 
-    for raw_match in shard.matcher.find_iter(haystack) {
+    for raw_match in shard.matcher.find_iter(matcher_haystack) {
         let local_index = raw_match.pattern().as_usize();
         let Some(&detector_index) = shard.local_to_detector.get(local_index) else {
             return Err(validation(
@@ -329,13 +825,24 @@ fn scan_literal_shard(
                 ),
             ));
         };
-        push_utf8_match(
-            buffer,
-            haystack,
-            detector_index,
-            raw_match.start() as u64,
-            raw_match.end() as u64,
-        )?;
+        let (start, end) = match &mapped {
+            Some(mapped) => (
+                mapped.original_boundary(raw_match.start()).ok_or_else(|| {
+                    validation(
+                        format!("/engine/shards/{}/mapped_literal/start", shard.entity),
+                        "mapped literal start is outside the offset map",
+                    )
+                })?,
+                mapped.original_boundary(raw_match.end()).ok_or_else(|| {
+                    validation(
+                        format!("/engine/shards/{}/mapped_literal/end", shard.entity),
+                        "mapped literal end is outside the offset map",
+                    )
+                })?,
+            ),
+            None => (raw_match.start(), raw_match.end()),
+        };
+        push_utf8_match(buffer, haystack, detector_index, start as u64, end as u64)?;
     }
     Ok(())
 }
@@ -344,23 +851,22 @@ fn scan_layered_shard(
     shard: &LayeredMatcherShard,
     haystack: &[u8],
     buffer: &mut NativeMatchBuffer,
+    scan_slot: usize,
 ) -> Result<()> {
-    // Aho-Corasick's case-insensitive mode is deliberately ASCII-only. A
-    // non-ASCII haystack can participate in Unicode folds (for example, `k`
-    // and the Kelvin sign), so use the full entity regex in that case.
-    if !shard.ascii_case_insensitive_literals.is_empty() && !haystack.is_ascii() {
-        let regex = shard
-            .unicode_fallback_regex
-            .as_ref()
-            .expect("layered shards with case-insensitive literals compile their Unicode fallback");
-        let local_to_detector = shard
-            .fallback_local_to_detector
-            .as_ref()
-            .expect("fallback detector map is present when a fallback regex is required");
-        return scan_regex_matches(&shard.entity, regex, local_to_detector, haystack, buffer);
-    }
     let haystack_text = std::str::from_utf8(haystack)
         .expect("scan_bytes_into validates UTF-8 before dispatching to the layered matcher");
+    let needs_casefold_mapping = requires_ascii_casefold_mapping(haystack_text);
+    let needs_whitespace_mapping = requires_whitespace_mapping(haystack_text);
+    let casefold_haystack = (needs_casefold_mapping
+        && !shard.ascii_case_insensitive_literals.is_empty())
+    .then(|| map_haystack(haystack_text, false, true));
+    let normalized_case_sensitive_haystack = (needs_whitespace_mapping
+        && !shard.normalized_case_sensitive_literals.is_empty())
+    .then(|| map_haystack(haystack_text, true, false));
+    let normalized_case_insensitive_haystack = ((needs_whitespace_mapping
+        || needs_casefold_mapping)
+        && !shard.normalized_ascii_case_insensitive_literals.is_empty())
+    .then(|| map_haystack(haystack_text, true, true));
 
     let mut cursor = 0;
     let mut case_sensitive_without_left_boundary = next_literal_candidate(
@@ -377,7 +883,7 @@ fn scan_layered_shard(
         haystack_text,
         cursor,
     )?;
-    let mut case_insensitive_without_left_boundary = next_literal_candidate(
+    let mut case_insensitive_without_left_boundary = next_literal_candidate_with_mapping(
         &shard.entity,
         shard
             .ascii_case_insensitive_literals
@@ -385,9 +891,10 @@ fn scan_layered_shard(
             .as_ref(),
         haystack,
         haystack_text,
+        casefold_haystack.as_ref(),
         cursor,
     )?;
-    let mut case_insensitive_with_left_boundary = next_literal_candidate(
+    let mut case_insensitive_with_left_boundary = next_literal_candidate_with_mapping(
         &shard.entity,
         shard
             .ascii_case_insensitive_literals
@@ -395,14 +902,59 @@ fn scan_layered_shard(
             .as_ref(),
         haystack,
         haystack_text,
+        casefold_haystack.as_ref(),
         cursor,
     )?;
-    let mut residual = next_regex_candidate(
+    let mut normalized_case_sensitive_without_left_boundary = next_literal_candidate_with_mapping(
         &shard.entity,
-        shard.residual_regex.as_ref(),
+        shard
+            .normalized_case_sensitive_literals
+            .without_left_boundary
+            .as_ref(),
         haystack,
+        haystack_text,
+        normalized_case_sensitive_haystack.as_ref(),
         cursor,
     )?;
+    let mut normalized_case_sensitive_with_left_boundary = next_literal_candidate_with_mapping(
+        &shard.entity,
+        shard
+            .normalized_case_sensitive_literals
+            .with_left_boundary
+            .as_ref(),
+        haystack,
+        haystack_text,
+        normalized_case_sensitive_haystack.as_ref(),
+        cursor,
+    )?;
+    let mut normalized_case_insensitive_without_left_boundary =
+        next_literal_candidate_with_mapping(
+            &shard.entity,
+            shard
+                .normalized_ascii_case_insensitive_literals
+                .without_left_boundary
+                .as_ref(),
+            haystack,
+            haystack_text,
+            normalized_case_insensitive_haystack.as_ref(),
+            cursor,
+        )?;
+    let mut normalized_case_insensitive_with_left_boundary = next_literal_candidate_with_mapping(
+        &shard.entity,
+        shard
+            .normalized_ascii_case_insensitive_literals
+            .with_left_boundary
+            .as_ref(),
+        haystack,
+        haystack_text,
+        normalized_case_insensitive_haystack.as_ref(),
+        cursor,
+    )?;
+    let mut residual_candidates = shard
+        .residual_regex_layers
+        .iter()
+        .map(|layer| next_regex_candidate(&shard.entity, Some(layer), haystack, cursor, scan_slot))
+        .collect::<Result<Vec<_>>>()?;
 
     loop {
         // Each layer applies its own leftmost-first semantics. Merging the
@@ -413,10 +965,14 @@ fn scan_layered_shard(
             case_sensitive_with_left_boundary,
             case_insensitive_without_left_boundary,
             case_insensitive_with_left_boundary,
-            residual,
+            normalized_case_sensitive_without_left_boundary,
+            normalized_case_sensitive_with_left_boundary,
+            normalized_case_insensitive_without_left_boundary,
+            normalized_case_insensitive_with_left_boundary,
         ]
         .into_iter()
         .flatten()
+        .chain(residual_candidates.iter().flatten().copied())
         .min_by_key(|candidate| (candidate.start, candidate.pattern_order)) else {
             break;
         };
@@ -452,7 +1008,7 @@ fn scan_layered_shard(
             )?;
         }
         if candidate_precedes_cursor(case_insensitive_without_left_boundary, cursor) {
-            case_insensitive_without_left_boundary = next_literal_candidate(
+            case_insensitive_without_left_boundary = next_literal_candidate_with_mapping(
                 &shard.entity,
                 shard
                     .ascii_case_insensitive_literals
@@ -460,11 +1016,12 @@ fn scan_layered_shard(
                     .as_ref(),
                 haystack,
                 haystack_text,
+                casefold_haystack.as_ref(),
                 cursor,
             )?;
         }
         if candidate_precedes_cursor(case_insensitive_with_left_boundary, cursor) {
-            case_insensitive_with_left_boundary = next_literal_candidate(
+            case_insensitive_with_left_boundary = next_literal_candidate_with_mapping(
                 &shard.entity,
                 shard
                     .ascii_case_insensitive_literals
@@ -472,16 +1029,72 @@ fn scan_layered_shard(
                     .as_ref(),
                 haystack,
                 haystack_text,
+                casefold_haystack.as_ref(),
                 cursor,
             )?;
         }
-        if candidate_precedes_cursor(residual, cursor) {
-            residual = next_regex_candidate(
+        if candidate_precedes_cursor(normalized_case_sensitive_without_left_boundary, cursor) {
+            normalized_case_sensitive_without_left_boundary = next_literal_candidate_with_mapping(
                 &shard.entity,
-                shard.residual_regex.as_ref(),
+                shard
+                    .normalized_case_sensitive_literals
+                    .without_left_boundary
+                    .as_ref(),
                 haystack,
+                haystack_text,
+                normalized_case_sensitive_haystack.as_ref(),
                 cursor,
             )?;
+        }
+        if candidate_precedes_cursor(normalized_case_sensitive_with_left_boundary, cursor) {
+            normalized_case_sensitive_with_left_boundary = next_literal_candidate_with_mapping(
+                &shard.entity,
+                shard
+                    .normalized_case_sensitive_literals
+                    .with_left_boundary
+                    .as_ref(),
+                haystack,
+                haystack_text,
+                normalized_case_sensitive_haystack.as_ref(),
+                cursor,
+            )?;
+        }
+        if candidate_precedes_cursor(normalized_case_insensitive_without_left_boundary, cursor) {
+            normalized_case_insensitive_without_left_boundary =
+                next_literal_candidate_with_mapping(
+                    &shard.entity,
+                    shard
+                        .normalized_ascii_case_insensitive_literals
+                        .without_left_boundary
+                        .as_ref(),
+                    haystack,
+                    haystack_text,
+                    normalized_case_insensitive_haystack.as_ref(),
+                    cursor,
+                )?;
+        }
+        if candidate_precedes_cursor(normalized_case_insensitive_with_left_boundary, cursor) {
+            normalized_case_insensitive_with_left_boundary = next_literal_candidate_with_mapping(
+                &shard.entity,
+                shard
+                    .normalized_ascii_case_insensitive_literals
+                    .with_left_boundary
+                    .as_ref(),
+                haystack,
+                haystack_text,
+                normalized_case_insensitive_haystack.as_ref(),
+                cursor,
+            )?;
+        }
+        for (layer, candidate) in shard
+            .residual_regex_layers
+            .iter()
+            .zip(&mut residual_candidates)
+        {
+            if candidate_precedes_cursor(*candidate, cursor) {
+                *candidate =
+                    next_regex_candidate(&shard.entity, Some(layer), haystack, cursor, scan_slot)?;
+            }
         }
     }
     Ok(())
@@ -497,6 +1110,155 @@ fn candidate_precedes_cursor(candidate: Option<LayerCandidate>, cursor: usize) -
     candidate
         .map(|candidate| candidate.start < cursor)
         .unwrap_or(false)
+}
+
+fn map_haystack(
+    haystack: &str,
+    normalize_whitespace: bool,
+    ascii_casefold: bool,
+) -> MappedHaystack {
+    let mut bytes = Vec::with_capacity(haystack.len());
+    let mut checkpoints = Vec::new();
+    let mut characters = haystack.char_indices().peekable();
+    while let Some((start, character)) = characters.next() {
+        if normalize_whitespace && is_regex_unicode_whitespace(character) {
+            let mut end = start + character.len_utf8();
+            while let Some(&(next_start, next_character)) = characters.peek() {
+                if !is_regex_unicode_whitespace(next_character) {
+                    break;
+                }
+                characters.next();
+                end = next_start + next_character.len_utf8();
+            }
+            bytes.push(b' ');
+            let mapped_after = bytes.len();
+            let previous_delta = checkpoints
+                .last()
+                .map(|&(mapped, original)| original - mapped)
+                .unwrap_or(0);
+            if end - mapped_after != previous_delta {
+                checkpoints.push((mapped_after, end));
+            }
+            continue;
+        }
+        if ascii_casefold {
+            if let Some(folded) = ascii_casefold_equivalent(character) {
+                bytes.push(folded);
+                checkpoints.push((bytes.len(), start + character.len_utf8()));
+                continue;
+            }
+        }
+        let mut encoded_buffer = [0; 4];
+        let encoded = character.encode_utf8(&mut encoded_buffer).as_bytes();
+        bytes.extend_from_slice(encoded);
+    }
+    let mapped = MappedHaystack { bytes, checkpoints };
+    debug_assert_eq!(
+        mapped.original_boundary(mapped.bytes.len()),
+        Some(haystack.len())
+    );
+    mapped
+}
+
+fn is_regex_unicode_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\u{0009}'..='\u{000D}'
+            | '\u{0020}'
+            | '\u{0085}'
+            | '\u{00A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
+}
+
+fn requires_whitespace_mapping(haystack: &str) -> bool {
+    let mut previous_was_whitespace = false;
+    for character in haystack.chars() {
+        let is_whitespace = is_regex_unicode_whitespace(character);
+        if is_whitespace && (character != ' ' || previous_was_whitespace) {
+            return true;
+        }
+        previous_was_whitespace = is_whitespace;
+    }
+    false
+}
+
+fn requires_ascii_casefold_mapping(haystack: &str) -> bool {
+    haystack
+        .chars()
+        .any(|character| ascii_casefold_equivalent(character).is_some())
+}
+
+fn ascii_casefold_equivalent(character: char) -> Option<u8> {
+    // regex-syntax 0.8.10's Unicode 16 simple-fold table has exactly these
+    // two non-ASCII equivalences for ASCII letters. Rust's general-purpose
+    // to_uppercase/to_lowercase mappings are broader (for example dotless ı)
+    // and would overmatch the regex contract here.
+    match character {
+        '\u{017F}' => Some(b's'),
+        '\u{212A}' => Some(b'k'),
+        _ => None,
+    }
+}
+
+fn next_mapped_literal_candidate(
+    entity: &str,
+    layer: Option<&LiteralMatcherLayer>,
+    mapped: &MappedHaystack,
+    cursor: usize,
+) -> Result<Option<LayerCandidate>> {
+    let Some(layer) = layer else {
+        return Ok(None);
+    };
+    let mapped_cursor = mapped.mapped_boundary_at_or_after(cursor);
+    let mapped_text =
+        std::str::from_utf8(&mapped.bytes).expect("literal haystack mapping preserves valid UTF-8");
+    let Some(candidate) = next_literal_candidate(
+        entity,
+        Some(layer),
+        &mapped.bytes,
+        mapped_text,
+        mapped_cursor,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(start) = mapped.original_boundary(candidate.start) else {
+        return Err(validation(
+            format!("/engine/shards/{entity}/mapped_literal/start"),
+            "mapped literal start is outside the offset map",
+        ));
+    };
+    let Some(end) = mapped.original_boundary(candidate.end) else {
+        return Err(validation(
+            format!("/engine/shards/{entity}/mapped_literal/end"),
+            "mapped literal end is outside the offset map",
+        ));
+    };
+    Ok(Some(LayerCandidate {
+        start,
+        end,
+        ..candidate
+    }))
+}
+
+fn next_literal_candidate_with_mapping(
+    entity: &str,
+    layer: Option<&LiteralMatcherLayer>,
+    haystack: &[u8],
+    haystack_text: &str,
+    mapped: Option<&MappedHaystack>,
+    cursor: usize,
+) -> Result<Option<LayerCandidate>> {
+    match mapped {
+        Some(mapped) => next_mapped_literal_candidate(entity, layer, mapped, cursor),
+        None => next_literal_candidate(entity, layer, haystack, haystack_text, cursor),
+    }
 }
 
 fn next_literal_candidate(
@@ -677,14 +1439,14 @@ fn next_regex_candidate(
     layer: Option<&RegexMatcherLayer>,
     haystack: &[u8],
     cursor: usize,
+    scan_slot: usize,
 ) -> Result<Option<LayerCandidate>> {
     let Some(layer) = layer else {
         return Ok(None);
     };
-    let Some(raw_match) = layer
-        .regex
-        .find(Input::new(haystack).span(cursor..haystack.len()))
-    else {
+    let mut cache = layer.regex.cache(scan_slot);
+    let input = Input::new(haystack).span(cursor..haystack.len());
+    let Some(raw_match) = layer.regex.regex.search_with(&mut cache, &input) else {
         return Ok(None);
     };
     layer_candidate(
@@ -697,6 +1459,53 @@ fn next_regex_candidate(
         raw_match.end(),
     )
     .map(Some)
+}
+
+fn scan_regex_layers_leftmost(
+    entity: &str,
+    layers: &[RegexMatcherLayer],
+    haystack: &[u8],
+    buffer: &mut NativeMatchBuffer,
+    scan_slot: usize,
+) -> Result<()> {
+    if layers.is_empty() {
+        return Err(validation(
+            format!("/engine/shards/{entity}/regex_layers"),
+            "bounded regex matcher has no physical layers",
+        ));
+    }
+    let mut cursor = 0;
+    let mut candidates = layers
+        .iter()
+        .map(|layer| next_regex_candidate(entity, Some(layer), haystack, cursor, scan_slot))
+        .collect::<Result<Vec<_>>>()?;
+
+    loop {
+        let Some(winner) = candidates
+            .iter()
+            .flatten()
+            .copied()
+            .min_by_key(|candidate| (candidate.start, candidate.pattern_order))
+        else {
+            break;
+        };
+        push_utf8_match(
+            buffer,
+            haystack,
+            winner.detector_index,
+            winner.start as u64,
+            winner.end as u64,
+        )?;
+        cursor = winner.end;
+
+        for (layer, candidate) in layers.iter().zip(&mut candidates) {
+            if candidate_precedes_cursor(*candidate, cursor) {
+                *candidate =
+                    next_regex_candidate(entity, Some(layer), haystack, cursor, scan_slot)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn layer_candidate(
@@ -736,12 +1545,17 @@ fn layer_candidate(
 
 fn scan_regex_matches(
     entity: &str,
-    regex: &Regex,
+    regex: &CachedRegex,
     local_to_detector: &[u32],
     haystack: &[u8],
     buffer: &mut NativeMatchBuffer,
+    scan_slot: usize,
 ) -> Result<()> {
-    for raw_match in regex.find_iter(haystack) {
+    let mut cache = regex.cache(scan_slot);
+    let mut searcher = Searcher::new(Input::new(haystack));
+    while let Some(raw_match) =
+        searcher.advance(|input| Ok::<_, MatchError>(regex.regex.search_with(&mut cache, input)))
+    {
         let local_index = raw_match.pattern().as_usize();
         let Some(&detector_index) = local_to_detector.get(local_index) else {
             return Err(validation(
@@ -839,8 +1653,13 @@ fn scan_global_leftmost(
     matcher: &GlobalLeftmostMatcher,
     haystack: &[u8],
     buffer: &mut NativeMatchBuffer,
+    scan_slot: usize,
 ) -> Result<()> {
-    for raw_match in matcher.regex.find_iter(haystack) {
+    let mut cache = matcher.regex.cache(scan_slot);
+    let mut searcher = Searcher::new(Input::new(haystack));
+    while let Some(raw_match) = searcher
+        .advance(|input| Ok::<_, MatchError>(matcher.regex.regex.search_with(&mut cache, input)))
+    {
         let local_index = raw_match.pattern().as_usize();
         let Some(&detector_index) = matcher.local_to_detector.get(local_index) else {
             return Err(validation(
@@ -983,7 +1802,7 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
         .configure(
             HybridDfa::config()
                 .match_kind(RegexMatchKind::All)
-                .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),
+                .cache_capacity(INTERNAL_MODE_HYBRID_CACHE_CAPACITY),
         )
         .build_from_nfa(forward_nfa)
         .map_err(|error| {
@@ -999,7 +1818,7 @@ fn compile_all_overlaps(canonical: &CanonicalBank) -> Result<AllOverlapsMatcher>
                 .starts_for_each_pattern(true)
                 .prefilter(None)
                 .specialize_start_states(false)
-                .cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY),
+                .cache_capacity(INTERNAL_MODE_HYBRID_CACHE_CAPACITY),
         )
         .build_from_nfa(reverse_nfa)
         .map_err(|error| {
@@ -1044,9 +1863,12 @@ fn compile_global_leftmost(canonical: &CanonicalBank) -> Result<GlobalLeftmostMa
         .configure(
             Regex::config()
                 .match_kind(RegexMatchKind::LeftmostFirst)
+                .which_captures(WhichCaptures::Implicit)
+                .onepass(false)
+                .backtrack(false)
                 .nfa_size_limit(Some(ENTITY_INDEPENDENT_NFA_SIZE_LIMIT))
                 .onepass_size_limit(Some(ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT))
-                .hybrid_cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY)
+                .hybrid_cache_capacity(INTERNAL_MODE_HYBRID_CACHE_CAPACITY)
                 .dfa_size_limit(Some(ENTITY_INDEPENDENT_DFA_SIZE_LIMIT))
                 .dfa_state_limit(Some(ENTITY_INDEPENDENT_DFA_STATE_LIMIT)),
         )
@@ -1066,17 +1888,22 @@ fn compile_global_leftmost(canonical: &CanonicalBank) -> Result<GlobalLeftmostMa
         })?;
 
     Ok(GlobalLeftmostMatcher {
-        regex,
+        regex: CachedRegex::new(regex),
         local_to_detector,
     })
 }
 
-fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherShard>> {
+fn compile_entity_independent(
+    canonical: &CanonicalBank,
+) -> Result<(Vec<MatcherShard>, RegexResourceProfile)> {
     let mut shards = Vec::with_capacity(canonical.entities.len());
     let mut next_detector_index = 0u32;
+    let mut regex_budget = RegexResourceBudget::default();
     for entity in &canonical.entities {
+        regex_budget.start_entity();
         let mut patterns = Vec::with_capacity(entity.patterns.len());
         let mut literal_patterns = Vec::with_capacity(entity.patterns.len());
+        let mut normalized_whitespace_patterns = Vec::with_capacity(entity.patterns.len());
         let mut local_to_detector = Vec::with_capacity(entity.patterns.len());
         for (pattern_index, pattern) in entity.patterns.iter().enumerate() {
             let hir = parse_pattern_with_flags(
@@ -1085,7 +1912,14 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
                 &pattern.regex,
                 &pattern.flags,
             )?;
-            literal_patterns.push(layer_literal_pattern(pattern, &hir));
+            let literal = layer_literal_pattern(pattern, &hir);
+            normalized_whitespace_patterns.push(
+                literal
+                    .is_none()
+                    .then(|| normalized_whitespace_literal_pattern(pattern, &hir))
+                    .flatten(),
+            );
+            literal_patterns.push(literal);
             patterns.push(hir);
             local_to_detector.push(next_detector_index);
             next_detector_index = next_detector_index.checked_add(1).ok_or_else(|| {
@@ -1104,21 +1938,46 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
             .all(|hir| matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0));
         let literal_count = literal_patterns
             .iter()
-            .filter(|literal| literal.is_some())
+            .zip(&normalized_whitespace_patterns)
+            .filter(|(literal, normalized)| literal.is_some() || normalized.is_some())
             .count();
         let first_literal_case = literal_patterns
             .iter()
-            .flatten()
-            .next()
+            .zip(&normalized_whitespace_patterns)
+            .find_map(|(literal, normalized)| literal.as_ref().or(normalized.as_ref()))
             .map(|literal| literal.case_insensitive);
 
-        let shard = if !all_patterns_non_empty || literal_count == 0 {
+        let shard = if !all_patterns_non_empty {
+            let regex = compile_entity_regex(&entity.name, &patterns)?;
+            regex_budget.record(
+                &entity.name,
+                &regex,
+                &patterns,
+                ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+            )?;
             MatcherShard::Regex(RegexMatcherShard {
                 entity: entity.name.clone(),
-                regex: compile_entity_regex(&entity.name, &patterns)?,
-                local_to_detector,
+                matcher: RegexShardMatcher::Monolithic {
+                    regex: CachedRegex::new(regex),
+                    local_to_detector,
+                },
+            })
+        } else if literal_count == 0 {
+            let pattern_orders = (0..patterns.len()).collect::<Vec<_>>();
+            MatcherShard::Regex(RegexMatcherShard {
+                entity: entity.name.clone(),
+                matcher: RegexShardMatcher::Bounded {
+                    layers: compile_bounded_regex_layers(
+                        &entity.name,
+                        &patterns,
+                        &local_to_detector,
+                        &pattern_orders,
+                        &mut regex_budget,
+                    )?,
+                },
             })
         } else if literal_count == patterns.len()
+            && normalized_whitespace_patterns.iter().all(Option::is_none)
             && literal_patterns
                 .iter()
                 .flatten()
@@ -1147,72 +2006,80 @@ fn compile_entity_independent(canonical: &CanonicalBank) -> Result<Vec<MatcherSh
                     .collect(),
                 case_insensitive,
                 local_to_detector,
-                patterns,
             )?)
         } else {
             MatcherShard::Layered(compile_layered_shard(
                 &entity.name,
                 patterns,
                 literal_patterns,
+                normalized_whitespace_patterns,
                 local_to_detector,
+                &mut regex_budget,
             )?)
         };
 
         shards.push(shard);
     }
-    Ok(shards)
+    Ok((shards, regex_budget.profile()))
 }
 
 fn compile_layered_shard(
     entity_name: &str,
     patterns: Vec<Hir>,
     literal_patterns: Vec<Option<SimpleLiteralPattern>>,
+    normalized_whitespace_patterns: Vec<Option<SimpleLiteralPattern>>,
     local_to_detector: Vec<u32>,
+    regex_budget: &mut RegexResourceBudget,
 ) -> Result<LayeredMatcherShard> {
     let mut case_sensitive_patterns = Vec::new();
     let mut case_insensitive_patterns = Vec::new();
+    let mut normalized_case_sensitive_patterns = Vec::new();
+    let mut normalized_case_insensitive_patterns = Vec::new();
     let mut residual_patterns = Vec::new();
     let mut residual_detectors = Vec::new();
     let mut residual_orders = Vec::new();
-    let has_case_insensitive_literals = literal_patterns
-        .iter()
-        .flatten()
-        .any(|literal| literal.case_insensitive);
-    // Aho-Corasick only provides ASCII case folding. Compile the complete
-    // Unicode fallback now so a successful engine construction guarantees
-    // every scan path is ready and within the configured regex limits.
-    let unicode_fallback_regex = if has_case_insensitive_literals {
-        Some(compile_entity_regex(entity_name, &patterns)?)
-    } else {
-        None
-    };
-
-    for (pattern_order, ((hir, literal), detector_index)) in patterns
+    for (pattern_order, (((hir, literal), normalized), detector_index)) in patterns
         .into_iter()
         .zip(literal_patterns)
+        .zip(normalized_whitespace_patterns)
         .zip(local_to_detector.iter().copied())
         .enumerate()
     {
-        match literal {
-            Some(literal) if literal.case_insensitive => {
+        match (literal, normalized) {
+            (Some(literal), None) if literal.case_insensitive => {
                 case_insensitive_patterns.push(LayerLiteralPattern {
                     literal,
                     detector_index,
                     pattern_order,
                 });
             }
-            Some(literal) => {
+            (Some(literal), None) => {
                 case_sensitive_patterns.push(LayerLiteralPattern {
                     literal,
                     detector_index,
                     pattern_order,
                 });
             }
-            None => {
+            (None, Some(literal)) if literal.case_insensitive => {
+                normalized_case_insensitive_patterns.push(LayerLiteralPattern {
+                    literal,
+                    detector_index,
+                    pattern_order,
+                });
+            }
+            (None, Some(literal)) => {
+                normalized_case_sensitive_patterns.push(LayerLiteralPattern {
+                    literal,
+                    detector_index,
+                    pattern_order,
+                });
+            }
+            (None, None) => {
                 residual_patterns.push(hir);
                 residual_detectors.push(detector_index);
                 residual_orders.push(pattern_order);
             }
+            (Some(_), Some(_)) => unreachable!("literal classifiers are mutually exclusive"),
         }
     }
 
@@ -1228,21 +2095,27 @@ fn compile_layered_shard(
             case_insensitive_patterns,
             true,
         )?,
-        residual_regex: if residual_patterns.is_empty() {
-            None
+        normalized_case_sensitive_literals: compile_literal_layers(
+            entity_name,
+            normalized_case_sensitive_patterns,
+            false,
+        )?,
+        normalized_ascii_case_insensitive_literals: compile_literal_layers(
+            entity_name,
+            normalized_case_insensitive_patterns,
+            true,
+        )?,
+        residual_regex_layers: if residual_patterns.is_empty() {
+            Vec::new()
         } else {
-            Some(RegexMatcherLayer {
-                regex: compile_entity_regex_with_pattern_orders(
-                    entity_name,
-                    &residual_patterns,
-                    Some(&residual_orders),
-                )?,
-                local_to_detector: residual_detectors,
-                local_to_pattern_order: residual_orders,
-            })
+            compile_bounded_regex_layers(
+                entity_name,
+                &residual_patterns,
+                &residual_detectors,
+                &residual_orders,
+                regex_budget,
+            )?
         },
-        fallback_local_to_detector: has_case_insensitive_literals.then_some(local_to_detector),
-        unicode_fallback_regex,
     })
 }
 
@@ -1381,36 +2254,206 @@ fn compile_entity_regex_with_pattern_orders(
     patterns: &[Hir],
     pattern_orders: Option<&[usize]>,
 ) -> Result<Regex> {
+    build_entity_regex(patterns)
+        .map_err(|error| entity_regex_build_error(entity_name, pattern_orders, error))
+}
+
+fn build_entity_regex(patterns: &[Hir]) -> std::result::Result<Regex, RegexBuildError> {
+    build_entity_regex_with_cache(patterns, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY)
+}
+
+fn build_entity_regex_with_cache(
+    patterns: &[Hir],
+    hybrid_cache_capacity: usize,
+) -> std::result::Result<Regex, RegexBuildError> {
     Regex::builder()
         .configure(
             Regex::config()
                 .match_kind(RegexMatchKind::LeftmostFirst)
+                .which_captures(WhichCaptures::Implicit)
+                .onepass(false)
+                .backtrack(false)
                 .nfa_size_limit(Some(ENTITY_INDEPENDENT_NFA_SIZE_LIMIT))
                 .onepass_size_limit(Some(ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT))
-                .hybrid_cache_capacity(ENTITY_INDEPENDENT_HYBRID_CACHE_CAPACITY)
+                .hybrid_cache_capacity(hybrid_cache_capacity)
                 .dfa_size_limit(Some(ENTITY_INDEPENDENT_DFA_SIZE_LIMIT))
                 .dfa_state_limit(Some(ENTITY_INDEPENDENT_DFA_STATE_LIMIT)),
         )
         .build_many_from_hir(patterns)
-        .map_err(|error| {
-            let path = match error.pattern() {
-                Some(pattern_id) => {
-                    let local_index = pattern_id.as_usize();
-                    let pattern_index = pattern_orders
-                        .and_then(|orders| orders.get(local_index))
-                        .copied()
-                        .unwrap_or(local_index);
-                    pattern_path_by_index(entity_name, pattern_index)
+}
+
+fn entity_regex_build_error(
+    entity_name: &str,
+    pattern_orders: Option<&[usize]>,
+    error: RegexBuildError,
+) -> crate::error::BankError {
+    let path = match error.pattern() {
+        Some(pattern_id) => {
+            let local_index = pattern_id.as_usize();
+            let pattern_index = pattern_orders
+                .and_then(|orders| orders.get(local_index))
+                .copied()
+                .unwrap_or(local_index);
+            pattern_path_by_index(entity_name, pattern_index)
+        }
+        None => pattern_orders
+            .and_then(|orders| (orders.len() == 1).then(|| orders[0]))
+            .map(|pattern_index| pattern_path_by_index(entity_name, pattern_index))
+            .unwrap_or_else(|| format!("/entities/{entity_name}/patterns")),
+    };
+    validation(
+        path,
+        format!(
+            "could not compile entity-independent regex matcher for entity {entity_name:?}: {error}"
+        ),
+    )
+}
+
+fn compile_bounded_regex_layers(
+    entity_name: &str,
+    patterns: &[Hir],
+    local_to_detector: &[u32],
+    pattern_orders: &[usize],
+    regex_budget: &mut RegexResourceBudget,
+) -> Result<Vec<RegexMatcherLayer>> {
+    if patterns.len() != local_to_detector.len()
+        || patterns.len() != pattern_orders.len()
+        || patterns.is_empty()
+    {
+        return Err(validation(
+            format!("/engine/shards/{entity_name}/regex_layers"),
+            "bounded regex pattern and detector maps are inconsistent",
+        ));
+    }
+    if patterns
+        .iter()
+        .any(|hir| !matches!(hir.properties().minimum_len(), Some(minimum) if minimum > 0))
+    {
+        return Err(validation(
+            format!("/engine/shards/{entity_name}/regex_layers"),
+            "bounded regex shards require every pattern to advance the shared cursor",
+        ));
+    }
+    let mut layers = Vec::new();
+    let mut start = 0;
+    while start < patterns.len() {
+        let mut end = start;
+        let mut minimum_bytes = 0usize;
+        while end < patterns.len() && end - start < MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER {
+            let pattern_minimum = patterns[end]
+                .properties()
+                .minimum_len()
+                .expect("bounded regex layers reject unknown minimum lengths");
+            if end > start
+                && minimum_bytes.saturating_add(pattern_minimum)
+                    > BOUNDED_REGEX_INITIAL_MAX_MINIMUM_BYTES
+            {
+                break;
+            }
+            minimum_bytes = minimum_bytes.saturating_add(pattern_minimum);
+            end += 1;
+        }
+        compile_bounded_regex_shard(
+            entity_name,
+            &patterns[start..end],
+            &local_to_detector[start..end],
+            &pattern_orders[start..end],
+            regex_budget,
+            &mut layers,
+        )?;
+        start = end;
+    }
+    Ok(layers)
+}
+
+fn compile_bounded_regex_shard(
+    entity_name: &str,
+    patterns: &[Hir],
+    local_to_detector: &[u32],
+    pattern_orders: &[usize],
+    regex_budget: &mut RegexResourceBudget,
+    layers: &mut Vec<RegexMatcherLayer>,
+) -> Result<()> {
+    match build_entity_regex_with_cache(patterns, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY) {
+        Ok(regex) => {
+            let record = regex_budget.record(
+                entity_name,
+                &regex,
+                patterns,
+                ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+            );
+            if let Err(error) = record {
+                if patterns.len() == 1 {
+                    return Err(error);
                 }
-                None => format!("/entities/{entity_name}/patterns"),
-            };
-            validation(
-                path,
-                format!(
-                    "could not compile entity-independent regex matcher for entity {entity_name:?}: {error}"
-                ),
+                regex_budget.resource_limit_bisections = regex_budget
+                    .resource_limit_bisections
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        memory(
+                            format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                            "compiled regex resource-limit bisection count overflowed",
+                        )
+                    })?;
+                let middle = patterns.len() / 2;
+                compile_bounded_regex_shard(
+                    entity_name,
+                    &patterns[..middle],
+                    &local_to_detector[..middle],
+                    &pattern_orders[..middle],
+                    regex_budget,
+                    layers,
+                )?;
+                return compile_bounded_regex_shard(
+                    entity_name,
+                    &patterns[middle..],
+                    &local_to_detector[middle..],
+                    &pattern_orders[middle..],
+                    regex_budget,
+                    layers,
+                );
+            }
+            layers.push(RegexMatcherLayer {
+                regex: CachedRegex::new(regex),
+                local_to_detector: local_to_detector.to_vec(),
+                local_to_pattern_order: pattern_orders.to_vec(),
+            });
+            Ok(())
+        }
+        Err(error) if error.size_limit().is_some() && patterns.len() > 1 => {
+            regex_budget.size_limit_bisections = regex_budget
+                .size_limit_bisections
+                .checked_add(1)
+                .ok_or_else(|| {
+                    memory(
+                        format!("/engine/shards/{entity_name}/regex_resource_budget"),
+                        "compiled regex size-limit bisection count overflowed",
+                    )
+                })?;
+            let middle = patterns.len() / 2;
+            compile_bounded_regex_shard(
+                entity_name,
+                &patterns[..middle],
+                &local_to_detector[..middle],
+                &pattern_orders[..middle],
+                regex_budget,
+                layers,
+            )?;
+            compile_bounded_regex_shard(
+                entity_name,
+                &patterns[middle..],
+                &local_to_detector[middle..],
+                &pattern_orders[middle..],
+                regex_budget,
+                layers,
             )
-        })
+        }
+        Err(error) => Err(entity_regex_build_error(
+            entity_name,
+            Some(pattern_orders),
+            error,
+        )),
+    }
 }
 
 fn compile_literal_shard(
@@ -1418,25 +2461,17 @@ fn compile_literal_shard(
     literal_patterns: Vec<String>,
     case_insensitive: bool,
     local_to_detector: Vec<u32>,
-    fallback_patterns: Vec<Hir>,
 ) -> Result<LiteralMatcherShard> {
     let matcher = compile_literal_matcher(
         entity_name,
         literal_patterns.iter().map(String::as_str),
         case_insensitive,
     )?;
-    let unicode_fallback_regex = if case_insensitive {
-        Some(compile_entity_regex(entity_name, &fallback_patterns)?)
-    } else {
-        None
-    };
-
     Ok(LiteralMatcherShard {
         entity: entity_name.to_string(),
         matcher,
         case_insensitive,
         local_to_detector,
-        unicode_fallback_regex,
     })
 }
 
@@ -1474,6 +2509,43 @@ fn layer_literal_pattern(pattern: &CanonicalPattern, hir: &Hir) -> Option<Simple
     // residual regex layer. Left-bounded and fully unbounded literals retain
     // the optimized Aho-Corasick paths.
     (!literal.right_unicode_word_boundary || literal.left_unicode_word_boundary).then_some(literal)
+}
+
+fn normalized_whitespace_literal_pattern(
+    pattern: &CanonicalPattern,
+    hir: &Hir,
+) -> Option<SimpleLiteralPattern> {
+    let (regex, raw_left_boundary, raw_right_boundary) =
+        strip_simple_unicode_word_boundaries(&pattern.regex)?;
+    let mut parts = Vec::new();
+    flatten_hir_sequence(hir, &mut parts);
+    let (_, _, hir_left_boundary, hir_right_boundary) = unicode_word_boundary_body(&parts)?;
+    if (raw_left_boundary, raw_right_boundary) != (hir_left_boundary, hir_right_boundary) {
+        return None;
+    }
+    let case_insensitive = match pattern.flags.as_slice() {
+        [] => false,
+        [flag] if flag == "IGNORECASE" => true,
+        _ => return None,
+    };
+    let raw_parts = regex.split(r"\s+").collect::<Vec<_>>();
+    if raw_parts.len() < 2 || raw_parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let value = raw_parts
+        .into_iter()
+        .map(unescape_simple_literal_regex)
+        .collect::<Option<Vec<_>>>()?
+        .join(" ");
+    if value.is_empty() || (case_insensitive && !value.is_ascii()) {
+        return None;
+    }
+    Some(SimpleLiteralPattern {
+        value,
+        case_insensitive,
+        left_unicode_word_boundary: raw_left_boundary,
+        right_unicode_word_boundary: raw_right_boundary,
+    })
 }
 
 fn exact_hir_literal_pattern(hir: &Hir) -> Option<SimpleLiteralPattern> {
@@ -1797,7 +2869,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let regex = compile_entity_regex("entity", &hirs).unwrap();
+        let regex = CachedRegex::new(compile_entity_regex("entity", &hirs).unwrap());
         let local_to_detector = (0..patterns.len())
             .map(|index| u32::try_from(index).unwrap())
             .collect::<Vec<_>>();
@@ -1808,6 +2880,54 @@ mod tests {
             &local_to_detector,
             text.as_bytes(),
             &mut buffer,
+            0,
+        )
+        .unwrap();
+        buffer.sort();
+        (0..buffer.len())
+            .map(|index| buffer.get(index).unwrap().as_tuple())
+            .collect()
+    }
+
+    fn unbounded_monolithic_raw_matches(
+        patterns: &[CanonicalPattern],
+        text: &str,
+    ) -> Vec<(u32, u64, u64)> {
+        let hirs = patterns
+            .iter()
+            .enumerate()
+            .map(|(pattern_index, pattern)| {
+                parse_pattern_with_flags("entity", pattern_index, &pattern.regex, &pattern.flags)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let regex = Regex::builder()
+            .configure(
+                Regex::config()
+                    .match_kind(RegexMatchKind::LeftmostFirst)
+                    .which_captures(WhichCaptures::Implicit)
+                    .onepass(false)
+                    .backtrack(false)
+                    .nfa_size_limit(None)
+                    .onepass_size_limit(Some(ENTITY_INDEPENDENT_ONEPASS_SIZE_LIMIT))
+                    .hybrid_cache_capacity(INTERNAL_MODE_HYBRID_CACHE_CAPACITY)
+                    .dfa_size_limit(Some(ENTITY_INDEPENDENT_DFA_SIZE_LIMIT))
+                    .dfa_state_limit(Some(ENTITY_INDEPENDENT_DFA_STATE_LIMIT)),
+            )
+            .build_many_from_hir(&hirs)
+            .unwrap();
+        let regex = CachedRegex::new(regex);
+        let local_to_detector = (0..patterns.len())
+            .map(|index| u32::try_from(index).unwrap())
+            .collect::<Vec<_>>();
+        let mut buffer = NativeMatchBuffer::new();
+        scan_regex_matches(
+            "entity",
+            &regex,
+            &local_to_detector,
+            text.as_bytes(),
+            &mut buffer,
+            0,
         )
         .unwrap();
         buffer.sort();
@@ -1824,6 +2944,37 @@ mod tests {
             [MatcherShard::Layered(_)]
         ));
         assert_eq!(engine_raw_matches(&engine, text), expected);
+    }
+
+    fn large_regex_pattern_fixture(
+        first: CanonicalPattern,
+        second_half: CanonicalPattern,
+    ) -> Vec<CanonicalPattern> {
+        const PATTERN_COUNT: usize = 160;
+        const SECOND_HALF_INDEX: usize = PATTERN_COUNT / 2;
+        let padding = "a".repeat(112);
+        let mut patterns = vec![first];
+        patterns.extend((1..SECOND_HALF_INDEX).map(|index| {
+            canonical_pattern(
+                &format!(r"(?:NERB_UNUSED_{index:08}{padding})[aA]"),
+                &["IGNORECASE"],
+            )
+        }));
+        patterns.push(second_half);
+        patterns.extend(((SECOND_HALF_INDEX + 1)..PATTERN_COUNT).map(|index| {
+            canonical_pattern(
+                &format!(r"(?:NERB_UNUSED_{index:08}{padding})[aA]"),
+                &["IGNORECASE"],
+            )
+        }));
+        patterns
+    }
+
+    fn regex_layer_pattern_orders(layers: &[RegexMatcherLayer]) -> Vec<usize> {
+        layers
+            .iter()
+            .flat_map(|layer| layer.local_to_pattern_order.iter().copied())
+            .collect()
     }
 
     #[test]
@@ -1844,19 +2995,76 @@ mod tests {
     }
 
     #[test]
-    fn literal_shard_falls_back_for_non_ascii_case_folding() {
-        let engine = engine_for_patterns(vec![canonical_pattern("k", &["IGNORECASE"])]);
+    fn literal_shard_maps_only_regex_simple_unicode_folds() {
+        let patterns = vec![
+            canonical_pattern("k", &["IGNORECASE"]),
+            canonical_pattern("s", &["IGNORECASE"]),
+            canonical_pattern("i", &["IGNORECASE"]),
+        ];
+        let engine = engine_for_patterns(patterns.clone());
 
-        let [MatcherShard::Literal(shard)] = engine.shards.as_slice() else {
+        let [MatcherShard::Literal(_)] = engine.shards.as_slice() else {
             panic!("case-insensitive exact literals should use a literal shard");
         };
-        assert!(shard.unicode_fallback_regex.is_some());
-        assert_eq!(engine_raw_matches(&engine, "K"), [(0, 0, 1)]);
-        assert_eq!(engine_raw_matches(&engine, "K"), [(0, 0, 3)]);
+        for text in ["K S I", "K ſ ı", "Kſi"] {
+            assert_eq!(
+                engine_raw_matches(&engine, text),
+                monolithic_raw_matches(&patterns, text)
+            );
+        }
+        assert!(!engine_raw_matches(&engine, "ı")
+            .iter()
+            .any(|&(detector, _, _)| detector == 2));
     }
 
     #[test]
-    fn unicode_fallback_compile_limits_fail_engine_construction() {
+    fn mapped_unicode_fold_and_whitespace_tables_match_monolithic_exhaustively() {
+        let fold_patterns = ('a'..='z')
+            .map(|character| canonical_pattern(&character.to_string(), &["IGNORECASE"]))
+            .collect::<Vec<_>>();
+        let mut all_scalars = String::new();
+        let mut whitespace_segments = String::new();
+        for codepoint in 0..=0x10FFFF {
+            let Some(character) = char::from_u32(codepoint) else {
+                continue;
+            };
+            all_scalars.push(character);
+            all_scalars.push('|');
+            whitespace_segments.push('a');
+            whitespace_segments.push(character);
+            whitespace_segments.push('b');
+            whitespace_segments.push('|');
+        }
+        let fold_engine = engine_for_patterns(fold_patterns.clone());
+        assert_eq!(
+            engine_raw_matches(&fold_engine, &all_scalars),
+            monolithic_raw_matches(&fold_patterns, &all_scalars)
+        );
+
+        let whitespace_patterns = vec![canonical_pattern(r"\b(?:a\s+b)\b", &[])];
+        let whitespace_engine = engine_for_patterns(whitespace_patterns.clone());
+        let [MatcherShard::Layered(whitespace_shard)] = whitespace_engine.shards.as_slice() else {
+            panic!("the exhaustive whitespace fixture must exercise the mapped Aho layer");
+        };
+        assert_eq!(
+            whitespace_shard
+                .normalized_case_sensitive_literals
+                .with_left_boundary
+                .as_ref()
+                .unwrap()
+                .patterns
+                .len(),
+            1
+        );
+        assert!(whitespace_shard.residual_regex_layers.is_empty());
+        assert_eq!(
+            engine_raw_matches(&whitespace_engine, &whitespace_segments),
+            monolithic_raw_matches(&whitespace_patterns, &whitespace_segments)
+        );
+    }
+
+    #[test]
+    fn large_case_insensitive_literal_entity_needs_only_true_residual_regex_layers() {
         const LITERAL_COUNT: usize = 1_500;
         const LITERAL_LENGTH: usize = 128;
         let padding = "a".repeat(LITERAL_LENGTH - 16);
@@ -1865,11 +3073,8 @@ mod tests {
             .collect::<Vec<_>>();
         patterns.push(canonical_pattern(r"\d+", &[]));
 
-        // The optimized pieces are independently valid: exact ASCII-CI
-        // literals fit the Aho-Corasick layer and the true residual fits its
-        // small regex layer. Only the complete Unicode-correct fallback,
-        // which must represent every long case-insensitive literal, exceeds
-        // the entity regex NFA limit.
+        // Exact ASCII-CI literals fit the mapped Aho-Corasick layer. Only the
+        // true residual regex consumes the regex resource budget.
         let literal_layers = compile_literal_layers(
             "entity",
             patterns[..LITERAL_COUNT]
@@ -1905,17 +3110,490 @@ mod tests {
         compile_entity_regex_with_pattern_orders("entity", &[residual], Some(&[LITERAL_COUNT]))
             .expect("the residual regex layer should compile independently");
 
-        let error = match NativeEngine::compile(
-            &canonical_for_patterns(patterns),
-            MatchMode::EntityIndependent,
-        ) {
-            Ok(_) => panic!("the full Unicode fallback must compile before construction succeeds"),
-            Err(error) => error,
+        let canonical = canonical_for_patterns(patterns);
+        let engine = NativeEngine::compile(&canonical, MatchMode::EntityIndependent)
+            .expect("mapped literals and the residual should compile");
+        let replayed = NativeEngine::compile(&canonical, MatchMode::EntityIndependent)
+            .expect("mapped literals and the residual should compile deterministically");
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("the mixed fixture should use a layered matcher");
         };
+        assert_eq!(shard.residual_regex_layers.len(), 1);
+        assert_eq!(
+            engine.regex_resource_profile(),
+            replayed.regex_resource_profile()
+        );
+        assert_eq!(
+            engine
+                .regex_resource_profile()
+                .unwrap()
+                .physical_regex_layers,
+            1
+        );
+        let text = format!("CONTACT00000042{padding} 123");
+        let matches = engine_raw_matches(&engine, &text);
+        assert!(matches.iter().any(|&(detector, _, _)| detector == 42));
+        assert!(matches
+            .iter()
+            .any(|&(detector, _, _)| detector == LITERAL_COUNT as u32));
+    }
 
+    #[test]
+    fn bounded_regex_singleton_size_error_preserves_original_pattern_index() {
+        let pattern = canonical_pattern(r"[a-z]{1000000}", &["IGNORECASE"]);
+        let hir = parse_pattern_with_flags("entity", 37, &pattern.regex, &pattern.flags).unwrap();
+        let mut budget = RegexResourceBudget::default();
+        let error =
+            compile_bounded_regex_layers("entity", &[hir], &[11], &[37], &mut budget).unwrap_err();
+
+        assert!(error.to_string().contains("/entities/entity/patterns/37"));
         assert!(error
             .to_string()
             .contains("could not compile entity-independent regex matcher"));
+    }
+
+    #[test]
+    fn pikevm_fixed_cache_projection_is_accounted_above_hybrid_capacity() {
+        const PATTERN_COUNT: usize = 8;
+        let patterns = (0..PATTERN_COUNT)
+            .map(|index| {
+                let pattern = canonical_pattern(
+                    &format!(
+                        r"(?:\p{{Letter}}|\p{{Number}}){{{minimum},{maximum}}}",
+                        minimum = index + 1,
+                        maximum = index + 2,
+                    ),
+                    &["IGNORECASE"],
+                );
+                parse_pattern_with_flags("cache-shape", index, &pattern.regex, &pattern.flags)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let regex =
+            build_entity_regex_with_cache(&patterns, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY)
+                .unwrap();
+        let mut budget = RegexResourceBudget::default();
+        budget.start_entity();
+        budget
+            .record(
+                "cache-shape",
+                &regex,
+                &patterns,
+                ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+            )
+            .unwrap();
+        let profile = budget.profile();
+
+        assert_eq!(profile.physical_regex_layers, 1);
+        assert!(profile.eager_cache_bytes_per_scan > 0);
+        assert!(
+            profile.pikevm_cache_projection_bytes_per_scan
+                > ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+            "complex regex PikeVM fixed cache was only {} bytes",
+            profile.pikevm_cache_projection_bytes_per_scan
+        );
+        assert!(profile.pikevm_stack_growth_allowance_bytes_per_scan > 0);
+        assert_eq!(
+            profile.lazy_dfa_growth_allowance_bytes_per_scan,
+            ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY * MAX_LAZY_DFA_CACHES_PER_META_REGEX
+        );
+        assert_eq!(
+            profile.regex_cache_allowance_bytes,
+            (profile.eager_cache_bytes_per_scan
+                + profile.pikevm_cache_projection_bytes_per_scan
+                + profile.pikevm_stack_growth_allowance_bytes_per_scan
+                + profile.lazy_dfa_growth_allowance_bytes_per_scan)
+                * MAX_CONCURRENT_SCANS_PER_ENGINE
+        );
+    }
+
+    #[test]
+    fn pikevm_fixed_cache_projection_bounds_actual_cache_and_fails_closed_on_overflow() {
+        use regex_automata::nfa::thompson::pikevm::PikeVM;
+
+        let fixtures = [
+            vec![parse_pattern_with_flags("projection", 0, r"\d+", &[]).unwrap()],
+            (0..8)
+                .map(|index| {
+                    parse_pattern_with_flags(
+                        "projection",
+                        index,
+                        &format!(
+                            r"(?:\p{{Letter}}|\p{{Number}}){{{minimum},{maximum}}}",
+                            minimum = index + 1,
+                            maximum = index + 2,
+                        ),
+                        &["IGNORECASE".to_string()],
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>(),
+        ];
+
+        for patterns in fixtures {
+            let nfa = thompson::NFA::compiler()
+                .configure(
+                    thompson::Config::new()
+                        .which_captures(WhichCaptures::Implicit)
+                        .nfa_size_limit(Some(ENTITY_INDEPENDENT_NFA_SIZE_LIMIT)),
+                )
+                .build_many_from_hir(&patterns)
+                .unwrap();
+            let projection = project_pikevm_cache_bytes(&nfa).unwrap();
+            let actual = PikeVM::new_from_nfa(nfa)
+                .unwrap()
+                .create_cache()
+                .memory_usage();
+            assert!(
+                projection >= actual,
+                "PikeVM cache projection {projection} did not bound {actual} actual bytes"
+            );
+        }
+
+        assert_eq!(
+            project_pikevm_cache_bytes_from_counts(usize::MAX, usize::MAX, usize::MAX),
+            None
+        );
+        assert_eq!(
+            project_pikevm_cache_bytes_from_counts(1, 1, usize::MAX),
+            None
+        );
+    }
+
+    #[test]
+    fn bounded_regex_layer_envelope_partitions_deterministically() {
+        let canonical_patterns = large_regex_pattern_fixture(
+            canonical_pattern(r"(?:NERB_FIRST)[aA]", &["IGNORECASE"]),
+            canonical_pattern(r"(?:NERB_MIDDLE)[aA]", &["IGNORECASE"]),
+        );
+        let patterns = canonical_patterns
+            .iter()
+            .enumerate()
+            .map(|(index, pattern)| {
+                parse_pattern_with_flags("entity", index, &pattern.regex, &pattern.flags).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let detectors = (0..patterns.len())
+            .map(|index| u32::try_from(index).unwrap())
+            .collect::<Vec<_>>();
+        let orders = (0..patterns.len()).collect::<Vec<_>>();
+
+        let compile = || {
+            let mut budget = RegexResourceBudget::default();
+            budget.start_entity();
+            let layers =
+                compile_bounded_regex_layers("entity", &patterns, &detectors, &orders, &mut budget)
+                    .unwrap();
+            (budget.profile(), layers)
+        };
+        let (first_profile, first_layers) = compile();
+        let (second_profile, second_layers) = compile();
+        let first_partition = first_layers
+            .iter()
+            .map(|layer| layer.local_to_pattern_order.len())
+            .collect::<Vec<_>>();
+        let second_partition = second_layers
+            .iter()
+            .map(|layer| layer.local_to_pattern_order.len())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_profile.size_limit_bisections, 0);
+        assert_eq!(first_profile.resource_limit_bisections, 0);
+        assert_eq!(
+            first_profile.physical_regex_layers,
+            (canonical_patterns.len() + MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER - 1)
+                / MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER
+        );
+        assert!(first_partition
+            .iter()
+            .all(|&count| count <= MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER));
+        assert_eq!(first_profile, second_profile);
+        assert_eq!(first_partition, second_partition);
+        assert_eq!(regex_layer_pattern_orders(&first_layers), orders);
+    }
+
+    #[test]
+    fn resource_budget_bisection_succeeds_and_is_deterministic() {
+        let canonical_patterns = large_regex_pattern_fixture(
+            canonical_pattern(r"(?:NERB_FIRST)[aA]", &["IGNORECASE"]),
+            canonical_pattern(r"(?:NERB_MIDDLE)[aA]", &["IGNORECASE"]),
+        );
+        let patterns = canonical_patterns
+            .iter()
+            .take(MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER)
+            .enumerate()
+            .map(|(index, pattern)| {
+                parse_pattern_with_flags("resource-split", index, &pattern.regex, &pattern.flags)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let detectors = (0..patterns.len())
+            .map(|index| u32::try_from(index).unwrap())
+            .collect::<Vec<_>>();
+        let orders = (0..patterns.len()).collect::<Vec<_>>();
+        let middle = patterns.len() / 2;
+
+        let whole_regex =
+            build_entity_regex_with_cache(&patterns, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY)
+                .unwrap();
+        let mut whole_budget = RegexResourceBudget::default();
+        whole_budget.start_entity();
+        whole_budget
+            .record(
+                "resource-split",
+                &whole_regex,
+                &patterns,
+                ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+            )
+            .unwrap();
+        let whole_profile = whole_budget.profile();
+        let whole_bytes =
+            whole_profile.compiled_regex_static_bytes + whole_profile.regex_cache_allowance_bytes;
+
+        let mut split_budget = RegexResourceBudget::default();
+        split_budget.start_entity();
+        for half in [&patterns[..middle], &patterns[middle..]] {
+            let regex =
+                build_entity_regex_with_cache(half, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY)
+                    .unwrap();
+            split_budget
+                .record(
+                    "resource-split",
+                    &regex,
+                    half,
+                    ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+                )
+                .unwrap();
+        }
+        let split_profile = split_budget.profile();
+        let split_bytes =
+            split_profile.compiled_regex_static_bytes + split_profile.regex_cache_allowance_bytes;
+        assert!(
+            split_bytes < whole_bytes,
+            "split regex accounting {split_bytes} should be below monolithic accounting {whole_bytes}"
+        );
+        let maximum_accounted_bytes = split_bytes + (whole_bytes.saturating_sub(split_bytes) / 2);
+        assert!(maximum_accounted_bytes < whole_bytes);
+
+        let compile = || {
+            let mut budget = RegexResourceBudget {
+                maximum_accounted_bytes,
+                ..RegexResourceBudget::default()
+            };
+            budget.start_entity();
+            let mut layers = Vec::new();
+            compile_bounded_regex_shard(
+                "resource-split",
+                &patterns,
+                &detectors,
+                &orders,
+                &mut budget,
+                &mut layers,
+            )
+            .unwrap();
+            (budget.profile(), layers)
+        };
+        let (first_profile, first_layers) = compile();
+        let (second_profile, second_layers) = compile();
+        let first_partition = first_layers
+            .iter()
+            .map(|layer| layer.local_to_pattern_order.len())
+            .collect::<Vec<_>>();
+        let second_partition = second_layers
+            .iter()
+            .map(|layer| layer.local_to_pattern_order.len())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_profile.resource_limit_bisections, 1);
+        assert_eq!(first_profile.physical_regex_layers, 2);
+        assert!(
+            first_profile.compiled_regex_static_bytes + first_profile.regex_cache_allowance_bytes
+                <= maximum_accounted_bytes
+        );
+        assert_eq!(first_profile, second_profile);
+        assert_eq!(first_partition, vec![middle, patterns.len() - middle]);
+        assert_eq!(first_partition, second_partition);
+        assert_eq!(regex_layer_pattern_orders(&first_layers), orders);
+    }
+
+    #[test]
+    fn aggregate_regex_resource_budget_fails_closed_before_layer_commit() {
+        let pattern = canonical_pattern("bounded", &["IGNORECASE"]);
+        let hir = parse_pattern_with_flags("capacity", 0, &pattern.regex, &pattern.flags).unwrap();
+        let mut layer_exhausted = RegexResourceBudget {
+            entity_layers: MAX_ENTITY_INDEPENDENT_REGEX_LAYERS_PER_ENTITY,
+            ..RegexResourceBudget::default()
+        };
+        let layer_error = compile_bounded_regex_layers(
+            "capacity",
+            std::slice::from_ref(&hir),
+            &[0],
+            &[0],
+            &mut layer_exhausted,
+        )
+        .unwrap_err();
+        assert!(layer_error
+            .to_string()
+            .contains("/engine/shards/capacity/regex_resource_budget"));
+        assert!(layer_error
+            .to_string()
+            .contains("compiled regex resource budget exceeded"));
+
+        let mut bytes_exhausted = RegexResourceBudget {
+            static_bytes: MAX_ENTITY_INDEPENDENT_REGEX_ACCOUNTED_BYTES,
+            ..RegexResourceBudget::default()
+        };
+        let bytes_error =
+            compile_bounded_regex_layers("capacity", &[hir], &[0], &[0], &mut bytes_exhausted)
+                .unwrap_err();
+        assert!(bytes_error
+            .to_string()
+            .contains("/engine/shards/capacity/regex_resource_budget"));
+        assert!(bytes_error.to_string().contains("accounted bytes"));
+    }
+
+    #[test]
+    fn bounded_regex_shards_preserve_global_ties_overlaps_order_and_folding() {
+        let fixtures = [
+            (
+                large_regex_pattern_fixture(
+                    canonical_pattern("(?i:tail)", &[]),
+                    canonical_pattern(r"\p{Letter}+", &[]),
+                ),
+                "K head tail",
+            ),
+            (
+                large_regex_pattern_fixture(
+                    canonical_pattern("(?i:k)", &[]),
+                    canonical_pattern(r"\p{Letter}+", &[]),
+                ),
+                "KX K",
+            ),
+            (
+                large_regex_pattern_fixture(
+                    canonical_pattern(r"(?i:\b(?:k|kx)\b)", &[]),
+                    canonical_pattern(r"(?i:\b(?:kx)\b)", &[]),
+                ),
+                "(KX) K",
+            ),
+            (
+                large_regex_pattern_fixture(
+                    canonical_pattern("(?i:k)", &[]),
+                    canonical_pattern("(?i:k)", &[]),
+                ),
+                "K K",
+            ),
+        ];
+
+        for (patterns, text) in fixtures {
+            let expected = unbounded_monolithic_raw_matches(&patterns, text);
+            let engine = engine_for_patterns(patterns);
+            let [MatcherShard::Regex(shard)] = engine.shards.as_slice() else {
+                panic!("regex fixture should use bounded regex layers");
+            };
+            let RegexShardMatcher::Bounded { layers } = &shard.matcher else {
+                panic!("nonempty regex fixture should use bounded layers");
+            };
+            assert!(layers.len() > 1);
+            assert_eq!(engine_raw_matches(&engine, text), expected);
+        }
+    }
+
+    #[test]
+    fn sharded_regex_is_cross_entity_bounded_and_parallel_deterministic() {
+        let first_entity_patterns = large_regex_pattern_fixture(
+            canonical_pattern("(?i:k)", &[]),
+            canonical_pattern("(?i:k)", &[]),
+        );
+        let second_detector = u32::try_from(first_entity_patterns.len()).unwrap();
+        let canonical = CanonicalBank {
+            schema: 1,
+            defaults: CanonicalDefaults {
+                engine: "rust-regex-meta".to_string(),
+                unicode: true,
+                case_insensitive: false,
+                word_boundaries: false,
+                normalization: "none".to_string(),
+            },
+            entities: vec![
+                CanonicalEntity {
+                    stable_id: "first".to_string(),
+                    name: "first".to_string(),
+                    patterns: first_entity_patterns,
+                },
+                CanonicalEntity {
+                    stable_id: "second".to_string(),
+                    name: "second".to_string(),
+                    patterns: vec![canonical_pattern("(?i:k)", &[])],
+                },
+            ],
+        };
+        let engine = NativeEngine::compile(&canonical, MatchMode::EntityIndependent).unwrap();
+        let expected = vec![
+            (0, 0, 3),
+            (second_detector, 0, 3),
+            (0, 4, 7),
+            (second_detector, 4, 7),
+        ];
+
+        for _ in 0..3 {
+            assert_eq!(engine_raw_matches(&engine, "K K"), expected);
+        }
+        let mut bounded = NativeMatchBuffer::with_match_limit(2).unwrap();
+        let error = engine
+            .scan_bytes_into("K K".as_bytes(), &mut bounded)
+            .unwrap_err();
+        assert!(error.to_string().contains("configured match limit 2"));
+        assert!(bounded.is_empty());
+
+        std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| scope.spawn(|| engine_raw_matches(&engine, "K K")))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn normalized_whitespace_literals_preserve_mapped_casefold_arbitration() {
+        const PATTERN_COUNT: usize = 1_500;
+        let padding = "a".repeat(112);
+        let patterns = (0..PATTERN_COUNT)
+            .map(|index| {
+                canonical_pattern(
+                    &format!(r"\b(?:person{index:08}{padding}\s+alias)\b"),
+                    &["IGNORECASE"],
+                )
+            })
+            .collect::<Vec<_>>();
+        let text = format!("K PERSON00000042{padding}   ALIAS PERSON00001234{padding} ALIAS");
+        let expected = unbounded_monolithic_raw_matches(&patterns, &text);
+        let engine = engine_for_patterns(patterns);
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("normalized whitespace fixture should use a layered matcher");
+        };
+
+        assert_eq!(
+            shard
+                .normalized_ascii_case_insensitive_literals
+                .with_left_boundary
+                .as_ref()
+                .unwrap()
+                .patterns
+                .len(),
+            PATTERN_COUNT
+        );
+        assert!(shard.residual_regex_layers.is_empty());
+        assert_eq!(
+            engine
+                .regex_resource_profile()
+                .unwrap()
+                .physical_regex_layers,
+            0
+        );
+        assert_eq!(engine_raw_matches(&engine, &text), expected);
     }
 
     #[test]
@@ -1924,6 +3602,129 @@ mod tests {
 
         assert!(matches!(engine.shards.as_slice(), [MatcherShard::Regex(_)]));
         assert_eq!(engine_raw_matches(&engine, "123"), [(0, 0, 3)]);
+        let profile = engine.regex_resource_profile().unwrap();
+        assert_eq!(profile.physical_regex_layers, 1);
+        assert!(profile.eager_cache_bytes_per_scan > 0);
+        assert!(profile.pikevm_cache_projection_bytes_per_scan > 0);
+        assert!(profile.pikevm_stack_growth_allowance_bytes_per_scan > 0);
+        assert_eq!(
+            profile.lazy_dfa_growth_allowance_bytes_per_scan,
+            ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY * MAX_LAZY_DFA_CACHES_PER_META_REGEX
+        );
+        assert_eq!(
+            profile.regex_cache_allowance_bytes,
+            (profile.eager_cache_bytes_per_scan
+                + profile.pikevm_cache_projection_bytes_per_scan
+                + profile.pikevm_stack_growth_allowance_bytes_per_scan
+                + profile.lazy_dfa_growth_allowance_bytes_per_scan)
+                * MAX_CONCURRENT_SCANS_PER_ENGINE
+        );
+    }
+
+    #[test]
+    fn many_single_regex_entities_are_accounted_and_fail_at_the_aggregate_ceiling() {
+        const ACCEPTED_ENTITY_COUNT: usize = 512;
+        let defaults = CanonicalDefaults {
+            engine: "rust-regex-meta".to_string(),
+            unicode: true,
+            case_insensitive: false,
+            word_boundaries: false,
+            normalization: "none".to_string(),
+        };
+        let nonempty = CanonicalBank {
+            schema: 1,
+            defaults: defaults.clone(),
+            entities: (0..ACCEPTED_ENTITY_COUNT)
+                .map(|index| CanonicalEntity {
+                    stable_id: format!("entity-{index:04}"),
+                    name: format!("entity-{index:04}"),
+                    patterns: vec![canonical_pattern(&format!(r"ENTITY{index:04}[0-9]+"), &[])],
+                })
+                .collect(),
+        };
+        let nonempty_engine =
+            NativeEngine::compile(&nonempty, MatchMode::EntityIndependent).unwrap();
+        let nonempty_profile = nonempty_engine.regex_resource_profile().unwrap();
+        assert_eq!(
+            nonempty_profile.physical_regex_layers,
+            ACCEPTED_ENTITY_COUNT
+        );
+        assert_eq!(
+            nonempty_profile.lazy_dfa_growth_allowance_bytes_per_scan,
+            ACCEPTED_ENTITY_COUNT
+                * ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY
+                * MAX_LAZY_DFA_CACHES_PER_META_REGEX
+        );
+        assert_eq!(
+            nonempty_profile.regex_cache_allowance_bytes,
+            (nonempty_profile.eager_cache_bytes_per_scan
+                + nonempty_profile.pikevm_cache_projection_bytes_per_scan
+                + nonempty_profile.pikevm_stack_growth_allowance_bytes_per_scan
+                + nonempty_profile.lazy_dfa_growth_allowance_bytes_per_scan)
+                * MAX_CONCURRENT_SCANS_PER_ENGINE
+        );
+        assert_eq!(
+            engine_raw_matches(&nonempty_engine, "ENTITY0511123"),
+            [(511, 0, 13)]
+        );
+
+        let possibly_empty = CanonicalBank {
+            schema: 1,
+            defaults: defaults.clone(),
+            entities: (0..ACCEPTED_ENTITY_COUNT)
+                .map(|index| CanonicalEntity {
+                    stable_id: format!("empty-{index:04}"),
+                    name: format!("empty-{index:04}"),
+                    patterns: vec![canonical_pattern("z?", &[])],
+                })
+                .collect(),
+        };
+        let possibly_empty_engine =
+            NativeEngine::compile(&possibly_empty, MatchMode::EntityIndependent).unwrap();
+        let possibly_empty_profile = possibly_empty_engine.regex_resource_profile().unwrap();
+        assert_eq!(
+            possibly_empty_profile.physical_regex_layers,
+            ACCEPTED_ENTITY_COUNT
+        );
+        assert_eq!(
+            possibly_empty_profile.lazy_dfa_growth_allowance_bytes_per_scan,
+            ACCEPTED_ENTITY_COUNT
+                * ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY
+                * MAX_LAZY_DFA_CACHES_PER_META_REGEX
+        );
+        assert_eq!(
+            possibly_empty_profile.regex_cache_allowance_bytes,
+            (possibly_empty_profile.eager_cache_bytes_per_scan
+                + possibly_empty_profile.pikevm_cache_projection_bytes_per_scan
+                + possibly_empty_profile.pikevm_stack_growth_allowance_bytes_per_scan
+                + possibly_empty_profile.lazy_dfa_growth_allowance_bytes_per_scan)
+                * MAX_CONCURRENT_SCANS_PER_ENGINE
+        );
+        assert_eq!(
+            engine_raw_matches(&possibly_empty_engine, "").len(),
+            ACCEPTED_ENTITY_COUNT
+        );
+
+        let exhausted = CanonicalBank {
+            schema: 1,
+            defaults,
+            entities: (0..1_000)
+                .map(|index| CanonicalEntity {
+                    stable_id: format!("exhausted-{index:04}"),
+                    name: format!("exhausted-{index:04}"),
+                    patterns: vec![canonical_pattern(
+                        &format!(r"EXHAUSTED{index:04}[0-9]+"),
+                        &[],
+                    )],
+                })
+                .collect(),
+        };
+        let error = NativeEngine::compile(&exhausted, MatchMode::EntityIndependent).unwrap_err();
+        assert!(error.to_string().contains("regex resource budget exceeded"));
+        assert!(error
+            .to_string()
+            .contains("PikeVM fixed cache projection bytes"));
+        assert!(error.to_string().contains("lazy-DFA growth allowance"));
     }
 
     #[test]
@@ -1974,7 +3775,7 @@ mod tests {
     }
 
     #[test]
-    fn layered_matcher_falls_back_for_unicode_case_folding() {
+    fn layered_matcher_maps_unicode_simple_case_folding() {
         let patterns = vec![
             canonical_pattern("k", &["IGNORECASE"]),
             canonical_pattern(r"\p{Letter}+", &[]),
@@ -1986,7 +3787,7 @@ mod tests {
             panic!("mixed case-folding entity should use a layered matcher");
         };
 
-        assert!(shard.unicode_fallback_regex.is_some());
+        assert!(!shard.ascii_case_insensitive_literals.is_empty());
         assert_eq!(engine_raw_matches(&engine, "K done"), expected);
         assert_eq!(
             engine_raw_matches(&engine, "K K"),
@@ -2102,7 +3903,7 @@ mod tests {
             .without_left_boundary
             .as_ref()
             .unwrap();
-        let residual = shard.residual_regex.as_ref().unwrap();
+        let residual_orders = regex_layer_pattern_orders(&shard.residual_regex_layers);
         let text = "tokenx";
         let bounded_lookup =
             indexed_valid_literal_at_start(bounded_layer, text.as_bytes(), text, 0);
@@ -2111,9 +3912,8 @@ mod tests {
 
         assert_eq!(bounded_layer.patterns.len(), 2_048);
         assert_eq!(unbounded_layer.patterns.len(), 1_024);
-        assert_eq!(residual.local_to_pattern_order.len(), 1_024);
-        assert!(residual
-            .local_to_pattern_order
+        assert_eq!(residual_orders.len(), 1_024);
+        assert!(residual_orders
             .iter()
             .all(|pattern_order| pattern_order % 4 == 1));
         assert_eq!(bounded_layer.prefix_index.sorted_pattern_indices.len(), 2);
@@ -2210,7 +4010,7 @@ mod tests {
             .without_left_boundary
             .as_ref()
             .unwrap();
-        let residual = shard.residual_regex.as_ref().unwrap();
+        let residual_orders = regex_layer_pattern_orders(&shard.residual_regex_layers);
 
         assert_eq!(
             unbounded_layer
@@ -2220,18 +4020,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1]
         );
-        assert_eq!(residual.local_to_pattern_order, [0]);
+        assert_eq!(residual_orders, [0]);
 
         let text = "a".repeat(literal.len() * 2);
         let actual = engine_raw_matches(&engine, &text);
-        assert_eq!(
-            actual,
-            monolithic_raw_matches(&patterns, &text)
-        );
-        assert_eq!(
-            actual,
-            [(0, literal.len() as u64, text.len() as u64)]
-        );
+        assert_eq!(actual, monolithic_raw_matches(&patterns, &text));
+        assert_eq!(actual, [(0, literal.len() as u64, text.len() as u64)]);
     }
 
     #[test]
@@ -2316,7 +4110,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_whitespace_literal_remains_in_residual_regex_layer() {
+    fn normalized_whitespace_literal_uses_mapped_literal_layer() {
         let patterns = vec![
             canonical_pattern(r"\b(?:alpha)\b", &[]),
             canonical_pattern(r"\b(?:John\s+Doe)\b", &[]),
@@ -2340,15 +4134,306 @@ mod tests {
         );
         assert_eq!(
             shard
-                .residual_regex
+                .normalized_case_sensitive_literals
+                .with_left_boundary
                 .as_ref()
                 .unwrap()
-                .local_to_pattern_order,
+                .patterns
+                .iter()
+                .map(|pattern| pattern.pattern_order)
+                .collect::<Vec<_>>(),
             [1]
         );
+        assert!(shard.residual_regex_layers.is_empty());
         assert_eq!(
             engine_raw_matches(&engine, "alpha John   Doe"),
             monolithic_raw_matches(&patterns, "alpha John   Doe")
+        );
+        let unicode_whitespace = "x John\u{2003}\tDoe y";
+        assert_eq!(
+            engine_raw_matches(&engine, unicode_whitespace),
+            monolithic_raw_matches(&patterns, unicode_whitespace)
+        );
+    }
+
+    #[test]
+    fn mapped_whitespace_layers_match_monolithic_across_offsets_priority_and_failures() {
+        let patterns = vec![
+            canonical_pattern(r"\b(?:John\s+Doe)\b", &["IGNORECASE"]),
+            canonical_pattern(r"\b(?:John Doe)\b", &["IGNORECASE"]),
+            canonical_pattern(r"(?i:\bJohn\s+Doe\b)", &[]),
+            canonical_pattern(r"\b(?:Case\s+Name)\b", &[]),
+            canonical_pattern(r"(?:\s+Leading)", &[]),
+            canonical_pattern(r"(?:Trailing\s+)", &[]),
+        ];
+        let engine = engine_for_patterns(patterns.clone());
+        let [MatcherShard::Layered(shard)] = engine.shards.as_slice() else {
+            panic!("mixed whitespace patterns should use layered matching");
+        };
+        assert_eq!(
+            regex_layer_pattern_orders(&shard.residual_regex_layers),
+            [2, 4, 5]
+        );
+
+        for text in [
+            "John Doe Case Name",
+            "John\tDoe Case\r\nName",
+            "John\u{00A0}Doe Case\u{2003}Name",
+            "é John   Doe      Case Name",
+            "John Doe John\t\tDoe Trailing   END",
+            "  Leading John Doe",
+        ] {
+            assert_eq!(
+                engine_raw_matches(&engine, text),
+                monolithic_raw_matches(&patterns, text),
+                "mapped mismatch for {text:?}"
+            );
+        }
+
+        let repeated = "John\tDoe John\u{2003}Doe";
+        let mut bounded = NativeMatchBuffer::with_match_limit(1).unwrap();
+        let error = engine
+            .scan_bytes_into(repeated.as_bytes(), &mut bounded)
+            .unwrap_err();
+        assert!(error.to_string().contains("configured match limit 1"));
+        assert!(bounded.is_empty());
+        let expected = monolithic_raw_matches(&patterns, repeated);
+        std::thread::scope(|scope| {
+            let handles = (0..4)
+                .map(|_| scope.spawn(|| engine_raw_matches(&engine, repeated)))
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), expected);
+            }
+        });
+
+        // The first residual match ends after only the first tab, leaving the
+        // shared cursor inside a whitespace run collapsed by the mapped Aho
+        // layer. Refresh must reject that overlapping mapped candidate and
+        // still discover the later normalized occurrence.
+        let interior_patterns = vec![
+            canonical_pattern(r"\AJohn[ \t]", &[]),
+            canonical_pattern(r"John\s+Doe", &[]),
+        ];
+        let interior_text = "John\t\tDoe / John\t\tDoe";
+        let interior_engine = engine_for_patterns(interior_patterns.clone());
+        assert_eq!(
+            engine_raw_matches(&interior_engine, interior_text),
+            monolithic_raw_matches(&interior_patterns, interior_text)
+        );
+        assert_eq!(
+            engine_raw_matches(&interior_engine, interior_text),
+            [(0, 0, 5), (1, 12, 21)]
+        );
+    }
+
+    #[test]
+    fn max_document_mapped_layers_are_deterministic_at_cache_concurrency_budget() {
+        let patterns = vec![
+            canonical_pattern(r"\b(?:John\s+Doe)\b", &["IGNORECASE"]),
+            canonical_pattern(r"\b(?:k)\b", &["IGNORECASE"]),
+            canonical_pattern(r"\b(?:s)\b", &["IGNORECASE"]),
+        ];
+        let engine = engine_for_patterns(patterns);
+        let mut document = vec![b'.'; MAX_SCAN_INPUT_BYTES];
+        let fixtures = [
+            (101, "John\u{2003}\tDoe"),
+            (MAX_SCAN_INPUT_BYTES / 3, "K"),
+            (MAX_SCAN_INPUT_BYTES * 2 / 3, "ſ"),
+            (MAX_SCAN_INPUT_BYTES - 101, "JOHN  DOE"),
+        ];
+        for (offset, value) in fixtures {
+            document[offset..offset + value.len()].copy_from_slice(value.as_bytes());
+        }
+        let expected = vec![
+            (0, 101, 112),
+            (
+                1,
+                (MAX_SCAN_INPUT_BYTES / 3) as u64,
+                (MAX_SCAN_INPUT_BYTES / 3 + 3) as u64,
+            ),
+            (
+                2,
+                (MAX_SCAN_INPUT_BYTES * 2 / 3) as u64,
+                (MAX_SCAN_INPUT_BYTES * 2 / 3 + 2) as u64,
+            ),
+            (
+                0,
+                (MAX_SCAN_INPUT_BYTES - 101) as u64,
+                (MAX_SCAN_INPUT_BYTES - 92) as u64,
+            ),
+        ];
+        assert_eq!(
+            engine_raw_matches(&engine, std::str::from_utf8(&document).unwrap()),
+            expected
+        );
+
+        std::thread::scope(|scope| {
+            let handles = (0..MAX_CONCURRENT_SCANS_PER_ENGINE)
+                .map(|_| {
+                    let document = &document;
+                    let engine = &engine;
+                    scope.spawn(move || {
+                        engine_raw_matches(engine, std::str::from_utf8(document).unwrap())
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), expected);
+            }
+        });
+    }
+
+    #[test]
+    fn shared_engine_limiter_admits_eight_and_releases_all_sixteen_waiters() {
+        use std::sync::{Arc, Barrier};
+
+        let engine = engine_for_patterns(vec![canonical_pattern("literal", &[])]);
+        let ready = Arc::new(Barrier::new(MAX_CONCURRENT_SCANS_PER_ENGINE + 1));
+        let release = Arc::new(Barrier::new(MAX_CONCURRENT_SCANS_PER_ENGINE + 1));
+        std::thread::scope(|scope| {
+            let handles = (0..MAX_CONCURRENT_SCANS_PER_ENGINE * 2)
+                .map(|_| {
+                    let ready = Arc::clone(&ready);
+                    let release = Arc::clone(&release);
+                    let limiter = &engine.scan_limiter;
+                    scope.spawn(move || {
+                        let _permit = limiter.acquire();
+                        ready.wait();
+                        release.wait();
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            for _ in 0..2 {
+                ready.wait();
+                assert_eq!(
+                    engine.scan_limiter.observed_concurrency(),
+                    (
+                        MAX_CONCURRENT_SCANS_PER_ENGINE,
+                        MAX_CONCURRENT_SCANS_PER_ENGINE
+                    )
+                );
+                release.wait();
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        assert_eq!(
+            engine.scan_limiter.observed_concurrency(),
+            (0, MAX_CONCURRENT_SCANS_PER_ENGINE)
+        );
+    }
+
+    #[test]
+    fn sixteen_concurrent_mapped_scans_complete_within_the_shared_engine_ceiling() {
+        use std::sync::{Arc, Barrier};
+
+        let engine = engine_for_patterns(vec![canonical_pattern("k", &["IGNORECASE"])]);
+        let text = format!("K{}", ".".repeat(1024 * 1024));
+        let start = Arc::new(Barrier::new(MAX_CONCURRENT_SCANS_PER_ENGINE * 2 + 1));
+        std::thread::scope(|scope| {
+            let handles = (0..MAX_CONCURRENT_SCANS_PER_ENGINE * 2)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    let engine = &engine;
+                    let text = &text;
+                    scope.spawn(move || {
+                        start.wait();
+                        engine_raw_matches(engine, text)
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), [(0, 0, 3)]);
+            }
+        });
+
+        let (active, maximum_observed) = engine.scan_limiter.observed_concurrency();
+        assert_eq!(active, 0);
+        assert!((1..=MAX_CONCURRENT_SCANS_PER_ENGINE).contains(&maximum_observed));
+    }
+
+    #[test]
+    fn scan_entry_waits_for_a_shared_engine_permit_and_then_progresses() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let engine = engine_for_patterns(vec![canonical_pattern("literal", &[])]);
+        let permits = (0..MAX_CONCURRENT_SCANS_PER_ENGINE)
+            .map(|_| engine.scan_limiter.acquire())
+            .collect::<Vec<_>>();
+        let mut slots = permits.iter().map(ScanPermit::slot).collect::<Vec<_>>();
+        slots.sort_unstable();
+        assert_eq!(
+            slots,
+            (0..MAX_CONCURRENT_SCANS_PER_ENGINE).collect::<Vec<_>>()
+        );
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = mpsc::channel();
+            let (complete_tx, complete_rx) = mpsc::channel();
+            let engine = &engine;
+            let handle = scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = engine_raw_matches(engine, "literal");
+                complete_tx.send(result).unwrap();
+            });
+
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(complete_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            drop(permits);
+            assert_eq!(
+                complete_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+                [(0, 0, 7)]
+            );
+            handle.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn poisoned_limiter_state_is_recovered_without_a_scan_panic() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let limiter = ScanLimiter::default();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _state = limiter.state.lock().unwrap();
+            panic!("poison the limiter for the regression fixture");
+        }));
+        assert!(poisoned.is_err());
+
+        let permit = limiter.acquire();
+        assert_eq!(limiter.observed_concurrency(), (1, 1));
+        drop(permit);
+        assert_eq!(limiter.observed_concurrency(), (0, 1));
+    }
+
+    #[test]
+    fn poisoned_explicit_regex_cache_is_reset_before_reuse() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let patterns = [parse_pattern_with_flags("cache", 0, r"[0-9]+", &[]).unwrap()];
+        let other_patterns = [parse_pattern_with_flags("other", 0, r"[A-Z]+", &[]).unwrap()];
+        let cached = CachedRegex::new(
+            build_entity_regex_with_cache(&patterns, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY)
+                .unwrap(),
+        );
+        let other =
+            build_entity_regex_with_cache(&other_patterns, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY)
+                .unwrap();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let mut cache = cached.caches[0].lock().unwrap();
+            cache.reset(&other);
+            panic!("poison a cache reset to the wrong regex");
+        }));
+        assert!(poisoned.is_err());
+
+        let mut cache = cached.cache(0);
+        assert!(!cached.caches[0].is_poisoned());
+        assert_eq!(
+            cached.regex.search_with(&mut cache, &Input::new("123")),
+            Some(regex_automata::Match::must(0, 0..3))
         );
     }
 
@@ -2376,11 +4461,7 @@ mod tests {
             [0]
         );
         assert_eq!(
-            shard
-                .residual_regex
-                .as_ref()
-                .unwrap()
-                .local_to_pattern_order,
+            regex_layer_pattern_orders(&shard.residual_regex_layers),
             [1]
         );
         assert_eq!(
@@ -2486,6 +4567,47 @@ mod tests {
     }
 
     #[test]
+    fn every_inline_scan_entry_rejects_mapped_unicode_over_the_byte_limit() {
+        let canonical = canonical_for_patterns(vec![canonical_pattern("k", &["IGNORECASE"])]);
+        let engine = NativeEngine::compile(&canonical, MatchMode::EntityIndependent).unwrap();
+        let overlap_engine = NativeEngine::compile(&canonical, MatchMode::AllOverlaps).unwrap();
+        let mut oversized = vec![b'.'; MAX_SCAN_INPUT_BYTES - 2];
+        oversized.extend_from_slice("K".as_bytes());
+        assert_eq!(oversized.len(), MAX_SCAN_INPUT_BYTES + 1);
+
+        let mut reusable = NativeMatchBuffer::new();
+        reusable.push(RawMatch::new(99, 0, 0).unwrap()).unwrap();
+        let error = engine
+            .scan_bytes_into(&oversized, &mut reusable)
+            .unwrap_err();
+        assert!(error.to_string().contains("configured limit"));
+        assert!(error
+            .to_string()
+            .contains(&MAX_SCAN_INPUT_BYTES.to_string()));
+        assert!(reusable.is_empty());
+
+        assert!(engine
+            .scan_bytes(&oversized)
+            .unwrap_err()
+            .to_string()
+            .contains("configured limit"));
+        assert!(engine
+            .scan_bytes_bounded(&oversized, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("configured limit"));
+
+        let mut leftmost = NativeMatchBuffer::new();
+        leftmost.push(RawMatch::new(99, 0, 0).unwrap()).unwrap();
+        assert!(overlap_engine
+            .scan_bytes_leftmost_from_all_overlaps(&oversized, &mut leftmost)
+            .unwrap_err()
+            .to_string()
+            .contains("configured limit"));
+        assert!(leftmost.is_empty());
+    }
+
+    #[test]
     fn layered_matcher_matches_monolithic_reference_across_generated_cases() {
         let mut state = 0x5eed_cafe_f00d_u64;
         for case_index in 0..192 {
@@ -2555,12 +4677,7 @@ mod tests {
             500
         );
         assert_eq!(
-            shard
-                .residual_regex
-                .as_ref()
-                .unwrap()
-                .local_to_pattern_order
-                .len(),
+            regex_layer_pattern_orders(&shard.residual_regex_layers).len(),
             1
         );
         assert_eq!(engine_raw_matches(&engine, &text), expected);

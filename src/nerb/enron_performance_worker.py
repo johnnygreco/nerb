@@ -1204,7 +1204,7 @@ def _operation_shape(operation: Operation) -> tuple[set[str], dict[str, Callable
         return {"input", "inventory"}, {
             "concurrency": concurrency,
             "max_records": record_limit,
-            "pattern_set": lambda value: _enum_string(value, frozenset({"email_format_v1"})),
+            "pattern_set": lambda value: _enum_string(value, frozenset({"email_format"})),
         }
     if operation == "python_literal_scan":
         return {"bank", "input", "inventory"}, {

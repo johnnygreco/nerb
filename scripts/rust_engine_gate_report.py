@@ -224,7 +224,7 @@ def _performance_report(iterations: int, target_bytes: int) -> dict[str, Any]:
     )
     return {
         "included_in_overall": True,
-        "baseline_id": "rust-engine-final-gates-v1",
+        "baseline_id": "rust-engine-final-gates",
         "iterations": iterations,
         "target_bytes": target_bytes,
         "checked_in_thresholds": {

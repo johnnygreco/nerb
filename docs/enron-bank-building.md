@@ -22,8 +22,7 @@ path, and choose a new output directory: the transactional writer does not repla
 ```shell
 uv run nerb build-enron-bank \
   --development-run .nerb/enron-splits/development \
-  --output-dir .nerb/enron-bank-builds/run \
-  --benchmark-version enron-v2
+  --output-dir .nerb/enron-bank-builds/run
 ```
 
 An optional verified [CMU annotation bundle](enron-evaluation.md#private-ingestion) adds an independent,
@@ -35,19 +34,34 @@ uv run nerb build-enron-bank \
   --development-run .nerb/enron-splits/development \
   --annotation-run .nerb/enron-annotations/cmu-meetings \
   --cmu-catalog-bindings .nerb/enron-annotations/cmu-reviewed-catalog-bindings.jsonl \
-  --output-dir .nerb/enron-bank-builds/run \
-  --benchmark-version enron-v2
+  --output-dir .nerb/enron-bank-builds/run
 ```
 
-Deep verification rehashes the complete private inventory, validates and compiles the selected bank, replays all three
-validation runs, replays catalog conformance, checks candidate-funnel conservation, and rescans the public card for
-direct identifiers and private paths. Supply the same annotation run to re-evaluate optional CMU evidence rather than
-only checking its stored commitment.
+Deep verification rehashes the complete private inventory, validates and compiles the selected bank, independently
+rebuilds the train candidate pool in bounded private scratch, streams all three validation replays, replays catalog
+conformance, checks candidate-funnel conservation, and rescans the public card for direct identifiers and private
+paths. Supply the same annotation run to re-evaluate optional CMU evidence rather than only checking its stored
+commitment.
+
+The verifier requires an existing owner-only scratch root. It creates a private child there and wipes every authenticated
+sensitive payload when verification ends; an owner-only, zero-byte cleanup tombstone can remain if safe removal cannot be
+proven. Mining snapshots, rebuilds, validation spools, and optional CMU spools never fall back to system temporary
+storage.
+
+The capacity workflow uses the shared internal `_run_enron_streaming_validation` adapter for its validation-only phase.
+That adapter snapshots the committed build and exact development bundle, compiles the selected bank once, streams the
+selected validation population once through the sole quality session, compares the result exactly with the stored
+selected aggregate, and returns only record/byte counts and hashes. It never remines train, retains documents or
+predictions, or reads the sealed bundle. Build, deep verification, and this adapter accept a separate observational
+activity callback for liveness; activity signals do not increment cumulative record progress or alter artifacts.
 
 ```shell
+install -d -m 700 .nerb/enron-scratch
 uv run nerb verify-enron-bank-build \
   --run-dir .nerb/enron-bank-builds/run \
-  --annotation-run .nerb/enron-annotations/cmu-meetings
+  --development-run .nerb/enron-splits/development \
+  --annotation-run .nerb/enron-annotations/cmu-meetings \
+  --scratch-root .nerb/enron-scratch
 ```
 
 Omit both `--annotation-run` and `--cmu-catalog-bindings` from the build when no auxiliary bundle is available; supplying
@@ -73,8 +87,7 @@ The initial taxonomy is deliberately narrow:
 | Phone number | The bounded US phone fallback is an experiment only. It remains draft in the selected bank because independent negative and over-redaction evidence is unavailable. |
 
 Validation records never enter the candidate spool. Their labels or literal surfaces are not copied into the bank.
-Changing the development bundle, construction policy, source code, or benchmark version changes the corresponding
-commitments.
+Changing the development bundle, construction policy, or executable source changes the corresponding commitments.
 
 ## Deferred candidate pools
 
@@ -198,32 +211,36 @@ or unexpectedly large source from causing unbounded work. The default policy use
 | Resource | Limit |
 | --- | ---: |
 | Train records | 600,000 |
-| Train role artifact | 512 MiB |
-| Validation records | 10,000 |
-| Validation role artifact | 96 MiB |
-| Validation structured header entries | 250,000 |
-| Validation structured labeled spans | 150,000 |
-| Validation structured-view UTF-8 bytes | 64 MiB |
-| Quality predictions per validation iteration | 500,000 |
-| Development memberships artifact | 48 MiB |
-| Development samples artifact | 24 MiB |
+| Train role artifact | 6 GiB |
+| Validation records | 75,000 |
+| Validation role artifact | 1 GiB |
+| Validation structured header entries | 1,000,000 |
+| Validation structured labeled spans | 1,000,000 |
+| Validation structured-view UTF-8 bytes | 1 GiB |
+| Quality predictions per validation iteration | 5,000,000 |
+| Development memberships artifact | 512 MiB |
+| Development samples artifact | 64 MiB |
 | Structured header entries per document | 8,192 |
-| Candidate observations | 2,000,000 |
-| Unique candidates | 50,000 |
+| Candidate observations | 10,000,000 |
+| Unique candidates | 200,000 |
 | UTF-8 bytes per candidate value | 4,096 |
-| Active contacts | 500 |
-| Active person identities | 500 |
-| Active person aliases | 500 |
-| Reserved active-domain capacity | 500 |
+| Active contacts | 12,000 |
+| Active person identities | 12,000 |
+| Active person aliases | 12,999 |
+| Active domains | 0 |
 | Observed draft candidates per class | 2,000 |
 | Active patterns in the selected bank | 25,000 |
 | Total active-pattern UTF-8 bytes | 5 MiB |
 | Canonical bank JSON | 32 MiB |
 | Private JSON artifact bytes | 64 MiB |
-| Private JSONL records per artifact | 750,000 |
-| Private JSONL bytes per artifact | 256 MiB |
+| Candidate ledger | 200,002 records / 1 GiB |
+| Auxiliary CMU bindings | 500,000 records / 256 MiB |
+| Conformance suite | 100,000 total records; 256 MiB per positive/negative artifact |
+| Iteration ledger | 16 MiB |
+| Validation plan | 256 records / 4 MiB |
 | Private JSONL bytes per line | 16 MiB |
-| Private SQLite spool bytes | 2 GiB |
+| Quality metadata spool | 2 GiB |
+| Deep-verification scratch | 12 GiB |
 | Private artifact-tree entries / nesting depth | 256 / 8 |
 
 Ingestion, candidate-value, and bank-size limit violations abort the build. Curation overflow moves into draft or
@@ -231,71 +248,150 @@ rejected decisions with aggregate funnel accounting; it is never silently droppe
 construction behavior, not a latency or memory claim. Realistic compile-once/scan-many performance still needs the
 frozen workload and release evidence required by the charter.
 
-The per-class active ceilings include headroom beneath the current Rust entity-independent matcher construction limit;
-the builder proved larger single-class banks fail closed during deep compilation. The 25,000-pattern global ceiling is
-still a bank-wide safety limit, not permission for one entity class to consume that entire budget. Issue #152 measures
-and, if justified, improves larger realistic shapes without weakening this builder's compile-before-commit guarantee.
+The selected-bank allocation conserves the complete 25,000-pattern envelope: at most 12,000 recurring exact contacts,
+at most 12,999 recurring collision-free person aliases across at most 12,000 person identities, and one generic email
+fallback. Organization domains remain draft because exact domain-boundary semantics are unavailable. The fallback is
+reserved before curation, the global ceiling remains independently enforced, and compilation remains a mandatory
+pre-commit check.
 
-These are the reviewed #151 development-build limits, not a claim that the current in-memory evaluator can process the
-full pinned source. The measured 50,000-row evidence run used 721,302 candidate observations and 15,171 unique
-candidates. Its train, validation, membership, and sample artifacts used 419,355,677, 64,931,388, 29,093,619, and
-13,477,581 bytes respectively. The defaults retain explicit measured headroom while bounding I/O and Python object
-amplification. Manifest-declared record and artifact-byte capacities are checked before hashing large role artifacts or
-starting candidate mining. The two non-selected iterations retain only aggregate funnel counters; only the selected
-iteration materializes the private candidate ledger needed for audit and replay.
+The 200,000-candidate cap is the frozen bounded envelope for full-source execution. It stays independently below the
+10,000,000-observation, 12 GiB SQLite, and 1 GiB candidate-ledger ceilings. Only a complete capacity run can establish
+that this envelope is sufficient; a partial-source extrapolation is not benchmark evidence.
 
-The 150,000-span ceiling bounds retained weak-label and per-iteration gold objects; it is not a prediction-count
-preflight. A bank can produce matches outside labeled spans, so the evaluator independently enforces its frozen
-500,000-prediction runtime ceiling and still fails closed if scanning reaches it.
+Conformance sizing is preflighted before evaluation or commit. The 32 MiB canonical-bank ceiling, 100,000-case total
+gate, and 256 MiB per positive/negative artifact are separate structural limits. They do not override the native
+compiler's regex and aggregate resource ceilings, and passing them is not a compile-latency or RSS claim.
 
-Raising these limits for the full pinned source requires #163 to demonstrate a streaming/capacity design with peak-RSS
-and runtime evidence and to review any evaluator-capacity change separately. The #153 run must fail before any sealed-test
-access if that development-stage proof has not landed; a higher numeric limit alone is not evidence of acceptable scale.
+The repository includes one locked, aggregate-only native witness for the exact selected-bank topology: one contact
+entity with 12,000 exact literals plus one structured fallback, and one person entity with 12,999 normalized-whitespace
+literals. It scans an exact 10 MiB document through one serial and eight concurrent calls, forcing Unicode whitespace
+collapse and the mapped simple-fold path:
 
-## Reviewed 50k development evidence
+```shell
+uv run --locked --python 3.13 python scripts/enron_native_capacity_probe.py --require-clean-commit
+```
 
-The committed aggregate-only evidence files `tests/data/enron_bank_card_real_50000.json` and
-`tests/data/enron_candidate_funnel_real_50000.json` come from a frozen 50,000-row real-source development fixture.
-The fixture is deliberately marked `fixture_mode: true` and non-promotable; it contains 40,007 train and 4,995
-validation records, and the sealed test remained unopened.
+The JSON output binds generator implementation hash, generated source/document hashes and bytes, exact detector output
+digest, current/embedded/committed native build-source hashes, binary and runtime identity, regex resource profile,
+compile/scan times, output equivalence, and absolute plus growth max-RSS gates. The clean-commit flag fails unless the
+extension was built from the checked-out commit and the complete working tree is clean. This is a reproducible native
+capacity smoke witness, not decision-grade timing, full-source quality, privacy, or promotion evidence.
 
-The final train-only run mined 721,302 observations into 15,171 candidates: 628 active, 3,667 draft, and 10,876
-rejected. The selected bank has 500 recurring exact contacts, one bounded unknown-email fallback, and 127 recurring
-person aliases. Structured-weak contact validation detected 59,854 of 59,854 labeled spans; known-catalog coverage was
-0.447121, with cataloged recall 1.0 and zero cataloged misses or wrong canonical mappings. Conformance covered all 628
-active patterns, 1,885 transformed positives, and 137 adversarial negatives with zero misses, wrong mappings, or
-unexpected negative matches.
+The defaults bound the full 517,401-row pinned source while keeping all high-volume work streaming or disk-backed.
+Manifest-declared record and artifact-byte capacities are checked before hashing large role artifacts or starting
+candidate mining. Validation is scanned in one prepare/consume/finish session, and the two non-selected iterations retain
+only aggregate funnel counters. Only the selected iteration materializes the private candidate ledger needed for audit
+and replay. Deep verification rebuilds train-derived candidates independently inside caller-owned scratch space, compares
+that rebuild with the committed ledger, destroys the first pool, and then replays the committed pool; it never retains two
+full candidate pools at once.
 
-The separately adjudicated CMU-train binding contains 94 cataloged and 1,802 explicitly uncataloged person labels.
-Independent review found zero decision, identity, ambiguity, or exact-offset mismatches. Its auxiliary diagnostic reports
-cataloged recall 1.0, open-world recall/catalog coverage 0.049578, precision 0.789916, document leak rate 0.968519, and
-over-redaction 0.000411. These low open-world values are the unknown-name limitation in measured form; they are not
-hidden by the catalog guarantee.
+The 1,000,000-span ceiling bounds validation gold input; it is not a prediction-count preflight. A bank can produce
+matches outside labeled spans, so the evaluator independently enforces its 5,000,000-prediction runtime ceiling and fails
+closed if scanning reaches it. Numeric capacity alone is not performance evidence: the capacity run must separately prove
+the frozen runtime, RSS, free-space, owned-high-water, progress, and sealed-access gates on the complete pinned source.
 
-On an Apple M4 with 16 GiB RAM, the fresh transactional rebuild took 43.32 seconds and 457,457,664 bytes peak RSS. Deep
-verification passed. The repeated setup and steady-state measurements are reported separately in the
-[decision-grade performance result](performance.md#decision-grade-development-result); a single construction timing is
-not a latency claim.
+### Full-source capacity run
 
-The only selected-bank scalar changed from the preceding reviewed artifact is
-`metadata.builder_implementation_sha256`; removing that provenance field from both canonical JSON objects produces the
-same semantic SHA-256, `1e4dd99cdb621700fe71b8562b90dadacb93af6dedfc8a2f72cee3c4cfb8514c`.
+The production reader is an exact non-runtime dependency group, not a base NERB dependency. Consume the checked-in
+lock with Python 3.13; do not use an independently resolved `--with` environment:
 
-Key commitments are:
+```shell
+uv sync --locked --no-default-groups --group enron-capacity --python 3.13 --reinstall-package nerb
+uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+  python -I -S -B scripts/run_enron_capacity.py run-enron-capacity \
+  --output-dir .nerb/enron/capacity \
+  --attempt-ledger-dir .nerb/enron/capacity-attempts
+uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+  python -I -S -B scripts/run_enron_capacity.py verify-enron-capacity \
+  --run-dir .nerb/enron/capacity \
+  --attempt-ledger-dir .nerb/enron/capacity-attempts
+uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+  python -I -S -B scripts/run_enron_capacity.py export-enron-capacity \
+  --run-dir .nerb/enron/capacity \
+  --attempt-ledger-dir .nerb/enron/capacity-attempts \
+  --output capacity-decision.json
+```
 
-- selected bank: `sha256:f0244b57c571d04784bb758d272292670252b82c1a3cd18cb7ba15a82e03d8d0`;
-- bank artifact: `sha256:f2d60ac98fa7d4aa218fe73f02eed0798f565ece6a28718b1b726f6aeab366cb`;
-- candidate source: `sha256:f2242a8d6d81799f5dca0c118059a3fdf95bfb7be565debc2ecc9c765f93323d`;
-- candidate ledger: `sha256:64a76cab8159031065df28a1df3d0b0967a2772efa799a427c9e5ecded5ca448`;
-- builder implementation: `sha256:c40abc903d8340830d9540f4a6befde6df01ff09b6e4931330279b21124968d6`;
-- privacy scanner implementation: `sha256:4fd3b726cc8a26eb8462ce7c0cdab772fcdfb024c5cc2d5aa97a51d8ab4009f8`;
-- reviewed CMU binding file: `sha256:361baa7fe257b7104bb6c1d854bb24276ac633d4895f34e451304173671ebd6d`;
-- canonical CMU catalog binding: `sha256:2be99b7d6ae81eaee466214d75e9a767583a7b3fd6e90595242b7d366b39e232`;
-- bank-card run: `sha256:c284e39601886898c52d3c42754d9f2a4979d016cb6dd92a47d1b995168178ee`;
-- committed bank-card file: `sha256:accfe490c84ce9704c25f557fd6c99e28d11c7589a0da5d727cbc72529eb8d2f`; and
-- committed candidate-funnel file: `sha256:3cbb0a616dc0c0becb274b2cb94633edfd9cb9b3aeb5d1173c477710d14f7f1f`.
+The tracked launcher is the only production-capacity entry. It starts with isolated mode, site processing disabled,
+and bytecode disabled; installs a fresh private pycache prefix before importing NERB; and adds the validated worktree
+source and virtual-environment dependency roots directly. It never calls `site.addsitedir`, so `.pth`, `sitecustomize`,
+and user-site hooks are not processed. Direct `nerb run-enron-capacity`, `nerb verify-enron-capacity`, and
+`nerb export-enron-capacity` invocations fail closed outside that bootstrap.
 
-The exact invocations remain bound inside the private run. Their privacy-safe CLI shape is:
+The capacity decision uses these frozen resource gates:
+
+| Resource gate | Passing requirement |
+| --- | --- |
+| Preflight free space | At least 25 GiB on each distinct output and attempt-ledger filesystem |
+| Owned and temporary high-water | At most 20 GiB |
+| Runtime free-space floor | At least 5 GiB on every monitored filesystem |
+| Total attempt runtime | At most 4 hours |
+| Phase throughput | At least 100 source rows per second in every phase |
+| Effective RSS cap | `min(8 GiB, 75% of physical memory)` |
+| Passing observed RSS | At most 75% of the effective RSS cap |
+| Resource-observation wall gap | At most 500 ms through report write, promotion, and the promoted final-tree scan |
+
+Reported RSS is the maximum, under the enforced cadence, of sampled current live-process-tree RSS and a conservative
+kernel high-water bound formed from the root process maximum plus the reaped-child maximum. Those two kernel maxima may
+come from different instants, so their sum can overestimate an instantaneous tree peak; the cadence still does not claim
+to capture every transient live-tree peak. The report freezes its resource totals before report serialization. The
+terminal attempt receipt strictly extends that envelope through report fsync, final staging inspection, atomic promotion,
+and the promoted final-tree observation.
+
+The run requires the exact locked reader set (`datasets==5.0.0`, `huggingface-hub==1.23.0`, `fsspec==2026.4.0`, and
+`pyarrow==25.0.0`). It records a path-free hash of the complete installed name/version inventory and hashes every regular
+in-root package or `.dist-info` file listed by those four distributions, excluding bytecode caches and external `..`
+entries such as installed console scripts. It proves each required top-level reader module originates below its hashed
+distribution root; the distribution inventory covers submodule source files but does not separately attest every loaded
+submodule origin. It also binds the checked-in `pyproject.toml` plus `uv.lock`.
+
+Those hashes identify the bytes that were observed; they do not compare them with a precommitted wheel attestation. A
+production run therefore requires a trusted, access-controlled host and a fresh uv-managed install from the checked-in
+lock. A locally modified package that retains its version metadata produces a different observed hash but is not rejected
+against a known-good package digest. Lower HTTP dependencies remain lock-and-version bound rather than individually
+byte-attested. Both limitations are explicit in portable evidence.
+
+Reader provenance is metadata-only before the preparation phase: neither `datasets` nor its Hub, filesystem, or Arrow
+dependencies may load before the phase owns its runtime tree. The first import occurs after HOME, temporary, XDG,
+dataset/module/download/extraction, Hub/assets/Xet, transformer, and credential paths are redirected to phase-owned
+private roots. The run fixes the official Hub endpoint, disables offline mode, ambient credentials, implicit tokens,
+Xet, telemetry, and cache symlinks, passes `token=False` plus the phase cache explicitly, and uses umask `077`. It
+validates the effective library constants before and after source consumption without publishing an absolute path or
+credential value.
+
+The full run has one cleanup owner for its complete lifetime. Preparation, split, and bank-build transactions transfer
+their retained payload descriptors to that outer transaction before their own commit handles close. After every phase
+stops its writers, the outer transaction also performs a bounded no-follow adoption pass over every regular file created
+directly by the reader or another third-party component. Cleanup authority remains live through post-promotion gates and
+durable attempt terminalization, so an in-process later failure wipes authenticated payload inodes even if a same-user
+race moved a child outside the staging tree. Before promotion, the attempt ledger durably binds the complete inode
+inventory. Crash recovery retains every reachable expected inode while wiping it. A failed authenticated wipe is moved
+to the bounded process retry registry and blocks terminalization until verified zero; a later in-process recovery retries
+that authority before writing a receipt. Recovery reports `sensitive_content_wiped: false` when inventory or path evidence
+is incomplete, and it does not claim that an inode moved before a new recovery process opened it can be recovered without
+a live descriptor. The process-wide limit is 128 retained files. Under `RLIMIT_NOFILE`, NERB also
+reserves the maximum 64-level cleanup walk plus 8 descriptors for the file and transaction overhead (72 total);
+exceeding either bound fails closed before promotion.
+
+`verify-portable-enron-capacity --artifact capacity-decision.json` is a clean-clone verifier. It checks closed report
+arithmetic, the full attempt hash chain, terminal cross-bindings, the measured Git commit and root tree, tracked source
+blobs, reader lock, and native build-source commitment. It does not independently re-read the original private payload,
+re-attest the promoted inode, prove recorded timing/RSS/disk observations, or reproduce/authenticate the native binary
+bytes. It also does not independently byte-attest HTTP dependencies below the four critical reader distributions.
+Those limits are included and hash-bound in the exported artifact itself.
+
+Export pins the report, commit marker, and complete attempt-chain snapshot while holding the ledger's shared lock through
+the no-replace publication and directory fsync. That successful publication is the snapshot's linearization point; a
+cooperating later attempt appends only after the export releases the lock and is therefore outside that artifact.
+
+## Regenerating bank evidence
+
+Policy, allocation, evaluator, or workload changes require a fresh private run and fresh aggregate commitments. A
+decision-grade result must bind the complete
+pinned source, selected bank, evaluator, validation result, implementation, resource observations, and
+`sealed_test_accessed: false`; planning projections and smoke fixtures cannot substitute for that evidence.
+
+The privacy-safe CLI shape for regenerating the private run is:
 
 ```shell
 /usr/bin/time -l uv run nerb build-enron-bank \
@@ -306,7 +402,9 @@ The exact invocations remain bound inside the private run. Their privacy-safe CL
 
 /usr/bin/time -l uv run nerb verify-enron-bank-build \
   --run-dir .nerb/enron/bank-build \
-  --annotation-run .nerb/enron/annotations
+  --development-run .nerb/enron/development \
+  --annotation-run .nerb/enron/annotations \
+  --scratch-root .nerb/enron-scratch
 ```
 
 ## Sealed-test boundary

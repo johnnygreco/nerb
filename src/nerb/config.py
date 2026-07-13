@@ -21,7 +21,6 @@ __all__ = [
     "add_entity_pattern",
     "ensure_rust_config_compatible",
     "load_config",
-    "load_yaml_config",
     "remove_entity_pattern",
     "resolve_default_config_path",
     "save_config",
@@ -214,11 +213,6 @@ def load_config(file_path: str | Path) -> PatternConfig:
         raise ConfigError(f"Could not parse YAML config at {config_path}.") from exc
 
     return validate_pattern_config(config)
-
-
-def load_yaml_config(file_path: str | Path) -> PatternConfig:
-    """Compatibility alias for loading a detector config from YAML."""
-    return load_config(file_path)
 
 
 def save_config(config: Any, file_path: str | Path) -> Path:

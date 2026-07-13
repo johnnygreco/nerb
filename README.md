@@ -207,7 +207,8 @@ MCP anonymization tools:
 
 MCP writes are explicit: `create_replacement_db` does not write files; `save_replacement_db` writes only to
 `save_db_path`; anonymize tools save DB changes only when `options.save` is true and `save_db_path` is provided. Reading
-from `replacement_db_path` never implies an in-place save.
+from `replacement_db_path` never implies an in-place save. To overwrite an existing destination, pass its current hash
+as `options.expected_replacement_db_hash`; this is the only MCP expected-hash field.
 
 ## YAML Detector Configs
 
@@ -264,10 +265,11 @@ For large-source bank construction, see the privacy-first Enron charter in
 [`docs/enron-benchmark.md`](docs/enron-benchmark.md), the
 [train-only bank construction guide](docs/enron-bank-building.md), its
 [private evaluation guide](docs/enron-evaluation.md), and the
-[decision-grade performance result](docs/performance.md#decision-grade-development-result). Train-only bank construction
-and development performance are implemented and deep-verified. The development bank remains non-promotable until the
-full pinned source passes its mandatory streaming/resource proof, the sealed test is evaluated exactly once, and the
-final privacy and lineage evidence passes. Agent workflows can also use the reusable
+[decision-grade performance benchmark standard](docs/performance.md#decision-grade-performance-benchmark-standard). Train-only bank construction
+and the performance evidence workflow are implemented and deep-verified. A fresh production-capacity result is still
+required, and the bank remains non-promotable until the full pinned source passes its mandatory streaming/resource proof,
+the sealed test is evaluated exactly once, and the final privacy and lineage evidence passes. Agent workflows can also
+use the reusable
 [`nerb-large-source-bank-building`](.agents/skills/nerb-large-source-bank-building/SKILL.md) skill for corpus profiling
 and privacy-safe handoff guidance.
 

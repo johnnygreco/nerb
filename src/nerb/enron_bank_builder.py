@@ -14,7 +14,7 @@ import re
 import sqlite3
 import unicodedata
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -29,8 +29,11 @@ BANK_CARD_SCHEMA_VERSION = "nerb.enron_bank_card.v2"
 BANK_BUILD_MANIFEST_SCHEMA_VERSION = "nerb.enron_bank_build_manifest.v2"
 BANK_BUILD_ITERATION_SCHEMA_VERSION = "nerb.enron_bank_build_iteration.v2"
 BANK_BUILD_TIMESTAMP = "2026-07-10T00:00:00Z"
+DEFAULT_MAX_CANDIDATE_SPOOL_BYTES = 12 * 1024**3
+MIN_CANDIDATE_SPOOL_BYTES = 64 * 1024
 
 _SHA256_PREFIX = "sha256:"
+_BUILDER_ACTIVITY_INTERVAL = 10_000
 _EMAIL_RE = re.compile(
     r"^[a-z0-9_][a-z0-9.!#$%&'*+/=?^_`{|}~-]*@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$",
@@ -43,7 +46,7 @@ _DOMAIN_RE = re.compile(
 _NAME_TOKEN_RE = re.compile(r"[^\W\d_]+(?:['’-][^\W\d_]+)*", re.UNICODE)
 _LOCAL_TOKEN_RE = re.compile(r"[a-z]+")
 _ID_SAFE_RE = re.compile(r"^[a-z][a-z0-9_]{0,79}$")
-_GENERIC_EMAIL_REGEX = (
+GENERIC_EMAIL_REGEX = (
     r"(?i)\b[a-z0-9_][a-z0-9.!#$%&'*+/=?^_`{|}~-]*@"
     r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
     r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?\b"
@@ -92,27 +95,27 @@ class EnronBankPolicy:
     minimum_contact_groups: int = 2
     minimum_person_alias_groups: int = 2
     minimum_domain_groups: int = 2
-    max_active_contacts: int = 500
-    max_active_people: int = 500
-    max_active_person_aliases: int = 500
-    max_active_domains: int = 500
+    max_active_contacts: int = 12_000
+    max_active_people: int = 12_000
+    max_active_person_aliases: int = 12_999
+    max_active_domains: int = 0
     max_draft_per_class: int = 2_000
     max_active_patterns: int = 25_000
     max_pattern_utf8_bytes: int = 5 * 1024 * 1024
     max_bank_json_bytes: int = 32 * 1024 * 1024
     max_train_records: int = 600_000
-    max_train_artifact_bytes: int = 512 * 1024 * 1024
-    max_validation_records: int = 10_000
-    max_validation_artifact_bytes: int = 96 * 1024 * 1024
-    max_validation_entries: int = 250_000
-    max_validation_spans: int = 150_000
-    max_validation_text_utf8_bytes: int = 64 * 1024 * 1024
-    max_development_memberships_bytes: int = 48 * 1024 * 1024
-    max_development_samples_bytes: int = 24 * 1024 * 1024
+    max_train_artifact_bytes: int = 6 * 1024 * 1024 * 1024
+    max_validation_records: int = 75_000
+    max_validation_artifact_bytes: int = 1024 * 1024 * 1024
+    max_validation_entries: int = 1_000_000
+    max_validation_spans: int = 1_000_000
+    max_validation_text_utf8_bytes: int = 1024 * 1024 * 1024
+    max_development_memberships_bytes: int = 512 * 1024 * 1024
+    max_development_samples_bytes: int = 64 * 1024 * 1024
     max_quality_predictions: int = DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL
     max_header_entries_per_document: int = 8_192
-    max_observations: int = 2_000_000
-    max_unique_candidates: int = 50_000
+    max_observations: int = 10_000_000
+    max_unique_candidates: int = 200_000
     max_candidate_value_bytes: int = 4_096
 
     def descriptor(self) -> dict[str, Any]:
@@ -328,10 +331,16 @@ def mine_enron_candidates(
     sqlite_path: Path,
     train_artifact_sha256: str,
     policy: EnronBankPolicy,
+    max_spool_bytes: int = DEFAULT_MAX_CANDIDATE_SPOOL_BYTES,
+    resource_checkpoint: Callable[[], object] | None = None,
 ) -> CandidatePool:
     """Stream verified train records into a bounded private SQLite spool."""
 
     _validate_policy(policy)
+    if type(max_spool_bytes) is not int or max_spool_bytes < MIN_CANDIDATE_SPOOL_BYTES:
+        raise EnronBankBuildError("Candidate mining spool byte limit is invalid.")
+    if resource_checkpoint is not None and not callable(resource_checkpoint):
+        raise EnronBankBuildError("Candidate mining resource checkpoint is invalid.")
     sqlite_path = Path(sqlite_path)
     try:
         connection = sqlite3.connect(sqlite_path)
@@ -341,10 +350,20 @@ def mine_enron_candidates(
     observations = 0
     unique_candidates = 0
     try:
-        connection.execute("PRAGMA journal_mode=DELETE")
+        journal_mode = connection.execute("PRAGMA journal_mode=MEMORY").fetchone()
+        if journal_mode is None or str(journal_mode[0]).lower() != "memory":
+            raise EnronBankBuildError("Candidate mining spool could not disable disk journal sidecars.")
         connection.execute("PRAGMA synchronous=FULL")
-        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        temp_store = connection.execute("PRAGMA temp_store").fetchone()
+        if temp_store is None or int(temp_store[0]) != 2:
+            raise EnronBankBuildError("Candidate mining spool could not disable external temporary files.")
         connection.execute("PRAGMA foreign_keys=ON")
+        page_size = int(connection.execute("PRAGMA page_size").fetchone()[0])
+        maximum_pages = max_spool_bytes // page_size
+        observed_maximum = int(connection.execute(f"PRAGMA max_page_count={maximum_pages}").fetchone()[0])
+        if maximum_pages < 1 or observed_maximum > maximum_pages:
+            raise EnronBankBuildError("Candidate mining spool byte limit could not be enforced.")
         connection.execute(
             """
             CREATE TABLE candidate_values (
@@ -379,6 +398,8 @@ def mine_enron_candidates(
             """
         )
         connection.execute("BEGIN IMMEDIATE")
+        if resource_checkpoint is not None:
+            resource_checkpoint()
         for record, membership in records_and_memberships:
             records += 1
             if records > policy.max_train_records:
@@ -464,19 +485,33 @@ def mine_enron_candidates(
                 )
             if records % 10_000 == 0:
                 connection.commit()
+                if resource_checkpoint is not None:
+                    resource_checkpoint()
                 connection.execute("BEGIN IMMEDIATE")
         connection.commit()
+        if resource_checkpoint is not None:
+            resource_checkpoint()
         if records == 0:
             raise EnronBankBuildError("Train split is empty.")
 
-        candidates = _read_candidate_evidence(connection)
+        candidates = _read_candidate_evidence(connection, resource_checkpoint=resource_checkpoint)
+        resource_activity = _ResourceCheckpointReporter(resource_checkpoint)
         source_digest = hashlib.sha256(b"nerb/enron/bank-mining-source/v2\0")
         for (payload,) in connection.execute("SELECT payload FROM source_projections ORDER BY document_id"):
             source_digest.update(bytes(payload))
-        ledger_sha256 = _candidate_pool_hash(candidates, train_artifact_sha256, policy.sha256)
+            resource_activity.worked()
+        resource_activity.boundary()
+        ledger_sha256 = _candidate_pool_hash(
+            candidates,
+            train_artifact_sha256,
+            policy.sha256,
+            resource_checkpoint=resource_checkpoint,
+        )
         by_kind: dict[str, list[CandidateEvidence]] = defaultdict(list)
         for candidate in candidates:
             by_kind[candidate.kind].append(candidate)
+            resource_activity.worked()
+        resource_activity.boundary()
         return CandidatePool(
             contacts=tuple(by_kind["contact"]),
             person_aliases=tuple(by_kind["person_alias"]),
@@ -495,7 +530,16 @@ def mine_enron_candidates(
         connection.close()
 
 
-def _read_candidate_evidence(connection: sqlite3.Connection) -> tuple[CandidateEvidence, ...]:
+def _read_candidate_evidence(
+    connection: sqlite3.Connection,
+    *,
+    activity_callback: Callable[[], None] | None = None,
+    resource_checkpoint: Callable[[], object] | None = None,
+) -> tuple[CandidateEvidence, ...]:
+    if activity_callback is not None and not callable(activity_callback):
+        raise EnronBankBuildError("Bank-build activity callback is invalid.")
+    activity = _BuilderActivityReporter(activity_callback)
+    resource_activity = _ResourceCheckpointReporter(resource_checkpoint)
     query = connection.execute(
         """
         SELECT kind, normalized_value, surface, related, source_type,
@@ -508,6 +552,8 @@ def _read_candidate_evidence(connection: sqlite3.Connection) -> tuple[CandidateE
     current: _EvidenceAccumulator | None = None
     current_key: tuple[str, str] | None = None
     for kind, normalized_value, surface, related, source_type, document_id, group_id, observed_at, occurrences in query:
+        activity.worked()
+        resource_activity.worked()
         key = (str(kind), str(normalized_value))
         if current_key != key:
             if current is not None:
@@ -526,6 +572,8 @@ def _read_candidate_evidence(connection: sqlite3.Connection) -> tuple[CandidateE
         )
     if current is not None:
         finished.append(current.finish())
+    activity.boundary()
+    resource_activity.boundary()
     return tuple(finished)
 
 
@@ -612,12 +660,21 @@ def _local_part_person_name(address: str) -> str | None:
 
 
 def _candidate_pool_hash(
-    candidates: Sequence[CandidateEvidence], train_artifact_sha256: str, policy_sha256: str
+    candidates: Sequence[CandidateEvidence],
+    train_artifact_sha256: str,
+    policy_sha256: str,
+    *,
+    activity_callback: Callable[[], None] | None = None,
+    resource_checkpoint: Callable[[], object] | None = None,
 ) -> str:
+    activity = _BuilderActivityReporter(activity_callback)
+    resource_activity = _ResourceCheckpointReporter(resource_checkpoint)
     digest = hashlib.sha256(b"nerb/enron/candidate-ledger/v2\0")
     digest.update(train_artifact_sha256.encode("ascii"))
     digest.update(policy_sha256.encode("ascii"))
     for candidate in candidates:
+        activity.worked()
+        resource_activity.worked()
         digest.update(
             _canonical_json_bytes(
                 {
@@ -636,6 +693,8 @@ def _candidate_pool_hash(
                 }
             )
         )
+    activity.boundary()
+    resource_activity.boundary()
     return _SHA256_PREFIX + digest.hexdigest()
 
 
@@ -679,6 +738,43 @@ class _CandidateLedger:
         )
 
 
+@dataclass(slots=True)
+class _BuilderActivityReporter:
+    callback: Callable[[], None] | None
+    pending_work: int = 0
+
+    def worked(self) -> None:
+        self.pending_work += 1
+        if self.pending_work == _BUILDER_ACTIVITY_INTERVAL:
+            self.boundary()
+
+    def boundary(self) -> None:
+        if self.callback is not None:
+            try:
+                self.callback()
+            except Exception:
+                raise EnronBankBuildError("Bank-build activity callback failed.") from None
+        self.pending_work = 0
+
+
+@dataclass(slots=True)
+class _ResourceCheckpointReporter:
+    """Report bounded mining work without translating an outer monitor's abort."""
+
+    callback: Callable[[], object] | None
+    pending_work: int = 0
+
+    def worked(self) -> None:
+        self.pending_work += 1
+        if self.pending_work == _BUILDER_ACTIVITY_INTERVAL:
+            self.boundary()
+
+    def boundary(self) -> None:
+        if self.callback is not None:
+            self.callback()
+        self.pending_work = 0
+
+
 def curate_enron_iteration(
     pool: CandidatePool,
     *,
@@ -687,6 +783,7 @@ def curate_enron_iteration(
     source_binding: Mapping[str, Any],
     created_at: str = BANK_BUILD_TIMESTAMP,
     retain_candidate_ledger: bool = True,
+    activity_callback: Callable[[], None] | None = None,
 ) -> CuratedIteration:
     """Create one deterministic bank candidate; optionally retain its private row ledger."""
 
@@ -694,6 +791,10 @@ def curate_enron_iteration(
         raise EnronBankBuildError("Unknown bank-build iteration policy.")
     if type(retain_candidate_ledger) is not bool:
         raise EnronBankBuildError("Candidate-ledger retention flag must be boolean.")
+    if activity_callback is not None and not callable(activity_callback):
+        raise EnronBankBuildError("Bank-build activity callback is invalid.")
+    activity = _BuilderActivityReporter(activity_callback)
+    activity.boundary()
     _validate_policy(policy)
     policy_sha256 = policy.sha256
     candidate_rows = _CandidateLedger(retain_rows=retain_candidate_ledger)
@@ -720,6 +821,7 @@ def curate_enron_iteration(
     }
     active_contact_values: set[str] = set()
     for evidence in contacts_ranked:
+        activity.worked()
         if (
             evidence.leakage_group_count >= policy.minimum_contact_groups
             and active_contact_patterns < policy.max_active_contacts
@@ -790,7 +892,7 @@ def curate_enron_iteration(
         "status": fallback_status,
         "patterns": {
             "structured_email": _regex_pattern(
-                _GENERIC_EMAIL_REGEX,
+                GENERIC_EMAIL_REGEX,
                 status=fallback_status,
                 priority=policy.max_active_patterns - 1,
                 description="Bounded RFC-like email fallback for otherwise unknown contacts.",
@@ -821,6 +923,7 @@ def curate_enron_iteration(
 
     person_identity_owners: dict[str, set[str]] = defaultdict(set)
     for evidence in pool.person_aliases:
+        activity.worked()
         if len(evidence.related_values) == 1:
             identity_value = _person_identity_value(evidence)
             if identity_value is not None:
@@ -828,6 +931,7 @@ def curate_enron_iteration(
 
     aliases_by_address: dict[str, list[CandidateEvidence]] = defaultdict(list)
     for evidence in pool.person_aliases:
+        activity.worked()
         identity_value = _person_identity_value(evidence)
         if len(evidence.related_values) == 1 and identity_value is not None:
             if len(person_identity_owners[identity_value]) == 1:
@@ -862,6 +966,7 @@ def curate_enron_iteration(
         ),
     )
     for address, aliases in ranked_identities:
+        activity.worked()
         aliases = sorted(
             aliases,
             key=lambda item: (-item.leakage_group_count, -item.document_count, item.normalized_value),
@@ -908,6 +1013,7 @@ def curate_enron_iteration(
         decisions_by_identity: dict[str, list[str]] = defaultdict(list)
         retained_aliases_by_identity: dict[str, list[CandidateEvidence]] = defaultdict(list)
         for alias in aliases:
+            activity.worked()
             identity_value = _person_identity_value(alias)
             if identity_value is None:
                 raise EnronBankBuildError("A retained person alias has no unambiguous normalized full identity.")
@@ -1066,6 +1172,7 @@ def curate_enron_iteration(
         pool.organization_domains,
         key=lambda item: (-item.leakage_group_count, -item.document_count, item.normalized_value),
     ):
+        activity.worked()
         if draft_domains >= policy.max_draft_per_class:
             candidate_rows.append(_candidate_row(evidence, "rejected", "draft_capacity", bank_ref=None))
             continue
@@ -1196,8 +1303,8 @@ def curate_enron_iteration(
 
     bank = {
         "schema_version": "nerb.bank.v1",
-        "id": "enron_intelligence_v2",
-        "name": "Private Enron Intelligence Bank v2",
+        "id": "enron_intelligence",
+        "name": "Private Enron Intelligence Bank",
         "description": "Train-only privacy-first contact and person intelligence with bounded structured fallbacks.",
         "version": "2026.07.10",
         "status": "active",
@@ -1221,12 +1328,14 @@ def curate_enron_iteration(
     active_stats = bank_stats(bank)["active_totals"]
     active_pattern_bytes = 0
     for entity in entities.values():
+        activity.worked()
         if entity["status"] != "active":
             continue
         for name in entity["names"].values():
             if name["status"] != "active":
                 continue
             for pattern in name["patterns"].values():
+                activity.worked()
                 if pattern["status"] == "active":
                     active_pattern_bytes += len(str(pattern["value"]).encode("utf-8"))
     if active_stats["patterns"] > policy.max_active_patterns:
@@ -1237,6 +1346,7 @@ def curate_enron_iteration(
         raise EnronBankBuildError("Curated bank exceeds the canonical JSON byte limit.")
 
     candidate_rows.rows.sort(key=lambda item: (str(item["candidate_type"]), str(item["candidate_id"])))
+    activity.boundary()
     funnel = candidate_rows.funnel()
     collisions = {
         "schema_version": "nerb.enron_bank_collisions.v2",
@@ -1606,7 +1716,6 @@ def _validate_policy(policy: EnronBankPolicy) -> None:
         policy.max_active_contacts,
         policy.max_active_people,
         policy.max_active_person_aliases,
-        policy.max_active_domains,
         policy.max_draft_per_class,
         policy.max_active_patterns,
         policy.max_pattern_utf8_bytes,
@@ -1628,6 +1737,8 @@ def _validate_policy(policy: EnronBankPolicy) -> None:
     )
     if any(type(value) is not int or value <= 0 for value in values):
         raise EnronBankBuildError("Bank-build policy limits must be positive integers.")
+    if type(policy.max_active_domains) is not int or policy.max_active_domains < 0:
+        raise EnronBankBuildError("Active-domain capacity must be a nonnegative integer.")
     if policy.max_quality_predictions != DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL:
         raise EnronBankBuildError("Bank-build prediction capacity must match the frozen quality evaluator limit.")
     if policy.max_validation_spans > policy.max_quality_predictions:

@@ -1,4 +1,4 @@
-use crate::engine::{DetectorMetadata, NativeEngine};
+use crate::engine::{DetectorMetadata, NativeEngine, RegexResourceProfile};
 use crate::error::{validation, BankError, Result};
 use crate::flags::{canonicalize_flag_names, merge_flags, parse_flags_value};
 use crate::formats::{parse_source_auto, parse_source_value, SourceFormat};
@@ -193,6 +193,10 @@ impl NativeBank {
 
     pub fn detectors(&self) -> &[DetectorMetadata] {
         self.engine.detectors()
+    }
+
+    pub fn regex_resource_profile(&self) -> Option<&RegexResourceProfile> {
+        self.engine.regex_resource_profile()
     }
 
     pub fn scan_bytes(&self, haystack: &[u8]) -> Result<NativeMatchBuffer> {
@@ -1325,7 +1329,9 @@ GENRE:
 
         let error = build_canonical_bank(defaults(false), candidates).unwrap_err();
 
-        assert!(error.to_string().contains("entity count 100001 exceeds limit 100000"));
+        assert!(error
+            .to_string()
+            .contains("entity count 100001 exceeds limit 100000"));
     }
 
     #[test]

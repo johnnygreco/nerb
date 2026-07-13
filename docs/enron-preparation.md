@@ -22,12 +22,20 @@ For the committed synthetic fixture:
 uv run nerb prepare-enron \
   --input-jsonl tests/data/enron_preparation.jsonl \
   --dataset synthetic/enron-preparation \
-  --dataset-revision fixture-v2 \
+  --dataset-revision fixture-revision \
   --output-dir .nerb/enron-preparation/fixture
 
+install -d -m 700 .nerb/enron-scratch
 uv run nerb verify-enron-preparation \
-  --run-dir .nerb/enron-preparation/fixture
+  --run-dir .nerb/enron-preparation/fixture \
+  --scratch-dir .nerb/enron-scratch
 ```
+
+Verification requires an existing directory owned by the current user with no group or other permissions. It creates
+one no-follow, descriptor-pinned child and keeps SQLite temporary and journal storage in memory. Before returning it
+wipes the database payload through its retained descriptor, quarantines the scratch child, and authenticates that only
+private zero-byte tombstones remain; it does not claim race-free path deletion. There is no implicit system-temporary
+fallback.
 
 The command streams its source once into a private disk-backed spool. Canonical export order, source commitments, and
 full SHA-256 document identities do not depend on source row order. Byte-identical source rows collapse into one record
@@ -91,10 +99,12 @@ that cannot provide the same boundary; the cross-platform cleaner remains usable
 writer is not substituted silently.
 
 Preparation builds a random sibling staging directory with mode `0700`, creates files with mode `0600`, flushes and
-validates the tree, writes `COMMITTED` last, and atomically promotes the directory without replacement. Failures remove
-owned staging data and cannot overwrite a previous run. If the operating system prevents cleanup (for example after a
-permission change), the cleanup failure is surfaced even when another exception is active; any residue remains private
-but requires explicit operator cleanup.
+validates the tree, writes `COMMITTED` last, and atomically promotes the directory without replacement. On failure it
+uses retained descriptors to wipe sensitive payload bytes first, quarantines the path as an owner-only
+`.nerb-cleanup-*` tombstone, and never overwrites a previous run. Automatic cleanup deliberately does not claim that a
+same-UID path can be deleted without a substitution race: the normal residue is a verified payload-empty tombstone or
+path shell for explicit offline operator removal. A wipe, quarantine, or verification failure is surfaced even when
+another exception is already active; cleanup failure never gets hidden by the original error.
 
 The committed directory contains:
 
@@ -110,8 +120,15 @@ The committed directory contains:
 `profile.json` and `manifest.json` contain no message text, addresses, message IDs, filenames, absolute paths, or
 per-record hashes. They report conservation counts, fixed size histograms, coarse date range/status counts, cleaning
 transforms, duplicate-group histograms, feature availability, policy/code hashes, and whole-artifact hashes. The verifier
-checks file hashes, canonical ordering, record counts, privacy-safe aggregate structure, and manifest/profile bindings
+checks the closed committed inventory, file hashes, canonical ordering, record counts, privacy-safe aggregate structure,
+manifest/profile bindings, and the transport receipt's closed schema, source kind, hash state, counters, and timing shape
 without returning private prepared text.
+
+Preparation and verification summaries expose the committed `manifest_sha256` as aggregate evidence. Verification pins
+the run directory and every committed file through no-follow descriptors for the complete operation, then rechecks each
+descriptor, directory entry, root identity, and exact inventory before returning. Callers do not need an ad hoc
+re-open/hash step. Optional activity callbacks report deterministic liveness during secondary write, hash, and
+verification passes without changing primary row progress or artifact commitments.
 
 Dataset, revision, and split labels are intentionally public provenance and must use bounded identifier tokens; free-form
 names or descriptions are rejected rather than copied into aggregate output.

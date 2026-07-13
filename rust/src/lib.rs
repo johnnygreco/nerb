@@ -1,6 +1,10 @@
 use pyo3::exceptions::{PyIndexError, PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PySequenceMethods};
+use pyo3::types::{
+    PyByteArray, PyByteArrayMethods, PyBytes, PyDict, PyList, PySequence, PySequenceMethods,
+};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::fs;
 use std::io::Read;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -14,9 +18,23 @@ mod ids;
 mod match_buffer;
 
 use bank::NativeBank;
+use engine::{
+    validate_scan_input_size, ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+    MAX_CONCURRENT_SCANS_PER_ENGINE, MAX_ENTITY_INDEPENDENT_REGEX_ACCOUNTED_BYTES,
+    MAX_ENTITY_INDEPENDENT_REGEX_LAYERS_PER_ENTITY, MAX_LAZY_DFA_CACHES_PER_META_REGEX,
+    MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER, MAX_SCAN_INPUT_BYTES, PIKEVM_STACK_NFA_MEMORY_MULTIPLIER,
+};
 use match_buffer::{NativeMatchBuffer, RawMatch};
 
-const MAX_SCAN_PATH_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_SCAN_PATH_BYTES: u64 = MAX_SCAN_INPUT_BYTES as u64;
+#[cfg(unix)]
+const DIRECTORY_OPEN_FLAGS: i32 =
+    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+#[cfg(unix)]
+const PRIVATE_FILE_OPEN_FLAGS: i32 =
+    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+#[cfg(unix)]
+const EXISTING_PRIVATE_FILE_OPEN_FLAGS: i32 = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
 
 fn ffi_boundary<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(operation)) {
@@ -25,6 +43,227 @@ fn ffi_boundary<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
             "NERB native engine panicked while handling an FFI call",
         )),
     }
+}
+
+#[cfg(unix)]
+fn write_status_bytes(status: &Bound<'_, PyByteArray>, value: &[u8]) -> PyResult<()> {
+    if status.len() != value.len() {
+        return Err(PyValueError::new_err(
+            "Native descriptor status buffer has invalid length",
+        ));
+    }
+    // SAFETY: the caller-created bytearray is exclusively borrowed by this
+    // GIL-held native call and no Python interaction occurs while mutating it.
+    unsafe { status.as_bytes_mut() }.copy_from_slice(value);
+    Ok(())
+}
+
+#[pyfunction]
+#[cfg(unix)]
+fn _close_fd_once(attempted: &Bound<'_, PyByteArray>, descriptor: i32) -> PyResult<i32> {
+    ffi_boundary(|| {
+        if attempted.len() != 1 || attempted.to_vec() != [0] {
+            return Err(PyValueError::new_err(
+                "Native close-attempt status buffer must contain one zero byte",
+            ));
+        }
+        // Python control flow cannot run between the syscall and the status
+        // commit because this function retains the interpreter lock.
+        let result = unsafe { libc::close(descriptor) };
+        let errno = if result == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        write_status_bytes(attempted, &[1])?;
+        Ok(errno)
+    })
+}
+
+#[pyfunction]
+#[cfg(not(unix))]
+fn _close_fd_once(_attempted: &Bound<'_, PyByteArray>, _descriptor: i32) -> PyResult<i32> {
+    Err(PyOSError::new_err(
+        "Native descriptor transactions require a Unix platform",
+    ))
+}
+
+#[pyfunction]
+#[cfg(unix)]
+fn _fsync_fd_commit(committed: &Bound<'_, PyByteArray>, descriptor: i32) -> PyResult<i32> {
+    ffi_boundary(|| {
+        if committed.len() != 1 || committed.to_vec() != [0] {
+            return Err(PyValueError::new_err(
+                "Native fsync-commit status buffer must contain one zero byte",
+            ));
+        }
+        // Retaining the interpreter lock across both the syscall and status
+        // mutation makes the successful durability boundary caller-visible
+        // without a Python control-flow gap.
+        let result = unsafe { libc::fsync(descriptor) };
+        let errno = if result == 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        if result == 0 {
+            write_status_bytes(committed, &[1])?;
+        }
+        Ok(errno)
+    })
+}
+
+#[pyfunction]
+#[cfg(not(unix))]
+fn _fsync_fd_commit(_committed: &Bound<'_, PyByteArray>, _descriptor: i32) -> PyResult<i32> {
+    Err(PyOSError::new_err(
+        "Native descriptor transactions require a Unix platform",
+    ))
+}
+
+#[pyfunction]
+#[cfg(unix)]
+#[pyo3(signature = (opened_fd, path, dir_fd=None))]
+fn _open_directory_fd_once(
+    opened_fd: &Bound<'_, PyByteArray>,
+    path: &[u8],
+    dir_fd: Option<i32>,
+) -> PyResult<i32> {
+    ffi_boundary(|| {
+        if opened_fd.len() != std::mem::size_of::<i32>()
+            || opened_fd.to_vec() != (-1_i32).to_ne_bytes()
+        {
+            return Err(PyValueError::new_err(
+                "Native directory-open status buffer must contain one negative descriptor",
+            ));
+        }
+        let path = CString::new(path)
+            .map_err(|_| PyValueError::new_err("Native directory path contains a null byte"))?;
+        let descriptor = unsafe {
+            match dir_fd {
+                Some(parent) => libc::openat(parent, path.as_ptr(), DIRECTORY_OPEN_FLAGS),
+                None => libc::open(path.as_ptr(), DIRECTORY_OPEN_FLAGS),
+            }
+        };
+        let errno = if descriptor >= 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        write_status_bytes(opened_fd, &descriptor.to_ne_bytes())?;
+        Ok(errno)
+    })
+}
+
+#[pyfunction]
+#[cfg(unix)]
+fn _open_private_file_fd_once(
+    opened_fd: &Bound<'_, PyByteArray>,
+    path: &[u8],
+    dir_fd: i32,
+) -> PyResult<i32> {
+    ffi_boundary(|| {
+        if opened_fd.len() != std::mem::size_of::<i32>()
+            || opened_fd.to_vec() != (-1_i32).to_ne_bytes()
+        {
+            return Err(PyValueError::new_err(
+                "Native private-file status buffer must contain one negative descriptor",
+            ));
+        }
+        let path = CString::new(path)
+            .map_err(|_| PyValueError::new_err("Native private-file path contains a null byte"))?;
+        let descriptor = unsafe {
+            libc::openat(
+                dir_fd,
+                path.as_ptr(),
+                PRIVATE_FILE_OPEN_FLAGS,
+                (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
+            )
+        };
+        let errno = if descriptor >= 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        write_status_bytes(opened_fd, &descriptor.to_ne_bytes())?;
+        Ok(errno)
+    })
+}
+
+#[pyfunction]
+#[cfg(unix)]
+fn _open_existing_private_file_fd_once(
+    opened_fd: &Bound<'_, PyByteArray>,
+    path: &[u8],
+    dir_fd: i32,
+) -> PyResult<i32> {
+    ffi_boundary(|| {
+        if opened_fd.len() != std::mem::size_of::<i32>()
+            || opened_fd.to_vec() != (-1_i32).to_ne_bytes()
+        {
+            return Err(PyValueError::new_err(
+                "Native existing-file status buffer must contain one negative descriptor",
+            ));
+        }
+        let path = CString::new(path)
+            .map_err(|_| PyValueError::new_err("Native existing-file path contains a null byte"))?;
+        let descriptor =
+            unsafe { libc::openat(dir_fd, path.as_ptr(), EXISTING_PRIVATE_FILE_OPEN_FLAGS) };
+        let errno = if descriptor >= 0 {
+            0
+        } else {
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO)
+        };
+        write_status_bytes(opened_fd, &descriptor.to_ne_bytes())?;
+        Ok(errno)
+    })
+}
+
+#[pyfunction]
+#[cfg(not(unix))]
+#[pyo3(signature = (_opened_fd, _path, _dir_fd=None))]
+fn _open_directory_fd_once(
+    _opened_fd: &Bound<'_, PyByteArray>,
+    _path: &[u8],
+    _dir_fd: Option<i32>,
+) -> PyResult<i32> {
+    Err(PyOSError::new_err(
+        "Native directory transactions require a Unix platform",
+    ))
+}
+
+#[pyfunction]
+#[cfg(not(unix))]
+fn _open_private_file_fd_once(
+    _opened_fd: &Bound<'_, PyByteArray>,
+    _path: &[u8],
+    _dir_fd: i32,
+) -> PyResult<i32> {
+    Err(PyOSError::new_err(
+        "Native private-file transactions require a Unix platform",
+    ))
+}
+
+#[pyfunction]
+#[cfg(not(unix))]
+fn _open_existing_private_file_fd_once(
+    _opened_fd: &Bound<'_, PyByteArray>,
+    _path: &[u8],
+    _dir_fd: i32,
+) -> PyResult<i32> {
+    Err(PyOSError::new_err(
+        "Native existing-file transactions require a Unix platform",
+    ))
 }
 
 #[pyclass(name = "Bank")]
@@ -80,6 +319,10 @@ impl PyBank {
                 .map(|entity| entity.patterns.len())
                 .sum();
             metadata.set_item("pattern_count", pattern_count)?;
+            metadata.set_item(
+                "build_source_sha256",
+                env!("NERB_NATIVE_BUILD_SOURCE_SHA256"),
+            )?;
 
             let defaults = PyDict::new(py);
             defaults.set_item("engine", &self.inner.canonical().defaults.engine)?;
@@ -112,6 +355,97 @@ impl PyBank {
             mode.set_item("internal_only", match_mode.internal_only())?;
             mode.set_item("semantic_notes", match_mode.semantic_notes())?;
             metadata.set_item("match_mode", mode)?;
+
+            let scan_limits = PyDict::new(py);
+            scan_limits.set_item("maximum_input_bytes", MAX_SCAN_INPUT_BYTES)?;
+            scan_limits.set_item(
+                "maximum_concurrent_scans_per_bank",
+                MAX_CONCURRENT_SCANS_PER_ENGINE,
+            )?;
+            metadata.set_item("scan_limits", scan_limits)?;
+
+            if match_mode.as_str() == "entity_independent" {
+                let resources = self
+                    .inner
+                    .regex_resource_profile()
+                    .expect("entity-independent mode must expose its regex resource profile");
+                let regex_resources = PyDict::new(py);
+                regex_resources.set_item("scope", "entity_independent_shards")?;
+                regex_resources
+                    .set_item("physical_regex_layers", resources.physical_regex_layers)?;
+                regex_resources.set_item(
+                    "maximum_regex_layers_per_entity",
+                    resources.maximum_regex_layers_per_entity,
+                )?;
+                regex_resources.set_item(
+                    "compiled_regex_static_bytes",
+                    resources.compiled_regex_static_bytes,
+                )?;
+                regex_resources.set_item(
+                    "eager_cache_bytes_per_scan",
+                    resources.eager_cache_bytes_per_scan,
+                )?;
+                regex_resources.set_item(
+                    "pikevm_cache_projection_bytes_per_scan",
+                    resources.pikevm_cache_projection_bytes_per_scan,
+                )?;
+                regex_resources.set_item(
+                    "pikevm_stack_growth_allowance_bytes_per_scan",
+                    resources.pikevm_stack_growth_allowance_bytes_per_scan,
+                )?;
+                regex_resources.set_item(
+                    "lazy_dfa_growth_allowance_bytes_per_scan",
+                    resources.lazy_dfa_growth_allowance_bytes_per_scan,
+                )?;
+                regex_resources.set_item(
+                    "regex_cache_allowance_bytes",
+                    resources.regex_cache_allowance_bytes,
+                )?;
+                regex_resources
+                    .set_item("size_limit_bisections", resources.size_limit_bisections)?;
+                regex_resources.set_item(
+                    "resource_limit_bisections",
+                    resources.resource_limit_bisections,
+                )?;
+                regex_resources.set_item(
+                    "accounted_bytes",
+                    resources.compiled_regex_static_bytes + resources.regex_cache_allowance_bytes,
+                )?;
+                regex_resources
+                    .set_item("cache_concurrency_budget", MAX_CONCURRENT_SCANS_PER_ENGINE)?;
+                regex_resources.set_item(
+                    "explicit_regex_cache_slots",
+                    MAX_CONCURRENT_SCANS_PER_ENGINE,
+                )?;
+                regex_resources.set_item("internal_meta_cache_pool_used", false)?;
+                regex_resources.set_item(
+                    "per_lazy_dfa_cache_capacity_bytes",
+                    ENTITY_INDEPENDENT_REGEX_CACHE_CAPACITY,
+                )?;
+                regex_resources.set_item(
+                    "maximum_lazy_dfa_caches_per_regex",
+                    MAX_LAZY_DFA_CACHES_PER_META_REGEX,
+                )?;
+                regex_resources.set_item(
+                    "pikevm_stack_nfa_memory_multiplier",
+                    PIKEVM_STACK_NFA_MEMORY_MULTIPLIER,
+                )?;
+                regex_resources.set_item("onepass_enabled", false)?;
+                regex_resources.set_item("bounded_backtracker_enabled", false)?;
+                regex_resources.set_item(
+                    "maximum_layers_per_entity",
+                    MAX_ENTITY_INDEPENDENT_REGEX_LAYERS_PER_ENTITY,
+                )?;
+                regex_resources.set_item(
+                    "maximum_patterns_per_regex_layer",
+                    MAX_PATTERNS_PER_BOUNDED_REGEX_LAYER,
+                )?;
+                regex_resources.set_item(
+                    "maximum_accounted_bytes",
+                    MAX_ENTITY_INDEPENDENT_REGEX_ACCOUNTED_BYTES,
+                )?;
+                metadata.set_item("regex_resources", regex_resources)?;
+            }
 
             let detectors = PyList::empty(py);
             for detector in self.inner.detectors() {
@@ -153,20 +487,28 @@ impl PyBank {
         haystack: &[u8],
         out: Option<Py<PyMatchBuffer>>,
     ) -> PyResult<Py<PyMatchBuffer>> {
-        ffi_boundary(|| match out {
-            Some(out) => {
-                let mut buffer = {
-                    let mut borrowed = out.bind(py).borrow_mut();
-                    std::mem::take(&mut borrowed.inner)
-                };
-                let scan_result = py.detach(|| self.inner.scan_bytes_into(haystack, &mut buffer));
-                out.bind(py).borrow_mut().inner = buffer;
-                scan_result?;
-                Ok(out)
-            }
-            None => {
-                let buffer = py.detach(|| self.inner.scan_bytes(haystack))?;
-                Py::new(py, PyMatchBuffer { inner: buffer })
+        ffi_boundary(|| {
+            let size_result = validate_scan_input_size(haystack).map_err(PyErr::from);
+            match out {
+                Some(out) => {
+                    let mut buffer = {
+                        let mut borrowed = out.bind(py).borrow_mut();
+                        std::mem::take(&mut borrowed.inner)
+                    };
+                    buffer.clear();
+                    let scan_result = size_result.and_then(|()| {
+                        py.detach(|| self.inner.scan_bytes_into(haystack, &mut buffer))
+                            .map_err(PyErr::from)
+                    });
+                    out.bind(py).borrow_mut().inner = buffer;
+                    scan_result?;
+                    Ok(out)
+                }
+                None => {
+                    size_result?;
+                    let buffer = py.detach(|| self.inner.scan_bytes(haystack))?;
+                    Py::new(py, PyMatchBuffer { inner: buffer })
+                }
             }
         })
     }
@@ -178,6 +520,7 @@ impl PyBank {
         max_matches: usize,
     ) -> PyResult<Py<PyMatchBuffer>> {
         ffi_boundary(|| {
+            validate_scan_input_size(haystack).map_err(PyErr::from)?;
             let buffer = py.detach(|| self.inner.scan_bytes_bounded(haystack, max_matches))?;
             Py::new(py, PyMatchBuffer { inner: buffer })
         })
@@ -190,27 +533,35 @@ impl PyBank {
         haystack: &[u8],
         out: Option<Py<PyMatchBuffer>>,
     ) -> PyResult<Py<PyMatchBuffer>> {
-        ffi_boundary(|| match out {
-            Some(out) => {
-                let mut buffer = {
-                    let mut borrowed = out.bind(py).borrow_mut();
-                    std::mem::take(&mut borrowed.inner)
-                };
-                let scan_result = py.detach(|| {
-                    self.inner
-                        .scan_bytes_leftmost_from_all_overlaps(haystack, &mut buffer)
-                });
-                out.bind(py).borrow_mut().inner = buffer;
-                scan_result?;
-                Ok(out)
-            }
-            None => {
-                let mut buffer = NativeMatchBuffer::new();
-                py.detach(|| {
-                    self.inner
-                        .scan_bytes_leftmost_from_all_overlaps(haystack, &mut buffer)
-                })?;
-                Py::new(py, PyMatchBuffer { inner: buffer })
+        ffi_boundary(|| {
+            let size_result = validate_scan_input_size(haystack).map_err(PyErr::from);
+            match out {
+                Some(out) => {
+                    let mut buffer = {
+                        let mut borrowed = out.bind(py).borrow_mut();
+                        std::mem::take(&mut borrowed.inner)
+                    };
+                    buffer.clear();
+                    let scan_result = size_result.and_then(|()| {
+                        py.detach(|| {
+                            self.inner
+                                .scan_bytes_leftmost_from_all_overlaps(haystack, &mut buffer)
+                        })
+                        .map_err(PyErr::from)
+                    });
+                    out.bind(py).borrow_mut().inner = buffer;
+                    scan_result?;
+                    Ok(out)
+                }
+                None => {
+                    size_result?;
+                    let mut buffer = NativeMatchBuffer::new();
+                    py.detach(|| {
+                        self.inner
+                            .scan_bytes_leftmost_from_all_overlaps(haystack, &mut buffer)
+                    })?;
+                    Py::new(py, PyMatchBuffer { inner: buffer })
+                }
             }
         })
     }
@@ -287,7 +638,9 @@ fn read_scan_path(path: &str) -> PyResult<Vec<u8>> {
     let mut haystack = Vec::new();
     file.take(MAX_SCAN_PATH_BYTES + 1)
         .read_to_end(&mut haystack)
-        .map_err(|error| PyOSError::new_err(format!("Could not read document path {path:?}: {error}")))?;
+        .map_err(|error| {
+            PyOSError::new_err(format!("Could not read document path {path:?}: {error}"))
+        })?;
     if haystack.len() as u64 > MAX_SCAN_PATH_BYTES {
         return Err(PyValueError::new_err(format!(
             "Document path {path:?} exceeds the configured limit of {MAX_SCAN_PATH_BYTES} bytes"
@@ -393,7 +746,19 @@ fn normalize_index(index: isize, len: usize) -> PyResult<usize> {
 fn _engine(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add("ENGINE_NAME", "nerb_engine")?;
+    module.add(
+        "BUILD_SOURCE_SHA256",
+        env!("NERB_NATIVE_BUILD_SOURCE_SHA256"),
+    )?;
     module.add_class::<PyBank>()?;
     module.add_class::<PyMatchBuffer>()?;
+    module.add_function(wrap_pyfunction!(_close_fd_once, module)?)?;
+    module.add_function(wrap_pyfunction!(_fsync_fd_commit, module)?)?;
+    module.add_function(wrap_pyfunction!(_open_directory_fd_once, module)?)?;
+    module.add_function(wrap_pyfunction!(_open_private_file_fd_once, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        _open_existing_private_file_fd_once,
+        module
+    )?)?;
     Ok(())
 }

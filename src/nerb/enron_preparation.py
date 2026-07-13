@@ -8,6 +8,7 @@ import math
 import os
 import platform
 import re
+import secrets
 import sqlite3
 import stat
 import tempfile
@@ -15,8 +16,10 @@ import time
 import unicodedata
 import zlib
 from collections import Counter, deque
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from email.errors import HeaderParseError
 from email.header import decode_header
@@ -40,7 +43,15 @@ from .enron_cleaning import (
     normalize_natural_text,
     normalize_thread_subject,
 )
-from .enron_private_io import EnronPrivateIOError, PrivateRun, open_private_binary_input
+from .enron_private_io import (
+    EnronPrivateIOError,
+    PrivateRun,
+    _wipe_and_quarantine_pinned_private_directory,
+    _wipe_and_quarantine_pinned_private_file,
+    open_private_binary_input,
+    open_private_binary_input_at,
+    open_private_directory_input,
+)
 
 PREPARED_RECORD_SCHEMA_VERSION = "nerb.enron_prepared_record.v2"
 PROFILE_SCHEMA_VERSION = "nerb.enron_preparation_profile.v2"
@@ -51,6 +62,7 @@ DEFAULT_DATASET_ID = "corbt/enron-emails"
 DEFAULT_DATASET_REVISION = "cfc06c758093d90993abce1a43668fb7357258a6"
 DEFAULT_DATASET_SPLIT = "train"
 PINNED_DATASET_RECORDS = 517_401
+PROGRESS_RECORD_INTERVAL = 10_000
 DEFAULT_OUTPUT_DIR = ".nerb/enron-preparation/run"
 DEFAULT_MAX_JSONL_LINE_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_BODY_CHARS = 2_500_000
@@ -75,6 +87,16 @@ _MANIFEST_FILENAME = "manifest.json"
 _TRANSPORT_FILENAME = "transport-receipt.json"
 _COMMITTED_FILENAME = "COMMITTED"
 _COMMITTED_PAYLOAD = b"nerb.enron.private-run.v2\n"
+_COMMITTED_RUN_FILES = frozenset(
+    {
+        _PREPARED_FILENAME,
+        _REJECTIONS_FILENAME,
+        _PROFILE_FILENAME,
+        _MANIFEST_FILENAME,
+        _TRANSPORT_FILENAME,
+        _COMMITTED_FILENAME,
+    }
+)
 _EXPECTED_FIELDS = frozenset({"message_id", "subject", "from", "to", "cc", "bcc", "date", "body", "file_name"})
 _TEXT_FIELDS = ("message_id", "subject", "from", "body", "file_name")
 _RECIPIENT_FIELDS = ("to", "cc", "bcc")
@@ -223,6 +245,8 @@ class EnronPreparationError(ValueError):
 class EnronPreparationOptions:
     output_dir: Path
     input_jsonl: Path | None = None
+    huggingface_cache_dir: Path | None = None
+    huggingface_anonymous: bool = False
     dataset_id: str = DEFAULT_DATASET_ID
     dataset_revision: str = DEFAULT_DATASET_REVISION
     dataset_split: str = DEFAULT_DATASET_SPLIT
@@ -234,6 +258,9 @@ class EnronPreparationOptions:
     max_subject_bytes: int = DEFAULT_MAX_SUBJECT_BYTES
     max_recipients_per_field: int = DEFAULT_MAX_RECIPIENTS_PER_FIELD
     allow_unignored_output: bool = False
+    progress_callback: Callable[[int], None] | None = None
+    activity_callback: Callable[[], None] | None = None
+    cleanup_successor: PrivateRun | None = dataclass_field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -308,6 +335,45 @@ class _RejectionVerification:
     subject_truncated_occurrences: int
 
 
+@dataclass(frozen=True, slots=True)
+class _JSONObjectSnapshot:
+    value: dict[str, Any]
+    sha256: str
+    identity: tuple[int, int, int, int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _FileSnapshot:
+    sha256: str
+    identity: tuple[int, int, int, int, int, int, int]
+
+
+@dataclass(slots=True)
+class _ActivityReporter:
+    """Report deterministic liveness without changing record progress or artifacts."""
+
+    callback: Callable[[], None] | None
+    pending_work: int = 0
+
+    def worked(self, units: int = 1) -> None:
+        self.pending_work += units
+        while self.pending_work >= PROGRESS_RECORD_INTERVAL:
+            self._report()
+            self.pending_work -= PROGRESS_RECORD_INTERVAL
+
+    def boundary(self) -> None:
+        self._report()
+        self.pending_work = 0
+
+    def _report(self) -> None:
+        if self.callback is None:
+            return
+        try:
+            self.callback()
+        except Exception:
+            raise EnronPreparationError("Preparation activity callback failed.") from None
+
+
 class _DuplicateJsonKey(ValueError):
     pass
 
@@ -319,6 +385,7 @@ class _NonfiniteJsonNumber(ValueError):
 def prepare_enron_source(options: EnronPreparationOptions) -> dict[str, Any]:
     """Prepare a pinned Enron-like source into a deterministic private run."""
     _validate_options(options)
+    activity = _ActivityReporter(options.activity_callback)
     implementation_sha256 = _implementation_sha256()
     runtime_provenance = {
         "python_implementation": platform.python_implementation(),
@@ -327,22 +394,32 @@ def prepare_enron_source(options: EnronPreparationOptions) -> dict[str, Any]:
     }
     started = time.perf_counter()
     try:
+        activity.boundary()
         with PrivateRun(
             options.output_dir,
             allow_unignored_output=options.allow_unignored_output,
         ) as run:
-            database_path = run.stage_dir / ".records.sqlite3"
-            connection = _open_spool(database_path)
+            spool_stack = ExitStack()
+            connection = spool_stack.enter_context(_private_preparation_spool())
             try:
                 source = _source_context(options)
-                ingest = _ingest_source(connection, source.events, options)
+                activity.boundary()
+                ingest = _ingest_source(connection, source.events, options, activity_reporter=activity)
+                activity.boundary()
                 with run.open_text(_PREPARED_FILENAME) as prepared_file:
                     prepared_descriptor, view_descriptors, aggregates = _write_prepared_records(
                         connection,
                         prepared_file,
+                        activity_reporter=activity,
                     )
+                activity.boundary()
                 with run.open_text(_REJECTIONS_FILENAME) as rejections_file:
-                    rejection_descriptor = _write_rejections(connection, rejections_file)
+                    rejection_descriptor = _write_rejections(
+                        connection,
+                        rejections_file,
+                        activity_reporter=activity,
+                    )
+                activity.boundary()
                 _validate_source_volume(options, source, ingest, aggregates)
                 profile = _profile_payload(
                     options,
@@ -359,7 +436,12 @@ def prepare_enron_source(options: EnronPreparationOptions) -> dict[str, Any]:
                 with run.open_text(_PROFILE_FILENAME) as profile_file:
                     _write_json_file(profile_file, profile)
                 profile_path = run.stage_dir / _PROFILE_FILENAME
-                profile_descriptor = _artifact_descriptor(_PROFILE_FILENAME, profile_path, records=1)
+                profile_descriptor = _artifact_descriptor(
+                    _PROFILE_FILENAME,
+                    profile_path,
+                    records=1,
+                    activity_reporter=activity,
+                )
                 manifest = _manifest_payload(
                     profile,
                     prepared_descriptor,
@@ -369,14 +451,22 @@ def prepare_enron_source(options: EnronPreparationOptions) -> dict[str, Any]:
                 _validate_aggregate_privacy(manifest)
                 with run.open_text(_MANIFEST_FILENAME) as manifest_file:
                     _write_json_file(manifest_file, manifest)
+                manifest_sha256 = _sha256_file(
+                    run.stage_dir / _MANIFEST_FILENAME,
+                    activity_reporter=activity,
+                )
                 with run.open_text(_TRANSPORT_FILENAME) as receipt_file:
                     _write_transport_receipt(receipt_file, source, started)
-                _validate_staged_run(run.stage_dir, source_connection=connection)
+                activity.boundary()
+                _validate_staged_run(
+                    run.stage_dir,
+                    source_connection=connection,
+                    activity_reporter=activity,
+                )
+                activity.boundary()
             finally:
-                connection.close()
-                if database_path.exists():
-                    database_path.unlink()
-            run.commit()
+                spool_stack.close()
+            run.commit(cleanup_successor=options.cleanup_successor)
     except (EnronPrivateIOError, EnronCleaningError) as exc:
         raise EnronPreparationError(str(exc)) from exc
 
@@ -390,97 +480,387 @@ def prepare_enron_source(options: EnronPreparationOptions) -> dict[str, Any]:
         "prepared_artifact_sha256": prepared_descriptor["sha256"],
         "profile_artifact_sha256": profile_descriptor["sha256"],
         "rejection_artifact_sha256": rejection_descriptor["sha256"],
+        "manifest_sha256": manifest_sha256,
         "elapsed_seconds": round(time.perf_counter() - started, 6),
     }
 
 
-def load_enron_preparation_run(path: Path) -> dict[str, Any]:
+def load_enron_preparation_run(
+    path: Path,
+    *,
+    scratch_dir: Path,
+    progress_callback: Callable[[int], None] | None = None,
+    activity_callback: Callable[[], None] | None = None,
+) -> dict[str, Any]:
     """Verify a committed preparation run without returning its private records."""
-    root = path.expanduser()
-    _assert_safe_existing_directory(root)
-    marker = root / _COMMITTED_FILENAME
-    if not marker.is_file() or marker.is_symlink():
-        raise EnronPreparationError("Enron preparation run is not committed.")
-    with _open_regular_binary(marker) as marker_file:
-        if marker_file.read(len(_COMMITTED_PAYLOAD) + 1) != _COMMITTED_PAYLOAD:
-            raise EnronPreparationError("Enron preparation commit marker is invalid.")
-    manifest = _read_json_object(root / _MANIFEST_FILENAME, 16 * 1024 * 1024)
-    profile = _read_json_object(root / _PROFILE_FILENAME, 16 * 1024 * 1024)
-    if manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
-        raise EnronPreparationError("Enron preparation manifest schema is invalid.")
-    if profile.get("schema_version") != PROFILE_SCHEMA_VERSION:
-        raise EnronPreparationError("Enron preparation profile schema is invalid.")
-    _validate_manifest_shape(manifest)
-    _validate_profile_shape(profile)
-    _validate_aggregate_privacy(manifest)
-    _validate_aggregate_privacy(profile)
-    artifacts = manifest.get("artifacts")
-    if not isinstance(artifacts, Mapping):
-        raise EnronPreparationError("Enron preparation manifest artifacts are invalid.")
-    for artifact_id, expected_name, expected_records in (
-        ("prepared_records", _PREPARED_FILENAME, None),
-        ("rejections", _REJECTIONS_FILENAME, None),
-        ("profile", _PROFILE_FILENAME, 1),
-    ):
-        descriptor = artifacts.get(artifact_id)
-        if (
-            not isinstance(descriptor, Mapping)
-            or descriptor.get("id") != artifact_id
-            or descriptor.get("name") != expected_name
-            or (expected_records is not None and descriptor.get("records") != expected_records)
-        ):
-            raise EnronPreparationError("Enron preparation artifact descriptor is invalid.")
-        artifact_path = root / expected_name
-        if descriptor.get("sha256") != _sha256_file(artifact_path):
-            raise EnronPreparationError("Enron preparation artifact hash mismatch.")
-        if descriptor.get("bytes") != artifact_path.stat().st_size:
-            raise EnronPreparationError("Enron preparation artifact size mismatch.")
+    if progress_callback is not None and not callable(progress_callback):
+        raise EnronPreparationError("Verification progress callback must be callable when provided.")
+    if activity_callback is not None and not callable(activity_callback):
+        raise EnronPreparationError("Verification activity callback must be callable when provided.")
+    activity = _ActivityReporter(activity_callback)
+    activity.boundary()
+    try:
+        root = path.expanduser().absolute()
+        with ExitStack() as stack:
+            root_fd = open_private_directory_input(root)
+            stack.callback(os.close, root_fd)
+            root_identity = _private_directory_identity(os.fstat(root_fd))
+            if set(os.listdir(root_fd)) != _COMMITTED_RUN_FILES:
+                raise EnronPreparationError("Enron preparation committed file inventory is invalid.")
 
-    prepared_descriptor = artifacts["prepared_records"]
-    profile_artifacts = profile.get("artifacts")
-    profile_prepared = profile_artifacts.get("prepared_records") if isinstance(profile_artifacts, Mapping) else None
-    rejection_descriptor = artifacts["rejections"]
-    profile_rejections = profile_artifacts.get("rejections") if isinstance(profile_artifacts, Mapping) else None
-    if profile_prepared != prepared_descriptor or profile_rejections != rejection_descriptor:
-        raise EnronPreparationError("Enron preparation profile artifact binding is invalid.")
-    expected_records, expected_occurrences, prepared_line_limit = _verify_profile_contract(profile, prepared_descriptor)
-    with tempfile.TemporaryDirectory(prefix="nerb-enron-verify-") as temporary_directory:
-        verification_root = Path(temporary_directory)
-        verification_root.chmod(0o700)
-        duplicate_connection = _open_duplicate_verification_spool(verification_root / "duplicates.sqlite3")
-        try:
-            verification = _verify_prepared_jsonl(
-                root / _PREPARED_FILENAME,
-                profile["source"],
-                max_line_bytes=prepared_line_limit,
-                duplicate_connection=duplicate_connection,
+            handles = {
+                name: stack.enter_context(open_private_binary_input_at(root_fd, name))
+                for name in sorted(_COMMITTED_RUN_FILES)
+            }
+            snapshots = {
+                name: _snapshot_open_file(handle, activity_reporter=activity) for name, handle in handles.items()
+            }
+            marker_file = handles[_COMMITTED_FILENAME]
+            marker_file.seek(0)
+            if marker_file.read(len(_COMMITTED_PAYLOAD) + 1) != _COMMITTED_PAYLOAD:
+                raise EnronPreparationError("Enron preparation commit marker is invalid.")
+
+            manifest_snapshot = _read_json_object_snapshot_from_handle(handles[_MANIFEST_FILENAME], 16 * 1024 * 1024)
+            profile_snapshot = _read_json_object_snapshot_from_handle(handles[_PROFILE_FILENAME], 16 * 1024 * 1024)
+            transport_snapshot = _read_json_object_snapshot_from_handle(handles[_TRANSPORT_FILENAME], 16 * 1024 * 1024)
+            if (
+                manifest_snapshot.sha256 != snapshots[_MANIFEST_FILENAME].sha256
+                or manifest_snapshot.identity != snapshots[_MANIFEST_FILENAME].identity
+                or profile_snapshot.sha256 != snapshots[_PROFILE_FILENAME].sha256
+                or profile_snapshot.identity != snapshots[_PROFILE_FILENAME].identity
+                or transport_snapshot.sha256 != snapshots[_TRANSPORT_FILENAME].sha256
+                or transport_snapshot.identity != snapshots[_TRANSPORT_FILENAME].identity
+            ):
+                raise EnronPreparationError("Enron preparation JSON artifact changed during verification.")
+            manifest = manifest_snapshot.value
+            manifest_sha256 = manifest_snapshot.sha256
+            profile = profile_snapshot.value
+            if manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION:
+                raise EnronPreparationError("Enron preparation manifest schema is invalid.")
+            if profile.get("schema_version") != PROFILE_SCHEMA_VERSION:
+                raise EnronPreparationError("Enron preparation profile schema is invalid.")
+            _validate_manifest_shape(manifest)
+            _validate_profile_shape(profile)
+            _validate_aggregate_privacy(manifest)
+            _validate_aggregate_privacy(profile)
+            _validate_transport_receipt(transport_snapshot.value, manifest["source"])
+            artifacts = manifest.get("artifacts")
+            if not isinstance(artifacts, Mapping):
+                raise EnronPreparationError("Enron preparation manifest artifacts are invalid.")
+            for artifact_id, expected_name, expected_records in (
+                ("prepared_records", _PREPARED_FILENAME, None),
+                ("rejections", _REJECTIONS_FILENAME, None),
+                ("profile", _PROFILE_FILENAME, 1),
+            ):
+                descriptor = artifacts.get(artifact_id)
+                observed = snapshots[expected_name]
+                if (
+                    not isinstance(descriptor, Mapping)
+                    or descriptor.get("id") != artifact_id
+                    or descriptor.get("name") != expected_name
+                    or (expected_records is not None and descriptor.get("records") != expected_records)
+                ):
+                    raise EnronPreparationError("Enron preparation artifact descriptor is invalid.")
+                if descriptor.get("sha256") != observed.sha256:
+                    raise EnronPreparationError("Enron preparation artifact hash mismatch.")
+                if descriptor.get("bytes") != observed.identity[4]:
+                    raise EnronPreparationError("Enron preparation artifact size mismatch.")
+
+            prepared_descriptor = artifacts["prepared_records"]
+            profile_artifacts = profile.get("artifacts")
+            profile_prepared = (
+                profile_artifacts.get("prepared_records") if isinstance(profile_artifacts, Mapping) else None
             )
-            verified_duplicates = _duplicate_aggregates(duplicate_connection)
-        finally:
-            duplicate_connection.close()
-    if verification.records != expected_records or verification.occurrences != expected_occurrences:
-        raise EnronPreparationError("Enron preparation record or occurrence count mismatch.")
-    _verify_view_projections(profile, verification)
-    _verify_prepared_aggregates(profile, verification)
-    _verify_duplicate_aggregates(profile, verified_duplicates)
-    rejection_verification = _verify_rejections_jsonl(root / _REJECTIONS_FILENAME, rejection_descriptor)
-    if rejection_verification.occurrences != profile["records"]["rejected_records"]:
-        raise EnronPreparationError("Enron preparation rejection count mismatch.")
-    _verify_ingestion_counters(profile, verification, rejection_verification)
-    _verify_source_multiset(profile, verification, rejection_verification)
-    _verify_manifest_profile_binding(manifest, profile)
-    return {
-        "valid": True,
-        "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
-        "manifest": manifest,
-        "profile": profile,
-        "artifacts": dict(artifacts),
-    }
+            rejection_descriptor = artifacts["rejections"]
+            profile_rejections = profile_artifacts.get("rejections") if isinstance(profile_artifacts, Mapping) else None
+            if profile_prepared != prepared_descriptor or profile_rejections != rejection_descriptor:
+                raise EnronPreparationError("Enron preparation profile artifact binding is invalid.")
+            expected_records, expected_occurrences, prepared_line_limit = _verify_profile_contract(
+                profile, prepared_descriptor
+            )
+            with _verification_scratch_directory(scratch_dir) as scratch:
+                duplicate_connection = _open_duplicate_verification_spool(
+                    scratch.path,
+                    expected_identity=scratch.identity,
+                    proof_fd=scratch.descriptor,
+                )
+                try:
+                    verification = _verify_prepared_jsonl(
+                        root / _PREPARED_FILENAME,
+                        profile["source"],
+                        max_line_bytes=prepared_line_limit,
+                        duplicate_connection=duplicate_connection,
+                        progress_callback=progress_callback,
+                        activity_reporter=activity,
+                        source_file=handles[_PREPARED_FILENAME],
+                        expected_snapshot=snapshots[_PREPARED_FILENAME],
+                    )
+                    activity.boundary()
+                    verified_duplicates = _duplicate_aggregates(duplicate_connection, activity_reporter=activity)
+                finally:
+                    duplicate_connection.close()
+            if verification.records != expected_records or verification.occurrences != expected_occurrences:
+                raise EnronPreparationError("Enron preparation record or occurrence count mismatch.")
+            _verify_view_projections(profile, verification)
+            _verify_prepared_aggregates(profile, verification)
+            _verify_duplicate_aggregates(profile, verified_duplicates)
+            activity.boundary()
+            rejection_verification = _verify_rejections_jsonl(
+                root / _REJECTIONS_FILENAME,
+                rejection_descriptor,
+                activity_reporter=activity,
+                source_file=handles[_REJECTIONS_FILENAME],
+                expected_snapshot=snapshots[_REJECTIONS_FILENAME],
+            )
+            if rejection_verification.occurrences != profile["records"]["rejected_records"]:
+                raise EnronPreparationError("Enron preparation rejection count mismatch.")
+            _verify_ingestion_counters(profile, verification, rejection_verification)
+            _verify_source_multiset(profile, verification, rejection_verification)
+            _verify_manifest_profile_binding(manifest, profile)
+
+            if (
+                set(os.listdir(root_fd)) != _COMMITTED_RUN_FILES
+                or _private_directory_identity(os.fstat(root_fd)) != root_identity
+            ):
+                raise EnronPreparationError("Enron preparation run changed during verification.")
+            for name, snapshot in snapshots.items():
+                _assert_open_file_snapshot_current(handles[name], snapshot)
+                with open_private_binary_input_at(root_fd, name) as current:
+                    if _regular_file_identity(os.fstat(current.fileno())) != snapshot.identity:
+                        raise EnronPreparationError("Enron preparation artifact changed during verification.")
+            current_root_fd = open_private_directory_input(root)
+            try:
+                if _private_directory_identity(os.fstat(current_root_fd)) != root_identity:
+                    raise EnronPreparationError("Enron preparation run changed during verification.")
+            finally:
+                os.close(current_root_fd)
+            activity.boundary()
+            return {
+                "valid": True,
+                "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
+                "manifest": manifest,
+                "profile": profile,
+                "artifacts": dict(artifacts),
+                "manifest_sha256": manifest_sha256,
+            }
+    except EnronPreparationError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError, RuntimeError, ValueError):
+        raise EnronPreparationError("Enron preparation run could not be verified safely.") from None
+
+
+def _verification_scratch_root(path: Path) -> Path:
+    if not isinstance(path, Path):
+        raise EnronPreparationError("Verification scratch root must be a path.")
+    try:
+        candidate = path.expanduser()
+        if any(part == os.pardir for part in candidate.parts):
+            raise EnronPreparationError("Verification scratch root is invalid.")
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+    except EnronPreparationError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise EnronPreparationError("Verification scratch root is unavailable.") from None
+    return candidate
+
+
+def _private_directory_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        raise EnronPreparationError("Verification scratch root must be an owned owner-only directory.")
+    return info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)
+
+
+def _private_scratch_file_identity(info: os.stat_result) -> tuple[int, int, int, int, int]:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise EnronPreparationError("Verification scratch file must be an owned private regular file.")
+    return info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode), info.st_nlink
+
+
+@dataclass(frozen=True, slots=True)
+class _VerificationScratchFile:
+    path: Path
+    descriptor: int
+    identity: tuple[int, int, int, int, int]
+
+
+def _assert_verification_scratch_root_current(path: Path, expected: tuple[int, int, int, int]) -> None:
+    current_fd: int | None = None
+    try:
+        current_fd = open_private_directory_input(path)
+        if _private_directory_identity(os.fstat(current_fd)) != expected:
+            raise EnronPreparationError("Verification scratch root changed during use.")
+    except EnronPreparationError:
+        raise
+    except (EnronPrivateIOError, OSError, ValueError):
+        raise EnronPreparationError("Verification scratch root changed during use.") from None
+    finally:
+        if current_fd is not None:
+            try:
+                os.close(current_fd)
+            except OSError:
+                pass
+
+
+def _cleanup_verification_scratch(
+    *,
+    root_path: Path,
+    root_fd: int | None,
+    root_identity: tuple[int, int, int, int] | None,
+    child_fd: int | None,
+    child_name: str | None,
+    child_identity: tuple[int, int, int, int] | None,
+    database_fd: int | None,
+    database_identity: tuple[int, int, int, int, int] | None,
+) -> None:
+    cleanup_failed = False
+    if database_fd is not None and child_fd is not None and child_name is not None and database_identity is not None:
+        try:
+            _wipe_and_quarantine_pinned_private_file(
+                database_fd,
+                child_fd,
+                root_path / child_name,
+                "duplicates.sqlite3",
+                database_identity[:2],
+                workspace_root=None,
+                allow_unignored_output=True,
+            )
+        except EnronPrivateIOError:
+            cleanup_failed = True
+    elif database_fd is not None:
+        cleanup_failed = True
+    if child_fd is not None and root_fd is not None and child_name is not None and child_identity is not None:
+        try:
+            _wipe_and_quarantine_pinned_private_directory(
+                child_fd,
+                root_fd,
+                root_path,
+                child_name,
+                child_identity[:2],
+                workspace_root=None,
+                allow_unignored_output=True,
+            )
+        except EnronPrivateIOError:
+            cleanup_failed = True
+    elif child_fd is not None or child_name is not None:
+        cleanup_failed = True
+    if database_fd is not None:
+        try:
+            os.close(database_fd)
+        except OSError:
+            cleanup_failed = True
+    if child_fd is not None:
+        try:
+            os.close(child_fd)
+        except OSError:
+            cleanup_failed = True
+    if root_identity is not None:
+        try:
+            _assert_verification_scratch_root_current(root_path, root_identity)
+        except EnronPreparationError:
+            cleanup_failed = True
+    if root_fd is not None:
+        try:
+            os.close(root_fd)
+        except OSError:
+            cleanup_failed = True
+    if cleanup_failed:
+        raise EnronPreparationError("Verification scratch could not be cleaned safely.")
+
+
+@contextmanager
+def _verification_scratch_directory(path: Path) -> Iterator[_VerificationScratchFile]:
+    root_path = _verification_scratch_root(path)
+    root_fd: int | None = None
+    root_identity: tuple[int, int, int, int] | None = None
+    child_fd: int | None = None
+    child_name: str | None = None
+    child_identity: tuple[int, int, int, int] | None = None
+    database_fd: int | None = None
+    database_identity: tuple[int, int, int, int, int] | None = None
+    operation_error: BaseException | None = None
+    try:
+        root_fd = open_private_directory_input(root_path)
+        root_identity = _private_directory_identity(os.fstat(root_fd))
+        for _ in range(128):
+            candidate = f".nerb-enron-verify-{secrets.token_hex(12)}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=root_fd)
+            except FileExistsError:
+                continue
+            child_name = candidate
+            break
+        if child_name is None:
+            raise EnronPreparationError("Verification scratch directory could not be allocated safely.")
+        os.chmod(child_name, 0o700, dir_fd=root_fd, follow_symlinks=False)
+        before = os.stat(child_name, dir_fd=root_fd, follow_symlinks=False)
+        child_fd = os.open(
+            child_name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=root_fd,
+        )
+        after = os.fstat(child_fd)
+        child_identity = _private_directory_identity(after)
+        if stat.S_ISLNK(before.st_mode) or _private_directory_identity(before) != child_identity:
+            raise EnronPreparationError("Verification scratch directory changed while it was opened.")
+        database_fd = os.open(
+            "duplicates.sqlite3",
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=child_fd,
+        )
+        os.fchmod(database_fd, 0o600)
+        database_identity = _private_scratch_file_identity(os.fstat(database_fd))
+        _assert_verification_scratch_root_current(root_path, root_identity)
+        yield _VerificationScratchFile(
+            path=root_path / child_name / "duplicates.sqlite3",
+            descriptor=database_fd,
+            identity=database_identity,
+        )
+    except EnronPreparationError as exc:
+        operation_error = exc
+        raise
+    except (EnronPrivateIOError, OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+        operation_error = exc
+        raise EnronPreparationError("Verification scratch could not be used safely.") from None
+    except BaseException as exc:
+        operation_error = exc
+        raise
+    finally:
+        try:
+            _cleanup_verification_scratch(
+                root_path=root_path,
+                root_fd=root_fd,
+                root_identity=root_identity,
+                child_fd=child_fd,
+                child_name=child_name,
+                child_identity=child_identity,
+                database_fd=database_fd,
+                database_identity=database_identity,
+            )
+        except EnronPreparationError as cleanup_error:
+            if operation_error is not None:
+                raise cleanup_error from operation_error
+            raise
 
 
 def _validate_options(options: EnronPreparationOptions) -> None:
     if not isinstance(options.output_dir, Path):
         raise EnronPreparationError("output_dir must be a path.")
+    if options.huggingface_cache_dir is not None:
+        if not isinstance(options.huggingface_cache_dir, Path):
+            raise EnronPreparationError("huggingface_cache_dir must be a path when provided.")
+        if not options.huggingface_cache_dir.is_absolute() or os.pardir in options.huggingface_cache_dir.parts:
+            raise EnronPreparationError("huggingface_cache_dir must be an absolute path without parent traversal.")
+    if type(options.huggingface_anonymous) is not bool:
+        raise EnronPreparationError("huggingface_anonymous must be a boolean.")
+    if options.input_jsonl is not None and (options.huggingface_cache_dir is not None or options.huggingface_anonymous):
+        raise EnronPreparationError("Hugging Face reader options cannot be used with a local JSONL source.")
     if not options.dataset_id.strip() or not options.dataset_revision.strip() or not options.dataset_split.strip():
         raise EnronPreparationError("Dataset id, revision, and split must be non-empty.")
     if any(
@@ -490,6 +870,12 @@ def _validate_options(options: EnronPreparationOptions) -> None:
         raise EnronPreparationError("Dataset provenance must use a bounded public identifier token.")
     if options.max_rows is not None and (isinstance(options.max_rows, bool) or options.max_rows <= 0):
         raise EnronPreparationError("max_rows must be a positive integer when provided.")
+    if options.progress_callback is not None and not callable(options.progress_callback):
+        raise EnronPreparationError("progress_callback must be callable when provided.")
+    if options.activity_callback is not None and not callable(options.activity_callback):
+        raise EnronPreparationError("activity_callback must be callable when provided.")
+    if options.cleanup_successor is not None and not isinstance(options.cleanup_successor, PrivateRun):
+        raise EnronPreparationError("cleanup_successor must be a private run when provided.")
     for name in (
         "max_jsonl_line_bytes",
         "max_body_chars",
@@ -534,12 +920,16 @@ def _source_context(options: EnronPreparationOptions) -> _SourceContext:
             "Hugging Face streaming requires the optional datasets package and a pinned dataset revision."
         ) from exc
     load_dataset = datasets_module.load_dataset
-    rows = load_dataset(
-        options.dataset_id,
-        split=options.dataset_split,
-        streaming=True,
-        revision=options.dataset_revision,
-    )
+    load_options: dict[str, Any] = {
+        "split": options.dataset_split,
+        "streaming": True,
+        "revision": options.dataset_revision,
+    }
+    if options.huggingface_cache_dir is not None:
+        load_options["cache_dir"] = options.huggingface_cache_dir
+    if options.huggingface_anonymous:
+        load_options["token"] = False
+    rows = load_dataset(options.dataset_id, **load_options)
     discovered_version = getattr(datasets_module, "__version__", None)
     if not isinstance(discovered_version, str):
         try:
@@ -622,6 +1012,8 @@ def _ingest_source(
     connection: sqlite3.Connection,
     events: Iterable[_InputEvent],
     options: EnronPreparationOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> dict[str, Any]:
     counters: Counter[str] = Counter()
     input_records = 0
@@ -632,10 +1024,13 @@ def _ingest_source(
         except StopIteration:
             break
         input_records += 1
+        if activity_reporter is not None:
+            activity_reporter.worked()
         if event.error_code is not None:
             counters[event.error_code] += 1
             _record_source_item(connection, event.source_digest)
             _record_rejection(connection, event.source_digest, event.error_code)
+            _report_ingest_progress(options, input_records)
             continue
         assert event.row is not None
         validated, validation_error = _validate_source_row(event.row)
@@ -644,6 +1039,7 @@ def _ingest_source(
             digest = _source_mapping_digest(event.row)
             _record_source_item(connection, digest)
             _record_rejection(connection, digest, validation_error or "invalid_source_schema")
+            _report_ingest_progress(options, input_records)
             continue
         source_bytes = _canonical_source_bytes(validated.source_projection)
         source_sha256 = _domain_hash("nerb/enron/source-record/v2", source_bytes)
@@ -662,6 +1058,7 @@ def _ingest_source(
                 (source_digest,),
             )
             counters["duplicate_source_rows"] += 1
+            _report_ingest_progress(options, input_records)
             continue
 
         try:
@@ -683,6 +1080,7 @@ def _ingest_source(
                 body_truncated=body_truncated,
                 subject_truncated=subject_truncated,
             )
+            _report_ingest_progress(options, input_records)
             continue
         document_id = _document_id(options.dataset_id, options.dataset_revision, source_sha256)
         payload = dict(prepared.payload)
@@ -717,12 +1115,30 @@ def _ingest_source(
             ),
         )
         counters["accepted_unique_rows"] += 1
+        _report_ingest_progress(options, input_records)
+    if options.progress_callback is not None and input_records > 0 and input_records % PROGRESS_RECORD_INTERVAL != 0:
+        options.progress_callback(input_records)
     connection.commit()
     return {
         "input_records": input_records,
         "ingestion_counters": dict(sorted(counters.items())),
-        "source_multiset_sha256": _source_multiset_hash(connection),
+        "source_multiset_sha256": _source_multiset_hash(connection, activity_reporter=activity_reporter),
     }
+
+
+def _report_ingest_progress(options: EnronPreparationOptions, input_records: int) -> None:
+    callback = options.progress_callback
+    if callback is not None and input_records % PROGRESS_RECORD_INTERVAL == 0:
+        callback(input_records)
+
+
+def _report_verification_progress(callback: Callable[[int], None], verified_records: int) -> None:
+    try:
+        callback(verified_records)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        raise EnronPreparationError("Verification progress callback failed.") from None
 
 
 def _validate_source_row(row: Mapping[str, Any]) -> tuple[_ValidatedRow | None, str | None]:
@@ -947,6 +1363,8 @@ def _prepare_unique_row(
 def _write_prepared_records(
     connection: sqlite3.Connection,
     file: TextIO,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     artifact_digest = hashlib.sha256()
     artifact_bytes = 0
@@ -972,6 +1390,8 @@ def _write_prepared_records(
         """
     )
     for document_id, payload_json_zlib, occurrences, date_utc in rows:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         payload = json.loads(zlib.decompress(payload_json_zlib))
         payload["source"]["identical_occurrence_count"] = occurrences
         line = (_canonical_json(payload) + "\n").encode("utf-8")
@@ -1033,7 +1453,11 @@ def _write_prepared_records(
         }
         for name in view_digests
     ]
-    duplicates = _duplicate_aggregates(connection)
+    if activity_reporter is not None:
+        activity_reporter.boundary()
+    duplicates = _duplicate_aggregates(connection, activity_reporter=activity_reporter)
+    if activity_reporter is not None:
+        activity_reporter.boundary()
     features = _feature_aggregates(connection)
     return (
         prepared_descriptor,
@@ -1060,7 +1484,12 @@ def _write_prepared_records(
     )
 
 
-def _write_rejections(connection: sqlite3.Connection, file: TextIO) -> dict[str, Any]:
+def _write_rejections(
+    connection: sqlite3.Connection,
+    file: TextIO,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> dict[str, Any]:
     digest = hashlib.sha256()
     artifact_bytes = 0
     records = 0
@@ -1071,6 +1500,8 @@ def _write_rejections(connection: sqlite3.Connection, file: TextIO) -> dict[str,
         FROM rejections ORDER BY source_digest, reason
         """
     ):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         payload = {
             "schema_version": REJECTION_RECORD_SCHEMA_VERSION,
             "source_digest_sha256": source_digest,
@@ -1250,15 +1681,150 @@ def _write_transport_receipt(file: TextIO, source: _SourceContext, started: floa
     _write_json_file(file, payload)
 
 
-def _open_spool(path: Path) -> sqlite3.Connection:
-    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-    os.close(descriptor)
-    path.chmod(0o600)
+def _validate_transport_receipt(receipt: Mapping[str, Any], source: Mapping[str, Any]) -> None:
+    _require_mapping_keys(
+        receipt,
+        {
+            "canonical",
+            "elapsed_seconds",
+            "physical_lines",
+            "schema_version",
+            "source_kind",
+            "transport_bytes",
+            "transport_complete",
+            "transport_prefix_sha256",
+            "transport_sha256",
+        },
+        "Enron preparation transport receipt schema is not closed.",
+    )
+    _validate_aggregate_privacy(receipt)
+    elapsed_seconds = receipt.get("elapsed_seconds")
+    if receipt.get("source_kind") != source.get("kind"):
+        raise EnronPreparationError("Enron preparation transport receipt source binding is invalid.")
+    if (
+        receipt.get("schema_version") != "nerb.enron_transport_receipt.v2"
+        or receipt.get("canonical") is not False
+        or isinstance(elapsed_seconds, bool)
+        or not isinstance(elapsed_seconds, (int, float))
+        or not math.isfinite(elapsed_seconds)
+        or elapsed_seconds < 0
+    ):
+        raise EnronPreparationError("Enron preparation transport receipt is invalid.")
+    if receipt["source_kind"] == "local_jsonl":
+        transport_complete = receipt.get("transport_complete")
+        transport_bytes = receipt.get("transport_bytes")
+        physical_lines = receipt.get("physical_lines")
+        if (
+            not isinstance(transport_complete, bool)
+            or isinstance(transport_bytes, bool)
+            or not isinstance(transport_bytes, int)
+            or transport_bytes < 0
+            or isinstance(physical_lines, bool)
+            or not isinstance(physical_lines, int)
+            or physical_lines < 0
+        ):
+            raise EnronPreparationError("Enron preparation transport receipt is invalid.")
+        transport_sha256 = receipt.get("transport_sha256")
+        transport_prefix_sha256 = receipt.get("transport_prefix_sha256")
+        if transport_complete:
+            valid_hash_state = (
+                isinstance(transport_sha256, str)
+                and _SHA256_RE.fullmatch(transport_sha256) is not None
+                and transport_prefix_sha256 is None
+            )
+        else:
+            valid_hash_state = (
+                transport_sha256 is None
+                and isinstance(transport_prefix_sha256, str)
+                and _SHA256_RE.fullmatch(transport_prefix_sha256) is not None
+            )
+        if not valid_hash_state:
+            raise EnronPreparationError("Enron preparation transport receipt is invalid.")
+    elif any(
+        receipt.get(field) is not None
+        for field in (
+            "transport_complete",
+            "transport_sha256",
+            "transport_prefix_sha256",
+            "transport_bytes",
+            "physical_lines",
+        )
+    ):
+        raise EnronPreparationError("Enron preparation transport receipt is invalid.")
+
+
+@contextmanager
+def _private_preparation_spool() -> Iterator[sqlite3.Connection]:
+    """Own the construction database in a pinned wipe-to-tombstone transaction."""
+
+    temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    final = temp_root / f"nerb-enron-preparation-{secrets.token_hex(16)}"
+    connection: sqlite3.Connection | None = None
+    operation_error: BaseException | None = None
+    try:
+        with PrivateRun(final, allow_unignored_output=True) as run:
+            try:
+                spool_path = run.create_external_file("records.sqlite3")
+                connection = _open_spool(spool_path, precreated=True)
+                run.pin_cleanup_file("records.sqlite3")
+                yield connection
+            except BaseException as exc:
+                operation_error = exc
+                raise
+            finally:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        cleanup_error = EnronPreparationError("Preparation spool could not be closed safely.")
+                        if operation_error is not None:
+                            raise cleanup_error from operation_error
+                        raise cleanup_error from None
+    except EnronPrivateIOError as exc:
+        raise EnronPreparationError("Preparation spool could not be cleaned safely.") from exc
+
+
+def _open_spool(path: Path, *, precreated: bool = False) -> sqlite3.Connection:
+    expected_identity: tuple[int, int] | None = None
+    if precreated:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size != 0
+        ):
+            raise EnronPreparationError("Precreated preparation spool is unsafe.")
+        expected_identity = int(before.st_dev), int(before.st_ino)
+    else:
+        descriptor = os.open(
+            path,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.close(descriptor)
+        path.chmod(0o600)
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA journal_mode=DELETE")
+    journal_mode = connection.execute("PRAGMA journal_mode=MEMORY").fetchone()
+    if journal_mode is None or str(journal_mode[0]).lower() != "memory":
+        connection.close()
+        raise EnronPreparationError("Preparation spool could not keep its journal in memory.")
     connection.execute("PRAGMA synchronous=FULL")
     connection.execute("PRAGMA temp_store=MEMORY")
     connection.execute("PRAGMA cache_size=-16384")
+    if expected_identity is not None:
+        after = path.lstat()
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or stat.S_ISLNK(after.st_mode)
+            or after.st_nlink != 1
+            or after.st_uid != os.geteuid()
+            or (after.st_dev, after.st_ino) != expected_identity
+        ):
+            connection.close()
+            raise EnronPreparationError("Preparation spool changed while SQLite opened it.")
     connection.execute(
         """
         CREATE TABLE records (
@@ -1296,27 +1862,62 @@ def _open_spool(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _open_duplicate_verification_spool(path: Path) -> sqlite3.Connection:
-    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-    os.close(descriptor)
-    path.chmod(0o600)
-    connection = sqlite3.connect(path)
-    connection.execute("PRAGMA journal_mode=OFF")
-    connection.execute("PRAGMA synchronous=OFF")
-    connection.execute("PRAGMA temp_store=FILE")
-    connection.execute("PRAGMA cache_size=-16384")
-    connection.execute(
-        """
-        CREATE TABLE records (
-            occurrence_count INTEGER NOT NULL,
-            exact_content_sha256 TEXT NOT NULL,
-            message_id_sha256 TEXT
+def _open_duplicate_verification_spool(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int, int, int, int],
+    proof_fd: int,
+) -> sqlite3.Connection:
+    connection: sqlite3.Connection | None = None
+    setup_error: BaseException | None = None
+    try:
+        before = path.lstat()
+        if _private_scratch_file_identity(before) != expected_identity:
+            raise EnronPreparationError("Verification scratch file changed before SQLite opened it.")
+        connection = sqlite3.connect(path)
+        connection.execute("PRAGMA journal_mode=OFF")
+        connection.execute("PRAGMA synchronous=OFF")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        connection.execute("PRAGMA cache_size=-16384")
+        connection.execute(
+            """
+            CREATE TABLE records (
+                occurrence_count INTEGER NOT NULL,
+                exact_content_sha256 TEXT NOT NULL,
+                message_id_sha256 TEXT
+            )
+            """
         )
-        """
-    )
-    connection.execute("CREATE INDEX records_exact_content_idx ON records (exact_content_sha256)")
-    connection.execute("CREATE INDEX records_message_id_idx ON records (message_id_sha256)")
-    return connection
+        connection.execute("CREATE INDEX records_exact_content_idx ON records (exact_content_sha256)")
+        connection.execute("CREATE INDEX records_message_id_idx ON records (message_id_sha256)")
+        connection.commit()
+        after = path.lstat()
+        proof = os.fstat(proof_fd)
+        if (
+            _private_scratch_file_identity(after) != expected_identity
+            or _private_scratch_file_identity(proof) != expected_identity
+            or proof.st_size <= 0
+            or after.st_size != proof.st_size
+        ):
+            raise EnronPreparationError("Verification scratch file changed while SQLite opened it.")
+        result = connection
+        connection = None
+        return result
+    except EnronPreparationError as exc:
+        setup_error = exc
+        raise
+    except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+        setup_error = exc
+        raise EnronPreparationError("Verification scratch database could not be opened safely.") from None
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                cleanup_error = EnronPreparationError("Verification scratch database could not be closed safely.")
+                if setup_error is not None:
+                    raise cleanup_error from setup_error
+                raise cleanup_error from None
 
 
 def _record_source_item(connection: sqlite3.Connection, digest: str) -> None:
@@ -1367,12 +1968,18 @@ def _preclean_truncation_flags(
     return body_truncated, subject_truncated
 
 
-def _source_multiset_hash(connection: sqlite3.Connection) -> str:
+def _source_multiset_hash(
+    connection: sqlite3.Connection,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> str:
     accumulator = 0
     occurrences = 0
     for source_digest, occurrence_count in connection.execute(
         "SELECT source_digest, occurrence_count FROM source_items"
     ):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         accumulator, occurrences = _add_source_multiset_item(
             accumulator,
             occurrences,
@@ -1405,12 +2012,18 @@ def _finalize_source_multiset_hash(accumulator: int, occurrences: int) -> str:
     return _domain_hash_prefixed("nerb/enron/source-row-multiset/v2", payload.hex())
 
 
-def _duplicate_aggregates(connection: sqlite3.Connection) -> dict[str, Any]:
+def _duplicate_aggregates(
+    connection: sqlite3.Connection,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> dict[str, Any]:
     source_duplicates, source_duplicate_groups, source_histogram = _fold_group_sizes(
-        connection.execute("SELECT occurrence_count FROM records")
+        connection.execute("SELECT occurrence_count FROM records"),
+        activity_reporter=activity_reporter,
     )
     content_duplicates, content_duplicate_groups, content_histogram = _fold_group_sizes(
-        connection.execute("SELECT SUM(occurrence_count) FROM records GROUP BY exact_content_sha256")
+        connection.execute("SELECT SUM(occurrence_count) FROM records GROUP BY exact_content_sha256"),
+        activity_reporter=activity_reporter,
     )
     message_duplicates, message_duplicate_groups, message_histogram = _fold_group_sizes(
         connection.execute(
@@ -1418,7 +2031,8 @@ def _duplicate_aggregates(connection: sqlite3.Connection) -> dict[str, Any]:
             SELECT SUM(occurrence_count) FROM records
             WHERE message_id_sha256 IS NOT NULL GROUP BY message_id_sha256
             """
-        )
+        ),
+        activity_reporter=activity_reporter,
     )
     return {
         "duplicate_source_row_occurrences": source_duplicates,
@@ -1433,11 +2047,17 @@ def _duplicate_aggregates(connection: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def _fold_group_sizes(rows: Iterable[Sequence[Any]]) -> tuple[int, int, dict[str, int]]:
+def _fold_group_sizes(
+    rows: Iterable[Sequence[Any]],
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> tuple[int, int, dict[str, int]]:
     duplicate_occurrences = 0
     duplicate_groups = 0
     histogram: Counter[str] = Counter()
     for row in rows:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         size = int(row[0])
         duplicate_occurrences += max(0, size - 1)
         duplicate_groups += int(size > 1)
@@ -1914,11 +2534,17 @@ def _hash_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def _artifact_descriptor(name: str, path: Path, *, records: int) -> dict[str, Any]:
+def _artifact_descriptor(
+    name: str,
+    path: Path,
+    *,
+    records: int,
+    activity_reporter: _ActivityReporter | None = None,
+) -> dict[str, Any]:
     return {
         "id": Path(name).stem,
         "name": name,
-        "sha256": _sha256_file(path),
+        "sha256": _sha256_file(path, activity_reporter=activity_reporter),
         "bytes": path.stat().st_size,
         "records": records,
     }
@@ -1939,12 +2565,51 @@ def _implementation_sha256() -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path, *, activity_reporter: _ActivityReporter | None = None) -> str:
     digest = hashlib.sha256()
     with _open_regular_binary(path) as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+        for chunk_index, chunk in enumerate(iter(lambda: file.read(1024 * 1024), b""), start=1):
             digest.update(chunk)
+            if activity_reporter is not None and chunk_index % 256 == 0:
+                activity_reporter.boundary()
     return "sha256:" + digest.hexdigest()
+
+
+def _snapshot_open_file(
+    file: BinaryIO,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> _FileSnapshot:
+    try:
+        before = _regular_file_identity(os.fstat(file.fileno()))
+        file.seek(0)
+        digest = hashlib.sha256()
+        byte_count = 0
+        for chunk_index, chunk in enumerate(iter(lambda: file.read(1024 * 1024), b""), start=1):
+            digest.update(chunk)
+            byte_count += len(chunk)
+            if activity_reporter is not None and chunk_index % 256 == 0:
+                activity_reporter.boundary()
+        after = _regular_file_identity(os.fstat(file.fileno()))
+        file.seek(0)
+    except EnronPreparationError:
+        raise
+    except (OSError, OverflowError, ValueError):
+        raise EnronPreparationError("Enron preparation artifact changed while it was read.") from None
+    if before != after or byte_count != after[4]:
+        raise EnronPreparationError("Enron preparation artifact changed while it was read.")
+    return _FileSnapshot(sha256="sha256:" + digest.hexdigest(), identity=after)
+
+
+def _assert_open_file_snapshot_current(file: BinaryIO, snapshot: _FileSnapshot) -> None:
+    try:
+        current = _regular_file_identity(os.fstat(file.fileno()))
+    except EnronPreparationError:
+        raise
+    except (OSError, OverflowError, ValueError):
+        raise EnronPreparationError("Enron preparation artifact changed during verification.") from None
+    if current != snapshot.identity:
+        raise EnronPreparationError("Enron preparation artifact changed during verification.")
 
 
 def _write_json_file(file: TextIO, payload: Mapping[str, Any]) -> None:
@@ -2020,6 +2685,77 @@ def _read_json_object(path: Path, max_bytes: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise EnronPreparationError("Enron preparation JSON artifact must be an object.")
     return value
+
+
+def _regular_file_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+        or info.st_uid != os.geteuid()
+        or stat.S_IMODE(info.st_mode) & 0o077
+    ):
+        raise EnronPreparationError("Enron preparation JSON artifact is not a private regular file.")
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IMODE(info.st_mode),
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _read_json_object_snapshot_from_handle(file: BinaryIO, max_bytes: int) -> _JSONObjectSnapshot:
+    try:
+        file.seek(0)
+        before = _regular_file_identity(os.fstat(file.fileno()))
+        payload = file.read(max_bytes + 1)
+        after = _regular_file_identity(os.fstat(file.fileno()))
+        file.seek(0)
+    except EnronPreparationError:
+        raise
+    except (OSError, OverflowError, ValueError):
+        raise EnronPreparationError("Enron preparation JSON artifact changed while it was read.") from None
+    if before != after or len(payload) != after[4]:
+        raise EnronPreparationError("Enron preparation JSON artifact changed while it was read.")
+    if len(payload) > max_bytes:
+        raise EnronPreparationError("Enron preparation JSON artifact exceeds its size limit.")
+    try:
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+            parse_float=_parse_finite_json_float,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, _DuplicateJsonKey, _NonfiniteJsonNumber) as exc:
+        raise EnronPreparationError("Enron preparation JSON artifact is invalid.") from exc
+    if not isinstance(value, dict):
+        raise EnronPreparationError("Enron preparation JSON artifact must be an object.")
+    snapshot = _JSONObjectSnapshot(
+        value=value,
+        sha256="sha256:" + hashlib.sha256(payload).hexdigest(),
+        identity=after,
+    )
+    return snapshot
+
+
+def _read_json_object_snapshot(path: Path, max_bytes: int) -> _JSONObjectSnapshot:
+    with _open_regular_binary(path) as file:
+        snapshot = _read_json_object_snapshot_from_handle(file, max_bytes)
+    _assert_json_snapshot_current(path, snapshot)
+    return snapshot
+
+
+def _assert_json_snapshot_current(path: Path, snapshot: _JSONObjectSnapshot) -> None:
+    try:
+        current = _regular_file_identity(path.lstat())
+    except EnronPreparationError:
+        raise
+    except OSError:
+        raise EnronPreparationError("Enron preparation JSON artifact changed during verification.") from None
+    if current != snapshot.identity:
+        raise EnronPreparationError("Enron preparation JSON artifact changed during verification.")
 
 
 def _require_mapping_keys(value: Any, keys: set[str], error: str) -> Mapping[str, Any]:
@@ -2248,6 +2984,10 @@ def _verify_prepared_jsonl(
     max_line_bytes: int,
     deep: bool = True,
     duplicate_connection: sqlite3.Connection | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+    activity_reporter: _ActivityReporter | None = None,
+    source_file: BinaryIO | None = None,
+    expected_snapshot: _FileSnapshot | None = None,
 ) -> _PreparedVerification:
     count = 0
     occurrences = 0
@@ -2274,7 +3014,12 @@ def _verify_prepared_jsonl(
     latest_eligible_date: str | None = None
     source_accumulator = 0
     source_occurrences = 0
-    with _open_regular_binary(path) as file:
+    source_context = nullcontext(source_file) if source_file is not None else _open_regular_binary(path)
+    with source_context as file:
+        assert file is not None
+        if expected_snapshot is not None:
+            _assert_open_file_snapshot_current(file, expected_snapshot)
+        file.seek(0)
         while line := file.readline(max_line_bytes + 1):
             if len(line) > max_line_bytes and not line.endswith(b"\n"):
                 raise EnronPreparationError("Prepared record exceeds its line-size limit.")
@@ -2293,6 +3038,8 @@ def _verify_prepared_jsonl(
                 raise EnronPreparationError("Prepared records are not canonically ordered.")
             previous_id = document_id
             count += 1
+            if activity_reporter is not None:
+                activity_reporter.worked()
             occurrences += row_occurrences
             for name, digest in view_digests.items():
                 text = row_views[name]
@@ -2365,6 +3112,12 @@ def _verify_prepared_jsonl(
                 grouping_feature_counts["current_near_duplicate_signature_available"] += row_occurrences
             if full_near.get("simhash64") is not None:
                 grouping_feature_counts["full_visible_near_duplicate_signature_available"] += row_occurrences
+            if progress_callback is not None and count % PROGRESS_RECORD_INTERVAL == 0:
+                _report_verification_progress(progress_callback, count)
+        if expected_snapshot is not None:
+            _assert_open_file_snapshot_current(file, expected_snapshot)
+    if progress_callback is not None and count > 0 and count % PROGRESS_RECORD_INTERVAL != 0:
+        _report_verification_progress(progress_callback, count)
     return _PreparedVerification(
         records=count,
         occurrences=occurrences,
@@ -2792,7 +3545,14 @@ def _verify_date_record(value: Any) -> None:
         raise EnronPreparationError("Prepared date offset is invalid.")
 
 
-def _verify_rejections_jsonl(path: Path, descriptor: Mapping[str, Any]) -> _RejectionVerification:
+def _verify_rejections_jsonl(
+    path: Path,
+    descriptor: Mapping[str, Any],
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+    source_file: BinaryIO | None = None,
+    expected_snapshot: _FileSnapshot | None = None,
+) -> _RejectionVerification:
     records = 0
     occurrences = 0
     source_accumulator = 0
@@ -2800,7 +3560,12 @@ def _verify_rejections_jsonl(path: Path, descriptor: Mapping[str, Any]) -> _Reje
     body_truncated_occurrences = 0
     subject_truncated_occurrences = 0
     previous_key: tuple[str, str] | None = None
-    with _open_regular_binary(path) as file:
+    source_context = nullcontext(source_file) if source_file is not None else _open_regular_binary(path)
+    with source_context as file:
+        assert file is not None
+        if expected_snapshot is not None:
+            _assert_open_file_snapshot_current(file, expected_snapshot)
+        file.seek(0)
         while line := file.readline(64 * 1024 + 1):
             if len(line) > 64 * 1024 and not line.endswith(b"\n"):
                 raise EnronPreparationError("Private rejection record exceeds its size limit.")
@@ -2840,6 +3605,8 @@ def _verify_rejections_jsonl(path: Path, descriptor: Mapping[str, Any]) -> _Reje
                 raise EnronPreparationError("Private rejection records are not canonically ordered.")
             previous_key = key
             records += 1
+            if activity_reporter is not None:
+                activity_reporter.worked()
             occurrences += occurrence_count
             reasons[reason] += occurrence_count
             if row["body_truncated_before_rejection"]:
@@ -2852,6 +3619,8 @@ def _verify_rejections_jsonl(path: Path, descriptor: Mapping[str, Any]) -> _Reje
                 source_digest,
                 occurrence_count,
             )
+        if expected_snapshot is not None:
+            _assert_open_file_snapshot_current(file, expected_snapshot)
     if records != descriptor.get("records") or occurrences != descriptor.get("occurrences"):
         raise EnronPreparationError("Private rejection artifact count mismatch.")
     return _RejectionVerification(
@@ -3141,7 +3910,12 @@ def _nonnegative_integer(value: Any, *, minimum: int = 0) -> int:
     return value
 
 
-def _validate_staged_run(stage_dir: Path, *, source_connection: sqlite3.Connection) -> None:
+def _validate_staged_run(
+    stage_dir: Path,
+    *,
+    source_connection: sqlite3.Connection,
+    activity_reporter: _ActivityReporter | None = None,
+) -> None:
     manifest_path = stage_dir / _MANIFEST_FILENAME
     profile_path = stage_dir / _PROFILE_FILENAME
     prepared_path = stage_dir / _PREPARED_FILENAME
@@ -3164,11 +3938,11 @@ def _validate_staged_run(stage_dir: Path, *, source_connection: sqlite3.Connecti
         or profile_descriptor.get("records") != 1
     ):
         raise EnronPreparationError("Staged profile artifact descriptor is invalid.")
-    if prepared_descriptor["sha256"] != _sha256_file(prepared_path):
+    if prepared_descriptor["sha256"] != _sha256_file(prepared_path, activity_reporter=activity_reporter):
         raise EnronPreparationError("Staged prepared artifact failed hash validation.")
-    if profile_descriptor["sha256"] != _sha256_file(profile_path):
+    if profile_descriptor["sha256"] != _sha256_file(profile_path, activity_reporter=activity_reporter):
         raise EnronPreparationError("Staged profile artifact failed hash validation.")
-    if rejection_descriptor["sha256"] != _sha256_file(rejection_path):
+    if rejection_descriptor["sha256"] != _sha256_file(rejection_path, activity_reporter=activity_reporter):
         raise EnronPreparationError("Staged rejection artifact failed hash validation.")
     expected_records, expected_occurrences, prepared_line_limit = _verify_profile_contract(profile, prepared_descriptor)
     verification = _verify_prepared_jsonl(
@@ -3176,13 +3950,21 @@ def _validate_staged_run(stage_dir: Path, *, source_connection: sqlite3.Connecti
         profile["source"],
         max_line_bytes=prepared_line_limit,
         deep=False,
+        activity_reporter=activity_reporter,
     )
     if verification.records != expected_records or verification.occurrences != expected_occurrences:
         raise EnronPreparationError("Staged prepared artifact failed count validation.")
     _verify_view_projections(profile, verification)
     _verify_prepared_aggregates(profile, verification)
-    _verify_duplicate_aggregates(profile, _duplicate_aggregates(source_connection))
-    rejection_verification = _verify_rejections_jsonl(rejection_path, rejection_descriptor)
+    _verify_duplicate_aggregates(
+        profile,
+        _duplicate_aggregates(source_connection, activity_reporter=activity_reporter),
+    )
+    rejection_verification = _verify_rejections_jsonl(
+        rejection_path,
+        rejection_descriptor,
+        activity_reporter=activity_reporter,
+    )
     if rejection_verification.occurrences != profile["records"]["rejected_records"]:
         raise EnronPreparationError("Staged rejection artifact failed count validation.")
     _verify_ingestion_counters(profile, verification, rejection_verification)

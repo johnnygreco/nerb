@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
+import stat
+import subprocess
+import sys
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -124,15 +128,19 @@ def _split(
     train_fraction: float = 0.8,
     validation_fraction: float = 0.1,
     sample_per_role: int = 4,
+    progress_callback: Callable[[int], None] | None = None,
+    activity_callback: Callable[[], None] | None = None,
+    scratch_dir: Path | None = None,
 ) -> SplitRun:
     development = tmp_path / f"{name}-development"
     sealed = tmp_path / f"{name}-sealed"
+    selected_scratch = scratch_dir or tmp_path / f"{name}-scratch"
+    selected_scratch.mkdir(mode=0o700, exist_ok=True)
     summary = split_enron_preparation(
         EnronSplitOptions(
             preparation_run=preparation,
             development_output_dir=development,
             sealed_output_dir=sealed,
-            benchmark_version="enron-v2-test",
             seed=seed,
             train_fraction=train_fraction,
             validation_fraction=validation_fraction,
@@ -141,6 +149,9 @@ def _split(
             sample_per_role=sample_per_role,
             fixture_mode=fixture_mode,
             allow_unignored_output=False,
+            progress_callback=progress_callback,
+            activity_callback=activity_callback,
+            scratch_dir=selected_scratch,
         )
     )
     assert summary["committed"] is True
@@ -263,8 +274,44 @@ def _frozen_target(run: SplitRun) -> dict[str, str]:
     }
 
 
+def _bound_final_test_access(
+    run: SplitRun,
+    *,
+    target: Mapping[str, str] | None = None,
+) -> enron_splitting.EnronFinalTestAccess:
+    access = enron_splitting.begin_enron_final_test_access(
+        run.sealed,
+        frozen_target=_frozen_target(run) if target is None else target,
+    )
+    access.bind_evidence("sha256:" + "7" * 64)
+    return access
+
+
 def _tree_bytes(root: Path) -> dict[str, bytes]:
     return {path.relative_to(root).as_posix(): path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+def _assert_payload_empty_private_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        info = path.lstat()
+        assert not stat.S_ISLNK(info.st_mode)
+        assert info.st_uid == os.geteuid()
+        if stat.S_ISDIR(info.st_mode):
+            assert stat.S_IMODE(info.st_mode) == 0o700
+        else:
+            assert stat.S_ISREG(info.st_mode)
+            assert stat.S_IMODE(info.st_mode) == 0o600
+            assert info.st_size == 0
+
+
+def _assert_cleanup_tombstones(root: Path, *, count: int) -> None:
+    entries = sorted(root.iterdir())
+    assert len(entries) == count
+    for entry in entries:
+        assert re.fullmatch(r"\.nerb-cleanup-[0-9a-f]{48}", entry.name)
+        assert entry.is_dir()
+        assert stat.S_IMODE(entry.stat().st_mode) == 0o700
+        _assert_payload_empty_private_tree(entry)
 
 
 def _serialized_aggregate(*values: Any) -> str:
@@ -445,6 +492,308 @@ def _cohort_flags(membership: Mapping[str, Any]) -> set[str]:
     return result
 
 
+def test_initial_ingest_progress_uses_fixed_intervals_and_final_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def records() -> Iterable[tuple[int, bytes, Mapping[str, Any]]]:
+        for index in range(20_001):
+            row = {
+                "document_id": "doc_" + f"{index:064x}",
+                "source": {
+                    "identical_occurrence_count": 1,
+                    "mailbox_folder_role": "unavailable",
+                    "mailbox_owner_sha256": None,
+                },
+                "date": {"temporal_eligible": False, "utc": None, "status": "missing"},
+                "views": {
+                    "full_visible_body": "",
+                    "current_body": "",
+                    "subject_current_body": "",
+                    "current_body_core": "",
+                    "structured_headers": {},
+                },
+                "grouping": {"normalized_thread_subject_sha256": None, "near_duplicate": {}},
+                "headers": {"message_id": ""},
+                "cleaning": {"body_truncated": False, "subject_truncated": False, "transform_counts": {}},
+            }
+            raw = enron_splitting._canonical_line(row)  # noqa: SLF001
+            yield index + 1, raw, row
+
+    monkeypatch.setattr(enron_splitting, "_iter_strict_jsonl", lambda *_args, **_kwargs: records())
+    monkeypatch.setattr(enron_splitting, "_verify_prepared_record", lambda *_args, **_kwargs: None)
+    connection = enron_splitting._open_spool(tmp_path / "progress.sqlite3")  # noqa: SLF001
+    observed: list[int] = []
+    try:
+        assert connection.execute("PRAGMA temp_store").fetchone()[0] == 2
+        count = enron_splitting._ingest_prepared(  # noqa: SLF001
+            connection,
+            tmp_path / "unused.jsonl",
+            {},
+            finalize=False,
+            progress_callback=observed.append,
+        )
+    finally:
+        connection.close()
+
+    assert count == 20_001
+    assert observed == [10_000, 20_000, 20_001]
+
+
+def test_observational_split_options_do_not_change_artifacts_and_replay_scratch_is_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="observational-options"))
+    baseline = _split(tmp_path, preparation, name="observational-baseline")
+    scratch = tmp_path / "capacity-scratch"
+    scratch.mkdir(mode=0o700)
+    actual_loader = enron_splitting.load_enron_preparation_run
+    actual_open_spool = enron_splitting._open_spool  # noqa: SLF001
+    observed_loader_scratch: list[Path | None] = []
+    observed_spools: list[Path] = []
+    progress: list[int] = []
+    activity = 0
+
+    def heartbeat() -> None:
+        nonlocal activity
+        activity += 1
+
+    def checked_loader(
+        path: Path,
+        *,
+        scratch_dir: Path | None = None,
+        activity_callback: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        observed_loader_scratch.append(scratch_dir)
+        assert scratch_dir is not None
+        return actual_loader(path, scratch_dir=scratch_dir, activity_callback=activity_callback)
+
+    def checked_spool(path: Path, **kwargs: Any) -> Any:
+        observed_spools.append(path)
+        connection = actual_open_spool(path, **kwargs)
+        assert connection.execute("PRAGMA temp_store").fetchone()[0] == 2
+        return connection
+
+    monkeypatch.setattr(enron_splitting, "load_enron_preparation_run", checked_loader)
+    monkeypatch.setattr(enron_splitting, "_open_spool", checked_spool)
+    observed = _split(
+        tmp_path,
+        preparation,
+        name="observational-enabled",
+        progress_callback=progress.append,
+        activity_callback=heartbeat,
+        scratch_dir=scratch,
+    )
+
+    replay_spools = [path for path in observed_spools if "preseal-replay" in path.parent.name]
+    assert observed_loader_scratch == [scratch]
+    assert progress == [24]
+    assert activity > 0
+    assert len(replay_spools) == 1
+    assert replay_spools[0].is_relative_to(scratch)
+    assert not replay_spools[0].parent.exists()
+    assert not any(path.name == ".preseal-replay" for path in observed.development.rglob("*"))
+    _assert_cleanup_tombstones(scratch, count=3)
+    assert _tree_bytes(observed.development) == _tree_bytes(baseline.development)
+    assert _tree_bytes(observed.sealed) == _tree_bytes(baseline.sealed)
+
+
+def test_split_rejects_preparation_manifest_substitution_after_deep_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="manifest-substitution"))
+    scratch = tmp_path / "manifest-substitution-scratch"
+    scratch.mkdir(mode=0o700)
+    manifest_path = preparation / "manifest.json"
+    parked_manifest = tmp_path / "verified-manifest.json"
+    actual_loader = enron_splitting.load_enron_preparation_run
+
+    def substitute_after_verification(
+        path: Path,
+        *,
+        scratch_dir: Path,
+        activity_callback: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        verified = actual_loader(path, scratch_dir=scratch_dir, activity_callback=activity_callback)
+        manifest_path.replace(parked_manifest)
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        manifest_path.chmod(0o600)
+        return verified
+
+    monkeypatch.setattr(enron_splitting, "load_enron_preparation_run", substitute_after_verification)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(verified|manifest|changed)"):
+        _split(
+            tmp_path,
+            preparation,
+            name="manifest-substitution",
+            scratch_dir=scratch,
+        )
+
+    assert parked_manifest.is_file()
+    assert not (tmp_path / "manifest-substitution-development").exists()
+    assert not (tmp_path / "manifest-substitution-sealed").exists()
+    _assert_cleanup_tombstones(scratch, count=1)
+
+
+def test_private_split_spool_hardlink_substitution_wipes_every_link_before_failing(tmp_path: Path) -> None:
+    scratch = tmp_path / "split-spool-scratch"
+    scratch.mkdir(mode=0o700)
+    linked_paths: list[tuple[Path, Path]] = []
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(spool|clean)"):
+        with enron_splitting._private_split_spool(  # noqa: SLF001
+            scratch,
+            purpose="hardlink-adversary",
+            allow_unignored_output=True,
+        ) as connection:
+            connection.execute("CREATE TABLE private_marker (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO private_marker VALUES (?)", ("private split marker",))
+            connection.commit()
+            spool_paths = list(scratch.rglob("split.sqlite3"))
+            assert len(spool_paths) == 1
+            original = spool_paths[0]
+            linked = original.with_name("split-hardlink.sqlite3")
+            os.link(original, linked)
+            linked_paths.append((original, linked))
+
+    assert len(linked_paths) == 1
+    original, linked = linked_paths[0]
+    assert original.read_bytes() == b""
+    assert linked.read_bytes() == b""
+    assert original.stat().st_ino == linked.stat().st_ino
+    _assert_payload_empty_private_tree(scratch)
+
+
+def test_private_split_spool_move_out_wipes_original_and_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = tmp_path / "split-spool-scratch"
+    scratch.mkdir(mode=0o700)
+    parked = tmp_path / "parked-split.sqlite3"
+    actual_open = enron_splitting._open_spool  # noqa: SLF001
+
+    def substitute_after_open(path: Path, **kwargs: Any) -> Any:
+        connection = actual_open(path, **kwargs)
+        path.replace(parked)
+        path.write_bytes(b"replacement private split payload")
+        path.chmod(0o600)
+        return connection
+
+    monkeypatch.setattr(enron_splitting, "_open_spool", substitute_after_open)
+
+    with enron_splitting._private_split_spool(  # noqa: SLF001
+        scratch,
+        purpose="move-out-adversary",
+        allow_unignored_output=True,
+    ) as connection:
+        connection.execute("CREATE TABLE private_marker (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO private_marker VALUES (?)", ("private split marker",))
+        connection.commit()
+
+    assert parked.read_bytes() == b""
+    _assert_cleanup_tombstones(scratch, count=1)
+    assert all(path.read_bytes() == b"" for path in scratch.rglob("split.sqlite3"))
+
+
+def test_private_split_spool_close_failure_supersedes_body_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scratch = tmp_path / "split-spool-scratch"
+    scratch.mkdir(mode=0o700)
+
+    class FailingCloseConnection:
+        def close(self) -> None:
+            raise enron_splitting.sqlite3.OperationalError("injected close failure")
+
+    monkeypatch.setattr(enron_splitting, "_open_spool", lambda *_args, **_kwargs: FailingCloseConnection())
+
+    with pytest.raises(EnronSplitError, match="could not be closed") as caught:
+        with enron_splitting._private_split_spool(
+            scratch,
+            purpose="close-failure",
+            allow_unignored_output=True,
+        ):
+            raise RuntimeError("injected split body failure")
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    _assert_cleanup_tombstones(scratch, count=1)
+
+
+def test_callback_and_replay_scratch_failures_roll_back_without_path_disclosure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="rollback-observers"))
+    private_marker = str(tmp_path / "private-progress-path")
+
+    def failed_progress(_records: int) -> None:
+        raise OSError(private_marker)
+
+    with pytest.raises(EnronSplitError, match="progress callback") as progress_error:
+        _split(
+            tmp_path,
+            preparation,
+            name="callback-rollback",
+            progress_callback=failed_progress,
+        )
+    assert private_marker not in str(progress_error.value)
+    assert not (tmp_path / "callback-rollback-development").exists()
+    assert not (tmp_path / "callback-rollback-sealed").exists()
+
+    def failed_activity() -> None:
+        stages = tuple(tmp_path.glob(".activity-rollback-development.stage-*"))
+        if stages and (stages[0] / "train.jsonl").exists():
+            raise OSError(private_marker)
+
+    with pytest.raises(EnronSplitError, match="activity callback failed") as activity_error:
+        _split(
+            tmp_path,
+            preparation,
+            name="activity-rollback",
+            activity_callback=failed_activity,
+        )
+    assert private_marker not in str(activity_error.value)
+    assert not (tmp_path / "activity-rollback-development").exists()
+    assert not (tmp_path / "activity-rollback-sealed").exists()
+    assert not tuple(tmp_path.glob(".activity-rollback-*.stage-*"))
+
+    actual_open_spool = enron_splitting._open_spool  # noqa: SLF001
+
+    def fail_replay_spool(path: Path, **kwargs: Any) -> Any:
+        if "preseal-replay" in path.parent.name:
+            raise OSError(private_marker)
+        return actual_open_spool(path, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "_open_spool", fail_replay_spool)
+    with pytest.raises(EnronSplitError, match=r"(?i)(construction|failed|safely)") as replay_error:
+        _split(tmp_path, preparation, name="replay-rollback")
+    assert private_marker not in str(replay_error.value)
+    assert not (tmp_path / "replay-rollback-development").exists()
+    assert not (tmp_path / "replay-rollback-sealed").exists()
+    assert not tuple(tmp_path.glob(".replay-rollback-*.stage-*"))
+
+
+def test_verifier_sanitizes_path_bearing_underlying_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_marker = str(tmp_path / "private-verification-path")
+    monkeypatch.setattr(
+        enron_splitting,
+        "_verify_enron_splits_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(private_marker)),
+    )
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(verification|failed|safely)") as error:
+        verify_enron_splits(tmp_path / "development", tmp_path / "sealed")
+    assert private_marker not in str(error.value)
+
+
 def test_split_artifacts_are_byte_deterministic_and_row_order_invariant(tmp_path: Path) -> None:
     rows = _dated_rows(24, prefix="reorder")
     preparation_a = _prepare(tmp_path / "a", rows)
@@ -550,6 +899,7 @@ def test_near_candidate_budget_aborts_before_materializing_an_oversized_bucket(t
             preparation_run=tmp_path / "unused-preparation",
             development_output_dir=tmp_path / "unused-development",
             sealed_output_dir=tmp_path / "unused-sealed",
+            scratch_dir=tmp_path / "unused-scratch",
             max_near_candidate_pairs=1,
             fixture_mode=True,
         )
@@ -747,7 +1097,7 @@ def test_representative_sampler_reserves_named_marginal_cohorts_before_hamilton_
         preparation_run=tmp_path / "unused-preparation",
         development_output_dir=tmp_path / "unused-development",
         sealed_output_dir=tmp_path / "unused-sealed",
-        benchmark_version="enron-v2-sample-reservations",
+        scratch_dir=tmp_path / "unused-scratch",
         seed="sample-gap",
         sample_per_role=4,
         fixture_mode=True,
@@ -764,7 +1114,7 @@ def test_representative_sampler_reserves_named_marginal_cohorts_before_hamilton_
         preparation_run=tmp_path / "production-preparation",
         development_output_dir=tmp_path / "production-development",
         sealed_output_dir=tmp_path / "production-sealed",
-        benchmark_version="enron-v2-sample-reservations-production",
+        scratch_dir=tmp_path / "production-scratch",
         seed="sample-gap",
         sample_per_role=2,
         fixture_mode=False,
@@ -1108,6 +1458,23 @@ def test_steward_projection_matches_the_closed_split_contract(tmp_path: Path) ->
     assert all(set(value["artifact"]) == {"id", "sha256", "bytes"} for value in projection["roles"].values())
 
 
+def test_final_test_state_starts_explicitly_sealed_unbound(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="sealed-unbound"))
+    run = _split(tmp_path, preparation)
+
+    manifest = json.loads((run.sealed / "manifest.json").read_text(encoding="utf-8"))
+    verified = verify_enron_splits(run.development, run.sealed, seed=run.seed)
+
+    assert manifest["sealing"]["initial_access_state"] == "sealed_unbound"
+    assert verified["preparation"] == manifest["preparation"]
+    assert verified["access"] == {
+        "status": "sealed_unbound",
+        "access_count": 0,
+        "accessed_at": None,
+        "aggregate_sha256": None,
+    }
+
+
 def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_path: Path) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="one-shot"))
     run = _split(tmp_path, preparation)
@@ -1119,11 +1486,14 @@ def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_pa
 
     invalid_target = {**target, "split_manifest_sha256": "sha256:" + "0" * 64}
     with pytest.raises(EnronSplitError, match=r"(?i)(target|manifest|hash|frozen)"):
-        with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=invalid_target):
-            pass
+        enron_splitting.begin_enron_final_test_access(
+            run.sealed,
+            frozen_target=invalid_target,
+        ).bind_evidence("sha256:" + "7" * 64)
     assert not claim_path.exists()
+    assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
 
-    with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target) as access:
+    with _bound_final_test_access(run, target=target) as access:
         assert claim_path.is_file()
         assert claim_path.stat().st_mode & 0o777 == 0o600
         accessed = tuple(access.iter_records())
@@ -1149,6 +1519,492 @@ def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_pa
         verify_enron_splits(run.development, run.sealed, seed=run.seed)
 
 
+def test_evidence_binding_and_claim_precede_the_only_test_content_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="claim-first"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    actual_open = enron_splitting.open_private_binary_input_at
+    opened = 0
+
+    def checked_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        nonlocal opened
+        if name != "test.jsonl":
+            return actual_open(directory_fd, name, **kwargs)
+        assert (run.sealed / "EVIDENCE_BOUND.json").is_file()
+        assert (run.sealed / "ACCESS_CLAIMED.json").is_file()
+        assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+        opened += 1
+        return actual_open(directory_fd, name, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "open_private_binary_input_at", checked_open)
+    with access as active:
+        assert tuple(active.iter_records()) == _role_rows(run)["test"]
+
+    assert opened == 1
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "completed"
+
+
+def test_claim_rechecks_every_transition_receipt_identity_before_test_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="transition-recheck"))
+    run = _split(tmp_path, preparation)
+    target = _frozen_target(run)
+    _bound_final_test_access(run, target=target)
+    actual_snapshot = enron_splitting._read_json_object_snapshot_at  # noqa: SLF001
+    actual_open = enron_splitting.open_private_binary_input_at
+
+    for critical_name in (
+        "manifest.json",
+        "PRESEAL_VERIFIED.json",
+        "PAIR_COMMITTED.json",
+        "EVIDENCE_BOUND.json",
+    ):
+        replaced = False
+        test_opened = False
+
+        def replace_after_snapshot(directory_fd: int, name: str, **kwargs: Any) -> Any:
+            nonlocal replaced
+            snapshot = actual_snapshot(directory_fd, name, **kwargs)
+            if name == critical_name and not replaced:
+                path = run.sealed / name
+                replacement = run.sealed / f".{name}.identity-replacement"
+                replacement.write_bytes(path.read_bytes())
+                replacement.chmod(0o600)
+                replacement.replace(path)
+                replaced = True
+            return snapshot
+
+        def reject_test_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+            nonlocal test_opened
+            if name == "test.jsonl":
+                test_opened = True
+                pytest.fail("transition identity failure opened test content")
+            return actual_open(directory_fd, name, **kwargs)
+
+        with monkeypatch.context() as context:
+            context.setattr(enron_splitting, "_read_json_object_snapshot_at", replace_after_snapshot)
+            context.setattr(enron_splitting, "open_private_binary_input_at", reject_test_open)
+            with pytest.raises(EnronSplitError, match=r"(?i)(changed|identity|verified)"):
+                with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target):
+                    pass
+
+        assert replaced is True
+        assert test_opened is False
+        assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+        assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+
+
+def test_transition_uses_the_directory_pinned_before_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="transition-root-pin"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    actual_snapshot = enron_splitting._read_json_object_snapshot_at  # noqa: SLF001
+    renamed = run.sealed.with_name("transition-root-pin-renamed")
+    renamed_once = False
+
+    def rename_after_manifest(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        nonlocal renamed_once
+        snapshot = actual_snapshot(directory_fd, name, **kwargs)
+        if name == "manifest.json" and not renamed_once:
+            run.sealed.rename(renamed)
+            run.sealed.mkdir(mode=0o700)
+            renamed_once = True
+        return snapshot
+
+    monkeypatch.setattr(enron_splitting, "_read_json_object_snapshot_at", rename_after_manifest)
+    with access as active:
+        assert tuple(active.iter_records())
+
+    assert renamed_once is True
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+    assert (renamed / "ACCESS_CLAIMED.json").is_file()
+    assert (renamed / "ACCESS_OUTCOME.json").is_file()
+    run.sealed.rmdir()
+    assert verify_enron_splits(run.development, renamed, seed=run.seed)["access"]["status"] == "completed"
+
+
+def test_final_access_requires_one_nonreplayable_evidence_binding(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="binding-required"))
+    run = _split(tmp_path, preparation)
+    target = _frozen_target(run)
+    unbound = enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(evidence|bound)"):
+        with unbound:
+            pass
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+
+    bound = enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target)
+    binding = bound.bind_evidence("sha256:" + "7" * 64)
+    assert binding["status"] == "evidence_bound"
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"] == {
+        "status": "evidence_bound",
+        "access_count": 0,
+        "accessed_at": None,
+        "aggregate_sha256": "sha256:" + "7" * 64,
+    }
+    with pytest.raises(EnronSplitError, match=r"(?i)(bound|replay)"):
+        enron_splitting.begin_enron_final_test_access(
+            run.sealed,
+            frozen_target=target,
+        ).bind_evidence("sha256:" + "7" * 64)
+
+
+def test_failure_opening_test_after_claim_consumes_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="claimed-open-failure"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    actual_open = enron_splitting.open_private_binary_input_at
+
+    def fail_test_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        if name == "test.jsonl":
+            raise EnronSplitError("injected content-open failure")
+        return actual_open(directory_fd, name, **kwargs)
+
+    monkeypatch.setattr(
+        enron_splitting,
+        "open_private_binary_input_at",
+        fail_test_open,
+    )
+
+    with pytest.raises(EnronSplitError, match="injected content-open failure"):
+        with access:
+            pass
+
+    assert (run.sealed / "ACCESS_CLAIMED.json").is_file()
+    assert json.loads((run.sealed / "ACCESS_OUTCOME.json").read_text(encoding="utf-8"))["status"] == "failed"
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "failed"
+    with pytest.raises(EnronSplitError, match=r"(?i)(claimed|retry|already)"):
+        with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=_frozen_target(run)):
+            pass
+
+
+def test_reordered_binding_timestamp_fails_before_claim_or_test_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="binding-time-order"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    actual_open = enron_splitting.open_private_binary_input_at
+
+    def reject_test_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        if name == "test.jsonl":
+            pytest.fail("reordered binding opened test content")
+        return actual_open(directory_fd, name, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "_utc_now", lambda: "2026-01-02T00:00:00.000000Z")
+    monkeypatch.setattr(enron_splitting, "open_private_binary_input_at", reject_test_open)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(ordered|binding|transition|timestamp)"):
+        with access:
+            pass
+
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+    assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+
+
+def test_future_binding_timestamp_is_rejected_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="future-binding-time"))
+    run = _split(tmp_path, preparation)
+    access = enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=_frozen_target(run))
+    monkeypatch.setattr(enron_splitting, "_utc_now", lambda: "2100-01-01T00:00:00.000000Z")
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(timestamp|wall clock|future)"):
+        access.bind_evidence("sha256:" + "7" * 64)
+
+    assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+    assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+
+
+def test_future_access_timestamp_is_rejected_before_claim_or_test_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="future-access-time"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    actual_open = enron_splitting.open_private_binary_input_at
+
+    def reject_test_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        if name == "test.jsonl":
+            pytest.fail("future access timestamp opened test content")
+        return actual_open(directory_fd, name, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "_utc_now", lambda: "2100-01-01T00:00:00.000000Z")
+    monkeypatch.setattr(enron_splitting, "open_private_binary_input_at", reject_test_open)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(timestamp|wall clock|future)"):
+        with access:
+            pass
+
+    assert (run.sealed / "EVIDENCE_BOUND.json").is_file()
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+    assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+
+
+def test_future_claim_timestamp_is_rejected_even_when_chain_is_rehashed(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="future-claim-time"))
+    run = _split(tmp_path, preparation)
+    with _bound_final_test_access(run) as active:
+        tuple(active.iter_records())
+    claim_path = run.sealed / "ACCESS_CLAIMED.json"
+    outcome_path = run.sealed / "ACCESS_OUTCOME.json"
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    claim["accessed_at"] = "2100-01-01T00:00:00.000000Z"
+    claim_core = {key: value for key, value in claim.items() if key != "claim_sha256"}
+    claim["claim_sha256"] = enron_splitting._hash_bytes(  # noqa: SLF001
+        enron_splitting._canonical_json(claim_core).encode("utf-8")  # noqa: SLF001
+    )
+    outcome["accessed_at"] = claim["accessed_at"]
+    outcome["claim_sha256"] = claim["claim_sha256"]
+    claim_path.write_bytes(enron_splitting._canonical_line(claim))  # noqa: SLF001
+    outcome_path.write_bytes(enron_splitting._canonical_line(outcome))  # noqa: SLF001
+    claim_path.chmod(0o600)
+    outcome_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(timestamp|order|access)"):
+        verify_enron_splits(run.development, run.sealed, seed=run.seed)
+
+
+def test_malformed_nested_manifest_is_sanitized_for_binding(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="malformed-binding"))
+    run = _split(tmp_path, preparation)
+    access = enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=_frozen_target(run))
+    manifest_path = run.sealed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["roles"] = []
+    manifest_path.write_bytes(enron_splitting._canonical_line(manifest))  # noqa: SLF001
+    manifest_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(role|structur|invalid)") as error:
+        access.bind_evidence("sha256:" + "7" * 64)
+
+    assert str(tmp_path) not in str(error.value)
+    assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+
+
+def test_malformed_nested_manifest_is_sanitized_before_claim_or_test_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="malformed-claim"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    manifest_path = run.sealed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["sealing"] = []
+    manifest_path.write_bytes(enron_splitting._canonical_line(manifest))  # noqa: SLF001
+    manifest_path.chmod(0o600)
+    actual_open = enron_splitting.open_private_binary_input_at
+
+    def reject_test_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        if name == "test.jsonl":
+            pytest.fail("malformed manifest opened test content")
+        return actual_open(directory_fd, name, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "open_private_binary_input_at", reject_test_open)
+    with pytest.raises(EnronSplitError, match=r"(?i)(sealing|structur|invalid)") as error:
+        with access:
+            pass
+
+    assert str(tmp_path) not in str(error.value)
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+    assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+
+
+def test_malformed_nested_manifest_is_sanitized_for_crash_finalizer(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="malformed-finalizer"))
+    run = _split(tmp_path, preparation)
+    with _bound_final_test_access(run) as active:
+        tuple(active.iter_records())
+    (run.sealed / "ACCESS_OUTCOME.json").unlink()
+    manifest_path = run.sealed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["leakage"] = []
+    manifest_path.write_bytes(enron_splitting._canonical_line(manifest))  # noqa: SLF001
+    manifest_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(leakage|structur|invalid)") as error:
+        enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
+
+    assert str(tmp_path) not in str(error.value)
+    assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+
+
+def test_malformed_nested_manifest_is_sanitized_for_metadata_verification(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="malformed-metadata"))
+    run = _split(tmp_path, preparation)
+    manifest_path = run.sealed / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["aggregates"] = []
+    manifest_path.write_bytes(enron_splitting._canonical_line(manifest))  # noqa: SLF001
+    manifest_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(aggregate|verification|invalid)") as error:
+        verify_enron_splits(run.development, run.sealed, seed=run.seed)
+
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_partial_or_unused_claimed_stream_is_aborted(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="claimed-abort"))
+    run = _split(tmp_path, preparation)
+
+    with _bound_final_test_access(run):
+        pass
+
+    outcome = json.loads((run.sealed / "ACCESS_OUTCOME.json").read_text(encoding="utf-8"))
+    assert outcome["status"] == "aborted"
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "aborted"
+
+
+@pytest.mark.parametrize("failure_kind", ["parse", "count", "hash", "identity"])
+def test_caught_stream_integrity_failures_are_recorded_failed(tmp_path: Path, failure_kind: str) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix=f"caught-stream-{failure_kind}"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    if failure_kind == "parse":
+        test_path = run.sealed / "test.jsonl"
+        original = test_path.read_bytes()
+        test_path.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        test_path.chmod(0o600)
+
+    with access as active:
+        if failure_kind == "count":
+            active._expected_records += 1  # noqa: SLF001
+        elif failure_kind == "hash":
+            active._expected_sha256 = "sha256:" + "0" * 64  # noqa: SLF001
+        elif failure_kind == "identity":
+            assert active._opened_identity is not None  # noqa: SLF001
+            active._opened_identity = (*active._opened_identity[:-1], active._opened_identity[-1] + 1)  # noqa: SLF001
+        with pytest.raises(EnronSplitError, match=r"(?i)(invalid|canonical|content|changed)"):
+            tuple(active.iter_records())
+
+    outcome = json.loads((run.sealed / "ACCESS_OUTCOME.json").read_text(encoding="utf-8"))
+    assert outcome["status"] == "failed"
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "failed"
+
+
+def test_live_access_owner_blocks_crash_finalization(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="live-finalizer"))
+    run = _split(tmp_path, preparation)
+
+    with _bound_final_test_access(run) as active:
+        with pytest.raises(EnronSplitError, match=r"(?i)(active|owner|transition)"):
+            enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
+        assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+        tuple(active.iter_records())
+
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "completed"
+
+
+def test_same_size_postseal_test_change_fails_only_after_claim(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="postseal-change"))
+    run = _split(tmp_path, preparation)
+    target = _frozen_target(run)
+    test_path = run.sealed / "test.jsonl"
+    original = test_path.read_bytes()
+    changed = bytes([original[0] ^ 1]) + original[1:]
+    assert len(changed) == len(original)
+    test_path.write_bytes(changed)
+    test_path.chmod(0o600)
+    access = _bound_final_test_access(run, target=target)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(invalid|canonical|content)"):
+        with access as active:
+            tuple(active.iter_records())
+
+    assert json.loads((run.sealed / "ACCESS_OUTCOME.json").read_text(encoding="utf-8"))["status"] == "failed"
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "failed"
+
+
+def test_rehashed_evidence_binding_substitution_breaks_claim_chain(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="binding-substitution"))
+    run = _split(tmp_path, preparation)
+    with _bound_final_test_access(run) as active:
+        tuple(active.iter_records())
+    binding_path = run.sealed / "EVIDENCE_BOUND.json"
+    binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    binding["aggregate_sha256"] = "sha256:" + "8" * 64
+    binding_core = {key: value for key, value in binding.items() if key != "binding_sha256"}
+    binding["binding_sha256"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(binding_core, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
+    binding_path.write_text(
+        json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    binding_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(evidence|binding|claim)"):
+        verify_enron_splits(run.development, run.sealed, seed=run.seed)
+
+
+def test_rehashed_claim_cannot_change_the_evidence_bound_target(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="claim-target-substitution"))
+    run = _split(tmp_path, preparation)
+    with _bound_final_test_access(run) as active:
+        tuple(active.iter_records())
+    claim_path = run.sealed / "ACCESS_CLAIMED.json"
+    outcome_path = run.sealed / "ACCESS_OUTCOME.json"
+    claim = json.loads(claim_path.read_text(encoding="utf-8"))
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    claim["frozen_target"]["bank_hash"] = "sha256:" + "9" * 64
+    claim_core = {key: value for key, value in claim.items() if key != "claim_sha256"}
+    claim["claim_sha256"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(claim_core, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+    )
+    outcome["claim_sha256"] = claim["claim_sha256"]
+    outcome["frozen_target_sha256"] = (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                claim["frozen_target"],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    claim_path.write_text(
+        json.dumps(claim, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    outcome_path.write_text(
+        json.dumps(outcome, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    claim_path.chmod(0o600)
+    outcome_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(claim target|evidence binding)"):
+        verify_enron_splits(run.development, run.sealed, seed=run.seed)
+
+
 def test_final_test_access_pins_directory_across_rename_and_cwd_change(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1163,7 +2019,10 @@ def test_final_test_access_pins_directory_across_rename_and_cwd_change(
     other.mkdir(mode=0o700)
 
     monkeypatch.chdir(parent)
-    with enron_splitting.begin_enron_final_test_access(Path(run.sealed.name), frozen_target=target) as access:
+    bound = _bound_final_test_access(run, target=target)
+    relative_access = enron_splitting.begin_enron_final_test_access(Path(run.sealed.name), frozen_target=target)
+    assert bound is not relative_access
+    with relative_access as access:
         accessed = tuple(access.iter_records())
         run.sealed.rename(renamed)
         monkeypatch.chdir(other)
@@ -1182,8 +2041,10 @@ def test_hard_linked_sealed_clone_is_not_an_independent_access_capability(tmp_pa
     assert (clone / "test.jsonl").stat().st_nlink == 2
 
     with pytest.raises(EnronSplitError, match=r"(?i)(unsafe|link|private|file)"):
-        with enron_splitting.begin_enron_final_test_access(clone, frozen_target=_frozen_target(run)):
-            pass
+        enron_splitting.begin_enron_final_test_access(
+            clone,
+            frozen_target=_frozen_target(run),
+        ).bind_evidence("sha256:" + "7" * 64)
     assert not (clone / "ACCESS_CLAIMED.json").exists()
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
 
@@ -1212,7 +2073,11 @@ def test_private_receipt_publication_is_atomic_after_interrupted_write(
             {"schema_version": "test", "commitment": "sha256:" + "1" * 64},
         )
 
-    assert list(root.iterdir()) == []
+    retained = tuple(root.iterdir())
+    assert len(retained) == 1
+    assert re.fullmatch(r"\.nerb-cleanup-[0-9a-f]{48}", retained[0].name)
+    assert retained[0].read_bytes() == b""
+    assert stat.S_IMODE(retained[0].stat().st_mode) == 0o600
     assert not tuple(root.glob(".ACCESS_CLAIMED.json.stage-*"))
 
 
@@ -1235,6 +2100,70 @@ def test_private_receipt_publication_needs_no_parent_write_permission(tmp_path: 
         parent.chmod(0o700)
 
 
+@pytest.mark.parametrize("swap_point", ["before", "after"])
+def test_private_receipt_publication_swaps_preserve_substitutes_and_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    swap_point: str,
+) -> None:
+    root = tmp_path / "private-receipts"
+    root.mkdir(mode=0o700)
+    moved_name = f"moved-authentic-{swap_point}"
+    substitute = b"unrelated-receipt-substitute"
+    real_rename = enron_splitting._rename_noreplace_at
+
+    def swap_around_rename(
+        source_directory_fd: int,
+        source_name: str,
+        destination_directory_fd: int,
+        destination_name: str,
+    ) -> None:
+        if destination_name == "ACCESS_CLAIMED.json" and swap_point == "before":
+            os.rename(source_name, moved_name, src_dir_fd=source_directory_fd, dst_dir_fd=source_directory_fd)
+            substitute_fd = os.open(
+                source_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=source_directory_fd,
+            )
+            try:
+                os.write(substitute_fd, substitute)
+            finally:
+                os.close(substitute_fd)
+        real_rename(source_directory_fd, source_name, destination_directory_fd, destination_name)
+        if destination_name == "ACCESS_CLAIMED.json" and swap_point == "after":
+            os.rename(
+                destination_name,
+                moved_name,
+                src_dir_fd=destination_directory_fd,
+                dst_dir_fd=destination_directory_fd,
+            )
+            substitute_fd = os.open(
+                destination_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=destination_directory_fd,
+            )
+            try:
+                os.write(substitute_fd, substitute)
+            finally:
+                os.close(substitute_fd)
+
+    monkeypatch.setattr(enron_splitting, "_rename_noreplace_at", swap_around_rename)
+    with pytest.raises(EnronSplitError, match=r"(?i)(receipt|identity|publish)"):
+        enron_splitting._write_exclusive_private_json(
+            root,
+            "ACCESS_CLAIMED.json",
+            {"schema_version": "test", "commitment": "sha256:" + "1" * 64},
+        )
+
+    assert not (root / "ACCESS_CLAIMED.json").exists()
+    assert (root / moved_name).read_bytes() == b""
+    stages = tuple(root.glob(".ACCESS_CLAIMED.json.stage-*"))
+    assert len(stages) == 1
+    assert stages[0].read_bytes() == substitute
+
+
 def test_stale_internal_receipt_stage_is_recovered_before_inventory_validation(tmp_path: Path) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="stale-receipt"))
     run = _split(tmp_path, preparation)
@@ -1251,6 +2180,108 @@ def test_stale_internal_receipt_stage_is_recovered_before_inventory_validation(t
     )
     assert root == run.sealed.absolute()
     assert not stage.exists()
+    retained = tuple(run.sealed.glob(".nerb-cleanup-*"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b""
+
+
+def test_stale_receipt_stage_swap_is_preserved_and_blocks_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "private-receipts"
+    root.mkdir(mode=0o700)
+    stage = root / (".ACCESS_CLAIMED.json.stage-" + "c" * 24)
+    stage.write_bytes(b"partial-private-receipt")
+    stage.chmod(0o600)
+    stale_time = time.time_ns() - 10_000_000_000
+    os.utime(stage, ns=(stale_time, stale_time))
+    moved = root / "moved-authentic-stage"
+    substitute = b"unrelated-stale-receipt"
+    real_cleanup = enron_splitting._wipe_and_quarantine_receipt_file_at
+
+    def swap_before_cleanup(
+        directory_fd: int,
+        name: str,
+        descriptor: int,
+        expected_identity: tuple[int, int],
+    ) -> str:
+        os.rename(name, moved.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        substitute_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.write(substitute_fd, substitute)
+        finally:
+            os.close(substitute_fd)
+        return real_cleanup(directory_fd, name, descriptor, expected_identity)
+
+    monkeypatch.setattr(enron_splitting, "_wipe_and_quarantine_receipt_file_at", swap_before_cleanup)
+    with pytest.raises(EnronSplitError, match=r"(?i)(receipt|staging|safe)"):
+        enron_splitting._cleanup_stale_receipt_stages(root)
+
+    assert stage.read_bytes() == substitute
+    assert moved.read_bytes() == b""
+
+
+def test_receipt_quarantine_rename_race_restores_the_substitute_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "private-receipts"
+    root.mkdir(mode=0o700)
+    source = root / (".ACCESS_CLAIMED.json.stage-" + "d" * 24)
+    source.write_bytes(b"authentic-private-receipt")
+    source.chmod(0o600)
+    moved = root / "moved-authentic-receipt"
+    substitute = b"preserve-receipt-substitute"
+    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    descriptor = os.open(source.name, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+    identity = enron_splitting._receipt_file_identity(os.fstat(descriptor))
+    real_rename = enron_splitting._rename_noreplace_at
+    swapped = False
+
+    def swap_inside_quarantine_rename(
+        source_directory_fd: int,
+        source_name: str,
+        destination_directory_fd: int,
+        destination_name: str,
+    ) -> None:
+        nonlocal swapped
+        if source_name == source.name and destination_name.startswith(".nerb-cleanup-") and not swapped:
+            swapped = True
+            os.rename(source_name, moved.name, src_dir_fd=source_directory_fd, dst_dir_fd=source_directory_fd)
+            substitute_fd = os.open(
+                source_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=source_directory_fd,
+            )
+            try:
+                os.write(substitute_fd, substitute)
+            finally:
+                os.close(substitute_fd)
+        real_rename(source_directory_fd, source_name, destination_directory_fd, destination_name)
+
+    monkeypatch.setattr(enron_splitting, "_rename_noreplace_at", swap_inside_quarantine_rename)
+    try:
+        with pytest.raises(EnronSplitError):
+            enron_splitting._wipe_and_quarantine_receipt_file_at(
+                directory_fd,
+                source.name,
+                descriptor,
+                identity,
+            )
+    finally:
+        os.close(descriptor)
+        os.close(directory_fd)
+
+    assert source.read_bytes() == substitute
+    assert moved.read_bytes() == b""
+    assert not tuple(root.glob(".nerb-cleanup-*"))
 
 
 def test_unsafe_internal_receipt_stage_uses_stable_split_error_boundary(tmp_path: Path) -> None:
@@ -1267,13 +2298,26 @@ def test_unsafe_internal_receipt_stage_uses_stable_split_error_boundary(tmp_path
         )
 
 
-def test_crash_stranded_claim_can_be_finalized_as_aborted_without_reopening_test(tmp_path: Path) -> None:
+def test_crash_stranded_claim_can_be_finalized_as_aborted_without_reopening_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="finalize-aborted"))
     run = _split(tmp_path, preparation)
-    with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=_frozen_target(run)) as access:
+    with _bound_final_test_access(run) as access:
         tuple(access.iter_records())
     (run.sealed / "ACCESS_OUTCOME.json").unlink()
     assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "claimed"
+    actual_open_at = enron_splitting.open_private_binary_input_at
+    monkeypatch.setattr(
+        enron_splitting,
+        "open_private_binary_input_at",
+        lambda directory_fd, name, **kwargs: (
+            pytest.fail("aborted finalization reopened sealed content")
+            if name == "test.jsonl"
+            else actual_open_at(directory_fd, name, **kwargs)
+        ),
+    )
 
     finalized = enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
     assert finalized["status"] == "aborted"
@@ -1283,14 +2327,133 @@ def test_crash_stranded_claim_can_be_finalized_as_aborted_without_reopening_test
         enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
 
 
+def test_process_exit_releases_claim_liveness_lock_for_aborted_finalization(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="process-stranded-claim"))
+    run = _split(tmp_path, preparation)
+    target = _frozen_target(run)
+    enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target).bind_evidence("sha256:" + "7" * 64)
+    script = """
+import json
+import os
+import sys
+from pathlib import Path
+from nerb.enron_splitting import begin_enron_final_test_access
+
+access = begin_enron_final_test_access(Path(sys.argv[1]), frozen_target=json.loads(sys.argv[2]))
+access.__enter__()
+os._exit(0)
+"""
+
+    subprocess.run(
+        [sys.executable, "-c", script, str(run.sealed), json.dumps(target, sort_keys=True)],
+        check=True,
+    )
+
+    assert (run.sealed / "ACCESS_CLAIMED.json").is_file()
+    assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
+    finalized = enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
+    assert finalized["status"] == "aborted"
+    assert finalized["access_count"] == 1
+
+
 def test_missing_pair_commit_receipt_blocks_sealed_access_without_creating_claim(tmp_path: Path) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="unpaired"))
     run = _split(tmp_path, preparation)
     (run.sealed / "PAIR_COMMITTED.json").unlink()
 
     with pytest.raises(EnronSplitError, match=r"(?i)(pair|commit|missing|inventory|file)"):
-        with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=_frozen_target(run)):
-            pass
+        enron_splitting.begin_enron_final_test_access(
+            run.sealed,
+            frozen_target=_frozen_target(run),
+        ).bind_evidence("sha256:" + "7" * 64)
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+
+
+def test_preseal_receipt_is_pair_bound_and_postseal_verification_never_opens_test(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="preseal-proof"))
+    run = _split(tmp_path, preparation)
+    receipt_path = run.sealed / "PRESEAL_VERIFIED.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    pair = json.loads((run.sealed / "PAIR_COMMITTED.json").read_text(encoding="utf-8"))
+    assert receipt["test_content_verified_before_seal"] is True
+    assert pair["preseal_verification_sha256"] == _file_sha256(receipt_path)
+    actual_open = enron_splitting.open_private_binary_input
+    actual_open_at = enron_splitting.open_private_binary_input_at
+
+    def reject_test_open(path: Path, **kwargs: Any) -> Any:
+        if Path(path).name == "test.jsonl":
+            pytest.fail("post-seal verification opened test content")
+        return actual_open(path, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "open_private_binary_input", reject_test_open)
+    monkeypatch.setattr(
+        enron_splitting,
+        "open_private_binary_input_at",
+        lambda directory_fd, name, **kwargs: (
+            pytest.fail("post-seal verification opened pinned test content")
+            if name == "test.jsonl"
+            else actual_open_at(directory_fd, name, **kwargs)
+        ),
+    )
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["valid"] is True
+    assert (
+        enron_splitting.project_enron_contract_splits(run.development, run.sealed, seed=run.seed)["test_sealed"] is True
+    )
+
+
+def test_preseal_verification_failure_is_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="preseal-atomic"))
+    monkeypatch.setattr(
+        enron_splitting,
+        "_verify_prepared_conservation",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(EnronSplitError("injected preseal failure")),
+    )
+
+    with pytest.raises(EnronSplitError, match="injected preseal failure"):
+        _split(tmp_path, preparation, name="preseal-failure")
+    assert not (tmp_path / "preseal-failure-development").exists()
+    assert not (tmp_path / "preseal-failure-sealed").exists()
+
+
+def test_preseal_replay_rejects_a_coherently_wrong_build_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="preseal-independent-replay"))
+    actual_build_state = enron_splitting._build_state
+
+    def wrong_build_state(*args: Any, **kwargs: Any) -> Any:
+        state = actual_build_state(*args, **kwargs)
+        return replace(state, edge_counts={**state.edge_counts, "coherently_wrong": 1})
+
+    monkeypatch.setattr(enron_splitting, "_build_state", wrong_build_state)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(pre-seal|replay|aggregate)"):
+        _split(tmp_path, preparation, name="preseal-independent-replay")
+    assert not (tmp_path / "preseal-independent-replay-development").exists()
+    assert not (tmp_path / "preseal-independent-replay-sealed").exists()
+
+
+def test_changed_preseal_receipt_is_rejected_without_opening_test(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="preseal-tamper"))
+    run = _split(tmp_path, preparation)
+    receipt_path = run.sealed / "PRESEAL_VERIFIED.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["prepared_records"] += 1
+    receipt_path.write_text(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    receipt_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(pre-seal|receipt|hash|bind)"):
+        verify_enron_splits(run.development, run.sealed, seed=run.seed)
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
 
 
@@ -1306,40 +2469,19 @@ def test_deep_verifier_rejects_deliberate_cross_role_contamination(tmp_path: Pat
         verify_enron_splits(run.development, run.sealed, seed=run.seed)
 
 
-def test_deep_verifier_rejects_same_byte_artifact_aba_during_ingestion(
+def test_postseal_verifier_uses_preseal_receipt_without_reingesting_roles(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="ingestion-aba"))
     run = _split(tmp_path, preparation)
-    train_path = run.development / "train.jsonl"
-    parked_original = tmp_path / "train.original.jsonl"
-    replacement = tmp_path / "train.replacement.jsonl"
-    shutil.copyfile(train_path, replacement)
-    replacement.chmod(0o600)
-    real_ingest = enron_splitting._ingest_prepared  # noqa: SLF001
-    replaced = False
+    monkeypatch.setattr(
+        enron_splitting,
+        "_ingest_prepared",
+        lambda *_args, **_kwargs: pytest.fail("post-seal verification must not reingest role content"),
+    )
 
-    def ingest_with_aba(*args: Any, **kwargs: Any) -> int:
-        nonlocal replaced
-        prepared_path = Path(args[1])
-        expected_snapshot = kwargs.get("expected_snapshot")
-        if not replaced and expected_snapshot is not None and prepared_path == train_path:
-            replaced = True
-            train_path.replace(parked_original)
-            replacement.replace(train_path)
-            try:
-                return real_ingest(*args, **kwargs)
-            finally:
-                train_path.replace(replacement)
-                parked_original.replace(train_path)
-        return real_ingest(*args, **kwargs)
-
-    monkeypatch.setattr(enron_splitting, "_ingest_prepared", ingest_with_aba)
-
-    with pytest.raises(EnronSplitError, match=r"(?i)(artifact|identity|snapshot|changed|private)"):
-        verify_enron_splits(run.development, run.sealed, seed=run.seed)
-    assert replaced is True
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["valid"] is True
 
 
 def test_small_corpora_require_explicit_non_promotable_fixture_mode(tmp_path: Path) -> None:
@@ -1358,6 +2500,7 @@ def test_production_support_floors_enforce_each_frozen_boundary(tmp_path: Path) 
         preparation_run=tmp_path / "unused-preparation",
         development_output_dir=tmp_path / "unused-development",
         sealed_output_dir=tmp_path / "unused-sealed",
+        scratch_dir=tmp_path / "unused-scratch",
         fixture_mode=False,
     )
 
@@ -1422,6 +2565,7 @@ def test_production_cohort_support_accepts_exact_floor_and_rejects_one_below(tmp
         preparation_run=tmp_path / "unused-preparation",
         development_output_dir=tmp_path / "unused-development",
         sealed_output_dir=tmp_path / "unused-sealed",
+        scratch_dir=tmp_path / "unused-scratch",
         fixture_mode=False,
     )
     required = {
@@ -1458,7 +2602,7 @@ def test_split_rejects_nested_private_roots_before_creating_output(
                 preparation_run=preparation,
                 development_output_dir=development,
                 sealed_output_dir=sealed,
-                benchmark_version="enron-v2-nested-fixture",
+                scratch_dir=tmp_path / "unused-scratch",
                 seed="nested-seed",
                 sample_per_role=1,
                 fixture_mode=True,

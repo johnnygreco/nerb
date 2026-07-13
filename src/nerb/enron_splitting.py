@@ -16,19 +16,18 @@ import re
 import secrets
 import sqlite3
 import stat
-import tempfile
 import time
 from array import array
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO
 
 from .enron_preparation import (
-    EnronPreparationError,
     _normalize_message_id,
     _participant_values,
     _size_bucket,
@@ -41,6 +40,8 @@ from .enron_private_io import (
     _iter_strict_jsonl,
     _rename_noreplace_at,
     open_private_binary_input,
+    open_private_binary_input_at,
+    open_private_directory_input,
 )
 
 SPLIT_MANIFEST_SCHEMA_VERSION = "nerb.enron_split_manifest.v2"
@@ -50,9 +51,12 @@ SPLIT_SAMPLE_SCHEMA_VERSION = "nerb.enron_split_sample.v2"
 SPLIT_GROUP_SCHEMA_VERSION = "nerb.enron_split_group.v2"
 SPLIT_LEAKAGE_AUDIT_SCHEMA_VERSION = "nerb.enron_split_leakage_audit.v2"
 FINAL_TEST_ACCESS_SCHEMA_VERSION = "nerb.enron_final_test_access.v2"
+FINAL_TEST_EVIDENCE_BINDING_SCHEMA_VERSION = "nerb.enron_final_test_evidence_binding.v2"
 SPLIT_PAIR_RECEIPT_SCHEMA_VERSION = "nerb.enron_split_pair_receipt.v2"
+SPLIT_PRESEAL_VERIFICATION_SCHEMA_VERSION = "nerb.enron_split_preseal_verification.v2"
 
-DEFAULT_SPLIT_SEED = "nerb-enron-v2-split-v1"
+DEFAULT_SPLIT_SEED = "nerb-enron-split"
+_BENCHMARK_ID = "enron"
 DEFAULT_MAX_PREPARED_LINE_BYTES = 384 * 1024 * 1024
 PRODUCTION_MIN_ROLE_RECORDS = 10_000
 PRODUCTION_MIN_ROLE_GROUPS = 1_000
@@ -71,7 +75,6 @@ _MESSAGE_ID_HEADER_RE = re.compile(
     r"(?:\r?\n(?:[ \t]+[^\r\n]*|[ \t]*<[^<>\s]{1,512}>(?:[ \t,]+<[^<>\s]{1,512}>)*[ \t]*))*"
 )
 _ANGLE_MESSAGE_ID_RE = re.compile(r"<[^<>\s]{1,512}>")
-_BENCHMARK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+\-/]{0,127}$")
 _FROZEN_TARGET_KEYS = frozenset(
     {
         "frozen_at",
@@ -108,10 +111,13 @@ _PREPARATION_BINDING_KEYS = {
     "grouping_policy_sha256",
     "date_policy_sha256",
 }
-_RECEIPT_NAMES = frozenset({"PAIR_COMMITTED.json", "ACCESS_CLAIMED.json", "ACCESS_OUTCOME.json"})
+_RECEIPT_NAMES = frozenset({"PAIR_COMMITTED.json", "EVIDENCE_BOUND.json", "ACCESS_CLAIMED.json", "ACCESS_OUTCOME.json"})
 _RECEIPT_STAGE_RE = re.compile(
-    r"^\.(?:PAIR_COMMITTED\.json|ACCESS_CLAIMED\.json|ACCESS_OUTCOME\.json)\.stage-[0-9a-f]{24}$"
+    r"^\.(?:PAIR_COMMITTED\.json|EVIDENCE_BOUND\.json|ACCESS_CLAIMED\.json|ACCESS_OUTCOME\.json)"
+    r"\.stage-[0-9a-f]{24}$"
 )
+_RECEIPT_TOMBSTONE_RE = re.compile(r"^\.nerb-cleanup-[0-9a-f]{48}$")
+_MAX_RECEIPT_TOMBSTONES = 32
 _MAX_PRIVATE_JSON_DEPTH = 256
 _MAX_PRIVATE_JSON_INTEGER_DIGITS = 256
 
@@ -130,6 +136,7 @@ _SEALED_FILES = (
     "group-assignments.jsonl",
     "leakage-audit.json",
     "manifest.json",
+    "PRESEAL_VERIFIED.json",
     "PAIR_COMMITTED.json",
 )
 
@@ -147,7 +154,7 @@ class EnronSplitOptions:
     preparation_run: Path
     development_output_dir: Path
     sealed_output_dir: Path
-    benchmark_version: str = "enron-v2"
+    scratch_dir: Path
     seed: str = DEFAULT_SPLIT_SEED
     train_fraction: float = 0.8
     validation_fraction: float = 0.1
@@ -156,6 +163,9 @@ class EnronSplitOptions:
     sample_per_role: int = 10_000
     fixture_mode: bool = False
     allow_unignored_output: bool = False
+    progress_callback: Callable[[int], None] | None = None
+    activity_callback: Callable[[], None] | None = None
+    cleanup_successor: PrivateRun | None = dataclass_field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +254,32 @@ class _BuildState:
     allocation_audit: Mapping[str, Any]
 
 
+@dataclass(slots=True)
+class _ActivityReporter:
+    """Emit deterministic liveness signals without changing split progress."""
+
+    callback: Callable[[], None] | None
+    pending_work: int = 0
+
+    def worked(self, units: int = 1) -> None:
+        self.pending_work += units
+        while self.pending_work >= 10_000:
+            self._report()
+            self.pending_work -= 10_000
+
+    def boundary(self) -> None:
+        self._report()
+        self.pending_work = 0
+
+    def _report(self) -> None:
+        if self.callback is None:
+            return
+        try:
+            self.callback()
+        except Exception:
+            raise EnronSplitError("Split activity callback failed.") from None
+
+
 class _UnionFind:
     def __init__(self, count: int) -> None:
         if count < 0 or count >= 2**32:
@@ -292,11 +328,13 @@ def _hash_value(domain: str, value: str) -> str:
     return "sha256:" + digest
 
 
-def _hash_file(path: Path) -> str:
+def _hash_file(path: Path, *, activity_reporter: _ActivityReporter | None = None) -> str:
     digest = hashlib.sha256()
     with open_private_binary_input(path) as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        for chunk_index, chunk in enumerate(iter(lambda: handle.read(1024 * 1024), b""), start=1):
             digest.update(chunk)
+            if activity_reporter is not None and chunk_index % 256 == 0:
+                activity_reporter.boundary()
     return "sha256:" + digest.hexdigest()
 
 
@@ -310,11 +348,17 @@ def _utc_instant(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _artifact_descriptor(path: Path, *, records: int, artifact_id: str | None = None) -> dict[str, Any]:
+def _artifact_descriptor(
+    path: Path,
+    *,
+    records: int,
+    artifact_id: str | None = None,
+    activity_reporter: _ActivityReporter | None = None,
+) -> dict[str, Any]:
     return {
         "id": artifact_id or path.stem,
         "name": path.name,
-        "sha256": _hash_file(path),
+        "sha256": _hash_file(path, activity_reporter=activity_reporter),
         "bytes": path.stat().st_size,
         "records": records,
     }
@@ -345,6 +389,64 @@ def _validate_aggregate_privacy(value: Any) -> None:
                 or _DOCUMENT_ID_RE.fullmatch(item)
             ):
                 raise EnronSplitError("Aggregate split metadata contains a private identifier or path.")
+
+
+def _require_split_mapping(value: Any, error: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise EnronSplitError(error)
+    return value
+
+
+def _sealed_test_role(manifest: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    roles = _require_split_mapping(manifest.get("roles"), "Sealed split role inventory is invalid.")
+    role = _require_split_mapping(roles.get("test"), "Sealed test descriptor is invalid.")
+    artifact = _require_split_mapping(role.get("artifact"), "Sealed test artifact descriptor is invalid.")
+    return role, artifact
+
+
+def _validate_sealed_access_manifest(
+    manifest: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    expected_keys = {
+        "schema_version",
+        "benchmark_version",
+        "artifact_kind",
+        "fixture_mode",
+        "promotable",
+        "preparation",
+        "policy",
+        "roles",
+        "aggregates",
+        "allocation",
+        "cohorts",
+        "sampling",
+        "leakage",
+        "sealing",
+        "artifacts",
+        "privacy",
+    }
+    sealing = _require_split_mapping(
+        manifest.get("sealing"),
+        "Sealed split sealing metadata is invalid for final access.",
+    )
+    leakage = _require_split_mapping(
+        manifest.get("leakage"),
+        "Sealed split leakage metadata is invalid for final access.",
+    )
+    roles = _require_split_mapping(
+        manifest.get("roles"),
+        "Sealed split role inventory is invalid for final access.",
+    )
+    role, artifact = _sealed_test_role(manifest)
+    if (
+        set(manifest) != expected_keys
+        or manifest.get("schema_version") != SPLIT_MANIFEST_SCHEMA_VERSION
+        or sealing.get("test_sealed") is not True
+        or leakage.get("crossing_groups") != 0
+        or set(roles) != set(_ROLE_NAMES)
+    ):
+        raise EnronSplitError("Sealed split is not structurally valid for final access.")
+    return role, artifact
 
 
 def _validate_preparation_binding(value: Any) -> Mapping[str, Any]:
@@ -395,8 +497,6 @@ def _validate_options(options: EnronSplitOptions) -> None:
         for right in paths[index + 1 :]
     ):
         raise EnronSplitError("Preparation, development, and sealed directories must not be nested.")
-    if not isinstance(options.benchmark_version, str) or not _BENCHMARK_RE.fullmatch(options.benchmark_version):
-        raise EnronSplitError("benchmark_version is invalid.")
     if not isinstance(options.seed, str) or not options.seed or len(options.seed) > 512:
         raise EnronSplitError("seed must be a bounded non-empty string.")
     for name in ("train_fraction", "validation_fraction"):
@@ -430,6 +530,14 @@ def _validate_options(options: EnronSplitOptions) -> None:
         raise EnronSplitError("sample_per_role must be a positive integer.")
     if not isinstance(options.fixture_mode, bool) or not isinstance(options.allow_unignored_output, bool):
         raise EnronSplitError("Boolean split options must be booleans.")
+    if options.progress_callback is not None and not callable(options.progress_callback):
+        raise EnronSplitError("progress_callback must be callable when provided.")
+    if options.activity_callback is not None and not callable(options.activity_callback):
+        raise EnronSplitError("activity_callback must be callable when provided.")
+    if options.cleanup_successor is not None and not isinstance(options.cleanup_successor, PrivateRun):
+        raise EnronSplitError("cleanup_successor must be a private run when provided.")
+    if not isinstance(options.scratch_dir, Path):
+        raise EnronSplitError("scratch_dir must be a path.")
     if not options.fixture_mode and (
         options.train_fraction != 0.8 or options.validation_fraction != 0.1 or options.near_hamming != 3
     ):
@@ -438,14 +546,43 @@ def _validate_options(options: EnronSplitOptions) -> None:
         )
 
 
-def _open_spool(path: Path) -> sqlite3.Connection:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    os.close(descriptor)
-    os.chmod(path, 0o600, follow_symlinks=False)
+def _open_spool(path: Path, *, precreated: bool = False) -> sqlite3.Connection:
+    expected_identity: tuple[int, int] | None = None
+    if precreated:
+        before = path.lstat()
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o077
+            or before.st_size != 0
+        ):
+            raise EnronSplitError("Precreated split spool is unsafe.")
+        expected_identity = int(before.st_dev), int(before.st_ino)
+    else:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        os.close(descriptor)
+        os.chmod(path, 0o600, follow_symlinks=False)
     connection = sqlite3.connect(path)
     connection.execute("PRAGMA journal_mode=OFF")
     connection.execute("PRAGMA synchronous=OFF")
-    connection.execute("PRAGMA temp_store=FILE")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    if expected_identity is not None:
+        after = path.lstat()
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or stat.S_ISLNK(after.st_mode)
+            or after.st_nlink != 1
+            or after.st_uid != os.geteuid()
+            or (after.st_dev, after.st_ino) != expected_identity
+        ):
+            connection.close()
+            raise EnronSplitError("Split spool changed while SQLite opened it.")
     connection.executescript(
         """
         CREATE TABLE records (
@@ -533,6 +670,8 @@ def _ingest_prepared(
     start_node: int = 0,
     finalize: bool = True,
     expected_snapshot: _PrivateFileSnapshot | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> int:
     records = 0
     previous_document_id: str | None = None
@@ -542,6 +681,8 @@ def _ingest_prepared(
         else _iter_strict_jsonl(prepared_path, DEFAULT_MAX_PREPARED_LINE_BYTES)
     )
     for _, raw, row in record_stream:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         document_id = row.get("document_id")
         if not isinstance(document_id, str) or not _DOCUMENT_ID_RE.fullmatch(document_id):
             raise EnronSplitError("Prepared document identity is invalid.")
@@ -605,10 +746,28 @@ def _ingest_prepared(
             signature = str(near["simhash64"])
             connection.execute("INSERT OR IGNORE INTO near_signatures VALUES (?, ?)", (node, signature))
         records += 1
+        if progress_callback is not None and records % 10_000 == 0:
+            try:
+                progress_callback(records)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:
+                raise EnronSplitError("Split progress callback failed.") from None
+    if progress_callback is not None and records % 10_000 != 0:
+        try:
+            progress_callback(records)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            raise EnronSplitError("Split progress callback failed.") from None
     if finalize:
+        if activity_reporter is not None:
+            activity_reporter.boundary()
         for node, signature in connection.execute(
             "SELECT node, signature FROM near_signatures ORDER BY node, signature"
         ):
+            if activity_reporter is not None:
+                activity_reporter.worked()
             for pair_index, value in _near_pair_keys(str(signature)):
                 connection.execute("INSERT OR IGNORE INTO near_bands VALUES (?, ?, ?)", (pair_index, value, node))
         for table, columns in (
@@ -618,6 +777,8 @@ def _ingest_prepared(
             ("thread_participants", "thread, identity, node"),
             ("identities", "identity, node"),
         ):
+            if activity_reporter is not None:
+                activity_reporter.boundary()
             connection.execute(f"CREATE INDEX {table}_lookup ON {table} ({columns})")
     connection.commit()
     if records == 0:
@@ -631,10 +792,14 @@ def _union_runs(
     query: str,
     edge_name: str,
     edge_counts: Counter[str],
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> None:
     previous_key: tuple[Any, ...] | None = None
     first_node: int | None = None
     for *keys, node_value in connection.execute(query):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         key = tuple(keys)
         node = int(node_value)
         if key != previous_key:
@@ -653,6 +818,8 @@ def _build_leakage_graph(
     connection: sqlite3.Connection,
     records: int,
     options: EnronSplitOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> tuple[_UnionFind, Counter[str], int, int]:
     union_find = _UnionFind(records)
     edge_counts: Counter[str] = Counter()
@@ -662,6 +829,7 @@ def _build_leakage_graph(
         "SELECT feature, node FROM exact_features GROUP BY feature, node ORDER BY feature, node",
         "exact_plaintext",
         edge_counts,
+        activity_reporter=activity_reporter,
     )
     _union_runs(
         connection,
@@ -669,6 +837,7 @@ def _build_leakage_graph(
         "SELECT feature, node FROM own_message_ids GROUP BY feature, node ORDER BY feature, node",
         "same_message_id",
         edge_counts,
+        activity_reporter=activity_reporter,
     )
     _union_runs(
         connection,
@@ -681,6 +850,7 @@ def _build_leakage_graph(
         """,
         "message_id_reference",
         edge_counts,
+        activity_reporter=activity_reporter,
     )
     _union_runs(
         connection,
@@ -691,6 +861,7 @@ def _build_leakage_graph(
         """,
         "thread_shared_participant",
         edge_counts,
+        activity_reporter=activity_reporter,
     )
 
     # Five disjoint 13/13/13/13/12-bit bands indexed by all ten band pairs
@@ -700,6 +871,8 @@ def _build_leakage_graph(
     # band keys are unique, so the bucket sum exactly bounds SQL join work.
     near_candidate_emissions = 0
     for (bucket_size,) in connection.execute("SELECT COUNT(*) FROM near_bands GROUP BY band, value"):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         size = int(bucket_size)
         near_candidate_emissions += size * (size - 1) // 2
         if near_candidate_emissions > options.max_near_candidate_pairs:
@@ -719,29 +892,38 @@ def _build_leakage_graph(
     )
     near_candidate_pairs = 0
     for pair_index in range(len(_NEAR_BAND_PAIRS)):
-        try:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO near_candidates
-                SELECT left_band.node, right_band.node
-                FROM near_bands AS left_band JOIN near_bands AS right_band
-                  ON left_band.band = right_band.band AND left_band.value = right_band.value
-                 AND left_band.node < right_band.node
-                WHERE left_band.band = ?
-                """,
-                (pair_index,),
+        for first_node in range(0, records, 10_000):
+            try:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO near_candidates
+                    SELECT left_band.node, right_band.node
+                    FROM near_bands AS left_band JOIN near_bands AS right_band
+                      ON left_band.band = right_band.band AND left_band.value = right_band.value
+                     AND left_band.node < right_band.node
+                    WHERE left_band.band = ? AND left_band.node >= ? AND left_band.node < ?
+                    """,
+                    (pair_index, first_node, min(first_node + 10_000, records)),
+                )
+            except sqlite3.IntegrityError as exc:
+                if "near candidate budget exceeded" in str(exc):
+                    raise EnronSplitError(
+                        "Near-duplicate candidate budget exceeded; split aborted fail-closed."
+                    ) from exc
+                raise
+            near_candidate_pairs = int(
+                connection.execute("SELECT candidate_count FROM near_candidate_budget").fetchone()[0]
             )
-        except sqlite3.IntegrityError as exc:
-            if "near candidate budget exceeded" in str(exc):
-                raise EnronSplitError("Near-duplicate candidate budget exceeded; split aborted fail-closed.") from exc
-            raise
-        near_candidate_pairs = int(connection.execute("SELECT COUNT(*) FROM near_candidates").fetchone()[0])
-        if near_candidate_pairs > options.max_near_candidate_pairs:
-            raise EnronSplitError("Near-duplicate candidate budget exceeded; split aborted fail-closed.")
+            if near_candidate_pairs > options.max_near_candidate_pairs:
+                raise EnronSplitError("Near-duplicate candidate budget exceeded; split aborted fail-closed.")
+            if activity_reporter is not None:
+                activity_reporter.boundary()
     signatures_by_node: list[tuple[int, ...]] = [()] * records
     current_node: int | None = None
     current_values: list[int] = []
     for node, signature in connection.execute("SELECT node, signature FROM near_signatures ORDER BY node, signature"):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         node_int = int(node)
         if current_node is not None and node_int != current_node:
             signatures_by_node[current_node] = tuple(current_values)
@@ -753,6 +935,8 @@ def _build_leakage_graph(
     for left, right in connection.execute(
         "SELECT left_node, right_node FROM near_candidates ORDER BY left_node, right_node"
     ):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         # SQLite builds do not consistently expose bit_count; compare the
         # small signature inventories in Python while preserving disk-bounded
         # candidate enumeration.
@@ -770,25 +954,40 @@ def _component_id(document_ids: Sequence[str]) -> str:
     return _hash_value("nerb/enron/split-component/v2", "\n".join(sorted(document_ids)))
 
 
-def _components(connection: sqlite3.Connection, union_find: _UnionFind) -> tuple[_Component, ...]:
+def _components(
+    connection: sqlite3.Connection,
+    union_find: _UnionFind,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> tuple[_Component, ...]:
     members: dict[int, list[int]] = defaultdict(list)
     metadata: dict[int, tuple[str, int, str | None, bool]] = {}
     for node, document_id, occurrences, date_utc, temporal in connection.execute(
         "SELECT node, document_id, occurrences, date_utc, temporal FROM records ORDER BY node"
     ):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         node_int = int(node)
         members[union_find.find(node_int)].append(node_int)
         metadata[node_int] = (str(document_id), int(occurrences), date_utc, bool(temporal))
     result: list[_Component] = []
     for nodes in members.values():
-        document_ids = [metadata[node][0] for node in nodes]
-        eligible_dates = [metadata[node][2] for node in nodes if metadata[node][3]]
+        document_ids: list[str] = []
+        eligible_dates: list[str | None] = []
+        occurrences = 0
+        for node in nodes:
+            if activity_reporter is not None:
+                activity_reporter.worked()
+            document_ids.append(metadata[node][0])
+            occurrences += metadata[node][1]
+            if metadata[node][3]:
+                eligible_dates.append(metadata[node][2])
         result.append(
             _Component(
                 group_id=_component_id(document_ids),
                 nodes=tuple(nodes),
                 records=len(nodes),
-                occurrences=sum(metadata[node][1] for node in nodes),
+                occurrences=occurrences,
                 temporal=bool(eligible_dates),
                 anchor_utc=max((str(value) for value in eligible_dates), key=_utc_instant) if eligible_dates else None,
             )
@@ -815,7 +1014,10 @@ def _temporal_cut_indices(
 
 
 def _assign_components(
-    components: Sequence[_Component], options: EnronSplitOptions
+    components: Sequence[_Component],
+    options: EnronSplitOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...], Counter[str], Counter[str]]:
     temporal = sorted(
         (component for component in components if component.temporal),
@@ -826,21 +1028,20 @@ def _assign_components(
     if temporal:
         train_end, validation_end = _temporal_cut_indices(temporal, options.train_fraction, options.validation_fraction)
         for index, component in enumerate(temporal):
+            if activity_reporter is not None:
+                activity_reporter.worked()
             roles[component.group_id] = (
                 "train" if index < train_end else "validation" if index < validation_end else "test"
             )
     validation_boundary = options.train_fraction + options.validation_fraction
     for component in non_temporal:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         value = (
             int(
                 hashlib.sha256(
                     (
-                        "nerb/enron/non-temporal/v2\0"
-                        + options.benchmark_version
-                        + "\0"
-                        + options.seed
-                        + "\0"
-                        + component.group_id
+                        "nerb/enron/non-temporal/v2\0" + _BENCHMARK_ID + "\0" + options.seed + "\0" + component.group_id
                     ).encode()
                 ).hexdigest(),
                 16,
@@ -860,6 +1061,8 @@ def _assign_components(
         role_groups[role] += 1
         role_records[role] += component.records
         for node in component.nodes:
+            if activity_reporter is not None:
+                activity_reporter.worked()
             node_roles[node] = role
             node_groups[node] = component.group_id
     return tuple(node_roles), tuple(node_groups), role_records, role_groups
@@ -884,12 +1087,16 @@ def _derive_memberships(
     components: Sequence[_Component],
     node_roles: Sequence[str],
     node_groups: Sequence[str],
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> tuple[tuple[_Membership, ...], dict[str, dict[str, int]]]:
     component_by_group = {component.group_id: component for component in components}
     connection.execute("DROP TABLE IF EXISTS node_assignments")
     connection.execute(
         "CREATE TEMP TABLE node_assignments (node INTEGER PRIMARY KEY, role TEXT NOT NULL, group_id TEXT NOT NULL)"
     )
+    if activity_reporter is not None:
+        activity_reporter.boundary()
     connection.executemany(
         "INSERT INTO node_assignments VALUES (?, ?, ?)",
         ((node, node_roles[node], node_groups[node]) for node in range(len(node_roles))),
@@ -905,6 +1112,8 @@ def _derive_memberships(
         """
     )
     connection.execute("CREATE UNIQUE INDEX train_identity_counts_key ON train_identity_counts(identity)")
+    if activity_reporter is not None:
+        activity_reporter.boundary()
     connection.execute("DROP TABLE IF EXISTS train_mailbox_counts")
     connection.execute(
         """
@@ -917,8 +1126,12 @@ def _derive_memberships(
         """
     )
     connection.execute("CREATE UNIQUE INDEX train_mailbox_counts_key ON train_mailbox_counts(mailbox_owner)")
+    if activity_reporter is not None:
+        activity_reporter.boundary()
     edge_families_by_group: dict[str, set[str]] = defaultdict(set)
     for edge, node in connection.execute("SELECT edge, node FROM edge_provenance ORDER BY edge, node"):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         edge_families_by_group[node_groups[int(node)]].add(str(edge))
 
     memberships: list[_Membership] = []
@@ -943,6 +1156,8 @@ def _derive_memberships(
         ORDER BY records.node
         """
     ):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         node = int(row[0])
         document_id = str(row[1])
         occurrences = int(row[2])
@@ -1072,14 +1287,17 @@ def _sample_rank(membership: _Membership, options: EnronSplitOptions) -> tuple[s
     return (
         _hash_value(
             "nerb/enron/split-sample/v2",
-            options.benchmark_version + "\0" + options.seed + "\0" + membership.document_id,
+            _BENCHMARK_ID + "\0" + options.seed + "\0" + membership.document_id,
         ),
         membership.document_id,
     )
 
 
 def _select_samples(
-    memberships: Sequence[_Membership], options: EnronSplitOptions
+    memberships: Sequence[_Membership],
+    options: EnronSplitOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> tuple[frozenset[int], dict[str, int]]:
     selected: set[int] = set()
     sample_counts: dict[str, int] = {}
@@ -1089,6 +1307,8 @@ def _select_samples(
         role_nodes = [index for index, membership in enumerate(memberships) if membership.role == role]
         ranks = {node: _sample_rank(memberships[node], options) for node in role_nodes}
         for node in role_nodes:
+            if activity_reporter is not None:
+                activity_reporter.worked()
             strata[_sample_stratum(memberships[node])].append(node)
             for margin in _sample_margins(memberships[node]):
                 margins[margin].append(node)
@@ -1191,6 +1411,8 @@ def _allocation_audit(
     role_records: Mapping[str, int],
     records: int,
     options: EnronSplitOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> dict[str, Any]:
     component_by_group = {component.group_id: component for component in components}
     component_anchor_instants = {
@@ -1203,6 +1425,8 @@ def _allocation_audit(
     cumulative = 0
     boundary_rows: dict[str, dict[str, Any] | None] = {"train": None, "validation": None}
     for component in temporal_components:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         cumulative += component.records
         role = node_roles[component.nodes[0]]
         if role in boundary_rows:
@@ -1222,6 +1446,8 @@ def _allocation_audit(
     for node, date_utc, record_temporal, record_date_status in connection.execute(
         "SELECT node, date_utc, temporal, date_status FROM records ORDER BY node"
     ):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         node_int = int(node)
         role = node_roles[node_int]
         component = component_by_group[node_groups[node_int]]
@@ -1233,6 +1459,8 @@ def _allocation_audit(
         ):
             boundary_promoted_records += 1
     for component in components:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         role = node_roles[component.nodes[0]]
         key = "eligible" if component.temporal else "non_temporal"
         eligibility[role][f"{key}_groups"] += 1
@@ -1242,7 +1470,7 @@ def _allocation_audit(
         "test": 1.0 - options.train_fraction - options.validation_fraction,
     }
     boundary_payload = {
-        "benchmark_version": options.benchmark_version,
+        "benchmark_version": _BENCHMARK_ID,
         "temporal_boundaries": boundary_rows,
         "seed_sha256": _hash_value("nerb/enron/split-seed/v2", options.seed),
     }
@@ -1256,12 +1484,27 @@ def _allocation_audit(
     }
 
 
-def _build_state(connection: sqlite3.Connection, records: int, options: EnronSplitOptions) -> _BuildState:
+def _build_state(
+    connection: sqlite3.Connection,
+    records: int,
+    options: EnronSplitOptions,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> _BuildState:
     union_find, edge_counts, near_candidate_emissions, near_candidate_pairs = _build_leakage_graph(
-        connection, records, options
+        connection,
+        records,
+        options,
+        activity_reporter=activity_reporter,
     )
-    components = _components(connection, union_find)
-    node_roles, node_groups, role_records, role_groups = _assign_components(components, options)
+    if activity_reporter is not None:
+        activity_reporter.boundary()
+    components = _components(connection, union_find, activity_reporter=activity_reporter)
+    node_roles, node_groups, role_records, role_groups = _assign_components(
+        components,
+        options,
+        activity_reporter=activity_reporter,
+    )
     grouping_truncated_records = int(
         connection.execute("SELECT COUNT(*) FROM records WHERE grouping_truncated = 1").fetchone()[0]
     )
@@ -1273,9 +1516,19 @@ def _build_state(connection: sqlite3.Connection, records: int, options: EnronSpl
         grouping_truncated_records,
         options,
     )
-    memberships, cohort_counts = _derive_memberships(connection, components, node_roles, node_groups)
+    memberships, cohort_counts = _derive_memberships(
+        connection,
+        components,
+        node_roles,
+        node_groups,
+        activity_reporter=activity_reporter,
+    )
     _enforce_cohort_support(cohort_counts, options)
-    selected_nodes, sample_counts = _select_samples(memberships, options)
+    selected_nodes, sample_counts = _select_samples(
+        memberships,
+        options,
+        activity_reporter=activity_reporter,
+    )
     allocation_audit = _allocation_audit(
         connection,
         components,
@@ -1284,6 +1537,7 @@ def _build_state(connection: sqlite3.Connection, records: int, options: EnronSpl
         role_records,
         records,
         options,
+        activity_reporter=activity_reporter,
     )
     return _BuildState(
         components=components,
@@ -1400,6 +1654,8 @@ def _write_role_records(
     train_file: BinaryIO,
     validation_file: BinaryIO,
     test_file: BinaryIO,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> None:
     handles = {"train": train_file, "validation": validation_file, "test": test_file}
     count = 0
@@ -1410,6 +1666,8 @@ def _write_role_records(
         expected_documents,
         strict=True,
     ):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         if row.get("document_id") != expected_document_id:
             raise EnronSplitError("Prepared record stream changed during splitting.")
         digest.update(raw)
@@ -1427,10 +1685,14 @@ def _write_memberships_and_samples(
     development_samples: BinaryIO,
     sealed_memberships: BinaryIO,
     sealed_samples: BinaryIO,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> tuple[int, int]:
     dev_membership_count = 0
     sealed_membership_count = 0
     for node, membership in enumerate(state.memberships):
+        if activity_reporter is not None:
+            activity_reporter.worked()
         membership_payload = membership.payload()
         encoded = _canonical_line(membership_payload)
         sample = {
@@ -1455,8 +1717,15 @@ def _write_memberships_and_samples(
     return dev_membership_count, sealed_membership_count
 
 
-def _write_groups(handle: BinaryIO, state: _BuildState) -> None:
+def _write_groups(
+    handle: BinaryIO,
+    state: _BuildState,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> None:
     for component in state.components:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         role = state.node_roles[component.nodes[0]]
         challenges = {challenge for node in component.nodes for challenge in state.memberships[node].challenges}
         value = {
@@ -1498,13 +1767,18 @@ def _role_descriptors(
     state: _BuildState,
     development_stage: Path,
     sealed_stage: Path,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> dict[str, Any]:
     return {
         "train": {
             "records": state.role_records["train"],
             "groups": state.role_groups["train"],
             "artifact": _artifact_descriptor(
-                development_stage / "train.jsonl", records=state.role_records["train"], artifact_id="train"
+                development_stage / "train.jsonl",
+                records=state.role_records["train"],
+                artifact_id="train",
+                activity_reporter=activity_reporter,
             ),
         },
         "validation": {
@@ -1514,24 +1788,44 @@ def _role_descriptors(
                 development_stage / "validation.jsonl",
                 records=state.role_records["validation"],
                 artifact_id="validation",
+                activity_reporter=activity_reporter,
             ),
         },
         "test": {
             "records": state.role_records["test"],
             "groups": state.role_groups["test"],
             "artifact": _artifact_descriptor(
-                sealed_stage / "test.jsonl", records=state.role_records["test"], artifact_id="test"
+                sealed_stage / "test.jsonl",
+                records=state.role_records["test"],
+                artifact_id="test",
+                activity_reporter=activity_reporter,
             ),
         },
     }
 
 
-def _preparation_binding(preparation_run: Path, verified: Mapping[str, Any]) -> dict[str, Any]:
+def _preparation_binding(
+    preparation_run: Path,
+    verified: Mapping[str, Any],
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> dict[str, Any]:
     profile = verified["profile"]
     source = profile["source"]
     prepared = verified["artifacts"]["prepared_records"]
+    verified_manifest_sha256 = verified.get("manifest_sha256")
+    if (
+        not isinstance(verified_manifest_sha256, str)
+        or not _SHA256_RE.fullmatch(verified_manifest_sha256)
+        or _hash_file(preparation_run / "manifest.json", activity_reporter=activity_reporter)
+        != verified_manifest_sha256
+    ):
+        raise EnronSplitError("Verified preparation manifest changed before split construction.")
     return {
-        "manifest_sha256": _hash_file(preparation_run / "manifest.json"),
+        # This is the hash of the exact manifest handle pinned and deep-verified
+        # by ``load_enron_preparation_run``. Reopening the path here would let a
+        # substituted manifest become bound to the already-verified profile.
+        "manifest_sha256": verified_manifest_sha256,
         "profile_sha256": verified["artifacts"]["profile"]["sha256"],
         "prepared_sha256": prepared["sha256"],
         "prepared_records": prepared["records"],
@@ -1563,7 +1857,7 @@ def _full_manifest(
     }
     return {
         "schema_version": SPLIT_MANIFEST_SCHEMA_VERSION,
-        "benchmark_version": options.benchmark_version,
+        "benchmark_version": _BENCHMARK_ID,
         "artifact_kind": "synthetic_fixture" if options.fixture_mode else "real_benchmark",
         "fixture_mode": options.fixture_mode,
         "promotable": not options.fixture_mode,
@@ -1599,7 +1893,7 @@ def _full_manifest(
         "sealing": {
             "test_sealed": True,
             "access_claim_file": "ACCESS_CLAIMED.json",
-            "initial_access_state": "sealed",
+            "initial_access_state": "sealed_unbound",
             "one_shot": True,
             "required_frozen_target_fields": sorted(_FROZEN_TARGET_KEYS),
         },
@@ -1624,7 +1918,7 @@ def _redacted_development_manifest(
 ) -> dict[str, Any]:
     return {
         "schema_version": SPLIT_MANIFEST_SCHEMA_VERSION,
-        "benchmark_version": options.benchmark_version,
+        "benchmark_version": _BENCHMARK_ID,
         "artifact_kind": "synthetic_fixture" if options.fixture_mode else "real_benchmark",
         "fixture_mode": options.fixture_mode,
         "promotable": not options.fixture_mode,
@@ -1653,13 +1947,395 @@ def _redacted_development_manifest(
     }
 
 
+def _preseal_verification_receipt(
+    *,
+    options: EnronSplitOptions,
+    preparation: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    development_root: Path,
+    sealed_root: Path,
+    full_manifest: Mapping[str, Any],
+    development_manifest: Mapping[str, Any],
+    roles: Mapping[str, Any],
+    development_artifacts: Mapping[str, Any],
+    sealed_artifacts: Mapping[str, Any],
+    replay_root: Path,
+    activity_reporter: _ActivityReporter | None = None,
+) -> dict[str, Any]:
+    """Deep-check both staging roots and bind the proof before test sealing."""
+
+    full_manifest_snapshot = _read_json_object_snapshot(sealed_root / "manifest.json")
+    development_manifest_snapshot = _read_json_object_snapshot(development_root / "manifest.json")
+    freeze_receipt_snapshot = _read_json_object_snapshot(development_root / "split-freeze-receipt.json")
+    if full_manifest_snapshot.value != full_manifest or development_manifest_snapshot.value != development_manifest:
+        raise EnronSplitError("Staged split manifests changed before pre-seal verification.")
+
+    artifact_snapshots: dict[Path, _PrivateFileSnapshot] = {}
+    role_snapshots: dict[str, _PrivateFileSnapshot] = {}
+    for role in _ROLE_NAMES:
+        if activity_reporter is not None:
+            activity_reporter.boundary()
+        root = sealed_root if role == "test" else development_root
+        path = root / f"{role}.jsonl"
+        snapshot = _verify_descriptor(
+            root,
+            roles[role]["artifact"],
+            path.name,
+            int(roles[role]["records"]),
+            activity_reporter=activity_reporter,
+        )
+        role_snapshots[role] = snapshot
+        artifact_snapshots[path] = snapshot
+    for artifact_id, filename in (("memberships", "memberships.jsonl"), ("samples", "samples.jsonl")):
+        path = development_root / filename
+        artifact_snapshots[path] = _verify_descriptor(
+            development_root,
+            development_artifacts[artifact_id],
+            filename,
+            activity_reporter=activity_reporter,
+        )
+    artifact_snapshots[development_root / "split-freeze-receipt.json"] = _verify_descriptor(
+        development_root,
+        development_artifacts["freeze_receipt"],
+        "split-freeze-receipt.json",
+        observed=freeze_receipt_snapshot.file,
+        activity_reporter=activity_reporter,
+    )
+    leakage_audit_snapshot = _read_json_object_snapshot(sealed_root / "leakage-audit.json")
+    for artifact_id, filename in (
+        ("memberships", "memberships.jsonl"),
+        ("samples", "samples.jsonl"),
+        ("group_assignments", "group-assignments.jsonl"),
+        ("leakage_audit", "leakage-audit.json"),
+    ):
+        path = sealed_root / filename
+        artifact_snapshots[path] = _verify_descriptor(
+            sealed_root,
+            sealed_artifacts[artifact_id],
+            filename,
+            observed=leakage_audit_snapshot.file if artifact_id == "leakage_audit" else None,
+            activity_reporter=activity_reporter,
+        )
+
+    _verify_prepared_conservation(
+        development_root,
+        sealed_root,
+        str(preparation["prepared_sha256"]),
+        int(preparation["prepared_records"]),
+        role_snapshots,
+        activity_reporter=activity_reporter,
+    )
+    replayed_state = _rebuild_preseal_state(
+        options=options,
+        preparation=preparation,
+        policy=policy,
+        development_root=development_root,
+        sealed_root=sealed_root,
+        full_manifest=full_manifest,
+        development_manifest=development_manifest,
+        roles=roles,
+        development_artifacts=development_artifacts,
+        sealed_artifacts=sealed_artifacts,
+        artifact_snapshots=artifact_snapshots,
+        role_snapshots=role_snapshots,
+        leakage_audit=leakage_audit_snapshot.value,
+        freeze_receipt=freeze_receipt_snapshot.value,
+        replay_root=replay_root,
+        activity_reporter=activity_reporter,
+    )
+    for path, snapshot in artifact_snapshots.items():
+        _assert_private_snapshot_current(path, snapshot)
+    _assert_private_snapshot_current(sealed_root / "manifest.json", full_manifest_snapshot.file)
+    _assert_private_snapshot_current(development_root / "manifest.json", development_manifest_snapshot.file)
+
+    artifact_commitments = {
+        "roles": {role: dict(roles[role]["artifact"]) for role in _ROLE_NAMES},
+        "development": {name: dict(value) for name, value in sorted(development_artifacts.items())},
+        "sealed": {name: dict(value) for name, value in sorted(sealed_artifacts.items())},
+    }
+    core = {
+        "schema_version": SPLIT_PRESEAL_VERIFICATION_SCHEMA_VERSION,
+        "benchmark_version": _BENCHMARK_ID,
+        "fixture_mode": options.fixture_mode,
+        "full_split_manifest_sha256": full_manifest_snapshot.file.sha256,
+        "development_manifest_sha256": development_manifest_snapshot.file.sha256,
+        "freeze_receipt_sha256": freeze_receipt_snapshot.file.sha256,
+        "preparation_manifest_sha256": preparation["manifest_sha256"],
+        "prepared_artifact_sha256": preparation["prepared_sha256"],
+        "prepared_records": preparation["prepared_records"],
+        "split_policy_sha256": policy["sha256"],
+        "artifact_commitments_sha256": _hash_bytes(_canonical_json(artifact_commitments).encode("utf-8")),
+        "roles": {
+            role: {"records": replayed_state.role_records[role], "groups": replayed_state.role_groups[role]}
+            for role in _ROLE_NAMES
+        },
+        "leakage_groups_crossing": 0,
+        "test_content_verified_before_seal": True,
+        "implementation_sha256": _hash_file(Path(__file__)),
+    }
+    return {**core, "receipt_sha256": _hash_bytes(_canonical_json(core).encode("utf-8"))}
+
+
+@contextmanager
+def _private_split_spool(
+    scratch_root: Path,
+    *,
+    purpose: str,
+    allow_unignored_output: bool,
+) -> Iterator[sqlite3.Connection]:
+    """Own one SQLite spool in a pinned transaction that wipes to a tombstone."""
+
+    if not re.fullmatch(r"[a-z0-9-]{1,48}", purpose):
+        raise EnronSplitError("Private split spool purpose is invalid.")
+    final = scratch_root / f".nerb-enron-{purpose}-{secrets.token_hex(12)}"
+    connection: sqlite3.Connection | None = None
+    operation_error: BaseException | None = None
+    try:
+        with PrivateRun(final, allow_unignored_output=allow_unignored_output) as run:
+            try:
+                spool_path = run.create_external_file("split.sqlite3")
+                connection = _open_spool(spool_path, precreated=True)
+                run.pin_cleanup_file("split.sqlite3")
+                yield connection
+            except BaseException as exc:
+                operation_error = exc
+                raise
+            finally:
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        cleanup_error = EnronSplitError("Private split spool could not be closed safely.")
+                        if operation_error is not None:
+                            raise cleanup_error from operation_error
+                        raise cleanup_error from None
+    except EnronPrivateIOError as exc:
+        raise EnronSplitError("Private split spool could not be cleaned safely.") from exc
+
+
+@contextmanager
+def _preseal_replay_connection(
+    scratch_root: Path,
+    *,
+    allow_unignored_output: bool,
+) -> Iterator[sqlite3.Connection]:
+    """Own the independent replay spool outside either committed split run."""
+
+    with _private_split_spool(
+        scratch_root,
+        purpose="preseal-replay",
+        allow_unignored_output=allow_unignored_output,
+    ) as connection:
+        yield connection
+
+
+def _rebuild_preseal_state(
+    *,
+    options: EnronSplitOptions,
+    preparation: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    development_root: Path,
+    sealed_root: Path,
+    full_manifest: Mapping[str, Any],
+    development_manifest: Mapping[str, Any],
+    roles: Mapping[str, Any],
+    development_artifacts: Mapping[str, Any],
+    sealed_artifacts: Mapping[str, Any],
+    artifact_snapshots: Mapping[Path, _PrivateFileSnapshot],
+    role_snapshots: Mapping[str, _PrivateFileSnapshot],
+    leakage_audit: Mapping[str, Any],
+    freeze_receipt: Mapping[str, Any],
+    replay_root: Path,
+    activity_reporter: _ActivityReporter | None = None,
+) -> _BuildState:
+    """Independently reconstruct the split from staged role bytes before sealing."""
+
+    expected_policy = _split_policy(options)
+    if _canonical_json(policy) != _canonical_json(expected_policy):
+        raise EnronSplitError("Frozen split policy differs from its canonical implementation.")
+    expected_source = {
+        "dataset_id": preparation["dataset_id"],
+        "revision": preparation["dataset_revision"],
+        "split": preparation["dataset_split"],
+    }
+    with _preseal_replay_connection(
+        replay_root,
+        allow_unignored_output=options.allow_unignored_output,
+    ) as connection:
+        try:
+            role_counts: dict[str, int] = {}
+            start_node = 0
+            for index, role in enumerate(_ROLE_NAMES):
+                count = _ingest_prepared(
+                    connection,
+                    (sealed_root if role == "test" else development_root) / f"{role}.jsonl",
+                    expected_source,
+                    start_node=start_node,
+                    finalize=index == len(_ROLE_NAMES) - 1,
+                    expected_snapshot=role_snapshots[role],
+                    activity_reporter=activity_reporter,
+                )
+                role_counts[role] = count
+                start_node += count
+            observed_roles = tuple(role for role in _ROLE_NAMES for _ in range(role_counts[role]))
+            union_find, edge_counts, near_candidate_emissions, near_candidate_pairs = _build_leakage_graph(
+                connection,
+                start_node,
+                options,
+                activity_reporter=activity_reporter,
+            )
+            components = _components(connection, union_find, activity_reporter=activity_reporter)
+            expected_roles, node_groups, role_records, role_groups = _assign_components(
+                components,
+                options,
+                activity_reporter=activity_reporter,
+            )
+            if expected_roles != observed_roles:
+                raise EnronSplitError("Pre-seal role assignment differs from deterministic replay.")
+            if any(
+                role_records[role] != roles[role]["records"] or role_groups[role] != roles[role]["groups"]
+                for role in _ROLE_NAMES
+            ):
+                raise EnronSplitError("Pre-seal role aggregates differ from deterministic replay.")
+            grouping_truncated_records = int(
+                connection.execute("SELECT COUNT(*) FROM records WHERE grouping_truncated = 1").fetchone()[0]
+            )
+            _enforce_support(
+                components,
+                start_node,
+                role_records,
+                role_groups,
+                grouping_truncated_records,
+                options,
+            )
+            memberships, cohorts = _derive_memberships(
+                connection,
+                components,
+                expected_roles,
+                node_groups,
+                activity_reporter=activity_reporter,
+            )
+            _enforce_cohort_support(cohorts, options)
+            selected_nodes, sample_counts = _select_samples(
+                memberships,
+                options,
+                activity_reporter=activity_reporter,
+            )
+            state = _BuildState(
+                components=components,
+                node_roles=expected_roles,
+                node_groups=node_groups,
+                memberships=memberships,
+                selected_nodes=selected_nodes,
+                edge_counts=dict(sorted(edge_counts.items())),
+                near_candidate_emissions=near_candidate_emissions,
+                near_candidate_pairs=near_candidate_pairs,
+                grouping_truncated_records=grouping_truncated_records,
+                role_records=dict(role_records),
+                role_groups=dict(role_groups),
+                cohort_counts=cohorts,
+                sample_counts=sample_counts,
+                allocation_audit=_allocation_audit(
+                    connection,
+                    components,
+                    expected_roles,
+                    node_groups,
+                    role_records,
+                    start_node,
+                    options,
+                    activity_reporter=activity_reporter,
+                ),
+            )
+            _verify_private_membership_artifacts(
+                development_root,
+                sealed_root,
+                full_manifest,
+                state,
+                artifact_snapshots,
+                activity_reporter=activity_reporter,
+            )
+            _verify_group_artifact(
+                sealed_root,
+                state,
+                artifact_snapshots[sealed_root / "group-assignments.jsonl"],
+                activity_reporter=activity_reporter,
+            )
+            expected_allocation = {
+                **dict(state.allocation_audit),
+                "group_assignments_sha256": sealed_artifacts["group_assignments"]["sha256"],
+            }
+            if (
+                full_manifest.get("allocation") != expected_allocation
+                or development_manifest.get("allocation") != state.allocation_audit
+                or full_manifest.get("cohorts", {}).get("roles") != {role: dict(cohorts[role]) for role in _ROLE_NAMES}
+                or full_manifest.get("sampling", {}).get("role_records") != sample_counts
+                or leakage_audit != _leakage_audit(state)
+            ):
+                raise EnronSplitError("Pre-seal aggregate evidence differs from deterministic replay.")
+            manifest_sha256 = _hash_file(
+                sealed_root / "manifest.json",
+                activity_reporter=activity_reporter,
+            )
+            expected_full_manifest = _full_manifest(
+                options,
+                preparation,
+                expected_policy,
+                state,
+                roles,
+                sealed_artifacts,
+            )
+            expected_development_manifest = _redacted_development_manifest(
+                options,
+                preparation,
+                expected_policy,
+                state,
+                roles,
+                development_artifacts,
+                manifest_sha256,
+            )
+            expected_freeze_receipt = {
+                "schema_version": SPLIT_FREEZE_RECEIPT_SCHEMA_VERSION,
+                "benchmark_version": _BENCHMARK_ID,
+                "fixture_mode": options.fixture_mode,
+                "promotable": not options.fixture_mode,
+                "preparation_manifest_sha256": preparation["manifest_sha256"],
+                "split_policy_sha256": expected_policy["sha256"],
+                "full_split_manifest_sha256": manifest_sha256,
+                "roles": {
+                    role: {"records": state.role_records[role], "groups": state.role_groups[role]}
+                    for role in _ROLE_NAMES
+                },
+                "leakage_groups_crossing": 0,
+                "test_sealed": True,
+            }
+            if (
+                _canonical_json(full_manifest) != _canonical_json(expected_full_manifest)
+                or _canonical_json(development_manifest) != _canonical_json(expected_development_manifest)
+                or _canonical_json(freeze_receipt) != _canonical_json(expected_freeze_receipt)
+            ):
+                raise EnronSplitError("Pre-seal manifests differ from deterministic replay.")
+            return state
+        finally:
+            connection.close()
+
+
 def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
     """Create immutable development and sealed split runs from a verified preparation run."""
 
     _validate_options(options)
+    activity = _ActivityReporter(options.activity_callback)
     try:
-        verified = load_enron_preparation_run(options.preparation_run)
-        preparation = _preparation_binding(options.preparation_run, verified)
+        activity.boundary()
+        verified = load_enron_preparation_run(
+            options.preparation_run,
+            scratch_dir=options.scratch_dir,
+            activity_callback=options.activity_callback,
+        )
+        preparation = _preparation_binding(
+            options.preparation_run,
+            verified,
+            activity_reporter=activity,
+        )
         policy = _split_policy(options)
         prepared_path = options.preparation_run / "prepared.jsonl"
         with (
@@ -1672,11 +2348,25 @@ def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
                 allow_unignored_output=options.allow_unignored_output,
             ) as sealed_run,
         ):
-            spool_path = development_run.stage_dir / ".split.sqlite3"
-            connection = _open_spool(spool_path)
+            spool_stack = ExitStack()
+            connection = spool_stack.enter_context(
+                _private_split_spool(
+                    options.scratch_dir,
+                    purpose="construction",
+                    allow_unignored_output=options.allow_unignored_output,
+                )
+            )
             try:
-                records = _ingest_prepared(connection, prepared_path, verified["profile"]["source"])
-                state = _build_state(connection, records, options)
+                records = _ingest_prepared(
+                    connection,
+                    prepared_path,
+                    verified["profile"]["source"],
+                    progress_callback=options.progress_callback,
+                    activity_reporter=activity,
+                )
+                activity.boundary()
+                state = _build_state(connection, records, options, activity_reporter=activity)
+                activity.boundary()
                 with (
                     development_run.open_binary("train.jsonl") as train_file,
                     development_run.open_binary("validation.jsonl") as validation_file,
@@ -1690,6 +2380,7 @@ def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
                         train_file,
                         validation_file,
                         test_file,
+                        activity_reporter=activity,
                     )
                 with (
                     development_run.open_binary("memberships.jsonl") as development_memberships,
@@ -1703,44 +2394,60 @@ def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
                         development_samples,
                         sealed_memberships,
                         sealed_samples,
+                        activity_reporter=activity,
                     )
                 with sealed_run.open_binary("group-assignments.jsonl") as group_file:
-                    _write_groups(group_file, state)
+                    _write_groups(group_file, state, activity_reporter=activity)
                 audit = _leakage_audit(state)
                 with sealed_run.open_text("leakage-audit.json") as audit_file:
                     _write_json(audit_file, audit)
 
-                roles = _role_descriptors(state, development_run.stage_dir, sealed_run.stage_dir)
+                activity.boundary()
+                roles = _role_descriptors(
+                    state,
+                    development_run.stage_dir,
+                    sealed_run.stage_dir,
+                    activity_reporter=activity,
+                )
                 sealed_artifacts = {
                     "test": roles["test"]["artifact"],
                     "memberships": _artifact_descriptor(
                         sealed_run.stage_dir / "memberships.jsonl",
                         records=sealed_membership_count,
                         artifact_id="test_memberships",
+                        activity_reporter=activity,
                     ),
                     "samples": _artifact_descriptor(
                         sealed_run.stage_dir / "samples.jsonl",
                         records=state.sample_counts["test"],
                         artifact_id="test_samples",
+                        activity_reporter=activity,
                     ),
                     "group_assignments": _artifact_descriptor(
                         sealed_run.stage_dir / "group-assignments.jsonl",
                         records=len(state.components),
                         artifact_id="group_assignments",
+                        activity_reporter=activity,
                     ),
                     "leakage_audit": _artifact_descriptor(
-                        sealed_run.stage_dir / "leakage-audit.json", records=1, artifact_id="leakage_audit"
+                        sealed_run.stage_dir / "leakage-audit.json",
+                        records=1,
+                        artifact_id="leakage_audit",
+                        activity_reporter=activity,
                     ),
                 }
                 full_manifest = _full_manifest(options, preparation, policy, state, roles, sealed_artifacts)
                 _validate_aggregate_privacy(full_manifest)
                 with sealed_run.open_text("manifest.json") as manifest_file:
                     _write_json(manifest_file, full_manifest)
-                full_manifest_sha256 = _hash_file(sealed_run.stage_dir / "manifest.json")
+                full_manifest_sha256 = _hash_file(
+                    sealed_run.stage_dir / "manifest.json",
+                    activity_reporter=activity,
+                )
 
                 freeze_receipt = {
                     "schema_version": SPLIT_FREEZE_RECEIPT_SCHEMA_VERSION,
-                    "benchmark_version": options.benchmark_version,
+                    "benchmark_version": _BENCHMARK_ID,
                     "fixture_mode": options.fixture_mode,
                     "promotable": not options.fixture_mode,
                     "preparation_manifest_sha256": preparation["manifest_sha256"],
@@ -1763,16 +2470,19 @@ def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
                         development_run.stage_dir / "memberships.jsonl",
                         records=development_membership_count,
                         artifact_id="development_memberships",
+                        activity_reporter=activity,
                     ),
                     "samples": _artifact_descriptor(
                         development_run.stage_dir / "samples.jsonl",
                         records=state.sample_counts["train"] + state.sample_counts["validation"],
                         artifact_id="development_samples",
+                        activity_reporter=activity,
                     ),
                     "freeze_receipt": _artifact_descriptor(
                         development_run.stage_dir / "split-freeze-receipt.json",
                         records=1,
                         artifact_id="freeze_receipt",
+                        activity_reporter=activity,
                     ),
                 }
                 development_manifest = _redacted_development_manifest(
@@ -1787,39 +2497,69 @@ def split_enron_preparation(options: EnronSplitOptions) -> dict[str, Any]:
                 _validate_aggregate_privacy(development_manifest)
                 with development_run.open_text("manifest.json") as manifest_file:
                     _write_json(manifest_file, development_manifest)
-                development_manifest_sha256 = _hash_file(development_run.stage_dir / "manifest.json")
+                development_manifest_sha256 = _hash_file(
+                    development_run.stage_dir / "manifest.json",
+                    activity_reporter=activity,
+                )
+                summary_groups = len(state.components)
+                summary_roles = {
+                    role: {"records": state.role_records[role], "groups": state.role_groups[role]}
+                    for role in _ROLE_NAMES
+                }
+                spool_stack.close()
+                del state
+                preseal_verification = _preseal_verification_receipt(
+                    options=options,
+                    preparation=preparation,
+                    policy=policy,
+                    development_root=development_run.stage_dir,
+                    sealed_root=sealed_run.stage_dir,
+                    full_manifest=full_manifest,
+                    development_manifest=development_manifest,
+                    roles=roles,
+                    development_artifacts=development_artifacts,
+                    sealed_artifacts=sealed_artifacts,
+                    replay_root=options.scratch_dir,
+                    activity_reporter=activity,
+                )
+                _validate_aggregate_privacy(preseal_verification)
+                with sealed_run.open_text("PRESEAL_VERIFIED.json") as receipt_file:
+                    _write_json(receipt_file, preseal_verification)
+                preseal_verification_sha256 = _hash_file(
+                    sealed_run.stage_dir / "PRESEAL_VERIFIED.json",
+                    activity_reporter=activity,
+                )
+                activity.boundary()
             finally:
-                connection.close()
-                for candidate in (spool_path, Path(str(spool_path) + "-journal")):
-                    if candidate.exists():
-                        candidate.unlink()
+                spool_stack.close()
             # Sealed data becomes immutable before its redacted development
             # receipt, preventing a visible receipt for an absent sealed run.
-            sealed_run.commit()
-            development_run.commit()
+            sealed_run.commit(cleanup_successor=options.cleanup_successor)
+            development_run.commit(cleanup_successor=options.cleanup_successor)
             pair_receipt = {
                 "schema_version": SPLIT_PAIR_RECEIPT_SCHEMA_VERSION,
-                "benchmark_version": options.benchmark_version,
+                "benchmark_version": _BENCHMARK_ID,
                 "sealed_manifest_sha256": full_manifest_sha256,
                 "development_manifest_sha256": development_manifest_sha256,
                 "freeze_receipt_sha256": development_artifacts["freeze_receipt"]["sha256"],
+                "preseal_verification_sha256": preseal_verification_sha256,
             }
             _validate_aggregate_privacy(pair_receipt)
             _write_exclusive_private_json(sealed_run.final_dir, "PAIR_COMMITTED.json", pair_receipt)
-    except (EnronPreparationError, EnronPrivateIOError, OSError, sqlite3.Error) as exc:
-        raise EnronSplitError(str(exc)) from exc
+    except EnronSplitError:
+        raise
+    except Exception:
+        raise EnronSplitError("Enron split construction failed safely.") from None
 
     return {
         "schema_version": SPLIT_MANIFEST_SCHEMA_VERSION,
         "committed": True,
-        "benchmark_version": options.benchmark_version,
+        "benchmark_version": _BENCHMARK_ID,
         "fixture_mode": options.fixture_mode,
         "promotable": not options.fixture_mode,
         "records": records,
-        "groups": len(state.components),
-        "roles": {
-            role: {"records": state.role_records[role], "groups": state.role_groups[role]} for role in _ROLE_NAMES
-        },
+        "groups": summary_groups,
+        "roles": summary_roles,
         "manifest_sha256": full_manifest_sha256,
         "policy_sha256": policy["sha256"],
     }
@@ -1859,6 +2599,54 @@ def _assert_private_snapshot_current(path: Path, snapshot: _PrivateFileSnapshot)
         raise EnronSplitError(f"{path.name} changed while it was being verified.")
 
 
+def _assert_private_snapshot_current_at(
+    directory_fd: int,
+    name: str,
+    snapshot: _PrivateFileSnapshot,
+) -> None:
+    try:
+        with open_private_binary_input_at(directory_fd, name) as current:
+            current_identity = _private_regular_identity(os.fstat(current.fileno()))
+    except EnronSplitError:
+        raise
+    except (EnronPrivateIOError, OSError, OverflowError, ValueError):
+        raise EnronSplitError(f"{name} changed while it was being verified.") from None
+    if current_identity != snapshot.identity:
+        raise EnronSplitError(f"{name} changed while it was being verified.")
+
+
+def _read_json_snapshot_from_handle(
+    handle: BinaryIO,
+    name: str,
+    max_bytes: int,
+) -> _PrivateJSONObjectSnapshot:
+    before_identity = _private_regular_identity(os.fstat(handle.fileno()))
+    if before_identity[4] > max_bytes:
+        raise EnronSplitError(f"{name} exceeds its byte limit.")
+    raw = handle.read(max_bytes + 1)
+    after_identity = _private_regular_identity(os.fstat(handle.fileno()))
+    if before_identity != after_identity or len(raw) != before_identity[4]:
+        raise EnronSplitError(f"{name} changed while it was being read.")
+    value = json.loads(
+        raw.decode("utf-8"),
+        parse_constant=lambda _value: (_ for _ in ()).throw(EnronSplitError("Non-finite JSON is invalid.")),
+        parse_float=_parse_finite_split_float,
+        parse_int=_parse_bounded_split_int,
+        object_pairs_hook=_reject_duplicate_keys,
+    )
+    if not isinstance(value, dict):
+        raise EnronSplitError(f"{name} must contain a JSON object.")
+    _validate_private_json_depth(value)
+    return _PrivateJSONObjectSnapshot(
+        value=value,
+        file=_PrivateFileSnapshot(
+            sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
+            bytes=len(raw),
+            identity=after_identity,
+        ),
+    )
+
+
 def _read_json_object_snapshot(
     path: Path,
     *,
@@ -1868,20 +2656,7 @@ def _read_json_object_snapshot(
         raise EnronSplitError("Private JSON byte limit must be a positive integer.")
     try:
         with open_private_binary_input(path) as handle:
-            before_identity = _private_regular_identity(os.fstat(handle.fileno()))
-            if before_identity[4] > max_bytes:
-                raise EnronSplitError(f"{path.name} exceeds its byte limit.")
-            raw = handle.read(max_bytes + 1)
-            after_identity = _private_regular_identity(os.fstat(handle.fileno()))
-            if before_identity != after_identity or len(raw) != before_identity[4]:
-                raise EnronSplitError(f"{path.name} changed while it was being read.")
-            value = json.loads(
-                raw.decode("utf-8"),
-                parse_constant=lambda _value: (_ for _ in ()).throw(EnronSplitError("Non-finite JSON is invalid.")),
-                parse_float=_parse_finite_split_float,
-                parse_int=_parse_bounded_split_int,
-                object_pairs_hook=_reject_duplicate_keys,
-            )
+            snapshot = _read_json_snapshot_from_handle(handle, path.name, max_bytes)
     except EnronSplitError:
         raise
     except (
@@ -1894,16 +2669,35 @@ def _read_json_object_snapshot(
         OSError,
     ):
         raise EnronSplitError(f"{path.name} is not a valid private JSON object.") from None
-    if not isinstance(value, dict):
-        raise EnronSplitError(f"{path.name} must contain a JSON object.")
-    _validate_private_json_depth(value)
-    snapshot = _PrivateFileSnapshot(
-        sha256="sha256:" + hashlib.sha256(raw).hexdigest(),
-        bytes=len(raw),
-        identity=after_identity,
-    )
-    _assert_private_snapshot_current(path, snapshot)
-    return _PrivateJSONObjectSnapshot(value=value, file=snapshot)
+    _assert_private_snapshot_current(path, snapshot.file)
+    return snapshot
+
+
+def _read_json_object_snapshot_at(
+    directory_fd: int,
+    name: str,
+    *,
+    max_bytes: int = 16 * 1024 * 1024,
+) -> _PrivateJSONObjectSnapshot:
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise EnronSplitError("Private JSON byte limit must be a positive integer.")
+    try:
+        with open_private_binary_input_at(directory_fd, name) as handle:
+            snapshot = _read_json_snapshot_from_handle(handle, name, max_bytes)
+    except EnronSplitError:
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        OverflowError,
+        ValueError,
+        EnronPrivateIOError,
+        OSError,
+    ):
+        raise EnronSplitError(f"{name} is not a valid private JSON object.") from None
+    _assert_private_snapshot_current_at(directory_fd, name, snapshot.file)
+    return snapshot
 
 
 def _read_json_object(path: Path, *, max_bytes: int = 16 * 1024 * 1024) -> dict[str, Any]:
@@ -1922,51 +2716,77 @@ def _validate_private_json_depth(value: Any) -> None:
             stack.extend((nested, depth + 1) for nested in item)
 
 
-def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_access_files: bool = False) -> Path:
+def _assert_committed_run_at(
+    directory_fd: int,
+    expected_files: Sequence[str],
+    *,
+    allow_access_files: bool = False,
+) -> None:
     try:
-        root = root.expanduser().absolute()
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise EnronSplitError("Split run path is invalid.") from exc
-    try:
-        root_info = root.lstat()
-    except OSError as exc:
-        raise EnronSplitError("Split run does not exist.") from exc
-    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
-        raise EnronSplitError("Split run must be a non-symlink directory.")
-    if stat.S_IMODE(root_info.st_mode) & 0o077:
-        raise EnronSplitError("Split run directory is not private.")
-    marker = root / _COMMIT_MARKER
-    with open_private_binary_input(marker) as handle:
-        if handle.read(len(_COMMIT_PAYLOAD) + 1) != _COMMIT_PAYLOAD:
-            raise EnronSplitError("Split commit marker is invalid.")
+        root_info = os.fstat(directory_fd)
+        if not stat.S_ISDIR(root_info.st_mode) or stat.S_IMODE(root_info.st_mode) & 0o077:
+            raise EnronSplitError("Split run directory is not private.")
+        with open_private_binary_input_at(directory_fd, _COMMIT_MARKER) as handle:
+            if handle.read(len(_COMMIT_PAYLOAD) + 1) != _COMMIT_PAYLOAD:
+                raise EnronSplitError("Split commit marker is invalid.")
+    except EnronSplitError:
+        raise
+    except (EnronPrivateIOError, OSError, ValueError):
+        raise EnronSplitError("Split run contains an unsafe private file.") from None
     allowed = set(expected_files) | {_COMMIT_MARKER}
     if allow_access_files:
-        allowed |= {"ACCESS_CLAIMED.json", "ACCESS_OUTCOME.json"}
+        allowed |= {"EVIDENCE_BOUND.json", "ACCESS_CLAIMED.json", "ACCESS_OUTCOME.json"}
     try:
-        actual = set(os.listdir(root))
-    except OSError as exc:
-        raise EnronSplitError("Split run could not be enumerated safely.") from exc
+        actual = set(os.listdir(directory_fd))
+    except OSError:
+        raise EnronSplitError("Split run could not be enumerated safely.") from None
     if any(_RECEIPT_STAGE_RE.fullmatch(name) for name in actual):
-        _cleanup_stale_receipt_stages(root)
+        _cleanup_stale_receipt_stages_at(directory_fd)
         try:
-            actual = set(os.listdir(root))
-        except OSError as exc:
-            raise EnronSplitError("Split run could not be re-enumerated after receipt recovery.") from exc
-    if actual != allowed and not (allow_access_files and set(expected_files) | {_COMMIT_MARKER} <= actual <= allowed):
+            actual = set(os.listdir(directory_fd))
+        except OSError:
+            raise EnronSplitError("Split run could not be re-enumerated after receipt recovery.") from None
+    tombstones = {name for name in actual if _RECEIPT_TOMBSTONE_RE.fullmatch(name)}
+    if len(tombstones) > _MAX_RECEIPT_TOMBSTONES:
+        raise EnronSplitError("Split run contains too many retained receipt tombstones.")
+    visible = actual - tombstones
+    if visible != allowed and not (allow_access_files and set(expected_files) | {_COMMIT_MARKER} <= visible <= allowed):
         raise EnronSplitError("Split run file inventory is invalid.")
     for name in actual:
-        info = (root / name).lstat()
+        try:
+            info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            raise EnronSplitError("Split run file inventory changed during validation.") from None
         if (
             not stat.S_ISREG(info.st_mode)
             or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()
             or info.st_nlink != 1
             or stat.S_IMODE(info.st_mode) & 0o077
+            or (_RECEIPT_TOMBSTONE_RE.fullmatch(name) is not None and info.st_size != 0)
         ):
             raise EnronSplitError("Split run contains an unsafe file.")
-    return root
 
 
-def _snapshot_private_artifact(path: Path, expected_bytes: int) -> _PrivateFileSnapshot:
+def _assert_committed_run(root: Path, expected_files: Sequence[str], *, allow_access_files: bool = False) -> Path:
+    try:
+        normalized = root.expanduser().absolute()
+    except (OSError, RuntimeError, ValueError):
+        raise EnronSplitError("Split run path is invalid.") from None
+    directory_fd = _open_pinned_private_root(normalized)
+    try:
+        _assert_committed_run_at(directory_fd, expected_files, allow_access_files=allow_access_files)
+    finally:
+        os.close(directory_fd)
+    return normalized
+
+
+def _snapshot_private_artifact(
+    path: Path,
+    expected_bytes: int,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
+) -> _PrivateFileSnapshot:
     digest = hashlib.sha256()
     byte_count = 0
     try:
@@ -1974,11 +2794,15 @@ def _snapshot_private_artifact(path: Path, expected_bytes: int) -> _PrivateFileS
             before_identity = _private_regular_identity(os.fstat(handle.fileno()))
             if before_identity[4] != expected_bytes:
                 raise EnronSplitError("Split artifact size differs from its descriptor.")
+            chunk_count = 0
             while chunk := handle.read(1024 * 1024):
+                chunk_count += 1
                 byte_count += len(chunk)
                 if byte_count > expected_bytes:
                     raise EnronSplitError("Split artifact size differs from its descriptor.")
                 digest.update(chunk)
+                if activity_reporter is not None and chunk_count % 256 == 0:
+                    activity_reporter.boundary()
             after_identity = _private_regular_identity(os.fstat(handle.fileno()))
     except EnronSplitError:
         raise
@@ -2002,6 +2826,7 @@ def _verify_descriptor(
     expected_records: int | None = None,
     *,
     observed: _PrivateFileSnapshot | None = None,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> _PrivateFileSnapshot:
     if not isinstance(descriptor, Mapping) or set(descriptor) != {"id", "name", "sha256", "bytes", "records"}:
         raise EnronSplitError("Split artifact descriptor is invalid.")
@@ -2021,10 +2846,56 @@ def _verify_descriptor(
     if expected_records is not None and descriptor.get("records") != expected_records:
         raise EnronSplitError("Split artifact descriptor record count is invalid.")
     artifact = root / expected_name
-    snapshot = observed or _snapshot_private_artifact(artifact, int(descriptor["bytes"]))
+    snapshot = observed or _snapshot_private_artifact(
+        artifact,
+        int(descriptor["bytes"]),
+        activity_reporter=activity_reporter,
+    )
     if descriptor.get("sha256") != snapshot.sha256 or descriptor.get("bytes") != snapshot.bytes:
         raise EnronSplitError("Split artifact descriptor does not match its file.")
     return snapshot
+
+
+def _verify_descriptor_metadata(
+    root: Path,
+    descriptor: Any,
+    expected_name: str,
+    expected_records: int | None = None,
+    *,
+    directory_fd: int | None = None,
+) -> None:
+    """Validate a sealed descriptor and file metadata without opening its content."""
+
+    if not isinstance(descriptor, Mapping) or set(descriptor) != {"id", "name", "sha256", "bytes", "records"}:
+        raise EnronSplitError("Split artifact descriptor is invalid.")
+    if (
+        descriptor.get("name") != expected_name
+        or not isinstance(descriptor.get("id"), str)
+        or not isinstance(descriptor.get("sha256"), str)
+        or not _SHA256_RE.fullmatch(str(descriptor["sha256"]))
+        or type(descriptor.get("bytes")) is not int
+        or int(descriptor["bytes"]) < 0
+        or type(descriptor.get("records")) is not int
+        or int(descriptor["records"]) < 0
+        or (expected_records is not None and descriptor["records"] != expected_records)
+    ):
+        raise EnronSplitError("Split artifact descriptor metadata is invalid.")
+    try:
+        info = (
+            os.stat(expected_name, dir_fd=directory_fd, follow_symlinks=False)
+            if directory_fd is not None
+            else (root / expected_name).lstat()
+        )
+    except OSError:
+        raise EnronSplitError("Sealed split artifact metadata could not be inspected safely.") from None
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o077
+        or info.st_size != descriptor["bytes"]
+    ):
+        raise EnronSplitError("Sealed split artifact metadata differs from its pre-seal descriptor.")
 
 
 def _frozen_artifact_contract(path: Path, descriptor: Mapping[str, Any]) -> tuple[str, int, int]:
@@ -2317,9 +3188,14 @@ def load_enron_development_split(
     path: Path,
     *,
     admission_limits: EnronDevelopmentAdmissionLimits | None = None,
+    activity_callback: Callable[[], None] | None = None,
 ) -> EnronDevelopmentSplit:
     """Load a redacted development run without exposing any test selector."""
 
+    if activity_callback is not None and not callable(activity_callback):
+        raise EnronSplitError("Development activity callback must be callable when provided.")
+    activity = _ActivityReporter(activity_callback)
+    activity.boundary()
     root = _assert_committed_run(path, _DEVELOPMENT_FILES)
     manifest_snapshot = _read_json_object_snapshot(root / "manifest.json")
     freeze_receipt_snapshot = _read_json_object_snapshot(root / "split-freeze-receipt.json")
@@ -2407,15 +3283,27 @@ def load_enron_development_split(
             artifacts[role],
             artifact_names[role],
             role_records[role],
+            activity_reporter=activity,
         )
-    artifact_snapshots["memberships"] = _verify_descriptor(root, artifacts["memberships"], "memberships.jsonl")
-    artifact_snapshots["samples"] = _verify_descriptor(root, artifacts["samples"], "samples.jsonl")
+    artifact_snapshots["memberships"] = _verify_descriptor(
+        root,
+        artifacts["memberships"],
+        "memberships.jsonl",
+        activity_reporter=activity,
+    )
+    artifact_snapshots["samples"] = _verify_descriptor(
+        root,
+        artifacts["samples"],
+        "samples.jsonl",
+        activity_reporter=activity,
+    )
     artifact_snapshots["freeze_receipt"] = _verify_descriptor(
         root,
         artifacts["freeze_receipt"],
         "split-freeze-receipt.json",
         1,
         observed=freeze_receipt_snapshot.file,
+        activity_reporter=activity,
     )
     if (
         set(receipt)
@@ -2439,6 +3327,7 @@ def load_enron_development_split(
         raise EnronSplitError("Development freeze receipt binding is invalid.")
     _assert_private_snapshot_current(root / "manifest.json", manifest_snapshot.file)
     _assert_private_snapshot_current(root / "split-freeze-receipt.json", freeze_receipt_snapshot.file)
+    activity.boundary()
     return EnronDevelopmentSplit(
         root,
         manifest,
@@ -2455,6 +3344,7 @@ def _iter_canonical_objects(
     schema_version: str,
     *,
     expected_snapshot: _PrivateFileSnapshot | None = None,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> Iterator[dict[str, Any]]:
     count = 0
     previous_document_id: str | None = None
@@ -2464,6 +3354,8 @@ def _iter_canonical_objects(
         else _iter_strict_jsonl(path, DEFAULT_MAX_PREPARED_LINE_BYTES)
     )
     for _, raw, row in source:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         if raw != _canonical_line(row) or row.get("schema_version") != schema_version:
             raise EnronSplitError(f"{path.name} is not canonical {schema_version} JSONL.")
         document_id = row.get("document_id")
@@ -2518,6 +3410,8 @@ def _verify_private_membership_artifacts(
     full_manifest: Mapping[str, Any],
     state: _BuildState,
     artifact_snapshots: Mapping[Path, _PrivateFileSnapshot],
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> None:
     expected = {row.document_id: row for row in state.memberships}
     observed: set[str] = set()
@@ -2535,6 +3429,7 @@ def _verify_private_membership_artifacts(
             count,
             SPLIT_MEMBERSHIP_SCHEMA_VERSION,
             expected_snapshot=artifact_snapshots[path],
+            activity_reporter=activity_reporter,
         ):
             document_id = row.get("document_id")
             if (
@@ -2572,6 +3467,7 @@ def _verify_private_membership_artifacts(
             expected_count,
             SPLIT_SAMPLE_SCHEMA_VERSION,
             expected_snapshot=artifact_snapshots[path],
+            activity_reporter=activity_reporter,
         ):
             document_id = row.get("document_id")
             if (
@@ -2590,9 +3486,13 @@ def _verify_group_artifact(
     sealed_root: Path,
     state: _BuildState,
     expected_snapshot: _PrivateFileSnapshot,
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> None:
     expected: list[dict[str, Any]] = []
     for component in state.components:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         challenges = {challenge for node in component.nodes for challenge in state.memberships[node].challenges}
         expected.append(
             {
@@ -2617,6 +3517,7 @@ def _verify_group_artifact(
             len(expected),
             SPLIT_GROUP_SCHEMA_VERSION,
             expected_snapshot=expected_snapshot,
+            activity_reporter=activity_reporter,
         )
     )
     if observed != expected:
@@ -2629,6 +3530,8 @@ def _verify_prepared_conservation(
     expected_sha256: str,
     expected_records: int,
     role_snapshots: Mapping[str, _PrivateFileSnapshot],
+    *,
+    activity_reporter: _ActivityReporter | None = None,
 ) -> None:
     streams: list[Iterator[tuple[int, bytes, Mapping[str, Any]]]] = []
     for role in _ROLE_NAMES:
@@ -2648,6 +3551,8 @@ def _verify_prepared_conservation(
     records = 0
     previous: str | None = None
     while heap:
+        if activity_reporter is not None:
+            activity_reporter.worked()
         document_id, index, raw, _ = heapq.heappop(heap)
         if previous is not None and document_id <= previous:
             raise EnronSplitError("Split roles duplicate or reorder a prepared document.")
@@ -2666,15 +3571,190 @@ def _verify_prepared_conservation(
         raise EnronSplitError("Split roles do not exactly conserve the frozen prepared artifact.")
 
 
+def _verify_preseal_receipt(
+    sealed_root: Path,
+    *,
+    manifest: Mapping[str, Any],
+    manifest_sha256: str,
+    development: EnronDevelopmentSplit,
+) -> _PrivateJSONObjectSnapshot:
+    snapshot = _read_json_object_snapshot(sealed_root / "PRESEAL_VERIFIED.json")
+    receipt = snapshot.value
+    expected_keys = {
+        "schema_version",
+        "benchmark_version",
+        "fixture_mode",
+        "full_split_manifest_sha256",
+        "development_manifest_sha256",
+        "freeze_receipt_sha256",
+        "preparation_manifest_sha256",
+        "prepared_artifact_sha256",
+        "prepared_records",
+        "split_policy_sha256",
+        "artifact_commitments_sha256",
+        "roles",
+        "leakage_groups_crossing",
+        "test_content_verified_before_seal",
+        "implementation_sha256",
+        "receipt_sha256",
+    }
+    if set(receipt) != expected_keys or receipt.get("schema_version") != SPLIT_PRESEAL_VERIFICATION_SCHEMA_VERSION:
+        raise EnronSplitError("Pre-seal verification receipt schema is invalid.")
+    receipt_core = {key: receipt[key] for key in receipt if key != "receipt_sha256"}
+    if receipt.get("receipt_sha256") != _hash_bytes(_canonical_json(receipt_core).encode("utf-8")):
+        raise EnronSplitError("Pre-seal verification receipt hash is invalid.")
+    roles = _require_split_mapping(manifest.get("roles"), "Pre-seal manifest role inventory is invalid.")
+    development_artifacts = _require_split_mapping(
+        development.manifest.get("artifacts"),
+        "Development artifact inventory is invalid for pre-seal verification.",
+    )
+    sealed_artifacts = _require_split_mapping(
+        manifest.get("artifacts"),
+        "Sealed artifact inventory is invalid for pre-seal verification.",
+    )
+    role_values = {
+        role: _require_split_mapping(roles.get(role), "Pre-seal manifest role descriptor is invalid.")
+        for role in _ROLE_NAMES
+    }
+    artifact_commitments = {
+        "roles": {
+            role: dict(
+                _require_split_mapping(
+                    role_values[role].get("artifact"),
+                    "Pre-seal role artifact descriptor is invalid.",
+                )
+            )
+            for role in _ROLE_NAMES
+        },
+        "development": {
+            name: dict(_require_split_mapping(value, "Development artifact descriptor is invalid."))
+            for name, value in sorted(development_artifacts.items())
+        },
+        "sealed": {
+            name: dict(_require_split_mapping(value, "Sealed artifact descriptor is invalid."))
+            for name, value in sorted(sealed_artifacts.items())
+        },
+    }
+    expected_roles = {
+        role: {"records": role_values[role].get("records"), "groups": role_values[role].get("groups")}
+        for role in _ROLE_NAMES
+    }
+    expected = {
+        "benchmark_version": manifest["benchmark_version"],
+        "fixture_mode": manifest["fixture_mode"],
+        "full_split_manifest_sha256": manifest_sha256,
+        "development_manifest_sha256": development._manifest_snapshot.sha256,
+        "freeze_receipt_sha256": development._freeze_receipt_snapshot.sha256,
+        "preparation_manifest_sha256": manifest["preparation"]["manifest_sha256"],
+        "prepared_artifact_sha256": manifest["preparation"]["prepared_sha256"],
+        "prepared_records": manifest["preparation"]["prepared_records"],
+        "split_policy_sha256": manifest["policy"]["sha256"],
+        "artifact_commitments_sha256": _hash_bytes(_canonical_json(artifact_commitments).encode("utf-8")),
+        "roles": expected_roles,
+        "leakage_groups_crossing": 0,
+        "test_content_verified_before_seal": True,
+        "implementation_sha256": _hash_file(Path(__file__)),
+    }
+    if any(receipt.get(field) != value for field, value in expected.items()):
+        raise EnronSplitError("Pre-seal verification receipt does not bind the committed split.")
+    return snapshot
+
+
+def _verify_preseal_access_metadata(
+    sealed_root: Path,
+    *,
+    manifest: Mapping[str, Any],
+    manifest_sha256: str,
+    directory_fd: int | None = None,
+) -> _PrivateJSONObjectSnapshot:
+    """Validate the self-bound pre-seal proof without reading any sealed artifact."""
+
+    snapshot = (
+        _read_json_object_snapshot_at(directory_fd, "PRESEAL_VERIFIED.json")
+        if directory_fd is not None
+        else _read_json_object_snapshot(sealed_root / "PRESEAL_VERIFIED.json")
+    )
+    receipt = snapshot.value
+    preparation = _require_split_mapping(
+        manifest.get("preparation"),
+        "Sealed manifest preparation binding is invalid.",
+    )
+    policy = _require_split_mapping(manifest.get("policy"), "Sealed manifest split policy is invalid.")
+    roles = _require_split_mapping(manifest.get("roles"), "Sealed manifest role inventory is invalid.")
+    expected_roles: dict[str, dict[str, Any]] = {}
+    for role in _ROLE_NAMES:
+        role_value = _require_split_mapping(roles.get(role), "Sealed manifest role descriptor is invalid.")
+        if "records" not in role_value or "groups" not in role_value:
+            raise EnronSplitError("Sealed manifest role descriptor is incomplete.")
+        expected_roles[role] = {"records": role_value["records"], "groups": role_value["groups"]}
+    expected_keys = {
+        "schema_version",
+        "benchmark_version",
+        "fixture_mode",
+        "full_split_manifest_sha256",
+        "development_manifest_sha256",
+        "freeze_receipt_sha256",
+        "preparation_manifest_sha256",
+        "prepared_artifact_sha256",
+        "prepared_records",
+        "split_policy_sha256",
+        "artifact_commitments_sha256",
+        "roles",
+        "leakage_groups_crossing",
+        "test_content_verified_before_seal",
+        "implementation_sha256",
+        "receipt_sha256",
+    }
+    receipt_core = {key: receipt[key] for key in receipt if key != "receipt_sha256"}
+    if (
+        set(receipt) != expected_keys
+        or receipt.get("schema_version") != SPLIT_PRESEAL_VERIFICATION_SCHEMA_VERSION
+        or receipt.get("benchmark_version") != manifest.get("benchmark_version")
+        or receipt.get("fixture_mode") != manifest.get("fixture_mode")
+        or receipt.get("full_split_manifest_sha256") != manifest_sha256
+        or receipt.get("preparation_manifest_sha256") != preparation.get("manifest_sha256")
+        or receipt.get("prepared_artifact_sha256") != preparation.get("prepared_sha256")
+        or receipt.get("prepared_records") != preparation.get("prepared_records")
+        or receipt.get("split_policy_sha256") != policy.get("sha256")
+        or receipt.get("roles") != expected_roles
+        or receipt.get("test_content_verified_before_seal") is not True
+        or receipt.get("leakage_groups_crossing") != 0
+        or receipt.get("implementation_sha256") != _hash_file(Path(__file__))
+        or not isinstance(receipt.get("artifact_commitments_sha256"), str)
+        or not _SHA256_RE.fullmatch(str(receipt["artifact_commitments_sha256"]))
+        or any(
+            not isinstance(receipt.get(field), str) or not _SHA256_RE.fullmatch(str(receipt[field]))
+            for field in (
+                "development_manifest_sha256",
+                "freeze_receipt_sha256",
+                "preparation_manifest_sha256",
+                "prepared_artifact_sha256",
+                "split_policy_sha256",
+                "implementation_sha256",
+            )
+        )
+        or receipt.get("receipt_sha256") != _hash_bytes(_canonical_json(receipt_core).encode("utf-8"))
+    ):
+        raise EnronSplitError("Pre-seal verification receipt is invalid for final-test access.")
+    return snapshot
+
+
 def _verify_pair_receipt(
     sealed_root: Path,
     sealed_manifest_sha256: str,
     benchmark_version: str,
     *,
+    preseal_verification_sha256: str,
     development_manifest_sha256: str | None = None,
     development_freeze_receipt_sha256: str | None = None,
-) -> dict[str, Any]:
-    receipt = _read_json_object(sealed_root / "PAIR_COMMITTED.json")
+    directory_fd: int | None = None,
+) -> _PrivateJSONObjectSnapshot:
+    snapshot = (
+        _read_json_object_snapshot_at(directory_fd, "PAIR_COMMITTED.json")
+        if directory_fd is not None
+        else _read_json_object_snapshot(sealed_root / "PAIR_COMMITTED.json")
+    )
+    receipt = snapshot.value
     if (
         set(receipt)
         != {
@@ -2683,6 +3763,7 @@ def _verify_pair_receipt(
             "sealed_manifest_sha256",
             "development_manifest_sha256",
             "freeze_receipt_sha256",
+            "preseal_verification_sha256",
         }
         or receipt.get("schema_version") != SPLIT_PAIR_RECEIPT_SCHEMA_VERSION
     ):
@@ -2690,9 +3771,15 @@ def _verify_pair_receipt(
     if (
         receipt.get("benchmark_version") != benchmark_version
         or receipt.get("sealed_manifest_sha256") != sealed_manifest_sha256
+        or receipt.get("preseal_verification_sha256") != preseal_verification_sha256
         or any(
             not isinstance(receipt.get(field), str) or not _SHA256_RE.fullmatch(str(receipt[field]))
-            for field in ("sealed_manifest_sha256", "development_manifest_sha256", "freeze_receipt_sha256")
+            for field in (
+                "sealed_manifest_sha256",
+                "development_manifest_sha256",
+                "freeze_receipt_sha256",
+                "preseal_verification_sha256",
+            )
         )
     ):
         raise EnronSplitError("Split pair receipt does not bind the sealed run.")
@@ -2703,23 +3790,119 @@ def _verify_pair_receipt(
         or receipt["freeze_receipt_sha256"] != development_freeze_receipt_sha256
     ):
         raise EnronSplitError("Split pair receipt does not bind the committed development run.")
-    return receipt
+    return snapshot
+
+
+def _verify_evidence_binding(
+    sealed_root: Path,
+    manifest: Mapping[str, Any],
+    manifest_sha256: str,
+    *,
+    preseal_verification_sha256: str,
+    directory_fd: int | None = None,
+    latest_allowed: datetime | None = None,
+) -> _PrivateJSONObjectSnapshot | None:
+    if directory_fd is None:
+        binding_exists = (sealed_root / "EVIDENCE_BOUND.json").exists()
+    else:
+        try:
+            binding_exists = "EVIDENCE_BOUND.json" in os.listdir(directory_fd)
+        except OSError:
+            raise EnronSplitError("Final-test evidence binding inventory could not be read safely.") from None
+    if not binding_exists:
+        return None
+    snapshot = (
+        _read_json_object_snapshot_at(directory_fd, "EVIDENCE_BOUND.json")
+        if directory_fd is not None
+        else _read_json_object_snapshot(sealed_root / "EVIDENCE_BOUND.json")
+    )
+    binding = snapshot.value
+    expected_keys = {
+        "schema_version",
+        "benchmark_version",
+        "bound_at",
+        "aggregate_sha256",
+        "frozen_target",
+        "preseal_verification_sha256",
+        "binding_sha256",
+    }
+    if (
+        set(binding) != expected_keys
+        or binding.get("schema_version") != FINAL_TEST_EVIDENCE_BINDING_SCHEMA_VERSION
+        or binding.get("benchmark_version") != manifest.get("benchmark_version")
+        or not isinstance(binding.get("aggregate_sha256"), str)
+        or not _SHA256_RE.fullmatch(str(binding["aggregate_sha256"]))
+        or binding.get("preseal_verification_sha256") != preseal_verification_sha256
+    ):
+        raise EnronSplitError("Final-test evidence binding schema is invalid.")
+    frozen_target = binding.get("frozen_target")
+    if not isinstance(frozen_target, Mapping):
+        raise EnronSplitError("Final-test evidence binding target is invalid.")
+    _, test_artifact = _sealed_test_role(manifest)
+    normalized_target = _validate_frozen_target(
+        frozen_target,
+        manifest_sha256,
+        str(test_artifact.get("sha256")),
+    )
+    binding_core = {key: binding[key] for key in binding if key != "binding_sha256"}
+    expected_binding_sha256 = _hash_bytes(_canonical_json(binding_core).encode("utf-8"))
+    if binding.get("binding_sha256") != expected_binding_sha256:
+        raise EnronSplitError("Final-test evidence binding hash is invalid.")
+    try:
+        bound_at = datetime.fromisoformat(str(binding["bound_at"]).replace("Z", "+00:00"))
+        frozen_at = datetime.fromisoformat(normalized_target["frozen_at"].replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise EnronSplitError("Final-test evidence binding timestamp is invalid.") from exc
+    if bound_at.tzinfo is None or bound_at.utcoffset() is None or bound_at < frozen_at:
+        raise EnronSplitError("Final-test evidence binding predates its frozen target.")
+    if bound_at > (latest_allowed or datetime.now(timezone.utc)):
+        raise EnronSplitError("Final-test evidence binding is ordered after the access transition.")
+    return snapshot
 
 
 def _verify_access_state(
     sealed_root: Path,
     manifest: Mapping[str, Any],
     manifest_sha256: str,
+    *,
+    preseal_verification_sha256: str,
+    directory_fd: int | None = None,
 ) -> dict[str, Any]:
-    claim_path = sealed_root / "ACCESS_CLAIMED.json"
-    outcome_path = sealed_root / "ACCESS_OUTCOME.json"
-    claim_exists = claim_path.exists()
-    outcome_exists = outcome_path.exists()
+    binding_snapshot = _verify_evidence_binding(
+        sealed_root,
+        manifest,
+        manifest_sha256,
+        preseal_verification_sha256=preseal_verification_sha256,
+        directory_fd=directory_fd,
+    )
+    binding = None if binding_snapshot is None else binding_snapshot.value
+    if directory_fd is None:
+        claim_exists = (sealed_root / "ACCESS_CLAIMED.json").exists()
+        outcome_exists = (sealed_root / "ACCESS_OUTCOME.json").exists()
+    else:
+        try:
+            names = set(os.listdir(directory_fd))
+        except OSError:
+            raise EnronSplitError("Final-test access inventory could not be read safely.") from None
+        claim_exists = "ACCESS_CLAIMED.json" in names
+        outcome_exists = "ACCESS_OUTCOME.json" in names
     if outcome_exists and not claim_exists:
         raise EnronSplitError("Final-test access outcome exists without its immutable claim.")
+    if claim_exists and binding is None:
+        raise EnronSplitError("Final-test access claim exists without its immutable evidence binding.")
     if not claim_exists:
-        return {"status": "sealed", "access_count": 0, "accessed_at": None}
-    claim = _read_json_object(claim_path)
+        return {
+            "status": "sealed_unbound" if binding is None else "evidence_bound",
+            "access_count": 0,
+            "accessed_at": None,
+            "aggregate_sha256": None if binding is None else binding["aggregate_sha256"],
+        }
+    assert binding is not None
+    claim = (
+        _read_json_object_snapshot_at(directory_fd, "ACCESS_CLAIMED.json").value
+        if directory_fd is not None
+        else _read_json_object(sealed_root / "ACCESS_CLAIMED.json")
+    )
     if (
         set(claim)
         != {
@@ -2727,6 +3910,7 @@ def _verify_access_state(
             "benchmark_version",
             "accessed_at",
             "frozen_target",
+            "evidence_binding_sha256",
             "claim_sha256",
         }
         or claim.get("schema_version") != FINAL_TEST_ACCESS_SCHEMA_VERSION
@@ -2734,6 +3918,8 @@ def _verify_access_state(
         raise EnronSplitError("Final-test access claim schema is invalid.")
     if claim.get("benchmark_version") != manifest.get("benchmark_version"):
         raise EnronSplitError("Final-test access claim benchmark binding is invalid.")
+    if claim.get("evidence_binding_sha256") != binding.get("binding_sha256"):
+        raise EnronSplitError("Final-test access claim evidence binding is invalid.")
     frozen_target = claim.get("frozen_target")
     if not isinstance(frozen_target, Mapping):
         raise EnronSplitError("Final-test access claim target is invalid.")
@@ -2742,6 +3928,8 @@ def _verify_access_state(
         manifest_sha256,
         str(manifest["roles"]["test"]["artifact"]["sha256"]),
     )
+    if normalized_target != binding.get("frozen_target"):
+        raise EnronSplitError("Final-test access claim target differs from its evidence binding.")
     if not manifest.get("fixture_mode") and (
         "sha256:" + "0" * 64 in normalized_target.values() or normalized_target["git_commit"] == "0" * 40
     ):
@@ -2753,13 +3941,29 @@ def _verify_access_state(
     try:
         accessed_at = datetime.fromisoformat(str(claim["accessed_at"]).replace("Z", "+00:00"))
         frozen_at = datetime.fromisoformat(normalized_target["frozen_at"].replace("Z", "+00:00"))
+        bound_at = datetime.fromisoformat(str(binding["bound_at"]).replace("Z", "+00:00"))
     except ValueError as exc:
         raise EnronSplitError("Final-test access timestamp is invalid.") from exc
-    if accessed_at.tzinfo is None or accessed_at.utcoffset() is None or accessed_at < frozen_at:
-        raise EnronSplitError("Final-test access predates its frozen target.")
+    if (
+        accessed_at.tzinfo is None
+        or accessed_at.utcoffset() is None
+        or accessed_at < frozen_at
+        or accessed_at < bound_at
+        or accessed_at > datetime.now(timezone.utc)
+    ):
+        raise EnronSplitError("Final-test access timestamp is outside its valid transition order.")
     if not outcome_exists:
-        return {"status": "claimed", "access_count": 1, "accessed_at": claim["accessed_at"]}
-    outcome = _read_json_object(outcome_path)
+        return {
+            "status": "claimed",
+            "access_count": 1,
+            "accessed_at": claim["accessed_at"],
+            "aggregate_sha256": binding["aggregate_sha256"],
+        }
+    outcome = (
+        _read_json_object_snapshot_at(directory_fd, "ACCESS_OUTCOME.json").value
+        if directory_fd is not None
+        else _read_json_object(sealed_root / "ACCESS_OUTCOME.json")
+    )
     if (
         set(outcome)
         != {
@@ -2768,6 +3972,7 @@ def _verify_access_state(
             "accessed_at",
             "status",
             "frozen_target_sha256",
+            "evidence_binding_sha256",
             "claim_sha256",
         }
         or outcome.get("schema_version") != FINAL_TEST_ACCESS_SCHEMA_VERSION
@@ -2776,24 +3981,38 @@ def _verify_access_state(
     if (
         outcome.get("benchmark_version") != claim.get("benchmark_version")
         or outcome.get("accessed_at") != claim.get("accessed_at")
+        or outcome.get("evidence_binding_sha256") != binding.get("binding_sha256")
         or outcome.get("claim_sha256") != expected_claim_sha256
         or outcome.get("frozen_target_sha256") != _hash_bytes(_canonical_json(normalized_target).encode("utf-8"))
         or outcome.get("status") not in {"completed", "failed", "aborted"}
     ):
         raise EnronSplitError("Final-test access outcome does not bind its claim.")
-    return {"status": outcome["status"], "access_count": 1, "accessed_at": claim["accessed_at"]}
+    return {
+        "status": outcome["status"],
+        "access_count": 1,
+        "accessed_at": claim["accessed_at"],
+        "aggregate_sha256": binding["aggregate_sha256"],
+    }
 
 
-def _verify_enron_splits(
+def _verify_enron_splits_metadata(
     development_path: Path,
     sealed_path: Path,
     *,
-    seed: str = DEFAULT_SPLIT_SEED,
+    seed: str,
+    activity_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """Deep steward verification over copied role records and both immutable roots."""
+    """Verify development content and sealed receipts without opening test content."""
 
-    development = load_enron_development_split(development_path)
-    development_root = development._root
+    if activity_callback is not None and not callable(activity_callback):
+        raise EnronSplitError("Split verification activity callback must be callable when provided.")
+    activity = _ActivityReporter(activity_callback)
+    activity.boundary()
+    development = load_enron_development_split(
+        development_path,
+        activity_callback=activity_callback,
+    )
+    activity.boundary()
     sealed_root = _assert_committed_run(sealed_path, _SEALED_FILES, allow_access_files=True)
     full_manifest_snapshot = _read_json_object_snapshot(sealed_root / "manifest.json")
     full_manifest = full_manifest_snapshot.value
@@ -2819,13 +4038,26 @@ def _verify_enron_splits(
     if set(full_manifest) != expected_keys or full_manifest.get("schema_version") != SPLIT_MANIFEST_SCHEMA_VERSION:
         raise EnronSplitError("Sealed split manifest schema is invalid.")
     _validate_preparation_binding(full_manifest.get("preparation"))
+    sealing = _require_split_mapping(full_manifest.get("sealing"), "Sealed split sealing metadata is invalid.")
+    leakage = _require_split_mapping(full_manifest.get("leakage"), "Sealed split leakage metadata is invalid.")
+    roles = _require_split_mapping(full_manifest.get("roles"), "Sealed split role inventory is invalid.")
+    artifacts = _require_split_mapping(full_manifest.get("artifacts"), "Sealed split artifact inventory is invalid.")
+    policy = _require_split_mapping(full_manifest.get("policy"), "Sealed split policy is invalid.")
+    aggregates = _require_split_mapping(full_manifest.get("aggregates"), "Sealed split aggregates are invalid.")
     manifest_sha256 = full_manifest_snapshot.file.sha256
     if manifest_sha256 != development.freeze_receipt.get("full_split_manifest_sha256"):
         raise EnronSplitError("Development receipt does not commit to the sealed split manifest.")
+    preseal_snapshot = _verify_preseal_receipt(
+        sealed_root,
+        manifest=full_manifest,
+        manifest_sha256=manifest_sha256,
+        development=development,
+    )
     _verify_pair_receipt(
         sealed_root,
         manifest_sha256,
         str(full_manifest.get("benchmark_version")),
+        preseal_verification_sha256=preseal_snapshot.file.sha256,
         development_manifest_sha256=development._manifest_snapshot.sha256,
         development_freeze_receipt_sha256=development._freeze_receipt_snapshot.sha256,
     )
@@ -2833,69 +4065,53 @@ def _verify_enron_splits(
         full_manifest.get("benchmark_version") != development.manifest.get("benchmark_version")
         or full_manifest.get("preparation") != development.manifest.get("preparation")
         or full_manifest.get("policy") != development.manifest.get("policy")
-        or full_manifest.get("sealing", {}).get("test_sealed") is not True
-        or full_manifest.get("leakage", {}).get("crossing_groups") != 0
+        or sealing.get("test_sealed") is not True
+        or leakage.get("crossing_groups") != 0
     ):
         raise EnronSplitError("Development and sealed split metadata are not consistently bound.")
-    roles = full_manifest.get("roles")
-    artifacts = full_manifest.get("artifacts")
-    if (
-        not isinstance(roles, Mapping)
-        or set(roles) != set(_ROLE_NAMES)
-        or not isinstance(artifacts, Mapping)
-        or set(artifacts) != {"test", "memberships", "samples", "group_assignments", "leakage_audit"}
-    ):
+    if set(roles) != set(_ROLE_NAMES) or set(artifacts) != {
+        "test",
+        "memberships",
+        "samples",
+        "group_assignments",
+        "leakage_audit",
+    }:
         raise EnronSplitError("Sealed role or artifact inventory is invalid.")
-    artifact_snapshots: dict[Path, _PrivateFileSnapshot] = {}
-    role_snapshots: dict[str, _PrivateFileSnapshot] = {}
     for role in _ROLE_NAMES:
         role_value = roles.get(role)
         if not isinstance(role_value, Mapping) or set(role_value) != {"records", "groups", "artifact"}:
             raise EnronSplitError("Sealed role descriptor is invalid.")
-        root = sealed_root if role == "test" else development_root
         if not isinstance(role_value["artifact"], Mapping) or role_value["artifact"].get("id") != role:
             raise EnronSplitError("Sealed role artifact identity is invalid.")
-        path = root / f"{role}.jsonl"
-        snapshot = _verify_descriptor(root, role_value["artifact"], path.name, int(role_value["records"]))
-        artifact_snapshots[path] = snapshot
-        role_snapshots[role] = snapshot
-    development_artifacts = development.manifest["artifacts"]
-    for artifact_id, filename in (("memberships", "memberships.jsonl"), ("samples", "samples.jsonl")):
-        path = development_root / filename
-        artifact_snapshots[path] = _verify_descriptor(
-            development_root,
-            development_artifacts[artifact_id],
-            filename,
-            observed=development._artifact_snapshots[artifact_id],
-        )
-    leakage_audit_snapshot = _read_json_object_snapshot(sealed_root / "leakage-audit.json")
+        if role == "test":
+            _verify_descriptor_metadata(
+                sealed_root,
+                role_value["artifact"],
+                "test.jsonl",
+                int(role_value["records"]),
+            )
     for artifact_id, expected_id, filename in (
         ("memberships", "test_memberships", "memberships.jsonl"),
         ("samples", "test_samples", "samples.jsonl"),
         ("group_assignments", "group_assignments", "group-assignments.jsonl"),
         ("leakage_audit", "leakage_audit", "leakage-audit.json"),
     ):
-        if not isinstance(artifacts.get(artifact_id), Mapping) or artifacts[artifact_id].get("id") != expected_id:
+        descriptor = artifacts.get(artifact_id)
+        if not isinstance(descriptor, Mapping) or descriptor.get("id") != expected_id:
             raise EnronSplitError("Sealed supporting artifact identity is invalid.")
-        path = sealed_root / filename
-        artifact_snapshots[path] = _verify_descriptor(
-            sealed_root,
-            artifacts.get(artifact_id),
-            filename,
-            observed=leakage_audit_snapshot.file if artifact_id == "leakage_audit" else None,
-        )
+        _verify_descriptor_metadata(sealed_root, descriptor, filename)
     if artifacts.get("test") != roles["test"]["artifact"]:
         raise EnronSplitError("Sealed test artifact binding is invalid.")
 
-    policy = full_manifest["policy"]
-    preparation = full_manifest["preparation"]
     if policy.get("seed_sha256") != _hash_value("nerb/enron/split-seed/v2", seed):
         raise EnronSplitError("Steward split seed does not match the frozen seed commitment.")
+    if full_manifest.get("benchmark_version") != _BENCHMARK_ID:
+        raise EnronSplitError("Steward split benchmark identity is invalid.")
     rebuild_options = EnronSplitOptions(
         preparation_run=Path("unused-preparation"),
         development_output_dir=Path("unused-development"),
         sealed_output_dir=Path("unused-sealed"),
-        benchmark_version=str(full_manifest["benchmark_version"]),
+        scratch_dir=Path("unused-scratch"),
         seed=seed,
         train_fraction=float(policy["train_fraction"]),
         validation_fraction=float(policy["validation_fraction"]),
@@ -2906,181 +4122,35 @@ def _verify_enron_splits(
         allow_unignored_output=True,
     )
     _validate_options(rebuild_options)
-    expected_policy = _split_policy(rebuild_options)
-    if _canonical_json(policy) != _canonical_json(expected_policy):
+    if _canonical_json(policy) != _canonical_json(_split_policy(rebuild_options)):
         raise EnronSplitError("Frozen split policy does not match its canonical implementation and hash.")
-    expected_source = {
-        "dataset_id": preparation["dataset_id"],
-        "revision": preparation["dataset_revision"],
-        "split": preparation["dataset_split"],
-    }
-    _verify_prepared_conservation(
-        development_root,
-        sealed_root,
-        str(preparation["prepared_sha256"]),
-        int(preparation["prepared_records"]),
-        role_snapshots,
-    )
-    with tempfile.TemporaryDirectory(prefix="nerb-enron-split-verify-") as temporary:
-        temporary_root = Path(temporary)
-        temporary_root.chmod(0o700)
-        spool = temporary_root / "split.sqlite3"
-        connection = _open_spool(spool)
-        try:
-            role_counts: dict[str, int] = {}
-            start_node = 0
-            for index, role in enumerate(_ROLE_NAMES):
-                count = _ingest_prepared(
-                    connection,
-                    (sealed_root if role == "test" else development_root) / f"{role}.jsonl",
-                    expected_source,
-                    start_node=start_node,
-                    finalize=index == len(_ROLE_NAMES) - 1,
-                    expected_snapshot=role_snapshots[role],
-                )
-                role_counts[role] = count
-                start_node += count
-            observed_roles = tuple(role for role in _ROLE_NAMES for _ in range(role_counts[role]))
-            union_find, edge_counts, near_candidate_emissions, near_candidate_pairs = _build_leakage_graph(
-                connection, start_node, rebuild_options
-            )
-            components = _components(connection, union_find)
-            expected_roles, node_groups, rebuilt_role_records, rebuilt_role_groups = _assign_components(
-                components, rebuild_options
-            )
-            if expected_roles != observed_roles:
-                raise EnronSplitError("Role assignment differs from the frozen deterministic split policy.")
-            if any(
-                rebuilt_role_records[role] != roles[role]["records"]
-                or rebuilt_role_groups[role] != roles[role]["groups"]
-                for role in _ROLE_NAMES
-            ):
-                raise EnronSplitError("Reconstructed role aggregates do not match the sealed manifest.")
-            grouping_truncated_records = int(
-                connection.execute("SELECT COUNT(*) FROM records WHERE grouping_truncated = 1").fetchone()[0]
-            )
-            _enforce_support(
-                components,
-                start_node,
-                rebuilt_role_records,
-                rebuilt_role_groups,
-                grouping_truncated_records,
-                rebuild_options,
-            )
-            memberships, cohorts = _derive_memberships(connection, components, expected_roles, node_groups)
-            _enforce_cohort_support(cohorts, rebuild_options)
-            selected_nodes, sample_counts = _select_samples(memberships, rebuild_options)
-            state = _BuildState(
-                components=components,
-                node_roles=expected_roles,
-                node_groups=node_groups,
-                memberships=memberships,
-                selected_nodes=selected_nodes,
-                edge_counts=dict(sorted(edge_counts.items())),
-                near_candidate_emissions=near_candidate_emissions,
-                near_candidate_pairs=near_candidate_pairs,
-                grouping_truncated_records=grouping_truncated_records,
-                role_records=dict(rebuilt_role_records),
-                role_groups=dict(rebuilt_role_groups),
-                cohort_counts=cohorts,
-                sample_counts=sample_counts,
-                allocation_audit=_allocation_audit(
-                    connection,
-                    components,
-                    expected_roles,
-                    node_groups,
-                    rebuilt_role_records,
-                    start_node,
-                    rebuild_options,
-                ),
-            )
-            _verify_private_membership_artifacts(
-                development_root,
-                sealed_root,
-                full_manifest,
-                state,
-                artifact_snapshots,
-            )
-            _verify_group_artifact(
-                sealed_root,
-                state,
-                artifact_snapshots[sealed_root / "group-assignments.jsonl"],
-            )
-            expected_allocation = {
-                **dict(state.allocation_audit),
-                "group_assignments_sha256": artifacts["group_assignments"]["sha256"],
-            }
-            if (
-                full_manifest.get("allocation") != expected_allocation
-                or development.manifest.get("allocation") != state.allocation_audit
-            ):
-                raise EnronSplitError("Allocation audit does not match reconstructed temporal boundaries.")
-            if leakage_audit_snapshot.value != _leakage_audit(state):
-                raise EnronSplitError("Leakage audit does not match the reconstructed leakage graph.")
-            if full_manifest.get("cohorts", {}).get("roles") != {role: dict(cohorts[role]) for role in _ROLE_NAMES}:
-                raise EnronSplitError("Cohort aggregates do not match reconstructed memberships.")
-            if full_manifest.get("sampling", {}).get("role_records") != sample_counts:
-                raise EnronSplitError("Sample aggregates do not match reconstructed representative samples.")
-            expected_full_manifest = _full_manifest(
-                rebuild_options,
-                preparation,
-                expected_policy,
-                state,
-                roles,
-                artifacts,
-            )
-            if _canonical_json(full_manifest) != _canonical_json(expected_full_manifest):
-                raise EnronSplitError("Sealed split manifest does not match its full reconstructed canonical form.")
-            expected_development_manifest = _redacted_development_manifest(
-                rebuild_options,
-                preparation,
-                expected_policy,
-                state,
-                roles,
-                development.manifest["artifacts"],
-                manifest_sha256,
-            )
-            if _canonical_json(development.manifest) != _canonical_json(expected_development_manifest):
-                raise EnronSplitError("Development manifest does not match its redacted canonical projection.")
-            expected_receipt = {
-                "schema_version": SPLIT_FREEZE_RECEIPT_SCHEMA_VERSION,
-                "benchmark_version": rebuild_options.benchmark_version,
-                "fixture_mode": rebuild_options.fixture_mode,
-                "promotable": not rebuild_options.fixture_mode,
-                "preparation_manifest_sha256": preparation["manifest_sha256"],
-                "split_policy_sha256": expected_policy["sha256"],
-                "full_split_manifest_sha256": manifest_sha256,
-                "roles": {
-                    role: {"records": state.role_records[role], "groups": state.role_groups[role]}
-                    for role in _ROLE_NAMES
-                },
-                "leakage_groups_crossing": 0,
-                "test_sealed": True,
-            }
-            if _canonical_json(development.freeze_receipt) != _canonical_json(expected_receipt):
-                raise EnronSplitError("Freeze receipt does not match the reconstructed split.")
-        finally:
-            connection.close()
 
-    access_state = _verify_access_state(sealed_root, full_manifest, manifest_sha256)
+    access_state = _verify_access_state(
+        sealed_root,
+        full_manifest,
+        manifest_sha256,
+        preseal_verification_sha256=preseal_snapshot.file.sha256,
+    )
     development._assert_metadata_current()
     _assert_private_snapshot_current(sealed_root / "manifest.json", full_manifest_snapshot.file)
-    _assert_private_snapshot_current(sealed_root / "leakage-audit.json", leakage_audit_snapshot.file)
-    for artifact_path, snapshot in artifact_snapshots.items():
-        _assert_private_snapshot_current(artifact_path, snapshot)
+    _assert_private_snapshot_current(sealed_root / "PRESEAL_VERIFIED.json", preseal_snapshot.file)
     contract_splits = _contract_split_projection(full_manifest, manifest_sha256)
+    activity.boundary()
     return {
         "valid": True,
         "schema_version": SPLIT_MANIFEST_SCHEMA_VERSION,
         "benchmark_version": full_manifest["benchmark_version"],
         "fixture_mode": full_manifest["fixture_mode"],
         "promotable": full_manifest["promotable"],
+        "preparation": dict(full_manifest["preparation"]),
         "records": sum(int(roles[role]["records"]) for role in _ROLE_NAMES),
-        "groups": len(components),
+        "groups": int(aggregates["groups"]),
         "roles": {
             role: {"records": int(roles[role]["records"]), "groups": int(roles[role]["groups"])} for role in _ROLE_NAMES
         },
         "manifest_sha256": manifest_sha256,
+        "development_manifest_sha256": development.manifest_sha256,
+        "preseal_verification_sha256": preseal_snapshot.file.sha256,
         "leakage_groups_crossing": 0,
         "test_sealed": True,
         "contract_splits": contract_splits,
@@ -3088,29 +4158,43 @@ def _verify_enron_splits(
     }
 
 
+def _verify_enron_splits(
+    development_path: Path,
+    sealed_path: Path,
+    *,
+    seed: str = DEFAULT_SPLIT_SEED,
+    activity_callback: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """Verify development content and sealed metadata with a stable boundary."""
+
+    return _verify_enron_splits_metadata(
+        development_path,
+        sealed_path,
+        seed=seed,
+        activity_callback=activity_callback,
+    )
+
+
 def verify_enron_splits(
     development_path: Path,
     sealed_path: Path,
     *,
     seed: str = DEFAULT_SPLIT_SEED,
+    activity_callback: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Deep steward verification with a stable, privacy-safe error boundary."""
 
     try:
-        return _verify_enron_splits(development_path, sealed_path, seed=seed)
+        return _verify_enron_splits(
+            development_path,
+            sealed_path,
+            seed=seed,
+            activity_callback=activity_callback,
+        )
     except EnronSplitError:
         raise
-    except (
-        EnronPreparationError,
-        EnronPrivateIOError,
-        OSError,
-        sqlite3.Error,
-        TypeError,
-        ValueError,
-        KeyError,
-        IndexError,
-    ) as exc:
-        raise EnronSplitError(str(exc)) from exc
+    except Exception:
+        raise EnronSplitError("Enron split verification failed safely.") from None
 
 
 def _contract_split_projection(manifest: Mapping[str, Any], manifest_sha256: str) -> dict[str, Any]:
@@ -3181,29 +4265,61 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _transition_timestamp(
+    value: str,
+    *,
+    description: str,
+    earliest: datetime | None = None,
+    latest: datetime | None = None,
+) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        raise EnronSplitError(f"{description} timestamp is invalid.") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise EnronSplitError(f"{description} timestamp must be timezone-aware.")
+    normalized = parsed.astimezone(timezone.utc)
+    if earliest is not None and normalized < earliest.astimezone(timezone.utc):
+        raise EnronSplitError(f"{description} timestamp violates the frozen transition order.")
+    if latest is not None and normalized > latest.astimezone(timezone.utc):
+        raise EnronSplitError(f"{description} timestamp is later than the current UTC wall clock.")
+    return normalized
+
+
 def _open_pinned_private_root(root: Path) -> int:
     if root.parent == root or not root.name:
         raise EnronSplitError("Private receipt root is invalid.")
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        before = root.lstat()
-        directory_fd = os.open(root, flags)
-    except OSError as exc:
-        raise EnronSplitError("Private receipt root could not be opened safely.") from exc
+        return open_private_directory_input(root)
+    except EnronPrivateIOError:
+        raise EnronSplitError("Private receipt root could not be pinned safely.") from None
+
+
+def _open_locked_transition_root(root: Path) -> tuple[Path, int]:
+    """Pin and exclusively lock the sealed transition capability."""
+
+    import fcntl
+
     try:
-        after = os.fstat(directory_fd)
-        if (
-            not stat.S_ISDIR(after.st_mode)
-            or stat.S_ISLNK(before.st_mode)
-            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-        ):
-            raise EnronSplitError("Private receipt root changed while it was opened.")
-        return directory_fd
-    except BaseException as exc:
-        os.close(directory_fd)
-        if isinstance(exc, EnronSplitError):
-            raise
-        raise EnronSplitError("Private receipt root could not be pinned safely.") from exc
+        normalized = root.expanduser().absolute()
+    except (OSError, RuntimeError, ValueError):
+        raise EnronSplitError("Final-test transition root is invalid.") from None
+    directory_fd = _open_pinned_private_root(normalized)
+    try:
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise EnronSplitError("A final-test transition owner is still active.") from None
+        except OSError:
+            raise EnronSplitError("The final-test transition capability could not be locked safely.") from None
+        _assert_committed_run_at(directory_fd, _SEALED_FILES, allow_access_files=True)
+        return normalized, directory_fd
+    except BaseException:
+        try:
+            os.close(directory_fd)
+        except OSError:
+            pass
+        raise
 
 
 def _write_exclusive_private_json_at(
@@ -3219,6 +4335,7 @@ def _write_exclusive_private_json_at(
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     temporary_name: str | None = None
     file_fd: int | None = None
+    staged_identity: tuple[int, int] | None = None
     published = False
     try:
         for _ in range(128):
@@ -3232,6 +4349,7 @@ def _write_exclusive_private_json_at(
         if file_fd is None or temporary_name is None:
             raise EnronSplitError("A unique private receipt staging file could not be created.")
         os.fchmod(file_fd, 0o600)
+        staged_identity = _receipt_file_identity(os.fstat(file_fd))
         fcntl.flock(file_fd, fcntl.LOCK_EX)
         offset = 0
         while offset < len(payload):
@@ -3240,81 +4358,241 @@ def _write_exclusive_private_json_at(
                 raise OSError("Private receipt write made no progress.")
             offset += written
         os.fsync(file_fd)
-        staged = os.fstat(file_fd)
+        _require_pinned_receipt_file_at(directory_fd, temporary_name, file_fd, staged_identity)
         _rename_noreplace_at(directory_fd, temporary_name, directory_fd, name)
         published = True
-        destination = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(destination.st_mode)
-            or destination.st_nlink != 1
-            or (staged.st_dev, staged.st_ino) != (destination.st_dev, destination.st_ino)
-        ):
-            raise EnronSplitError("Published private receipt does not match its staged inode.")
+        try:
+            _require_pinned_receipt_file_at(directory_fd, name, file_fd, staged_identity)
+        except EnronSplitError:
+            _restore_mismatched_receipt_publication_at(directory_fd, name, temporary_name)
+            published = False
+            raise
         os.fsync(directory_fd)
+        try:
+            _require_pinned_receipt_file_at(directory_fd, name, file_fd, staged_identity)
+        except EnronSplitError:
+            _restore_mismatched_receipt_publication_at(directory_fd, name, temporary_name)
+            published = False
+            raise
     except FileExistsError:
         raise EnronSplitError("Final-test access has already been claimed; retries are forbidden.") from None
     except EnronPrivateIOError as exc:
-        raise EnronSplitError(str(exc)) from exc
+        raise EnronSplitError("Private receipt could not be published safely.") from exc
     except OSError as exc:
         raise EnronSplitError("Private receipt could not be published atomically.") from exc
     finally:
+        if file_fd is not None and temporary_name is not None and staged_identity is not None and not published:
+            try:
+                _wipe_and_quarantine_receipt_file_at(
+                    directory_fd,
+                    temporary_name,
+                    file_fd,
+                    staged_identity,
+                )
+            except EnronSplitError:
+                pass
         if file_fd is not None:
             os.close(file_fd)
-        if temporary_name is not None and not published:
+
+
+def _receipt_file_identity(info: os.stat_result) -> tuple[int, int]:
+    return int(info.st_dev), int(info.st_ino)
+
+
+def _require_pinned_receipt_file_at(
+    directory_fd: int,
+    name: str,
+    descriptor: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        raise EnronSplitError("Private receipt staging identity changed.") from None
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(current.st_mode)
+        or opened.st_uid != os.geteuid()
+        or current.st_uid != os.geteuid()
+        or opened.st_nlink != 1
+        or current.st_nlink != 1
+        or stat.S_IMODE(opened.st_mode) != 0o600
+        or stat.S_IMODE(current.st_mode) != 0o600
+        or _receipt_file_identity(opened) != expected_identity
+        or _receipt_file_identity(current) != expected_identity
+    ):
+        raise EnronSplitError("Private receipt staging identity changed.")
+
+
+def _wipe_and_quarantine_receipt_file_at(
+    directory_fd: int,
+    name: str,
+    descriptor: int,
+    expected_identity: tuple[int, int],
+) -> str:
+    """Wipe one pinned receipt inode and retain its authenticated empty shell."""
+
+    try:
+        parent = os.fstat(directory_fd)
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) != 0o700
+            or not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or _receipt_file_identity(opened) != expected_identity
+        ):
+            raise OSError
+        os.fchmod(descriptor, 0o600)
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or current.st_uid != os.geteuid()
+            or current.st_nlink != 1
+            or stat.S_IMODE(current.st_mode) != 0o600
+            or _receipt_file_identity(current) != expected_identity
+        ):
+            raise OSError
+        tombstone_name: str | None = None
+        for _ in range(128):
+            candidate = f".nerb-cleanup-{secrets.token_hex(24)}"
             try:
-                os.unlink(temporary_name, dir_fd=directory_fd)
-                os.fsync(directory_fd)
-            except FileNotFoundError:
-                pass
+                _rename_noreplace_at(directory_fd, name, directory_fd, candidate)
+            except FileExistsError:
+                continue
+            tombstone_name = candidate
+            break
+        if tombstone_name is None:
+            raise OSError
+        tombstone = os.stat(tombstone_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(tombstone.st_mode)
+            or stat.S_ISLNK(tombstone.st_mode)
+            or tombstone.st_uid != os.geteuid()
+            or tombstone.st_nlink != 1
+            or stat.S_IMODE(tombstone.st_mode) != 0o600
+            or tombstone.st_size != 0
+            or _receipt_file_identity(tombstone) != expected_identity
+        ):
+            _restore_mismatched_receipt_quarantine_at(
+                directory_fd,
+                tombstone_name,
+                name,
+                _receipt_file_identity(tombstone),
+            )
+            raise OSError
+        os.fsync(directory_fd)
+        return tombstone_name
+    except (EnronPrivateIOError, OSError, ValueError):
+        raise EnronSplitError("Private receipt staging file could not be wiped safely.") from None
+
+
+def _restore_mismatched_receipt_quarantine_at(
+    directory_fd: int,
+    quarantine_name: str,
+    original_name: str,
+    observed_identity: tuple[int, int],
+) -> None:
+    """Restore a raced receipt substitute without overwriting either entry."""
+
+    try:
+        _rename_noreplace_at(directory_fd, quarantine_name, directory_fd, original_name)
+        restored = os.stat(original_name, dir_fd=directory_fd, follow_symlinks=False)
+        if _receipt_file_identity(restored) != observed_identity:
+            raise OSError
+        os.fsync(directory_fd)
+    except (EnronPrivateIOError, OSError, ValueError):
+        # A concurrent entry at the original name and the mismatched quarantine
+        # are both retained when an atomic no-replace rollback cannot succeed.
+        raise EnronSplitError("Raced private receipt substitute could not be restored safely.") from None
+
+
+def _restore_mismatched_receipt_publication_at(
+    directory_fd: int,
+    published_name: str,
+    staging_name: str,
+) -> None:
+    """Move a raced receipt back to its absent staging name without overwriting."""
+
+    try:
+        published = os.stat(published_name, dir_fd=directory_fd, follow_symlinks=False)
+        observed_identity = _receipt_file_identity(published)
+        _rename_noreplace_at(directory_fd, published_name, directory_fd, staging_name)
+        restored = os.stat(staging_name, dir_fd=directory_fd, follow_symlinks=False)
+        if _receipt_file_identity(restored) != observed_identity:
+            raise OSError
+        os.fsync(directory_fd)
+    except (EnronPrivateIOError, OSError, ValueError):
+        raise EnronSplitError("Raced private receipt publication could not be restored safely.") from None
+
+
+def _cleanup_stale_receipt_stages_at(directory_fd: int) -> None:
+    import fcntl
+
+    recovered = False
+    names = os.listdir(directory_fd)
+    for name in names:
+        if not _RECEIPT_STAGE_RE.fullmatch(name):
+            continue
+        stage_fd: int | None = None
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+            ):
+                raise EnronSplitError("Stale private receipt staging entry is unsafe.")
+            if time.time_ns() - before.st_mtime_ns < 5_000_000_000:
+                raise EnronSplitError("Private receipt publication is still in progress; retry shortly.")
+            stage_fd = os.open(
+                name,
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            after = os.fstat(stage_fd)
+            if (
+                not stat.S_ISREG(after.st_mode)
+                or after.st_nlink != 1
+                or after.st_uid != os.geteuid()
+                or stat.S_IMODE(after.st_mode) != 0o600
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            ):
+                raise EnronSplitError("Stale private receipt staging file is unsafe.")
+            try:
+                fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise EnronSplitError("Private receipt publication is still in progress; retry shortly.") from exc
+            _wipe_and_quarantine_receipt_file_at(
+                directory_fd,
+                name,
+                stage_fd,
+                _receipt_file_identity(after),
+            )
+            recovered = True
+        except FileNotFoundError:
+            continue
+        except EnronSplitError:
+            raise
+        except OSError as exc:
+            raise EnronSplitError("Stale private receipt staging entry could not be inspected safely.") from exc
+        finally:
+            if stage_fd is not None:
+                os.close(stage_fd)
+    if recovered:
+        os.fsync(directory_fd)
 
 
 def _cleanup_stale_receipt_stages(root: Path) -> None:
-    import fcntl
-
     directory_fd = _open_pinned_private_root(root)
-    removed = False
     try:
-        names = os.listdir(directory_fd)
-        for name in names:
-            if not _RECEIPT_STAGE_RE.fullmatch(name):
-                continue
-            stage_fd: int | None = None
-            try:
-                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) & 0o077:
-                    raise EnronSplitError("Stale private receipt staging entry is unsafe.")
-                if time.time_ns() - before.st_mtime_ns < 5_000_000_000:
-                    raise EnronSplitError("Private receipt publication is still in progress; retry shortly.")
-                stage_fd = os.open(
-                    name,
-                    os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=directory_fd,
-                )
-                after = os.fstat(stage_fd)
-                if (
-                    not stat.S_ISREG(after.st_mode)
-                    or after.st_nlink != 1
-                    or stat.S_IMODE(after.st_mode) & 0o077
-                    or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-                ):
-                    raise EnronSplitError("Stale private receipt staging file is unsafe.")
-                try:
-                    fcntl.flock(stage_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise EnronSplitError("Private receipt publication is still in progress; retry shortly.") from exc
-                os.unlink(name, dir_fd=directory_fd)
-                removed = True
-            except FileNotFoundError:
-                continue
-            except EnronSplitError:
-                raise
-            except OSError as exc:
-                raise EnronSplitError("Stale private receipt staging entry could not be inspected safely.") from exc
-            finally:
-                if stage_fd is not None:
-                    os.close(stage_fd)
-        if removed:
-            os.fsync(directory_fd)
+        _cleanup_stale_receipt_stages_at(directory_fd)
     finally:
         os.close(directory_fd)
 
@@ -3338,13 +4616,17 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         "_expected_records",
         "_expected_sha256",
         "_expected_bytes",
+        "_opened_identity",
         "_benchmark_version",
         "_accessed_at",
+        "_evidence_binding_sha256",
         "_claim_sha256",
+        "_claim_published",
         "_directory_fd",
         "_entered",
         "_iterated",
         "_exhausted",
+        "_stream_failed",
     )
 
     def __init__(self, root: Path, target: Mapping[str, str]) -> None:
@@ -3354,106 +4636,251 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         self._expected_records = 0
         self._expected_sha256 = ""
         self._expected_bytes = 0
+        self._opened_identity: tuple[int, int, int, int, int, int, int] | None = None
         self._benchmark_version = ""
         self._accessed_at = ""
+        self._evidence_binding_sha256 = ""
         self._claim_sha256 = ""
+        self._claim_published = False
         self._directory_fd: int | None = None
         self._entered = False
         self._iterated = False
         self._exhausted = False
+        self._stream_failed = False
 
-    def __enter__(self) -> EnronFinalTestAccess:
+    def bind_evidence(self, aggregate_sha256: str) -> dict[str, Any]:
+        """Durably bind evidence through a stable, path-free error boundary."""
+
+        try:
+            return self._bind_evidence(aggregate_sha256)
+        except EnronSplitError:
+            raise
+        except Exception:
+            raise EnronSplitError("Final-test evidence binding failed safely.") from None
+
+    def _bind_evidence(self, aggregate_sha256: str) -> dict[str, Any]:
+        """Durably bind the frozen evaluator/bank aggregate before access."""
+
         if self._entered:
-            raise EnronSplitError("Final-test access context cannot be entered twice.")
-        self._entered = True
-        root = _assert_committed_run(self._root, _SEALED_FILES, allow_access_files=True)
-        self._root = root
-        if (root / "ACCESS_CLAIMED.json").exists() or (root / "ACCESS_OUTCOME.json").exists():
-            raise EnronSplitError("Final-test access has already been claimed; retries are forbidden.")
-        manifest_snapshot = _read_json_object_snapshot(root / "manifest.json")
-        manifest = manifest_snapshot.value
-        expected_manifest_keys = {
-            "schema_version",
-            "benchmark_version",
-            "artifact_kind",
-            "fixture_mode",
-            "promotable",
-            "preparation",
-            "policy",
-            "roles",
-            "aggregates",
-            "allocation",
-            "cohorts",
-            "sampling",
-            "leakage",
-            "sealing",
-            "artifacts",
-            "privacy",
+            raise EnronSplitError("Final-test evidence must be bound before entering the access context.")
+        if not isinstance(aggregate_sha256, str) or not _SHA256_RE.fullmatch(aggregate_sha256):
+            raise EnronSplitError("Final-test evidence aggregate hash is invalid.")
+        root, directory_fd = _open_locked_transition_root(self._root)
+        try:
+            try:
+                names = set(os.listdir(directory_fd))
+            except OSError:
+                raise EnronSplitError("Final-test transition inventory could not be read safely.") from None
+            if names & {"EVIDENCE_BOUND.json", "ACCESS_CLAIMED.json", "ACCESS_OUTCOME.json"}:
+                raise EnronSplitError("Final-test evidence or access has already been bound; replay is forbidden.")
+            manifest_snapshot = _read_json_object_snapshot_at(directory_fd, "manifest.json")
+            manifest = manifest_snapshot.value
+            _, artifact = _validate_sealed_access_manifest(manifest)
+            target = _validate_frozen_target(
+                self._target,
+                manifest_snapshot.file.sha256,
+                str(artifact.get("sha256")),
+            )
+            preseal_snapshot = _verify_preseal_access_metadata(
+                root,
+                manifest=manifest,
+                manifest_sha256=manifest_snapshot.file.sha256,
+                directory_fd=directory_fd,
+            )
+            pair_snapshot = _verify_pair_receipt(
+                root,
+                manifest_snapshot.file.sha256,
+                str(manifest.get("benchmark_version")),
+                preseal_verification_sha256=preseal_snapshot.file.sha256,
+                development_manifest_sha256=str(preseal_snapshot.value["development_manifest_sha256"]),
+                development_freeze_receipt_sha256=str(preseal_snapshot.value["freeze_receipt_sha256"]),
+                directory_fd=directory_fd,
+            )
+            bound_at = _utc_now()
+            frozen_at = _transition_timestamp(
+                target["frozen_at"],
+                description="Final-test frozen",
+                latest=datetime.now(timezone.utc),
+            )
+            _transition_timestamp(
+                bound_at,
+                description="Final-test evidence binding",
+                earliest=frozen_at,
+                latest=datetime.now(timezone.utc),
+            )
+            binding_core = {
+                "schema_version": FINAL_TEST_EVIDENCE_BINDING_SCHEMA_VERSION,
+                "benchmark_version": manifest["benchmark_version"],
+                "bound_at": bound_at,
+                "aggregate_sha256": aggregate_sha256,
+                "frozen_target": target,
+                "preseal_verification_sha256": preseal_snapshot.file.sha256,
+            }
+            binding = {
+                **binding_core,
+                "binding_sha256": _hash_bytes(_canonical_json(binding_core).encode("utf-8")),
+            }
+            _assert_private_snapshot_current_at(directory_fd, "manifest.json", manifest_snapshot.file)
+            _assert_private_snapshot_current_at(directory_fd, "PRESEAL_VERIFIED.json", preseal_snapshot.file)
+            _assert_private_snapshot_current_at(directory_fd, "PAIR_COMMITTED.json", pair_snapshot.file)
+            _write_exclusive_private_json_at(directory_fd, "EVIDENCE_BOUND.json", binding)
+            self._root = root
+            self._target = target
+            self._evidence_binding_sha256 = str(binding["binding_sha256"])
+            return {
+                "status": "evidence_bound",
+                "aggregate_sha256": aggregate_sha256,
+                "binding_sha256": binding["binding_sha256"],
+            }
+        finally:
+            os.close(directory_fd)
+
+    def _publish_outcome(self, status: str) -> None:
+        directory_fd = self._directory_fd
+        if directory_fd is None or not self._claim_published:
+            raise EnronSplitError("Final-test access claim is not durably published.")
+        outcome = {
+            "schema_version": FINAL_TEST_ACCESS_SCHEMA_VERSION,
+            "benchmark_version": self._benchmark_version,
+            "accessed_at": self._accessed_at,
+            "status": status,
+            "frozen_target_sha256": _hash_bytes(_canonical_json(self._target).encode("utf-8")),
+            "evidence_binding_sha256": self._evidence_binding_sha256,
+            "claim_sha256": self._claim_sha256,
         }
-        if (
-            set(manifest) != expected_manifest_keys
-            or manifest.get("schema_version") != SPLIT_MANIFEST_SCHEMA_VERSION
-            or manifest.get("sealing", {}).get("test_sealed") is not True
-            or manifest.get("leakage", {}).get("crossing_groups") != 0
-            or set(manifest.get("roles", {})) != set(_ROLE_NAMES)
-        ):
-            raise EnronSplitError("Sealed split is not structurally valid for final access.")
-        manifest_sha256 = manifest_snapshot.file.sha256
-        _verify_pair_receipt(root, manifest_sha256, str(manifest.get("benchmark_version")))
-        role = manifest.get("roles", {}).get("test")
-        if not isinstance(role, Mapping) or not isinstance(role.get("artifact"), Mapping):
-            raise EnronSplitError("Sealed test descriptor is invalid.")
-        target = _validate_frozen_target(
-            self._target,
-            manifest_sha256,
-            str(role["artifact"].get("sha256")),
-        )
-        if not manifest.get("fixture_mode") and (
-            "sha256:" + "0" * 64 in target.values() or target["git_commit"] == "0" * 40
-        ):
-            raise EnronSplitError("Production final-test target contains a placeholder commitment.")
-        if manifest.get("artifacts", {}).get("test") != role["artifact"]:
-            raise EnronSplitError("Sealed test artifact binding is invalid.")
-        _verify_descriptor(root, role["artifact"], "test.jsonl", int(role["records"]))
-        _assert_private_snapshot_current(root / "manifest.json", manifest_snapshot.file)
-        directory_fd = _open_pinned_private_root(root)
+        _write_exclusive_private_json_at(directory_fd, "ACCESS_OUTCOME.json", outcome)
+
+    def _claim_and_open(self) -> EnronFinalTestAccess:
+        root, directory_fd = _open_locked_transition_root(self._root)
+        self._root = root
+        self._directory_fd = directory_fd
         handle: BinaryIO | None = None
         try:
-            handle = open_private_binary_input(root / "test.jsonl")
-            digest = hashlib.sha256()
-            byte_count = 0
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-                byte_count += len(chunk)
-            artifact = role["artifact"]
-            if artifact.get("sha256") != "sha256:" + digest.hexdigest() or artifact.get("bytes") != byte_count:
-                raise EnronSplitError("Sealed test changed before final access could be claimed.")
-            handle.seek(0)
+            try:
+                names = set(os.listdir(directory_fd))
+            except OSError:
+                raise EnronSplitError("Final-test transition inventory could not be read safely.") from None
+            if names & {"ACCESS_CLAIMED.json", "ACCESS_OUTCOME.json"}:
+                raise EnronSplitError("Final-test access has already been claimed; retries are forbidden.")
+            manifest_snapshot = _read_json_object_snapshot_at(directory_fd, "manifest.json")
+            manifest = manifest_snapshot.value
+            role, artifact = _validate_sealed_access_manifest(manifest)
+            manifest_sha256 = manifest_snapshot.file.sha256
+            preseal_snapshot = _verify_preseal_access_metadata(
+                root,
+                manifest=manifest,
+                manifest_sha256=manifest_sha256,
+                directory_fd=directory_fd,
+            )
+            pair_snapshot = _verify_pair_receipt(
+                root,
+                manifest_sha256,
+                str(manifest.get("benchmark_version")),
+                preseal_verification_sha256=preseal_snapshot.file.sha256,
+                development_manifest_sha256=str(preseal_snapshot.value["development_manifest_sha256"]),
+                development_freeze_receipt_sha256=str(preseal_snapshot.value["freeze_receipt_sha256"]),
+                directory_fd=directory_fd,
+            )
+            target = _validate_frozen_target(
+                self._target,
+                manifest_sha256,
+                str(artifact.get("sha256")),
+            )
+            if not manifest.get("fixture_mode") and (
+                "sha256:" + "0" * 64 in target.values() or target["git_commit"] == "0" * 40
+            ):
+                raise EnronSplitError("Production final-test target contains a placeholder commitment.")
+            artifacts = _require_split_mapping(
+                manifest.get("artifacts"),
+                "Sealed split artifact inventory is invalid for final access.",
+            )
+            if artifacts.get("test") != artifact:
+                raise EnronSplitError("Sealed test artifact binding is invalid.")
+            _verify_descriptor_metadata(
+                root,
+                artifact,
+                "test.jsonl",
+                int(role["records"]),
+                directory_fd=directory_fd,
+            )
+            self._accessed_at = _utc_now()
+            accessed_at = _transition_timestamp(
+                self._accessed_at,
+                description="Final-test access",
+                latest=datetime.now(timezone.utc),
+            )
+            binding_snapshot = _verify_evidence_binding(
+                root,
+                manifest,
+                manifest_sha256,
+                preseal_verification_sha256=preseal_snapshot.file.sha256,
+                directory_fd=directory_fd,
+                latest_allowed=accessed_at,
+            )
+            if binding_snapshot is None or binding_snapshot.value.get("frozen_target") != target:
+                raise EnronSplitError("Final-test evidence must be durably bound before access.")
+            binding = binding_snapshot.value
             self._expected_records = int(role["records"])
             self._expected_sha256 = str(artifact["sha256"])
             self._expected_bytes = int(artifact["bytes"])
-            self._handle = handle
-            self._directory_fd = directory_fd
             self._target = target
             self._benchmark_version = str(manifest["benchmark_version"])
-            self._accessed_at = _utc_now()
+            self._evidence_binding_sha256 = str(binding["binding_sha256"])
             claim_core = {
                 "schema_version": FINAL_TEST_ACCESS_SCHEMA_VERSION,
                 "benchmark_version": self._benchmark_version,
                 "accessed_at": self._accessed_at,
                 "frozen_target": target,
+                "evidence_binding_sha256": self._evidence_binding_sha256,
             }
             self._claim_sha256 = _hash_bytes(_canonical_json(claim_core).encode("utf-8"))
             claim = {**claim_core, "claim_sha256": self._claim_sha256}
+            _assert_private_snapshot_current_at(directory_fd, "manifest.json", manifest_snapshot.file)
+            _assert_private_snapshot_current_at(directory_fd, "PRESEAL_VERIFIED.json", preseal_snapshot.file)
+            _assert_private_snapshot_current_at(directory_fd, "PAIR_COMMITTED.json", pair_snapshot.file)
+            _assert_private_snapshot_current_at(directory_fd, "EVIDENCE_BOUND.json", binding_snapshot.file)
             _write_exclusive_private_json_at(directory_fd, "ACCESS_CLAIMED.json", claim)
+            self._claim_published = True
+            handle = open_private_binary_input_at(directory_fd, "test.jsonl")
+            if os.fstat(handle.fileno()).st_size != self._expected_bytes:
+                raise EnronSplitError("Sealed test size changed after final access was claimed.")
+            self._opened_identity = _private_regular_identity(os.fstat(handle.fileno()))
+            self._handle = handle
+            return self
         except BaseException:
-            if handle is not None:
-                handle.close()
-            self._handle = None
+            if handle is not None and not handle.closed:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            if self._handle is not None:
+                try:
+                    self._handle.close()
+                except OSError:
+                    pass
+                self._handle = None
+            if self._claim_published:
+                try:
+                    self._publish_outcome("failed")
+                except EnronSplitError:
+                    pass
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
             self._directory_fd = None
-            os.close(directory_fd)
             raise
-        return self
+
+    def __enter__(self) -> EnronFinalTestAccess:
+        if self._entered:
+            raise EnronSplitError("Final-test access context cannot be entered twice.")
+        self._entered = True
+        try:
+            return self._claim_and_open()
+        except EnronSplitError:
+            raise
+        except Exception:
+            raise EnronSplitError("Final-test access transition failed safely.") from None
 
     def iter_records(self) -> Iterator[dict[str, Any]]:
         if self._handle is None or not self._entered:
@@ -3461,11 +4888,28 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         if self._iterated:
             raise EnronSplitError("Final-test records can be iterated only once.")
         self._iterated = True
+        handle = self._handle
+        try:
+            yield from self._consume_records(handle)
+        except GeneratorExit:
+            raise
+        except EnronSplitError:
+            self._stream_failed = True
+            raise
+        except (OSError, OverflowError, ValueError):
+            self._stream_failed = True
+            raise EnronSplitError("Sealed test content could not be consumed safely.") from None
+        except BaseException:
+            self._stream_failed = True
+            raise
+        self._exhausted = True
+
+    def _consume_records(self, handle: BinaryIO) -> Iterator[dict[str, Any]]:
         records = 0
         digest = hashlib.sha256()
         byte_count = 0
         previous: str | None = None
-        while raw := self._handle.readline(DEFAULT_MAX_PREPARED_LINE_BYTES + 1):
+        while raw := handle.readline(DEFAULT_MAX_PREPARED_LINE_BYTES + 1):
             if len(raw) > DEFAULT_MAX_PREPARED_LINE_BYTES:
                 raise EnronSplitError("Sealed test record exceeds its byte limit.")
             try:
@@ -3501,32 +4945,32 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             records != self._expected_records
             or byte_count != self._expected_bytes
             or "sha256:" + digest.hexdigest() != self._expected_sha256
+            or self._opened_identity is None
+            or _private_regular_identity(os.fstat(handle.fileno())) != self._opened_identity
         ):
-            raise EnronSplitError("Sealed test record count changed during final access.")
-        self._exhausted = True
+            raise EnronSplitError("Sealed test content changed during final access.")
 
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
-        status = "completed" if exc is None and self._exhausted else "failed" if exc is not None else "aborted"
-        outcome = {
-            "schema_version": FINAL_TEST_ACCESS_SCHEMA_VERSION,
-            "benchmark_version": self._benchmark_version,
-            "accessed_at": self._accessed_at,
-            "status": status,
-            "frozen_target_sha256": _hash_bytes(_canonical_json(self._target).encode("utf-8")),
-            "claim_sha256": self._claim_sha256,
-        }
         directory_fd = self._directory_fd
         if directory_fd is None:
             raise EnronSplitError("Final-test access directory is no longer pinned.")
+        close_failed = False
         try:
-            _write_exclusive_private_json_at(
-                directory_fd,
-                "ACCESS_OUTCOME.json",
-                outcome,
-            )
+            if self._handle is not None:
+                try:
+                    self._handle.close()
+                except OSError:
+                    close_failed = True
+                self._handle = None
+            if exc is None and self._exhausted and not close_failed:
+                status = "completed"
+            elif exc is not None or self._stream_failed or close_failed:
+                status = "failed"
+            else:
+                status = "aborted"
+            self._publish_outcome(status)
+            if close_failed and exc is None:
+                raise EnronSplitError("Final-test content handle could not be closed safely.")
         except EnronSplitError:
             if exc is None:
                 raise
@@ -3542,31 +4986,91 @@ def begin_enron_final_test_access(
 ) -> EnronFinalTestAccess:
     """Return the one-shot steward context; no test byte is read before entering it."""
 
-    return EnronFinalTestAccess(sealed_path, frozen_target)
+    try:
+        return EnronFinalTestAccess(sealed_path, frozen_target)
+    except EnronSplitError:
+        raise
+    except Exception:
+        raise EnronSplitError("Final-test access request is invalid.") from None
 
 
 def finalize_aborted_enron_final_test_access(sealed_path: Path) -> dict[str, Any]:
+    """Finalize a stranded claim through a stable, path-free error boundary."""
+
+    try:
+        return _finalize_aborted_enron_final_test_access(sealed_path)
+    except EnronSplitError:
+        raise
+    except Exception:
+        raise EnronSplitError("Final-test aborted outcome could not be finalized safely.") from None
+
+
+def _finalize_aborted_enron_final_test_access(sealed_path: Path) -> dict[str, Any]:
     """Record an aborted outcome for a valid crash-stranded claim without reopening test data."""
 
-    root = _assert_committed_run(sealed_path, _SEALED_FILES, allow_access_files=True)
-    manifest_snapshot = _read_json_object_snapshot(root / "manifest.json")
-    manifest = manifest_snapshot.value
-    manifest_sha256 = manifest_snapshot.file.sha256
-    _verify_pair_receipt(root, manifest_sha256, str(manifest.get("benchmark_version")))
-    access_state = _verify_access_state(root, manifest, manifest_sha256)
-    if access_state.get("status") != "claimed":
-        raise EnronSplitError("Final-test access does not have a valid claim awaiting an outcome.")
-    claim = _read_json_object(root / "ACCESS_CLAIMED.json")
-    frozen_target = claim["frozen_target"]
-    outcome = {
-        "schema_version": FINAL_TEST_ACCESS_SCHEMA_VERSION,
-        "benchmark_version": claim["benchmark_version"],
-        "accessed_at": claim["accessed_at"],
-        "status": "aborted",
-        "frozen_target_sha256": _hash_bytes(_canonical_json(frozen_target).encode("utf-8")),
-        "claim_sha256": claim["claim_sha256"],
-    }
-    _write_exclusive_private_json(root, "ACCESS_OUTCOME.json", outcome)
-    result = _verify_access_state(root, manifest, manifest_sha256)
-    _validate_aggregate_privacy(result)
-    return result
+    root, directory_fd = _open_locked_transition_root(sealed_path)
+    try:
+        manifest_snapshot = _read_json_object_snapshot_at(directory_fd, "manifest.json")
+        manifest = manifest_snapshot.value
+        _validate_sealed_access_manifest(manifest)
+        manifest_sha256 = manifest_snapshot.file.sha256
+        preseal_snapshot = _verify_preseal_access_metadata(
+            root,
+            manifest=manifest,
+            manifest_sha256=manifest_sha256,
+            directory_fd=directory_fd,
+        )
+        pair_snapshot = _verify_pair_receipt(
+            root,
+            manifest_sha256,
+            str(manifest.get("benchmark_version")),
+            preseal_verification_sha256=preseal_snapshot.file.sha256,
+            development_manifest_sha256=str(preseal_snapshot.value["development_manifest_sha256"]),
+            development_freeze_receipt_sha256=str(preseal_snapshot.value["freeze_receipt_sha256"]),
+            directory_fd=directory_fd,
+        )
+        binding_snapshot = _verify_evidence_binding(
+            root,
+            manifest,
+            manifest_sha256,
+            preseal_verification_sha256=preseal_snapshot.file.sha256,
+            directory_fd=directory_fd,
+        )
+        access_state = _verify_access_state(
+            root,
+            manifest,
+            manifest_sha256,
+            preseal_verification_sha256=preseal_snapshot.file.sha256,
+            directory_fd=directory_fd,
+        )
+        if access_state.get("status") != "claimed" or binding_snapshot is None:
+            raise EnronSplitError("Final-test access does not have a valid claim awaiting an outcome.")
+        claim_snapshot = _read_json_object_snapshot_at(directory_fd, "ACCESS_CLAIMED.json")
+        claim = claim_snapshot.value
+        frozen_target = claim["frozen_target"]
+        outcome = {
+            "schema_version": FINAL_TEST_ACCESS_SCHEMA_VERSION,
+            "benchmark_version": claim["benchmark_version"],
+            "accessed_at": claim["accessed_at"],
+            "status": "aborted",
+            "frozen_target_sha256": _hash_bytes(_canonical_json(frozen_target).encode("utf-8")),
+            "evidence_binding_sha256": claim["evidence_binding_sha256"],
+            "claim_sha256": claim["claim_sha256"],
+        }
+        _assert_private_snapshot_current_at(directory_fd, "manifest.json", manifest_snapshot.file)
+        _assert_private_snapshot_current_at(directory_fd, "PRESEAL_VERIFIED.json", preseal_snapshot.file)
+        _assert_private_snapshot_current_at(directory_fd, "PAIR_COMMITTED.json", pair_snapshot.file)
+        _assert_private_snapshot_current_at(directory_fd, "EVIDENCE_BOUND.json", binding_snapshot.file)
+        _assert_private_snapshot_current_at(directory_fd, "ACCESS_CLAIMED.json", claim_snapshot.file)
+        _write_exclusive_private_json_at(directory_fd, "ACCESS_OUTCOME.json", outcome)
+        result = _verify_access_state(
+            root,
+            manifest,
+            manifest_sha256,
+            preseal_verification_sha256=preseal_snapshot.file.sha256,
+            directory_fd=directory_fd,
+        )
+        _validate_aggregate_privacy(result)
+        return result
+    finally:
+        os.close(directory_fd)
