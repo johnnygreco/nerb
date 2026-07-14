@@ -943,6 +943,92 @@ def test_same_five_adapters_complete_a_private_synthetic_capacity_run(
     assert options.output_dir.name not in portable_payload
 
 
+@pytest.mark.parametrize(
+    ("message", "expected_code"),
+    [
+        (
+            "Candidate observations exceed the bank-build limit.",
+            "bank_candidate_observation_limit",
+        ),
+        (
+            "Unique candidates exceed the bank-build limit.",
+            "bank_unique_candidate_limit",
+        ),
+        (
+            "Private scratch tree exceeds its declared byte budget.",
+            "bank_private_scratch_bytes_limit",
+        ),
+        (
+            "Curated bank exceeds the active-pattern byte limit.",
+            "bank_active_pattern_bytes_limit",
+        ),
+        (
+            "Curated bank exceeds the canonical JSON byte limit.",
+            "bank_json_bytes_limit",
+        ),
+        (
+            "Curated bank exceeds the canonical JSON byte limit after commitment binding.",
+            "bank_json_bytes_limit",
+        ),
+        (
+            "Active bank failed Rust engine validation.",
+            "bank_active_compile_limit",
+        ),
+        (
+            "Curated bank exceeds the canonical JSON byte limit. private/value@example.test",
+            "phase_execution_failed",
+        ),
+        ("private/value@example.test", "phase_execution_failed"),
+    ],
+)
+def test_integrated_build_classifies_only_exact_payload_free_bank_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    expected_code: str,
+) -> None:
+    workflow = __import__("nerb.enron_bank_workflow", fromlist=["EnronBankBuildError"])
+
+    def fail_build(_options: Any) -> None:
+        raise workflow.EnronBankBuildError(message)
+
+    monkeypatch.setattr(workflow, "build_enron_intelligence_bank", fail_build)
+    monkeypatch.setattr(enron_capacity, "_adapter_prior_commitment", lambda *_args: {})
+    monkeypatch.setattr(enron_capacity, "_verify_sealed_unbound", lambda *_args: None)
+    context = EnronCapacityPhaseContext(
+        "build",
+        tmp_path / "phases" / "build",
+        lambda _records: None,
+        lambda path: path,
+        lambda: None,
+        lambda: None,
+        runtime_environment={},
+        scratch_dir=tmp_path / "scratch",
+        spool_dir=tmp_path / "spool",
+        owned_root_count=2,
+    )
+    paths = enron_capacity._IntegratedCapacityPaths(
+        preparation=tmp_path / "preparation",
+        development=tmp_path / "development",
+        sealed=tmp_path / "sealed",
+        bank=tmp_path / "bank",
+    )
+
+    result, failure = enron_capacity._invoke_phase_runner(
+        lambda phase_context: enron_capacity._execute_capacity_build(
+            phase_context,
+            enron_capacity._IntegratedCapacityConfig(fixture_mode=True, enforce_production_runtime=False),
+            paths,
+        ),
+        context,
+    )
+
+    assert result is None
+    assert failure == expected_code
+    assert failure is not None
+    assert "private/value" not in enron_capacity._ERROR_MESSAGES[failure]
+
+
 def test_portable_export_binds_full_attempt_chain_and_rejects_tamper(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -888,7 +888,7 @@ def curate_enron_iteration(
                 "description": "Train-observed contact address.",
                 "status": decision,
                 "patterns": {pattern_id: pattern},
-                "metadata": metadata,
+                "metadata": _name_metadata_reference(pattern_id),
             }
             retained_contact_values.add(evidence.normalized_value)
             bank_ref = {"entity_id": "contact", "name_id": name_id, "pattern_ids": [pattern_id]}
@@ -917,7 +917,7 @@ def curate_enron_iteration(
                 metadata=fallback_metadata,
             )
         },
-        "metadata": fallback_metadata,
+        "metadata": _name_metadata_reference("structured_email"),
     }
     candidate_rows.append(
         _fallback_candidate_row(
@@ -1118,31 +1118,13 @@ def curate_enron_iteration(
                 retained_aliases[0],
             )
             person_identity_key = f"{address}\n{identity_value}"
-            name_metadata = _evidence_metadata(
-                canonical_alias,
-                policy_sha256=policy_sha256,
-                source_binding=source_binding,
-                review_status=name_status,
-                reason_code=("recurring_unique_identity" if name_status == "active" else "identity_not_eligible"),
-                privacy_class="person_name",
-                extra={
-                    "identity_ref": _opaque_id("identity", person_identity_key),
-                    "contact_ref": _opaque_id("contact", address),
-                    "contact_scope": _contact_scope(address, policy),
-                    "alias_count": len(patterns),
-                    "active_alias_count": sum(
-                        alias.normalized_value in active_alias_values for alias in retained_aliases
-                    ),
-                    "evidence_scope": "canonical_alias_only",
-                    "identity_aggregate_counts_supported": False,
-                },
-            )
+            canonical_pattern_id = _opaque_id("alias", canonical_alias.normalized_value)
             person_names[_opaque_id("person", person_identity_key)] = {
                 "canonical": canonical_alias.primary_surface,
                 "description": "Address-anchored train-observed person identity.",
                 "status": name_status,
                 "patterns": patterns,
-                "metadata": name_metadata,
+                "metadata": _name_metadata_reference(canonical_pattern_id),
             }
 
     if not person_names:
@@ -1170,7 +1152,7 @@ def curate_enron_iteration(
                     metadata=placeholder_metadata,
                 )
             },
-            "metadata": placeholder_metadata,
+            "metadata": _name_metadata_reference("unresolved"),
         }
     entities["person"] = {
         "description": "Address-anchored people with recurring collision-free full-name aliases.",
@@ -1224,7 +1206,7 @@ def curate_enron_iteration(
                     metadata=metadata,
                 )
             },
-            "metadata": metadata,
+            "metadata": _name_metadata_reference(pattern_id),
         }
         candidate_rows.append(
             _candidate_row(
@@ -1259,7 +1241,7 @@ def curate_enron_iteration(
                     metadata=placeholder_metadata,
                 )
             },
-            "metadata": placeholder_metadata,
+            "metadata": _name_metadata_reference("unresolved"),
         }
     entities["organization_domain"] = {
         "description": "Observed exact domains retained as draft until safe exact boundary semantics are available.",
@@ -1301,7 +1283,7 @@ def curate_enron_iteration(
                         metadata=phone_metadata,
                     )
                 },
-                "metadata": phone_metadata,
+                "metadata": _name_metadata_reference("structured_us_phone"),
             }
         },
         "metadata": {
@@ -1527,6 +1509,14 @@ def _evidence_metadata(
         },
         **dict(extra),
     }
+
+
+def _name_metadata_reference(canonical_pattern_id: str) -> dict[str, str]:
+    """Point name-level metadata at the authoritative pattern evidence."""
+
+    if not canonical_pattern_id:
+        raise EnronBankBuildError("Canonical name pattern reference is invalid.")
+    return {"authoritative_pattern_metadata_ref": canonical_pattern_id}
 
 
 def _fallback_metadata(

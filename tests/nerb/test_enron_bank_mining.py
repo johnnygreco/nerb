@@ -20,6 +20,18 @@ from nerb.enron_bank_workflow import _qualified_validation_gold
 from nerb.validation import validate_bank
 
 
+def _authoritative_pattern(name: dict[str, Any]) -> dict[str, Any]:
+    metadata = name["metadata"]
+    assert set(metadata) == {"authoritative_pattern_metadata_ref"}
+    pattern_id = metadata["authoritative_pattern_metadata_ref"]
+    assert isinstance(pattern_id, str)
+    return name["patterns"][pattern_id]
+
+
+def _fixed_alpha_suffix(index: int, *, width: int = 4) -> str:
+    return "".join(chr(ord("a") + (index // (26**position)) % 26) for position in reversed(range(width)))
+
+
 def _sender_record(
     index: int,
     *,
@@ -331,11 +343,14 @@ def test_same_initial_names_at_one_address_do_not_share_an_active_identity(tmp_p
     assert name_ids["jane smith"] != name_ids["john smith"]
     person_names = curated.bank["entities"]["person"]["names"]
     identity_refs = {
-        normalized_value: person_names[name_id]["metadata"]["identity_ref"]
+        normalized_value: _authoritative_pattern(person_names[name_id])["metadata"]["identity_ref"]
         for normalized_value, name_id in name_ids.items()
     }
     assert identity_refs["jane smith"] != identity_refs["john smith"]
-    assert len({person_names[name_id]["metadata"]["contact_ref"] for name_id in name_ids.values()}) == 1
+    assert (
+        len({_authoritative_pattern(person_names[name_id])["metadata"]["contact_ref"] for name_id in name_ids.values()})
+        == 1
+    )
     assert curated.collisions["by_reason"]["person_alias_incompatible_same_address"] == 1
 
 
@@ -398,8 +413,8 @@ def test_full_names_sharing_an_ambiguous_initial_address_remain_distinct_and_dra
     name_ids = {item["bank_ref"]["name_id"] for item in people}
     assert len(name_ids) == 2
     person_names = curated.bank["entities"]["person"]["names"]
-    assert len({person_names[name_id]["metadata"]["identity_ref"] for name_id in name_ids}) == 2
-    assert len({person_names[name_id]["metadata"]["contact_ref"] for name_id in name_ids}) == 1
+    assert len({_authoritative_pattern(person_names[name_id])["metadata"]["identity_ref"] for name_id in name_ids}) == 2
+    assert len({_authoritative_pattern(person_names[name_id])["metadata"]["contact_ref"] for name_id in name_ids}) == 1
 
 
 def test_person_draft_capacity_is_enforced_per_alias_pattern(tmp_path: Path) -> None:
@@ -510,10 +525,11 @@ def test_active_identity_canonical_uses_an_active_alias_not_higher_support_draft
     active_name = next(
         item for item in curated.bank["entities"]["person"]["names"].values() if item["status"] == "active"
     )
+    authoritative_pattern = _authoritative_pattern(active_name)
     assert active_name["canonical"] == "Robert Smith"
-    assert active_name["metadata"]["evidence_scope"] == "canonical_alias_only"
-    assert active_name["metadata"]["observation_count"] == 2
-    assert active_name["metadata"]["identity_aggregate_counts_supported"] is False
+    assert authoritative_pattern["status"] == "active"
+    assert authoritative_pattern["value"] == "Robert Smith"
+    assert authoritative_pattern["metadata"]["observation_count"] == 2
 
 
 def test_recurring_nickname_remains_draft_beside_exact_full_name_anchor(tmp_path: Path) -> None:
@@ -600,6 +616,97 @@ def test_default_policy_bounds_large_contact_pool_and_keeps_selected_bank_compil
     assert aggregate_only.funnel == curated.funnel
     assert aggregate_only.bank == curated.bank
     assert aggregate_only.collisions == curated.collisions
+
+
+def test_combined_policy_envelope_fits_canonical_bank_limit_and_compiles_active_patterns() -> None:
+    policy = EnronBankPolicy()
+    suffixes = tuple(_fixed_alpha_suffix(index) for index in range(14_000))
+    addresses = tuple(f"given{suffix}.surname{suffix}@example.invalid" for suffix in suffixes)
+    contacts = tuple(
+        CandidateEvidence(
+            kind="contact",
+            normalized_value=address,
+            surfaces=((address, 2),),
+            related_counts=(),
+            source_types=(("structured_header", 2),),
+            observation_count=2,
+            document_count=2,
+            leakage_group_count=2,
+            first_seen="2001-01-01T00:00:00Z",
+            last_seen="2001-01-02T00:00:00Z",
+            unknown_date_documents=0,
+            evidence_sha256=f"sha256:{index:064x}",
+        )
+        for index, address in enumerate(addresses)
+    )
+    people = tuple(
+        CandidateEvidence(
+            kind="person_alias",
+            normalized_value=f"given{suffix} surname{suffix}",
+            surfaces=((f"Given{suffix} Surname{suffix}", 2),),
+            related_counts=((addresses[index], 2),),
+            source_types=(("structured_header", 2),),
+            observation_count=2,
+            document_count=2,
+            leakage_group_count=2,
+            first_seen="2001-01-01T00:00:00Z",
+            last_seen="2001-01-02T00:00:00Z",
+            unknown_date_documents=0,
+            evidence_sha256=f"sha256:{index + 14_000:064x}",
+        )
+        for index, suffix in enumerate(suffixes[:1_000])
+    )
+    domains = tuple(
+        CandidateEvidence(
+            kind="organization_domain",
+            normalized_value=f"organization{index:04d}.invalid",
+            surfaces=((f"organization{index:04d}.invalid", 2),),
+            related_counts=(),
+            source_types=(("structured_header", 2),),
+            observation_count=2,
+            document_count=2,
+            leakage_group_count=2,
+            first_seen="2001-01-01T00:00:00Z",
+            last_seen="2001-01-02T00:00:00Z",
+            unknown_date_documents=0,
+            evidence_sha256=f"sha256:{index + 15_000:064x}",
+        )
+        for index in range(2_000)
+    )
+    pool = CandidatePool(
+        contacts=contacts,
+        person_aliases=people,
+        organization_domains=domains,
+        train_records=34_000,
+        observations=34_000,
+        source_sha256="sha256:" + "4" * 64,
+        ledger_sha256="sha256:" + "5" * 64,
+    )
+
+    curated = curate_enron_iteration(
+        pool,
+        policy=policy,
+        iteration=ITERATION_POLICIES[1],
+        source_binding={"fixture_mode": True},
+        retain_candidate_ledger=False,
+    )
+
+    canonical_bytes = bank_builder_module._canonical_json_bytes(curated.bank)
+    duplicated_metadata_bytes = len(canonical_bytes)
+    for entity in curated.bank["entities"].values():
+        for name in entity["names"].values():
+            authoritative_pattern = _authoritative_pattern(name)
+            duplicated_metadata_bytes += len(
+                bank_builder_module._canonical_json_bytes(authoritative_pattern["metadata"])
+            ) - len(bank_builder_module._canonical_json_bytes(name["metadata"]))
+
+    assert duplicated_metadata_bytes > policy.max_bank_json_bytes
+    assert len(canonical_bytes) <= policy.max_bank_json_bytes
+    structural = validate_bank(curated.bank, level="deep", strict=True, check_engine_compile=False)
+    assert structural["valid"] is True, [item["message"] for item in structural["diagnostics"]]
+    assert structural["engine_compatibility"]["compatible"] is True
+    assert structural["stats"]["active_totals"] == {"entities": 2, "names": 13_001, "patterns": 13_001}
+    compile_bank(curated.bank, options={"include_statuses": ["active"]})
 
 
 def test_match_distinct_person_surfaces_do_not_pool_recurrence_support(tmp_path: Path) -> None:
@@ -755,4 +862,4 @@ def test_person_candidates_are_rejected_when_contact_anchor_is_not_retained(tmp_
     contact_names = curated.bank["entities"]["contact"]["names"]
     for person_name in curated.bank["entities"]["person"]["names"].values():
         if person_name["status"] == "active":
-            assert person_name["metadata"]["contact_ref"] in contact_names
+            assert _authoritative_pattern(person_name)["metadata"]["contact_ref"] in contact_names

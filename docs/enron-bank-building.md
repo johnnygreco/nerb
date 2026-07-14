@@ -252,7 +252,10 @@ The selected-bank allocation conserves the complete 25,000-pattern envelope: at 
 at most 12,999 recurring collision-free person aliases across at most 12,000 person identities, and one generic email
 fallback. Organization domains remain draft because exact domain-boundary semantics are unavailable. The fallback is
 reserved before curation, the global ceiling remains independently enforced, and compilation remains a mandatory
-pre-commit check.
+pre-commit check. Each name keeps only an `authoritative_pattern_metadata_ref`; the referenced pattern holds the full
+evidence and provenance once, so repeated name metadata cannot consume the 32 MiB canonical-bank budget without adding
+detection coverage. Deep validation still checks the complete bank, including draft material, while the native compile
+gate compiles exactly the active production surface used for extraction.
 
 The 200,000-candidate cap is the frozen bounded envelope for full-source execution. It stays independently below the
 10,000,000-observation, 12 GiB SQLite, and 1 GiB candidate-ledger ceilings. Only a complete capacity run can establish
