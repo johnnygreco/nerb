@@ -318,6 +318,12 @@ _ERROR_MESSAGES = {
     "production_identity_invalid": "Capacity production implementation identity is invalid.",
     "production_integration_unavailable": "Capacity production phase integration is unavailable.",
     "phase_execution_failed": "Capacity phase execution failed safely.",
+    "bank_candidate_observation_limit": "Capacity bank-build candidate observations exceed the frozen limit.",
+    "bank_unique_candidate_limit": "Capacity bank-build unique candidates exceed the frozen limit.",
+    "bank_private_scratch_bytes_limit": "Capacity bank-build private scratch use exceeds the frozen limit.",
+    "bank_active_pattern_bytes_limit": "Capacity bank-build active-pattern bytes exceed the frozen limit.",
+    "bank_json_bytes_limit": "Capacity bank canonical JSON bytes exceed the frozen limit.",
+    "bank_active_compile_limit": "Capacity active bank failed native engine validation safely.",
     "phase_interrupted": "Capacity phase was interrupted safely.",
     "phase_result_invalid": "Capacity phase returned an invalid closed result.",
     "phase_commitment_invalid": "Capacity phase commitment chain is invalid.",
@@ -358,6 +364,16 @@ _ERROR_MESSAGES = {
     "worker_process_leak": "Capacity worker processes remained live at the terminal boundary.",
     "portable_decision_invalid": "Portable capacity decision evidence is invalid.",
     "portable_write_failed": "Portable capacity decision evidence could not be written safely.",
+}
+
+_BANK_BUILD_FAILURE_CODES = {
+    "Candidate observations exceed the bank-build limit.": "bank_candidate_observation_limit",
+    "Unique candidates exceed the bank-build limit.": "bank_unique_candidate_limit",
+    "Private scratch tree exceeds its declared byte budget.": "bank_private_scratch_bytes_limit",
+    "Curated bank exceeds the active-pattern byte limit.": "bank_active_pattern_bytes_limit",
+    "Curated bank exceeds the canonical JSON byte limit.": "bank_json_bytes_limit",
+    "Curated bank exceeds the canonical JSON byte limit after commitment binding.": "bank_json_bytes_limit",
+    "Active bank failed Rust engine validation.": "bank_active_compile_limit",
 }
 
 _FAILURE_DIAGNOSTIC_FIELDS = frozenset(
@@ -5978,18 +5994,24 @@ def _execute_capacity_build(
     workflow = importlib.import_module("nerb.enron_bank_workflow")
     prior = _adapter_prior_commitment(context, "split")
     _verify_sealed_unbound(paths, prior, context, importlib.import_module("nerb.enron_splitting"))
-    card = workflow.build_enron_intelligence_bank(
-        workflow.EnronBankBuildOptions(
-            development_run=paths.development,
-            output_dir=paths.bank,
-            annotation_run=None,
-            cmu_catalog_bindings_path=None,
-            allow_unignored_output=True,
-            progress_callback=context.checkpoint,
-            activity_callback=context.activity,
-            cleanup_successor=context.cleanup_successor,
+    try:
+        card = workflow.build_enron_intelligence_bank(
+            workflow.EnronBankBuildOptions(
+                development_run=paths.development,
+                output_dir=paths.bank,
+                annotation_run=None,
+                cmu_catalog_bindings_path=None,
+                allow_unignored_output=True,
+                progress_callback=context.checkpoint,
+                activity_callback=context.activity,
+                cleanup_successor=context.cleanup_successor,
+            )
         )
-    )
+    except workflow.EnronBankBuildError as exc:
+        failure_code = _BANK_BUILD_FAILURE_CODES.get(str(exc))
+        if failure_code is not None:
+            raise _CapacityAbort(failure_code) from None
+        raise
     _verify_sealed_unbound(paths, prior, context, importlib.import_module("nerb.enron_splitting"))
     source = _adapter_mapping(card.get("source"))
     bank = _adapter_mapping(card.get("bank"))

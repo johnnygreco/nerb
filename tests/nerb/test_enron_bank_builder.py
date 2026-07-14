@@ -622,6 +622,51 @@ def test_streaming_validation_activity_failure_cleans_caller_scratch(
     _assert_cleanup_tombstones(scratch, count=1)
 
 
+def test_active_bank_validation_structurally_checks_all_statuses_and_compiles_only_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bank: dict[str, Any] = {"fixture": True}
+    structural = {"valid": True, "engine_compatibility": {"compatible": True}}
+    calls: list[tuple[str, Any]] = []
+
+    def validate(candidate: dict[str, Any], **options: Any) -> dict[str, Any]:
+        assert candidate is bank
+        calls.append(("validate", options))
+        return structural
+
+    def compile_active(candidate: dict[str, Any], *, options: dict[str, Any]) -> tuple[object, bool]:
+        assert candidate is bank
+        calls.append(("compile", options))
+        return object(), False
+
+    monkeypatch.setattr(bank_workflow, "validate_bank", validate)
+    monkeypatch.setattr(bank_workflow, "compile_bank", compile_active)
+
+    assert bank_workflow._validate_active_bank(bank) is structural
+    assert calls == [
+        ("validate", {"level": "deep", "strict": True, "check_engine_compile": False}),
+        ("compile", {"include_statuses": ["active"]}),
+    ]
+
+
+def test_active_bank_validation_collapses_native_compile_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    private_marker = "private.person@example.invalid"
+    monkeypatch.setattr(
+        bank_workflow,
+        "validate_bank",
+        lambda *_args, **_kwargs: {"valid": True, "engine_compatibility": {"compatible": True}},
+    )
+
+    def fail_compile(*_args: Any, **_kwargs: Any) -> None:
+        raise MemoryError(private_marker)
+
+    monkeypatch.setattr(bank_workflow, "compile_bank", fail_compile)
+
+    with pytest.raises(EnronBankBuildError, match="Active bank failed Rust engine validation") as captured:
+        bank_workflow._validate_active_bank({"fixture": True})
+    assert private_marker not in str(captured.value)
+
+
 def test_full_capacity_allocation_and_near_max_bank_conformance_fit_closed_limits() -> None:
     policy = EnronBankPolicy()
     assert policy.max_active_contacts == 12_000

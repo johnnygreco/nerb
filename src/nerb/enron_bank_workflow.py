@@ -24,6 +24,7 @@ from urllib.parse import quote
 from . import enron_bank_builder as _bank_builder_module
 from . import enron_contract as _enron_contract_module
 from .bank import bank_stats, hash_bank
+from .engines import compile_bank
 from .enron_activity import ACTIVITY_RECORD_INTERVAL, sqlite_activity
 from .enron_annotations import EnronAnnotationError
 from .enron_bank_builder import (
@@ -1406,7 +1407,7 @@ def _evaluate_iteration(
 ) -> dict[str, Any]:
     if activity_reporter is not None:
         activity_reporter.boundary()
-    structural = validate_bank(curated.bank, level="deep", strict=True, check_engine_compile=True)
+    structural = _validate_active_bank(curated.bank)
     if activity_reporter is not None:
         activity_reporter.boundary()
     structural_summary = _structural_summary(structural)
@@ -1481,6 +1482,19 @@ def _structural_summary(structural: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "engine_compatible": compatibility.get("compatible"),
     }
+
+
+def _validate_active_bank(bank: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the full source while compiling only production-active patterns."""
+
+    structural = validate_bank(bank, level="deep", strict=True, check_engine_compile=False)
+    if structural["valid"] is not True or structural["engine_compatibility"]["compatible"] is not True:
+        return structural
+    try:
+        compile_bank(bank, options={"include_statuses": ["active"]})
+    except Exception:
+        raise EnronBankBuildError("Active bank failed Rust engine validation.") from None
+    return structural
 
 
 def _qualified_validation_gold(
@@ -3074,7 +3088,7 @@ def _verify_enron_bank_build_snapshot_in_scratch(
         activity_reporter=activity,
     )
     activity.boundary()
-    structural = validate_bank(bank, level="deep", strict=True, check_engine_compile=True)
+    structural = _validate_active_bank(bank)
     activity.boundary()
     if structural["valid"] is not True or structural["engine_compatibility"]["compatible"] is not True:
         raise EnronBankBuildError("Selected private bank failed deep verification.")
@@ -3278,12 +3292,7 @@ def _verify_enron_bank_build_snapshot_in_scratch(
         if not isinstance(expected_quality, Mapping):
             raise EnronBankBuildError("Private iteration artifact is invalid.")
         activity.boundary()
-        iteration_structural = validate_bank(
-            replayed_bank,
-            level="deep",
-            strict=True,
-            check_engine_compile=True,
-        )
+        iteration_structural = _validate_active_bank(replayed_bank)
         activity.boundary()
         if (
             iteration_structural["valid"] is not True
@@ -4461,6 +4470,14 @@ def _verify_candidate_ledger(
         patterns = name.get("patterns") if isinstance(name, Mapping) else None
         if not isinstance(patterns, Mapping):
             raise EnronBankBuildError("Private candidate bank reference does not resolve.")
+        name_metadata = name.get("metadata") if isinstance(name, Mapping) else None
+        if (
+            not isinstance(name_metadata, Mapping)
+            or set(name_metadata) != {"authoritative_pattern_metadata_ref"}
+            or not isinstance(name_metadata.get("authoritative_pattern_metadata_ref"), str)
+            or name_metadata["authoritative_pattern_metadata_ref"] not in patterns
+        ):
+            raise EnronBankBuildError("Private candidate canonical pattern reference is invalid.")
         for pattern_id in pattern_ids:
             pattern = patterns.get(pattern_id)
             if not isinstance(pattern, Mapping) or pattern.get("status") != decision:
