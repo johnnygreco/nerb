@@ -548,6 +548,27 @@ Export pins the report, commit marker, and complete attempt-chain snapshot while
 the no-replace publication and directory fsync. That successful publication is the snapshot's linearization point; a
 cooperating later attempt appends only after the export releases the lock and is therefore outside that artifact.
 
+### Recorded full-source capacity evidence
+
+The committed aggregate at `evidence/enron/capacity-decision.json` records the successful production run from Git commit
+`bd573361010fbb87198480eb2ed36a824e332c73`. It accounts for all 517,401 source rows in 5,888.611 seconds, with a
+3,122,921,472-byte peak process-tree RSS, a 16,424,824,832-byte owned-disk high-water mark, 23,774,683,136 bytes of
+minimum runtime free disk, a 92.436 ms maximum resource acquisition, and a 193.056 ms maximum observation gap. Every
+phase exceeded 100 records/s, deep replay was equal, all capacity gates passed, and the privacy scan found zero
+violations. The sealed state remained `sealed_unbound`; no sealed-test content was accessed.
+
+Its file SHA-256 is `441d90fc64d45d6febdd2a8ee13d9db25c712d195f4414ca6acb9bf1268ddca2`. Verify it from a
+clean clone with complete Git history:
+
+```shell
+uv run nerb verify-portable-enron-capacity \
+  --artifact evidence/enron/capacity-decision.json
+```
+
+The artifact's status is `pre_terminal_non_decision`: it proves realistic construction and validation capacity, not
+sealed-test quality or a final ship/no-ship decision. See `evidence/enron/README.md` for exact phase measurements,
+identity commitments, privacy properties, and verifier limitations.
+
 ## Regenerating bank evidence
 
 Policy, allocation, evaluator, or workload changes require a fresh private run and fresh aggregate commitments. A
