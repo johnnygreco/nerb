@@ -2821,6 +2821,28 @@ def test_private_run_accepts_unchanged_owner_only_sticky_parent(tmp_path: Path) 
     assert (tombstone / "private-customer-name.txt").read_bytes() == b""
 
 
+def test_private_run_accepts_pinned_sticky_shared_parent(tmp_path: Path) -> None:
+    parent = _resolved(tmp_path / "shared-sticky-parent")
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o1777)
+    parent_info = parent.lstat()
+    run = PrivateRun(
+        parent / "run",
+        allow_unignored_output=True,
+        expected_parent_identity=(int(parent_info.st_dev), int(parent_info.st_ino)),
+    )
+    run.__enter__()
+    with run.open_text("private-customer-name.txt") as handle:
+        handle.write("private")
+
+    failure = RuntimeError("stop")
+    run.__exit__(RuntimeError, failure, None)
+
+    tombstone = next(parent.glob(".nerb-cleanup-*"))
+    assert stat.S_IMODE(tombstone.stat().st_mode) == 0o700
+    assert (tombstone / "private-customer-name.txt").read_bytes() == b""
+
+
 def test_private_run_rejects_an_unpinned_sticky_shared_parent(tmp_path: Path) -> None:
     parent = _resolved(tmp_path / "shared-sticky-parent")
     parent.mkdir(mode=0o700)

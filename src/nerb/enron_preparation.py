@@ -1761,12 +1761,21 @@ def _private_preparation_spool(
 ) -> Iterator[sqlite3.Connection]:
     """Own the construction database in a pinned wipe-to-tombstone transaction."""
 
-    temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        temp_root_info = temp_root.lstat()
+        expected_parent_identity = int(temp_root_info.st_dev), int(temp_root_info.st_ino)
+    except (OSError, RuntimeError, TypeError, ValueError):
+        raise EnronPreparationError("Preparation spool could not be cleaned safely.") from None
     final = temp_root / f"nerb-enron-preparation-{secrets.token_hex(16)}"
     connection: sqlite3.Connection | None = None
     operation_error: BaseException | None = None
     try:
-        with PrivateRun(final, allow_unignored_output=True) as run:
+        with PrivateRun(
+            final,
+            allow_unignored_output=True,
+            expected_parent_identity=expected_parent_identity,
+        ) as run:
             try:
                 spool_path = run.create_external_file("records.sqlite3")
                 connection = _open_spool(spool_path, precreated=True)

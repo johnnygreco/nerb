@@ -1184,6 +1184,54 @@ def test_metadata_spool_contains_no_text_or_predictions_and_is_private(tmp_path:
     session.finish()
 
 
+def test_implicit_metadata_spool_accepts_pinned_sticky_shared_temp_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "shared-sticky-temp"
+    temp_root.mkdir(mode=0o700)
+    temp_root.chmod(0o1777)
+    monkeypatch.setattr(quality_module.tempfile, "tempdir", os.fspath(temp_root))
+
+    session = prepare_enron_quality(_bank(), slice_specs=[_slice()])
+    session.consume(
+        _document("doc_private", "PRIVATE_MARKER Alice"),
+        [_gold("doc_private", 15, 20, catalog_name_id="alice")],
+        ["person_all_validation"],
+    )
+    session.finish()
+
+    entries = list(temp_root.iterdir())
+    assert len(entries) == 1
+    tombstone = entries[0]
+    assert re.fullmatch(r"\.nerb-cleanup-[0-9a-f]{48}", tombstone.name)
+    assert tombstone.is_dir()
+    assert stat.S_IMODE(tombstone.stat().st_mode) == 0o700
+    for path in tombstone.rglob("*"):
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            assert stat.S_IMODE(info.st_mode) == 0o700
+        else:
+            assert stat.S_ISREG(info.st_mode)
+            assert stat.S_IMODE(info.st_mode) == 0o600
+            assert info.st_size == 0
+
+
+def test_implicit_metadata_spool_rejects_nonsticky_shared_temp_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "unsafe-shared-temp"
+    temp_root.mkdir(mode=0o700)
+    temp_root.chmod(0o777)
+    monkeypatch.setattr(quality_module.tempfile, "tempdir", os.fspath(temp_root))
+
+    with pytest.raises(EnronQualityError, match="metadata spool could not be created safely"):
+        prepare_enron_quality(_bank(), slice_specs=[_slice()])
+
+    assert not list(temp_root.iterdir())
+
+
 def test_metadata_spool_uses_memory_journal_and_temp_storage_without_sidecars(tmp_path: Path) -> None:
     spool = tmp_path / "owned-metadata.sqlite3"
     session = prepare_enron_quality(_bank(), slice_specs=[_slice()], spool_path=spool)

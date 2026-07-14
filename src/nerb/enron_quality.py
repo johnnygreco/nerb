@@ -1070,7 +1070,7 @@ def prepare_enron_quality(
         )
     except _EnronQualityCleanupError:
         raise
-    except (OSError, sqlite3.Error, ValueError, EnronQualityError):
+    except (OSError, sqlite3.Error, ValueError, EnronPrivateIOError, EnronQualityError):
         raise EnronQualityError("Quality metadata spool could not be created safely.") from None
     pending_cleanup = _PendingSpoolCleanup(connection, spool_cleanup, path, identity)
     try:
@@ -2316,8 +2316,14 @@ def _open_metadata_spool(
     owned_run: PrivateRun | None = None
     if requested_path is None:
         temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        temp_root_info = temp_root.lstat()
+        expected_parent_identity = int(temp_root_info.st_dev), int(temp_root_info.st_ino)
         final = temp_root / f"nerb-enron-quality-{secrets.token_hex(16)}"
-        owned_run = PrivateRun(final, allow_unignored_output=True)
+        owned_run = PrivateRun(
+            final,
+            allow_unignored_output=True,
+            expected_parent_identity=expected_parent_identity,
+        )
         owned_run.__enter__()
         path = owned_run.stage_dir / "metadata.sqlite3"
     else:
