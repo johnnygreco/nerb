@@ -11,6 +11,7 @@ import json
 import os
 import py_compile
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -658,6 +659,19 @@ def _start_terminal_crash_attempt(
     return process, options, ready
 
 
+def _relocate_crash_attempt_ledger(
+    options: EnronCapacityOptions,
+    destination: Path,
+) -> EnronCapacityOptions:
+    options.attempt_ledger_dir.rename(destination)
+    return EnronCapacityOptions(
+        output_dir=options.output_dir,
+        attempt_ledger_dir=destination,
+        workspace_root=options.workspace_root,
+        allow_unignored_output=options.allow_unignored_output,
+    )
+
+
 def _rehash_report(report: dict[str, Any]) -> None:
     report["run_sha256"] = hash_capacity_report(report)
 
@@ -685,6 +699,99 @@ def test_public_entry_is_noninjectable_and_fixture_cannot_verify_as_production(t
     _rehash_report(relabeled)
     with pytest.raises(EnronCapacityError):
         verify_capacity_report(relabeled)
+
+
+def test_capacity_report_rejects_a_tampered_process_containment_policy(tmp_path: Path) -> None:
+    report, _probe = _run(tmp_path)
+    tampered = copy.deepcopy(report)
+    tampered["execution"]["process_containment"]["policy_sha256"] = _hash("different-containment")
+    _rehash_report(tampered)
+
+    with pytest.raises(EnronCapacityError):
+        verify_capacity_report(tampered, require_production=False)
+
+
+def test_capacity_report_binds_production_containment_to_recorded_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _probe = _run(tmp_path)
+    execution = report["execution"]
+    current_mode = enron_capacity._expected_process_containment_mode()
+    current_containment = enron_capacity._process_containment_identity(production=True)
+    execution.update(
+        {
+            "production_evidence": True,
+            "fresh_worker": True,
+            "git_tree_clean": True,
+            "process_containment": current_containment,
+            "monitor_interval_ns": enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+        }
+    )
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_PROCESS_CONTAINMENT", current_mode)
+    _rehash_report(report)
+    enron_capacity._verify_execution(  # noqa: SLF001
+        execution,
+        require_production=True,
+        current_production_execution=copy.deepcopy(execution),
+    )
+    enron_capacity._verify_environment(report["environment"], require_current=False)  # noqa: SLF001
+    enron_capacity._verify_process_containment_runtime_binding(  # noqa: SLF001
+        execution,
+        report["environment"],
+    )
+
+    contradictory = copy.deepcopy(report)
+    alternate_mode = (
+        enron_capacity._LINUX_PROCESS_CONTAINMENT  # noqa: SLF001
+        if current_mode == enron_capacity._DARWIN_PROCESS_CONTAINMENT  # noqa: SLF001
+        else enron_capacity._DARWIN_PROCESS_CONTAINMENT  # noqa: SLF001
+    )
+    alternate_architecture = "x86_64"
+    contradictory_containment = {
+        "mode": alternate_mode,
+        "architecture": alternate_architecture,
+        "policy_sha256": enron_capacity._process_containment_policy_sha256(  # noqa: SLF001
+            alternate_mode,
+            alternate_architecture,
+        ),
+        "installed_before_workload": True,
+        "runtime_attested": True,
+    }
+    contradictory["execution"]["process_containment"] = contradictory_containment
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_PROCESS_CONTAINMENT", alternate_mode)
+    _rehash_report(contradictory)
+    enron_capacity._verify_execution(  # noqa: SLF001
+        contradictory["execution"],
+        require_production=True,
+        current_production_execution=copy.deepcopy(contradictory["execution"]),
+    )
+    enron_capacity._verify_environment(contradictory["environment"], require_current=False)  # noqa: SLF001
+    assert contradictory["run_sha256"] == hash_capacity_report(contradictory)
+
+    with pytest.raises(EnronCapacityError, match="Capacity aggregate report is invalid"):
+        enron_capacity._verify_process_containment_runtime_binding(  # noqa: SLF001
+            contradictory["execution"],
+            contradictory["environment"],
+        )
+
+
+def test_public_capacity_report_verifier_invokes_containment_runtime_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _probe = _run(tmp_path)
+    observed: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+    original = enron_capacity._verify_process_containment_runtime_binding  # noqa: SLF001
+
+    def record(execution: Mapping[str, Any], environment: Mapping[str, Any]) -> None:
+        observed.append((execution, environment))
+        original(execution, environment)
+
+    monkeypatch.setattr(enron_capacity, "_verify_process_containment_runtime_binding", record)
+
+    assert verify_capacity_report(report, require_production=False) == report
+    assert observed == [(report["execution"], report["environment"])]
 
 
 def test_same_five_adapters_complete_a_private_synthetic_capacity_run(
@@ -873,6 +980,10 @@ def test_portable_export_binds_full_attempt_chain_and_rejects_tamper(
     assert artifact["attestation"]["kind"] == "clean_clone_source_and_hash_chain_verification"
     assert (
         "recorded_native_binary_bytes_or_reproducible_binary_build"
+        in artifact["verification_scope"]["not_independently_attested"]
+    )
+    assert (
+        "failed_attempt_cleanup_fields_or_durable_wipe_state"
         in artifact["verification_scope"]["not_independently_attested"]
     )
     assert "trusted_access_controlled_host" in artifact["verification_scope"]["prerequisite"]
@@ -1349,10 +1460,12 @@ def test_private_atomic_writer_detects_publication_swaps_without_deleting_substi
 
 
 @pytest.mark.parametrize("entry_kind", ["binding", "marker"])
+@pytest.mark.parametrize("race_point", ["before_retirement", "after_staging"])
 def test_inflight_removal_swaps_preserve_substitutes_and_fail_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     entry_kind: str,
+    race_point: str,
 ) -> None:
     ledger = enron_capacity._AttemptLedger(tmp_path / "attempts")
     output_parent = enron_capacity._PinnedDirectory(tmp_path)
@@ -1376,15 +1489,44 @@ def test_inflight_removal_swaps_preserve_substitutes_and_fail_closed(
     target_name = inflight.binding_name if entry_kind == "binding" else inflight.marker_name
     substitute = b"unrelated-ledger-substitute"
     moved_name = f"moved-{entry_kind}"
+    real_rename = enron_capacity._private_io._rename_noreplace_at
     real_cleanup = enron_capacity._wipe_and_quarantine_private_file_at
 
-    def swap_before_cleanup(
+    def swap_before_retirement(
+        source_directory_fd: int,
+        source_name: str,
+        destination_directory_fd: int,
+        destination_name: str,
+    ) -> None:
+        if source_name == target_name:
+            os.rename(
+                source_name,
+                moved_name,
+                src_dir_fd=source_directory_fd,
+                dst_dir_fd=source_directory_fd,
+            )
+            substitute_fd = os.open(
+                source_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=source_directory_fd,
+            )
+            try:
+                os.write(substitute_fd, substitute)
+            finally:
+                os.close(substitute_fd)
+        real_rename(source_directory_fd, source_name, destination_directory_fd, destination_name)
+
+    def swap_after_staging(
         directory_fd: int,
         name: str,
         descriptor: int,
         expected_identity: tuple[int, int],
     ) -> str:
-        if name == target_name:
+        temp_pattern = (
+            enron_capacity._STAGE_BINDING_TEMP_RE if entry_kind == "binding" else enron_capacity._INFLIGHT_TEMP_RE
+        )
+        if temp_pattern.fullmatch(name) is not None:
             os.rename(name, moved_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
             substitute_fd = os.open(
                 name,
@@ -1398,7 +1540,10 @@ def test_inflight_removal_swaps_preserve_substitutes_and_fail_closed(
                 os.close(substitute_fd)
         return real_cleanup(directory_fd, name, descriptor, expected_identity)
 
-    monkeypatch.setattr(enron_capacity, "_wipe_and_quarantine_private_file_at", swap_before_cleanup)
+    if race_point == "before_retirement":
+        monkeypatch.setattr(enron_capacity._private_io, "_rename_noreplace_at", swap_before_retirement)
+    else:
+        monkeypatch.setattr(enron_capacity, "_wipe_and_quarantine_private_file_at", swap_after_staging)
     try:
         with pytest.raises(EnronCapacityError):
             enron_capacity._remove_inflight_files_locked(inflight)
@@ -2462,7 +2607,7 @@ def test_every_runner_exception_payload_is_sanitized_and_attempt_chain_is_append
     receipts = verify_capacity_attempt_ledger(tmp_path / "attempts")
     assert receipts[-1]["outcome"] == expected_outcome
     assert receipts[-1]["failure_code"] == expected_code
-    assert receipts[-1]["sensitive_content_wiped"] is True
+    assert receipts[-1]["sensitive_content_wiped"] is False
     assert receipts[-1]["path_tree_removed"] is False
     assert receipts[-1]["retained_private_tombstone_count"] == 1
     assert "private/value" not in json.dumps(receipts)
@@ -2631,7 +2776,7 @@ def test_outer_capacity_cleanup_owns_child_outputs_and_stopped_writer_cache_thro
     assert parked_child.read_bytes() == b""
     assert parked_cache.read_bytes() == b""
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
 
 
 def test_post_promotion_failure_wipes_registered_child_moved_out_of_promoted_root(
@@ -2669,7 +2814,67 @@ def test_post_promotion_failure_wipes_registered_child_moved_out_of_promoted_roo
     assert not output.exists()
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "failed"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
+
+
+def test_first_post_receipt_verifier_wipes_relabel_and_retains_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = _Probe()
+    output = tmp_path / "post-receipt-relabel"
+    original_enforce = enron_capacity._post_promotion_enforce
+    original_verify = enron_capacity._verify_recovered_failed_output_absent
+    relabeled = tmp_path / "arbitrary-after-durable-receipt"
+    injected_fd: int | None = None
+
+    def fail_after_promotion(*args: Any, **kwargs: Any) -> None:
+        original_enforce(*args, **kwargs)
+        raise RuntimeError("create a failed receipt before the relabel")
+
+    def relabel_then_verify(*args: Any, **kwargs: Any) -> None:
+        nonlocal injected_fd
+        if injected_fd is None:
+            receipt = cast(dict[str, Any], args[3])
+            parent = args[1].path
+            expected = receipt["promoted_root_device"], receipt["promoted_root_inode"]
+            bound = next(
+                path for path in parent.glob(".nerb-cleanup-*") if (path.stat().st_dev, path.stat().st_ino) == expected
+            )
+            bound.rename(relabeled)
+            injected = relabeled / "private-after-receipt.bin"
+            injected.write_bytes(b"private bytes inserted after durable receipt publication")
+            injected.chmod(0o600)
+            injected_fd = os.open(injected, os.O_RDONLY)
+        original_verify(*args, **kwargs)
+
+    monkeypatch.setattr(enron_capacity, "_post_promotion_enforce", fail_after_promotion)
+    monkeypatch.setattr(enron_capacity, "_verify_recovered_failed_output_absent", relabel_then_verify)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._run_enron_capacity_for_test(
+                _options(tmp_path, output.name),
+                phase_runners=_successful_runners(probe),
+                resource_probe=probe,
+            )
+
+        assert raised.value.code == "attempt_ledger_invalid"
+        assert injected_fd is not None
+        assert os.pread(injected_fd, 1, 0) == b""
+        assert (relabeled / "private-after-receipt.bin").read_bytes() == b""
+        receipt = json.loads(next((tmp_path / "attempts").glob("attempt-*.json")).read_text(encoding="utf-8"))
+        assert receipt["failure_code"] == "capacity_failed"
+        with pytest.raises(EnronCapacityError, match="attempt ledger"):
+            verify_capacity_attempt_ledger(tmp_path / "attempts")
+        assert list((tmp_path / "attempts").glob(".attempt-inflight-*.stage.json"))
+        assert [
+            path
+            for path in (tmp_path / "attempts").glob(".attempt-inflight-*.json")
+            if not path.name.endswith(".stage.json")
+        ]
+    finally:
+        if injected_fd is not None:
+            os.close(injected_fd)
 
 
 def test_report_write_and_atomic_promotion_are_inside_enforced_attempt_accounting(
@@ -2943,7 +3148,7 @@ def test_wrong_source_conservation_and_rehashed_arbitrary_aggregate_cannot_promo
         stop_events.append(stop_event)
         monitors.append(monitor)
 
-    def capture_cleanup(_directory_fd: int, directory_path: Path) -> bool:
+    def capture_cleanup(_directory_fd: int, directory_path: Path, **kwargs: Any) -> bool:
         if monitors and not cleanup_states:
             monitor = monitors[-1]
             cleanup_states.append(
@@ -2954,7 +3159,7 @@ def test_wrong_source_conservation_and_rehashed_arbitrary_aggregate_cannot_promo
                     monitor._stopped,
                 )
             )
-        return original_clear(_directory_fd, directory_path)
+        return original_clear(_directory_fd, directory_path, **kwargs)
 
     def interrupt_stop_entry(frame: Any, event: str, _arg: Any) -> Any:
         nonlocal trace_injected
@@ -2985,7 +3190,7 @@ def test_wrong_source_conservation_and_rehashed_arbitrary_aggregate_cannot_promo
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "failed"
     assert receipt["failure_code"] == "phase_commitment_invalid"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
     assert receipt["retained_private_tombstone_count"] == 1
     tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
     for path in (tombstone, *tombstone.rglob("*")):
@@ -3039,13 +3244,13 @@ def test_private_run_exit_entry_interruption_retries_cleanup_before_failure_rece
     assert len(runs) == 1
     run = runs[0]
     assert run._cleanup_is_settled() is True  # noqa: SLF001
-    assert run.cleanup_sensitive_content_wiped is True
+    assert run.cleanup_sensitive_content_wiped is False
     assert not (tmp_path / "capacity-run").exists()
     _assert_no_stage(tmp_path, "capacity-run")
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "failed"
     assert receipt["failure_code"] == "phase_commitment_invalid"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
     assert receipt["retained_private_tombstone_count"] == 1
     tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
     for path in (tombstone, *tombstone.rglob("*")):
@@ -3107,13 +3312,13 @@ def test_private_run_exit_boundary_entry_interruption_falls_back_before_failure_
     assert len(runs) == 1
     run = runs[0]
     assert run._cleanup_is_settled() is True  # noqa: SLF001
-    assert run.cleanup_sensitive_content_wiped is True
+    assert run.cleanup_sensitive_content_wiped is False
     assert not (tmp_path / "capacity-run").exists()
     _assert_no_stage(tmp_path, "capacity-run")
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "failed"
     assert receipt["failure_code"] == "phase_commitment_invalid"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
     assert receipt["retained_private_tombstone_count"] == 1
 
 
@@ -3216,13 +3421,13 @@ def test_private_run_exit_failure_survives_post_settlement_control_interruption(
     assert len(runs) == 1
     run = runs[0]
     assert run._cleanup_is_settled() is True  # noqa: SLF001
-    assert run.cleanup_sensitive_content_wiped is True
+    assert run.cleanup_sensitive_content_wiped is False
     assert not (tmp_path / "capacity-run").exists()
     _assert_no_stage(tmp_path, "capacity-run")
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "failed"
     assert receipt["failure_code"] == "capacity_failed"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
 
 
 @pytest.mark.parametrize(
@@ -3351,7 +3556,230 @@ def test_post_promotion_control_uses_final_cleanup_fallback(
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "failed"
     assert receipt["failure_code"] == "runtime_disk_floor"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        "helper_before_callback",
+        "callback_before_snapshot",
+        "callback_after_snapshot",
+        "remove_after_callback",
+        "pinned_close",
+        "wipe_after_tuple_assignment",
+        "wipe_return",
+        "recovery_before_scan",
+        "recovery_scan_return",
+    ],
+)
+def test_post_quarantine_control_cannot_overstate_durable_cleanup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interruption: str,
+) -> None:
+    output = tmp_path / "capacity-run"
+    original_close = enron_capacity._PinnedDirectory.close
+    remove_lines, remove_start = inspect.getsourcelines(enron_capacity._remove_pinned_directory)
+    helper_before_callback_line = next(
+        remove_start + offset
+        for offset, line in enumerate(remove_lines)
+        if "if cleanup_result_observer is not None:" in line
+    )
+    remove_after_callback_line = next(
+        remove_start + offset for offset, line in enumerate(remove_lines) if line.strip() == "return result"
+    )
+    callback_lines, callback_start = inspect.getsourcelines(enron_capacity._publish_incomplete_promoted_cleanup_metrics)
+    callback_snapshot_line = next(
+        callback_start + offset for offset, line in enumerate(callback_lines) if "metrics.cleanup_evidence =" in line
+    )
+    wipe_lines, wipe_start = inspect.getsourcelines(enron_capacity._wipe_promoted_capacity_run)
+    wipe_call_offset = next(
+        offset for offset, line in enumerate(wipe_lines) if "tree_cleanup = _remove_pinned_directory(" in line
+    )
+    wipe_after_tuple_assignment_line = next(
+        wipe_start + offset
+        for offset, line in enumerate(wipe_lines[wipe_call_offset + 1 :], start=wipe_call_offset + 1)
+        if "if cleanup_owner.cleanup_authority_retained:" in line
+    )
+    recovery_lines, recovery_start = inspect.getsourcelines(enron_capacity._recover_inflight_transaction)
+    recovery_before_scan_line = next(
+        recovery_start + offset
+        for offset, line in enumerate(recovery_lines)
+        if "_retained_inflight_private_tombstone_count(inflight)," in line
+    )
+    interrupted = False
+
+    def fail_after_promotion(*_args: Any, **_kwargs: Any) -> None:
+        raise enron_capacity._error("runtime_disk_floor")
+
+    def interrupt_cleanup_publication(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal interrupted
+        if interrupted:
+            return interrupt_cleanup_publication
+        matches = (
+            (
+                interruption == "helper_before_callback"
+                and event == "line"
+                and frame.f_code is enron_capacity._remove_pinned_directory.__code__
+                and frame.f_lineno == helper_before_callback_line
+            )
+            or (
+                interruption == "callback_before_snapshot"
+                and event == "line"
+                and frame.f_code is enron_capacity._publish_incomplete_promoted_cleanup_metrics.__code__
+                and frame.f_lineno == callback_snapshot_line
+            )
+            or (
+                interruption == "callback_after_snapshot"
+                and event == "return"
+                and frame.f_code is enron_capacity._publish_incomplete_promoted_cleanup_metrics.__code__
+            )
+            or (
+                interruption == "remove_after_callback"
+                and event == "line"
+                and frame.f_code is enron_capacity._remove_pinned_directory.__code__
+                and frame.f_lineno == remove_after_callback_line
+            )
+            or (
+                interruption == "wipe_after_tuple_assignment"
+                and event == "line"
+                and frame.f_code is enron_capacity._wipe_promoted_capacity_run.__code__
+                and frame.f_lineno == wipe_after_tuple_assignment_line
+            )
+            or (
+                interruption == "wipe_return"
+                and event == "return"
+                and frame.f_code is enron_capacity._wipe_promoted_capacity_run.__code__
+            )
+            or (
+                interruption == "recovery_before_scan"
+                and event == "line"
+                and frame.f_code is enron_capacity._recover_inflight_transaction.__code__
+                and frame.f_lineno == recovery_before_scan_line
+            )
+            or (
+                interruption == "recovery_scan_return"
+                and event == "return"
+                and frame.f_code is enron_capacity._retained_inflight_private_tombstone_count.__code__
+            )
+        )
+        if matches:
+            interrupted = True
+            sys.settrace(None)
+            raise KeyboardInterrupt(f"cleanup {interruption} interrupted")
+        return interrupt_cleanup_publication
+
+    def close_then_interrupt(directory: enron_capacity._PinnedDirectory) -> None:
+        nonlocal interrupted
+        interrupt_now = (
+            not interrupted
+            and directory.path == output.resolve()
+            and not output.exists()
+            and bool(list(tmp_path.glob(".nerb-cleanup-*")))
+        )
+        original_close(directory)
+        if interrupt_now:
+            interrupted = True
+            raise KeyboardInterrupt("cleanup pinned close interrupted")
+
+    monkeypatch.setattr(enron_capacity, "_post_promotion_enforce", fail_after_promotion)
+    if interruption == "pinned_close":
+        monkeypatch.setattr(enron_capacity._PinnedDirectory, "close", close_then_interrupt)
+    else:
+        sys.settrace(interrupt_cleanup_publication)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            _run(tmp_path)
+    finally:
+        sys.settrace(None)
+
+    assert interrupted is True
+    expected_code = "runtime_disk_floor" if interruption.startswith("recovery_") else "promotion_failed"
+    assert raised.value.code == expected_code
+    assert not output.exists()
+    assert len(list(tmp_path.glob(".nerb-cleanup-*"))) == 1
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+
+
+@pytest.mark.parametrize("interruption", ["incomplete_snapshot", "positive_snapshot"])
+def test_promoted_cleanup_metric_publication_updates_only_complete_snapshots(interruption: str) -> None:
+    class InterruptingMetrics:
+        sensitive_content_wiped: bool
+        path_tree_removed: bool
+        retained_private_tombstone_count: int
+        cleanup_evidence: tuple[bool | None, bool | None, int]
+
+        def __init__(self) -> None:
+            object.__setattr__(self, "cleanup_evidence", (None, None, 0))
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if name == "cleanup_evidence" and (
+                (interruption == "incomplete_snapshot" and value == (False, False, 1))
+                or (interruption == "positive_snapshot" and value == (True, False, 1))
+            ):
+                raise KeyboardInterrupt("cleanup metric publication interrupted")
+            object.__setattr__(self, name, value)
+
+    metrics = InterruptingMetrics()
+    with pytest.raises(KeyboardInterrupt):
+        enron_capacity._publish_promoted_cleanup_metrics(cast(Any, metrics), (True, False, 1))  # noqa: SLF001
+
+    expected = (None, None, 0) if interruption == "incomplete_snapshot" else (False, False, 1)
+    assert metrics.cleanup_evidence == expected
+
+
+def test_pre_binding_cleanup_publication_interruption_keeps_conservative_tombstone_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup_lines, cleanup_start = inspect.getsourcelines(enron_capacity.PrivateRun._cleanup_once)  # noqa: SLF001
+    cleanup_publication_line = next(
+        cleanup_start + offset
+        for offset, line in enumerate(cleanup_lines)
+        if "self._cleanup_sensitive_content_wiped =" in line
+    )
+    binding_interrupted = False
+    publication_interrupted = False
+
+    def interrupt_cleanup_publication(frame: Any, event: str, _arg: Any) -> Any:
+        nonlocal publication_interrupted
+        if (
+            not publication_interrupted
+            and event == "line"
+            and frame.f_code is enron_capacity.PrivateRun._cleanup_once.__code__  # noqa: SLF001
+            and frame.f_lineno == cleanup_publication_line
+        ):
+            publication_interrupted = True
+            sys.settrace(None)
+            raise KeyboardInterrupt("private cleanup publication interrupted")
+        return interrupt_cleanup_publication
+
+    def interrupt_before_binding(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal binding_interrupted
+        binding_interrupted = True
+        sys.settrace(interrupt_cleanup_publication)
+        raise KeyboardInterrupt("stage binding interrupted")
+
+    monkeypatch.setattr(enron_capacity, "_bind_inflight_stage", interrupt_before_binding)
+    try:
+        with pytest.raises(EnronCapacityError):
+            _run(tmp_path)
+    finally:
+        sys.settrace(None)
+
+    assert binding_interrupted is True
+    assert publication_interrupted is True
+    tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+    assert len(tombstones) == 1
+    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
 
 
 def test_success_tree_close_control_wipes_promoted_run_before_interrupt_receipt(
@@ -3378,7 +3806,7 @@ def test_success_tree_close_control_wipes_promoted_run_before_interrupt_receipt(
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "interrupted"
     assert receipt["failure_code"] == "phase_interrupted"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
 
 
 def test_success_final_fallback_entry_control_uses_caller_owned_recovery(
@@ -3416,7 +3844,7 @@ def test_success_final_fallback_entry_control_uses_caller_owned_recovery(
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
     assert receipt["outcome"] == "interrupted"
     assert receipt["failure_code"] == "phase_interrupted"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
 
 
 def test_post_return_control_invalidates_recovered_completed_run_before_receipt(
@@ -3455,7 +3883,7 @@ def test_post_return_control_invalidates_recovered_completed_run_before_receipt(
     assert len(receipts) == 1
     assert receipts[0]["outcome"] == "interrupted"
     assert receipts[0]["failure_code"] == "phase_interrupted"
-    assert receipts[0]["sensitive_content_wiped"] is True
+    assert receipts[0]["sensitive_content_wiped"] is False
 
 
 def test_pre_receipt_control_uses_outer_caller_recovery_boundary(
@@ -3494,7 +3922,7 @@ def test_pre_receipt_control_uses_outer_caller_recovery_boundary(
     assert len(receipts) == 1
     assert receipts[0]["outcome"] == "interrupted"
     assert receipts[0]["failure_code"] == "phase_interrupted"
-    assert receipts[0]["sensitive_content_wiped"] is True
+    assert receipts[0]["sensitive_content_wiped"] is False
 
 
 def test_failed_transaction_pre_receipt_control_preserves_semantic_failure(
@@ -3538,7 +3966,7 @@ def test_failed_transaction_pre_receipt_control_preserves_semantic_failure(
     assert len(receipts) == 1
     assert receipts[0]["outcome"] == "failed"
     assert receipts[0]["failure_code"] == "phase_commitment_invalid"
-    assert receipts[0]["sensitive_content_wiped"] is True
+    assert receipts[0]["sensitive_content_wiped"] is False
 
 
 @pytest.mark.parametrize("reuse_kind", ["different_inode", "same_inode"])
@@ -3607,7 +4035,7 @@ def test_commit_descriptor_handoff_control_leaks_no_owner_descriptors(
     assert not (tmp_path / "capacity-run").exists()
     assert _process_descriptor_inventory() == before_descriptors
     receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
 
 
 def test_post_commit_substitute_is_preserved_while_bound_payload_is_wiped(
@@ -3631,12 +4059,22 @@ def test_post_commit_substitute_is_preserved_while_bound_payload_is_wiped(
     with pytest.raises(EnronCapacityError) as raised:
         _run(tmp_path)
 
-    assert raised.value.code == "promotion_failed"
+    assert raised.value.code == "attempt_ledger_invalid"
     assert sentinel.read_text(encoding="utf-8") == "preserve"
     assert (moved / "capacity-report.json").read_bytes() == b""
-    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    receipt = json.loads(next((tmp_path / "attempts").glob("attempt-*.json")).read_text(encoding="utf-8"))
     assert receipt["failure_code"] == "promotion_failed"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    with pytest.raises(EnronCapacityError, match="attempt ledger"):
+        verify_capacity_attempt_ledger(tmp_path / "attempts")
+    assert list((tmp_path / "attempts").glob(".attempt-inflight-*.stage.json"))
+    assert [
+        path
+        for path in (tmp_path / "attempts").glob(".attempt-inflight-*.json")
+        if not path.name.endswith(".stage.json")
+    ]
 
 
 def test_post_commit_moved_output_wipes_payload_before_path_recovery_failure(
@@ -3656,12 +4094,22 @@ def test_post_commit_moved_output_wipes_payload_before_path_recovery_failure(
     with pytest.raises(EnronCapacityError) as raised:
         _run(tmp_path)
 
-    assert raised.value.code == "promotion_failed"
+    assert raised.value.code == "attempt_ledger_invalid"
     assert not output.exists()
     assert (moved / "capacity-report.json").read_bytes() == b""
-    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    receipt = json.loads(next((tmp_path / "attempts").glob("attempt-*.json")).read_text(encoding="utf-8"))
     assert receipt["failure_code"] == "promotion_failed"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    with pytest.raises(EnronCapacityError, match="attempt ledger"):
+        verify_capacity_attempt_ledger(tmp_path / "attempts")
+    assert list((tmp_path / "attempts").glob(".attempt-inflight-*.stage.json"))
+    assert [
+        path
+        for path in (tmp_path / "attempts").glob(".attempt-inflight-*.json")
+        if not path.name.endswith(".stage.json")
+    ]
 
 
 def test_failed_moved_output_wipe_parks_authority_for_retry(
@@ -3689,16 +4137,104 @@ def test_failed_moved_output_wipe_parks_authority_for_retry(
     with pytest.raises(EnronCapacityError) as raised:
         _run(tmp_path)
 
-    assert raised.value.code == "promotion_failed"
-    receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
+    assert raised.value.code == "attempt_ledger_invalid"
+    receipt = json.loads(next((tmp_path / "attempts").glob("attempt-*.json")).read_text(encoding="utf-8"))
+    assert receipt["failure_code"] == "promotion_failed"
     assert receipt["sensitive_content_wiped"] is False
-    assert (moved / "capacity-report.json").stat().st_size > 0
+    assert (moved / "capacity-report.json").read_bytes() == b""
     assert enron_capacity._private_io._UNRESOLVED_CLEANUP_FDS  # noqa: SLF001
+    with pytest.raises(EnronCapacityError, match="attempt ledger"):
+        verify_capacity_attempt_ledger(tmp_path / "attempts")
+    assert list((tmp_path / "attempts").glob(".attempt-inflight-*.stage.json"))
+    assert [
+        path
+        for path in (tmp_path / "attempts").glob(".attempt-inflight-*.json")
+        if not path.name.endswith(".stage.json")
+    ]
 
     fail_wipe = False
     enron_capacity._private_io._retry_unresolved_cleanup_descriptors()  # noqa: SLF001
     assert (moved / "capacity-report.json").read_bytes() == b""
     assert not enron_capacity._private_io._UNRESOLVED_CLEANUP_FDS  # noqa: SLF001
+
+
+def test_new_receipts_require_removed_tree_for_positive_wipe_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = enron_capacity._AttemptMetrics(  # noqa: SLF001
+        promoted_root_device=1,
+        promoted_root_inode=2,
+        promoted_parent_device=3,
+        promoted_parent_inode=4,
+        cleanup_evidence=(True, False, 1),
+    )
+    receipt = enron_capacity._make_attempt_receipt(  # noqa: SLF001
+        [],
+        attempt_sequence=1,
+        attempt_nonce_sha256=_hash("truthful-cleanup-receipt"),
+        recovered_from_inflight=False,
+        outcome="failed",
+        failure_code="capacity_failed",
+        identity=None,
+        execution=None,
+        metrics=metrics,
+    )
+
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+
+    retained_untracked_path = enron_capacity._make_attempt_receipt(  # noqa: SLF001
+        [],
+        attempt_sequence=1,
+        attempt_nonce_sha256=_hash("untracked-cleanup-path-receipt"),
+        recovered_from_inflight=False,
+        outcome="failed",
+        failure_code="capacity_failed",
+        identity=None,
+        execution=None,
+        metrics=enron_capacity._AttemptMetrics(  # noqa: SLF001
+            cleanup_evidence=(True, False, 0),
+        ),
+    )
+
+    assert retained_untracked_path["sensitive_content_wiped"] is False
+    assert retained_untracked_path["path_tree_removed"] is False
+    assert retained_untracked_path["retained_private_tombstone_count"] == 0
+
+    contradictory = dict(receipt)
+    contradictory["sensitive_content_wiped"] = True
+    contradictory["attempt_sha256"] = ""
+    contradictory["attempt_sha256"] = enron_capacity._hash_attempt_receipt(contradictory)  # noqa: SLF001
+    enron_capacity._verify_attempt_receipt(  # noqa: SLF001
+        contradictory,
+        expected_sequence=1,
+        previous_sha256=None,
+    )
+    writes: list[Mapping[str, Any]] = []
+    monkeypatch.setattr(
+        enron_capacity,
+        "_write_atomic_private_file_at",
+        lambda *_args, **kwargs: writes.append(cast(Mapping[str, Any], kwargs)),
+    )
+
+    retained_path_contradiction = dict(retained_untracked_path)
+    retained_path_contradiction["sensitive_content_wiped"] = True
+    retained_path_contradiction["attempt_sha256"] = ""
+    retained_path_contradiction["attempt_sha256"] = enron_capacity._hash_attempt_receipt(  # noqa: SLF001
+        retained_path_contradiction
+    )
+    enron_capacity._verify_attempt_receipt(  # noqa: SLF001
+        retained_path_contradiction,
+        expected_sequence=1,
+        previous_sha256=None,
+    )
+
+    for invalid_receipt in (contradictory, retained_path_contradiction):
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._write_attempt_receipt_locked(-1, invalid_receipt, bytearray())  # noqa: SLF001
+
+        assert raised.value.code == "attempt_ledger_write_failed"
+    assert writes == []
 
 
 def test_target_created_during_run_is_preserved_and_capacity_stage_is_removed(tmp_path: Path) -> None:
@@ -4055,7 +4591,7 @@ def test_crash_before_stage_binding_cleans_only_the_authentic_empty_stage(tmp_pa
     assert len(receipts) == 1
     assert receipts[0]["outcome"] == "interrupted"
     assert receipts[0]["recovered_from_inflight"] is True
-    assert receipts[0]["sensitive_content_wiped"] is True
+    assert receipts[0]["sensitive_content_wiped"] is False
     assert receipts[0]["path_tree_removed"] is False
     assert receipts[0]["retained_private_tombstone_count"] == 1
     assert not options.output_dir.exists()
@@ -4133,6 +4669,10 @@ def test_capacity_recovery_retains_empty_file_shells_and_never_calls_name_delete
     source = stage / "secret.txt"
     source.write_text("private", encoding="utf-8")
     source.chmod(0o600)
+    stage_info = stage.stat()
+    stage_identity = int(stage_info.st_dev), int(stage_info.st_ino)
+    source_info = source.stat()
+    source_identity = int(source_info.st_dev), int(source_info.st_ino)
     real_ftruncate = enron_capacity._private_io.os.ftruncate
     swapped = False
     delete_calls: list[str] = []
@@ -4140,11 +4680,18 @@ def test_capacity_recovery_retains_empty_file_shells_and_never_calls_name_delete
     def truncate_then_swap(descriptor: int, length: int) -> None:
         nonlocal swapped
         real_ftruncate(descriptor, length)
-        if not swapped:
+        opened = os.fstat(descriptor)
+        if not swapped and (int(opened.st_dev), int(opened.st_ino)) == source_identity:
             swapped = True
-            source.rename(stage / "moved-authentic.txt")
-            source.write_bytes(b"")
-            source.chmod(0o600)
+            active_stage = next(
+                path
+                for path in (*tmp_path.glob(".nerb-cleanup-*"), stage)
+                if path.exists() and (int(path.stat().st_dev), int(path.stat().st_ino)) == stage_identity
+            )
+            active_source = active_stage / source.relative_to(stage)
+            active_source.rename(active_stage / "moved-authentic.txt")
+            active_source.write_bytes(b"")
+            active_source.chmod(0o600)
 
     def forbidden_delete(_parent_fd: int, _parent_path: Path, name: str) -> None:
         delete_calls.append(name)
@@ -4158,6 +4705,7 @@ def test_capacity_recovery_retains_empty_file_shells_and_never_calls_name_delete
     enron_capacity._recover_worker_inflight(options)
 
     tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
+    assert swapped is True
     assert (tombstone / "secret.txt").read_bytes() == b""
     assert (tombstone / "moved-authentic.txt").read_bytes() == b""
     assert delete_calls == []
@@ -4180,16 +4728,19 @@ def test_capacity_recovery_retains_both_empty_directory_shells_after_swap(
     secret = child / "secret.txt"
     secret.write_text("private", encoding="utf-8")
     secret.chmod(0o600)
+    child_info = child.stat()
+    child_identity = int(child_info.st_dev), int(child_info.st_ino)
     real_clear = enron_capacity._private_io._clear_pinned_private_directory
     swapped = False
 
-    def clear_then_swap(directory_fd: int, directory_path: Path) -> bool:
+    def clear_then_swap(directory_fd: int, directory_path: Path, **kwargs: Any) -> bool:
         nonlocal swapped
-        cleared = real_clear(directory_fd, directory_path)
-        if directory_path.name == child.name and not swapped:
+        cleared = real_clear(directory_fd, directory_path, **kwargs)
+        opened = os.fstat(directory_fd)
+        if (int(opened.st_dev), int(opened.st_ino)) == child_identity and not swapped:
             swapped = True
-            child.rename(stage / "moved-child")
-            child.mkdir(mode=0o700)
+            directory_path.rename(directory_path.parent / "moved-child")
+            directory_path.mkdir(mode=0o700)
         return cleared
 
     monkeypatch.setattr(enron_capacity._private_io, "_clear_pinned_private_directory", clear_then_swap)
@@ -4198,10 +4749,13 @@ def test_capacity_recovery_retains_both_empty_directory_shells_after_swap(
     enron_capacity._recover_worker_inflight(options)
 
     tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
+    assert swapped is True
     assert (tombstone / "swap-child").is_dir()
     assert not list((tombstone / "swap-child").iterdir())
     assert (tombstone / "moved-child" / "secret.txt").read_bytes() == b""
     receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
     assert receipt["retained_private_tombstone_count"] == 1
 
 
@@ -4230,6 +4784,1653 @@ def test_stale_stage_substitution_is_rejected_and_never_deleted(tmp_path: Path) 
     ]
 
 
+def test_promoted_cleanup_wipes_before_parent_chain_validation(tmp_path: Path) -> None:
+    parent = tmp_path / "private-output"
+    parent.mkdir(mode=0o700)
+    run = parent / "run"
+    run.mkdir(mode=0o700)
+    secret = run / "private-customer-name.txt"
+    secret.write_bytes(b"secret")
+    secret.chmod(0o600)
+    pinned = enron_capacity._PinnedDirectory(run)
+    parent.chmod(0o755)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._remove_pinned_directory(  # noqa: SLF001
+                pinned,
+                workspace_root=None,
+                allow_unignored_output=True,
+            )
+    finally:
+        parent.chmod(0o700)
+        if not pinned.closed:
+            pinned.close()
+
+    assert raised.value.code == "promotion_failed"
+    assert secret.read_bytes() == b""
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+def test_crash_recovery_repairs_accessible_bound_parent_permission_drift(tmp_path: Path) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    assert secret.read_bytes()
+    tmp_path.chmod(0o755)
+
+    enron_capacity._recover_worker_inflight(options)
+
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    assert not options.output_dir.exists()
+    tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+    assert len(tombstones) == 1
+    assert (tombstones[0] / "phases" / "preparation" / "crash-secret.bin").read_bytes() == b""
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Descriptor-bound inaccessible-parent repair uses Linux O_PATH."
+)
+def test_linux_crash_recovery_repairs_inaccessible_bound_parent_and_wipes_payload(tmp_path: Path) -> None:
+    output_parent = tmp_path / "inaccessible-output-parent"
+    output_parent.mkdir(mode=0o700)
+    _process, original_options, _ready = _start_terminal_crash_attempt(
+        output_parent,
+        crash_point="post_promotion_payload",
+    )
+    options = _relocate_crash_attempt_ledger(original_options, tmp_path / "inaccessible-parent-attempts")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    output_parent.chmod(0o000)
+
+    try:
+        enron_capacity._recover_worker_inflight(options)
+
+        assert stat.S_IMODE(output_parent.stat().st_mode) == 0o700
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert not options.output_dir.exists()
+        tombstones = list(output_parent.glob(".nerb-cleanup-*"))
+        assert len(tombstones) == 1
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["path_tree_removed"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+    finally:
+        output_parent.chmod(0o700)
+        os.close(secret_fd)
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("linux"), reason="Linux supplies descriptor-bound inaccessible-parent repair."
+)
+def test_inaccessible_bound_parent_recovery_fails_without_name_based_mutation(tmp_path: Path) -> None:
+    output_parent = tmp_path / "inaccessible-output-parent"
+    output_parent.mkdir(mode=0o700)
+    _process, original_options, _ready = _start_terminal_crash_attempt(
+        output_parent,
+        crash_point="post_promotion_payload",
+    )
+    options = _relocate_crash_attempt_ledger(original_options, tmp_path / "inaccessible-parent-attempts")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    expected = os.pread(secret_fd, 1024, 0)
+    output_parent.chmod(0o000)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert os.pread(secret_fd, 1024, 0) == expected
+        assert stat.S_IMODE(output_parent.stat().st_mode) == 0o000
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+    finally:
+        output_parent.chmod(0o700)
+        os.close(secret_fd)
+
+    enron_capacity._recover_worker_inflight(options)
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+
+
+def test_inaccessible_intermediate_ancestor_is_never_repaired_and_retains_conservative_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    intermediate = tmp_path / "inaccessible-intermediate"
+    output_parent = intermediate / "bound-output-parent"
+    output_parent.mkdir(parents=True, mode=0o700)
+    intermediate.chmod(0o700)
+    _process, original_options, _ready = _start_terminal_crash_attempt(
+        output_parent,
+        crash_point="post_promotion_payload",
+    )
+    options = _relocate_crash_attempt_ledger(original_options, tmp_path / "intermediate-attempts")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    output_parent_fd = os.open(output_parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    expected = os.pread(secret_fd, 1024, 0)
+    real_repair = enron_capacity._open_owned_recovery_directory_descriptor
+    repair_calls = 0
+
+    def observed_repair(*args: Any, **kwargs: Any) -> Any:
+        nonlocal repair_calls
+        repair_calls += 1
+        return real_repair(*args, **kwargs)
+
+    monkeypatch.setattr(enron_capacity, "_open_owned_recovery_directory_descriptor", observed_repair)
+    intermediate.chmod(0o077)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert repair_calls == 0
+        assert os.pread(secret_fd, 1024, 0) == expected
+        assert stat.S_IMODE(intermediate.stat().st_mode) == 0o077
+        assert stat.S_IMODE(os.fstat(output_parent_fd).st_mode) == 0o700
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+    finally:
+        intermediate.chmod(0o700)
+        os.close(output_parent_fd)
+        os.close(secret_fd)
+
+    enron_capacity._recover_worker_inflight(options)
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Descriptor-bound inaccessible-parent repair uses Linux O_PATH."
+)
+def test_linux_bound_parent_substitution_during_repair_does_not_touch_substitute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_parent = tmp_path / "inaccessible-output-parent"
+    output_parent.mkdir(mode=0o700)
+    _process, original_options, _ready = _start_terminal_crash_attempt(
+        output_parent,
+        crash_point="post_promotion_payload",
+    )
+    options = _relocate_crash_attempt_ledger(original_options, tmp_path / "inaccessible-parent-attempts")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    expected = os.pread(secret_fd, 1024, 0)
+    output_parent.chmod(0o077)
+    parked = tmp_path / "parked-authenticated-output-parent"
+    real_repair = enron_capacity._native_engine._repair_and_open_directory_fd_once
+    swapped = False
+    sentinel_identity: tuple[int, int] | None = None
+
+    def repair_then_swap(*args: Any) -> int:
+        nonlocal sentinel_identity, swapped
+        result = real_repair(*args)
+        if result == 0 and not swapped:
+            output_parent.rename(parked)
+            output_parent.mkdir(mode=0o700)
+            sentinel = output_parent / "preserve.bin"
+            sentinel.write_bytes(b"unrelated")
+            sentinel.chmod(0o600)
+            info = sentinel.stat()
+            sentinel_identity = int(info.st_dev), int(info.st_ino)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(enron_capacity._native_engine, "_repair_and_open_directory_fd_once", repair_then_swap)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        sentinel = output_parent / "preserve.bin"
+        assert raised.value.code == "production_worker_failed"
+        assert swapped is True
+        assert os.pread(secret_fd, 1024, 0) == expected
+        assert stat.S_IMODE(parked.stat().st_mode) == 0o700
+        assert sentinel.read_bytes() == b"unrelated"
+        assert (sentinel.stat().st_dev, sentinel.stat().st_ino) == sentinel_identity
+        assert stat.S_IMODE(sentinel.stat().st_mode) == 0o600
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+    finally:
+        parked.chmod(0o700)
+        os.close(secret_fd)
+
+
+def test_crash_recovery_wipes_bound_output_before_rejecting_output_permission_drift(tmp_path: Path) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    assert os.pread(secret_fd, 1, 0)
+    options.output_dir.chmod(0o755)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert not options.output_dir.exists()
+        tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+        assert len(tombstones) == 1
+        assert stat.S_IMODE(tombstones[0].stat().st_mode) == 0o700
+        assert (tombstones[0] / "phases" / "preparation" / "crash-secret.bin").read_bytes() == b""
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["path_tree_removed"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert not options.output_dir.exists()
+        assert list(tmp_path.glob(".nerb-cleanup-*")) == tombstones
+        assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        os.close(secret_fd)
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_crash_recovery_retry_conservatively_downgrades_after_post_quarantine_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_error: type[BaseException],
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    assert secret.read_bytes()
+    real_wipe = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory_with_inventory
+    interrupted = False
+
+    def wipe_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        result = real_wipe(*args, **kwargs)
+        if kwargs["quarantine"] is True and not interrupted:
+            interrupted = True
+            raise control_error("injected post-quarantine pre-receipt control")
+        return result
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        wipe_then_interrupt,
+    )
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert raised.value.code == "production_worker_failed"
+    assert interrupted is True
+    assert not options.output_dir.exists()
+    tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+    assert len(tombstones) == 1
+    assert (tombstones[0] / "phases" / "preparation" / "crash-secret.bin").read_bytes() == b""
+    assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        real_wipe,
+    )
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert not options.output_dir.exists()
+    assert list(tmp_path.glob(".nerb-cleanup-*")) == tombstones
+    assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+
+def test_crash_recovery_rewipes_retained_tombstone_without_overstating_durable_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    source_info = source.stat()
+    source_identity = int(source_info.st_dev), int(source_info.st_ino)
+    restored_payload = b"private bytes restored after inventory cleanup returned"
+    real_wipe = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory_with_inventory
+    retained_payload: Path | None = None
+
+    def wipe_then_restore(*args: Any, **kwargs: Any) -> tuple[bool, bool, int]:
+        nonlocal retained_payload
+        result = real_wipe(*args, **kwargs)
+        if kwargs["quarantine"] is True and retained_payload is None:
+            assert result == (True, False, 1)
+            complete_name = cast(str, kwargs["complete_quarantine_name"])
+            retained_payload = cast(Path, args[2]) / complete_name / "phases" / "preparation" / source.name
+            cleaned = retained_payload.stat()
+            assert (int(cleaned.st_dev), int(cleaned.st_ino)) == source_identity
+            assert retained_payload.read_bytes() == b""
+            retained_payload.write_bytes(restored_payload)
+            retained_payload.chmod(0o600)
+            restored = retained_payload.stat()
+            assert (int(restored.st_dev), int(restored.st_ino)) == source_identity
+        return result
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        wipe_then_restore,
+    )
+    enron_capacity._recover_worker_inflight(options)
+
+    assert retained_payload is not None
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert retained_payload.read_bytes() == b""
+    retained_info = retained_payload.stat()
+    assert (int(retained_info.st_dev), int(retained_info.st_ino)) == source_identity
+    assert not options.output_dir.exists()
+    assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+
+def test_crash_recovery_missing_commit_marker_persists_incomplete_cleanup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    (options.output_dir / "COMMITTED").unlink()
+    real_wipe = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory_with_inventory
+    interrupted = False
+
+    def wipe_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        result = real_wipe(*args, **kwargs)
+        if kwargs["quarantine"] is True and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("inspect the persisted incomplete verdict")
+        return result
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        wipe_then_interrupt,
+    )
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert raised.value.code == "production_worker_failed"
+    assert interrupted is True
+    intent = json.loads(next(options.attempt_ledger_dir.glob("*.cleanup-intent-*.json")).read_text(encoding="utf-8"))
+    tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
+    tombstone_hash = f"sha256:{hashlib.sha256(tombstone.name.encode('ascii')).hexdigest()}"
+    assert tombstone_hash == intent["incomplete_tombstone_name_sha256"]
+    assert tombstone_hash != intent["complete_tombstone_name_sha256"]
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        real_wipe,
+    )
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+
+
+def test_crash_recovery_does_not_discard_incomplete_inventory_verdict_when_unknown_file_moves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    unknown = options.output_dir / "unknown-private.bin"
+    unknown.write_bytes(b"unregistered private bytes")
+    unknown.chmod(0o600)
+    parked = tmp_path / "parked-unknown-private.bin"
+    original_wipe = enron_capacity._private_io._wipe_authenticated_cleanup_descriptor
+    moved = False
+
+    def move_unknown_then_wipe(identity: tuple[int, int], descriptor: int) -> bool:
+        nonlocal moved
+        if not moved:
+            moved = True
+            active = next(tmp_path.glob(".nerb-cleanup-*"))
+            (active / unknown.name).replace(parked)
+        return original_wipe(identity, descriptor)
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_authenticated_cleanup_descriptor",
+        move_unknown_then_wipe,
+    )
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert moved is True
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert parked.read_bytes() == b"unregistered private bytes"
+
+
+def test_crash_recovery_does_not_overstate_wiping_when_a_late_private_file_escapes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    parked = tmp_path / "escaped-late-private.bin"
+    payload = b"late unregistered private bytes"
+    original_wipe = enron_capacity._private_io._wipe_authenticated_cleanup_descriptor
+    escaped = False
+
+    def escape_late_file_then_wipe(identity: tuple[int, int], descriptor: int) -> bool:
+        nonlocal escaped
+        if not escaped:
+            late = next(tmp_path.glob(".nerb-cleanup-*")) / "late-private.bin"
+            late.write_bytes(payload)
+            late.chmod(0o600)
+            late.replace(parked)
+            escaped = True
+        return original_wipe(identity, descriptor)
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_authenticated_cleanup_descriptor",
+        escape_late_file_then_wipe,
+    )
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert escaped is True
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert parked.read_bytes() == payload
+
+
+def test_crash_recovery_rechecks_inventory_inside_the_destructive_clear_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    parked = tmp_path / "escaped-at-clear-boundary.bin"
+    payload = b"private bytes inserted at the destructive boundary"
+    real_clear = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory
+    escaped = False
+
+    def escape_then_clear(*args: Any, **kwargs: Any) -> tuple[bool, bool, int]:
+        nonlocal escaped
+        entry_name = cast(str, args[3])
+        if not escaped and kwargs.get("quarantine") is False and entry_name.startswith(".nerb-cleanup-"):
+            late = cast(Path, args[2]) / entry_name / "late-boundary-private.bin"
+            late.write_bytes(payload)
+            late.chmod(0o600)
+            late.replace(parked)
+            escaped = True
+        return real_clear(*args, **kwargs)
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory",
+        escape_then_clear,
+    )
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert escaped is True
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert parked.read_bytes() == payload
+
+
+def test_crash_recovery_rechecks_empty_state_inside_complete_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    parked = tmp_path / "escaped-at-complete-publication.bin"
+    payload = b"private bytes inserted before complete publication"
+    real_promote = enron_capacity._private_io._promote_completed_cleanup_tombstone
+    escaped = False
+
+    def escape_then_promote(*args: Any, **kwargs: Any) -> bool:
+        nonlocal escaped
+        if not escaped:
+            late = cast(Path, args[2]) / cast(str, args[3]) / "late-complete-private.bin"
+            late.write_bytes(payload)
+            late.chmod(0o600)
+            late.replace(parked)
+            escaped = True
+        return real_promote(*args, **kwargs)
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_promote_completed_cleanup_tombstone",
+        escape_then_promote,
+    )
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert escaped is True
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert parked.read_bytes() == payload
+
+
+def test_recovery_tombstone_discovery_streams_and_bounds_the_output_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    complete_name = f".nerb-cleanup-{'a' * 48}"
+    incomplete_name = f".nerb-cleanup-{'b' * 48}"
+    intent = {
+        "complete_tombstone_name_sha256": enron_capacity._hash_bytes(complete_name.encode("ascii")),  # noqa: SLF001
+        "incomplete_tombstone_name_sha256": enron_capacity._hash_bytes(  # noqa: SLF001
+            incomplete_name.encode("ascii")
+        ),
+    }
+    (tmp_path / "unrelated").write_bytes(b"")
+    (tmp_path / complete_name).mkdir(mode=0o700)
+    monkeypatch.setattr(enron_capacity, "MAX_RECOVERY_OUTPUT_PARENT_ENTRIES", 2)
+    descriptor = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        assert enron_capacity._recovery_tombstone_names(descriptor, intent) == (  # noqa: SLF001
+            complete_name,
+            None,
+            True,
+            (),
+        )
+        (tmp_path / "third").write_bytes(b"")
+        assert enron_capacity._recovery_tombstone_names(descriptor, intent)[2] is False  # noqa: SLF001
+    finally:
+        os.close(descriptor)
+
+
+def test_crash_recovery_rejects_relabeling_an_incomplete_committed_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    parked = tmp_path / "escaped-before-cleanup.bin"
+    escaped = source.read_bytes()
+    source.replace(parked)
+    real_wipe = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory_with_inventory
+    interrupted = False
+
+    def wipe_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        result = real_wipe(*args, **kwargs)
+        if kwargs["quarantine"] is True and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("inspect the incomplete tombstone")
+        return result
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        wipe_then_interrupt,
+    )
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._recover_worker_inflight(options)
+    original_tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
+    relabeled_tombstone = tmp_path / f".nerb-cleanup-{secrets.token_hex(24)}"
+    original_tombstone.rename(relabeled_tombstone)
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        real_wipe,
+    )
+
+    with pytest.raises(EnronCapacityError) as rejected:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert rejected.value.code == "production_worker_failed"
+    assert parked.read_bytes() == escaped
+    assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+    assert list(options.attempt_ledger_dir.glob("*.cleanup-intent-*.json"))
+    relabeled_tombstone.rename(original_tombstone)
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert parked.read_bytes() == escaped
+
+
+def test_crash_recovery_does_not_trust_an_incomplete_tombstone_relabeled_to_the_committed_complete_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    parked = tmp_path / "escaped-before-committed-relabel.bin"
+    escaped = source.read_bytes()
+    source.replace(parked)
+    real_wipe = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory_with_inventory
+    complete_name: str | None = None
+
+    def wipe_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal complete_name
+        complete_name = cast(str, kwargs["complete_quarantine_name"])
+        real_wipe(*args, **kwargs)
+        raise KeyboardInterrupt("relabel the incomplete inode to its committed complete name")
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        wipe_then_interrupt,
+    )
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._recover_worker_inflight(options)
+    assert complete_name is not None
+    incomplete = next(tmp_path.glob(".nerb-cleanup-*"))
+    complete = tmp_path / complete_name
+    incomplete.rename(complete)
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        real_wipe,
+    )
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert parked.read_bytes() == escaped
+    assert complete.is_dir()
+
+
+def test_crash_recovery_cannot_upgrade_an_incomplete_tombstone_relabeled_as_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    parked = tmp_path / "escaped-before-relabel.bin"
+    original = source.read_bytes()
+    source.replace(parked)
+    real_wipe = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory_with_inventory
+    interrupted = False
+
+    def wipe_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        result = real_wipe(*args, **kwargs)
+        if kwargs["quarantine"] is True and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("relabel the persisted incomplete tombstone")
+        return result
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        wipe_then_interrupt,
+    )
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._recover_worker_inflight(options)
+    incomplete_tombstone = next(tmp_path.glob(".nerb-cleanup-*"))
+    incomplete_tombstone.rename(options.output_dir)
+    restored = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    parked.replace(restored)
+    restored.chmod(0o600)
+    commit_marker = options.output_dir / "COMMITTED"
+    commit_marker.write_bytes(enron_capacity._COMMIT_PAYLOAD)
+    commit_marker.chmod(0o600)
+    restored_fd = os.open(restored, os.O_RDONLY)
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        real_wipe,
+    )
+
+    try:
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert os.pread(restored_fd, len(original), 0) == b""
+        assert not options.output_dir.exists()
+        assert len(list(tmp_path.glob(".nerb-cleanup-*"))) == 1
+    finally:
+        os.close(restored_fd)
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_crash_recovery_rotates_an_intent_left_before_cleanup_without_overstating_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_error: type[BaseException],
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    original = secret.read_bytes()
+    real_install = enron_capacity._install_cleanup_intent_locked
+    interrupted = False
+
+    def install_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        result = real_install(*args, **kwargs)
+        if not interrupted:
+            interrupted = True
+            raise control_error("injected post-intent pre-cleanup control")
+        return result
+
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", install_then_interrupt)
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert raised.value.code == "production_worker_failed"
+    assert interrupted is True
+    assert secret.read_bytes() == original
+    assert options.output_dir.is_dir()
+    assert not list(tmp_path.glob(".nerb-cleanup-*"))
+    assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.cleanup-intent-*.json"))
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", real_install)
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert not options.output_dir.exists()
+    assert len(list(tmp_path.glob(".nerb-cleanup-*"))) == 1
+    assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_crash_after_pessimistic_quarantine_preserves_incomplete_evidence_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_error: type[BaseException],
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    relative_source = source.relative_to(options.output_dir)
+    original = source.read_bytes()
+    real_quarantine = enron_capacity._private_io._pessimistically_quarantine_pinned_private_directory
+    interrupted = False
+
+    def quarantine_then_interrupt(*args: Any, **kwargs: Any) -> Path:
+        nonlocal interrupted
+        result = real_quarantine(*args, **kwargs)
+        if not interrupted:
+            interrupted = True
+            raise control_error("injected post-pessimistic-quarantine control")
+        return result
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_pessimistically_quarantine_pinned_private_directory",
+        quarantine_then_interrupt,
+    )
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert raised.value.code == "production_worker_failed"
+    assert interrupted is True
+    assert not options.output_dir.exists()
+    tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+    assert len(tombstones) == 1
+    assert (tombstones[0] / relative_source).read_bytes() == original
+    intent = json.loads(next(options.attempt_ledger_dir.glob("*.cleanup-intent-*.json")).read_text(encoding="utf-8"))
+    tombstone_hash = enron_capacity._hash_bytes(tombstones[0].name.encode("ascii"))  # noqa: SLF001
+    assert tombstone_hash == intent["incomplete_tombstone_name_sha256"]
+    assert tombstone_hash != intent["complete_tombstone_name_sha256"]
+    assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_pessimistically_quarantine_pinned_private_directory",
+        real_quarantine,
+    )
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["path_tree_removed"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert (tombstones[0] / relative_source).read_bytes() == b""
+    assert list(tmp_path.glob(".nerb-cleanup-*")) == tombstones
+    assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+
+@pytest.mark.parametrize("mutation", ["missing_predecessor", "broken_link", "duplicate_generation"])
+def test_crash_recovery_rejects_a_corrupted_cleanup_intent_chain_before_wiping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    original = secret.read_bytes()
+    real_install = enron_capacity._install_cleanup_intent_locked
+
+    def install_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        real_install(*args, **kwargs)
+        raise KeyboardInterrupt("leave the next immutable cleanup-intent generation")
+
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", install_then_interrupt)
+    for _ in range(2):
+        with pytest.raises(EnronCapacityError) as interrupted:
+            enron_capacity._recover_worker_inflight(options)
+        assert interrupted.value.code == "production_worker_failed"
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", real_install)
+
+    intent_paths = list(options.attempt_ledger_dir.glob(".attempt-inflight-*.cleanup-intent-*.json"))
+    intents = {json.loads(path.read_text(encoding="utf-8"))["generation"]: path for path in intent_paths}
+    assert set(intents) == {1, 2}
+    if mutation == "missing_predecessor":
+        intents[1].unlink()
+    else:
+        latest = json.loads(intents[2].read_text(encoding="utf-8"))
+        if mutation == "broken_link":
+            latest["previous_intent_sha256"] = enron_capacity._hash_bytes(b"forged predecessor")  # noqa: SLF001
+        else:
+            latest["generation"] = 1
+            latest["previous_intent_sha256"] = None
+        latest["intent_sha256"] = enron_capacity._canonical_hash(  # noqa: SLF001
+            {key: value for key, value in latest.items() if key != "intent_sha256"}
+        )
+        intents[2].write_bytes(enron_capacity._pretty_json_bytes(latest))  # noqa: SLF001
+
+    with pytest.raises(EnronCapacityError) as rejected:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert rejected.value.code == "production_worker_failed"
+    assert secret.read_bytes() == original
+    assert options.output_dir.is_dir()
+    assert not list(tmp_path.glob(".nerb-cleanup-*"))
+    assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+    assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+
+def test_crash_recovery_terminalizes_a_receipt_after_newest_intent_removal_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    real_install = enron_capacity._install_cleanup_intent_locked
+    intent_published = False
+
+    def install_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal intent_published
+        result = real_install(*args, **kwargs)
+        if not intent_published:
+            intent_published = True
+            raise KeyboardInterrupt("leave generation one before cleanup")
+        return result
+
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", install_then_interrupt)
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._recover_worker_inflight(options)
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", real_install)
+    real_remove = enron_capacity._wipe_and_quarantine_private_file_at
+    newest_removed = False
+
+    def remove_then_interrupt(
+        directory_fd: int,
+        name: str,
+        descriptor: int,
+        expected_identity: tuple[int, int],
+    ) -> str:
+        nonlocal newest_removed
+        result = real_remove(directory_fd, name, descriptor, expected_identity)
+        if "cleanup-intent-" in name and not newest_removed:
+            newest_removed = True
+            raise KeyboardInterrupt("interrupt after newest intent removal")
+        return result
+
+    monkeypatch.setattr(enron_capacity, "_wipe_and_quarantine_private_file_at", remove_then_interrupt)
+    with pytest.raises(EnronCapacityError) as interrupted:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert interrupted.value.code == "production_worker_failed"
+    assert newest_removed is True
+    assert len(list(options.attempt_ledger_dir.glob(".attempt-inflight-*.cleanup-intent-*.json"))) == 1
+    assert len(list(options.attempt_ledger_dir.glob("attempt-*.json"))) == 1
+    assert len(list(tmp_path.glob(".nerb-cleanup-*"))) == 1
+    monkeypatch.setattr(enron_capacity, "_wipe_and_quarantine_private_file_at", real_remove)
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+
+@pytest.mark.parametrize("kind", ["cleanup_intent", "cleanup_inventory", "stage_binding", "marker"])
+def test_crash_recovery_terminalizes_after_an_inflight_removal_temp_is_truncated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    real_install = enron_capacity._install_cleanup_intent_locked
+    intent_published = False
+
+    def install_then_interrupt(*args: Any, **kwargs: Any) -> Any:
+        nonlocal intent_published
+        result = real_install(*args, **kwargs)
+        if not intent_published:
+            intent_published = True
+            raise KeyboardInterrupt("leave generation one before cleanup")
+        return result
+
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", install_then_interrupt)
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._recover_worker_inflight(options)
+    monkeypatch.setattr(enron_capacity, "_install_cleanup_intent_locked", real_install)
+    real_remove = enron_capacity._wipe_and_quarantine_private_file_at
+    interrupted = False
+    temp_patterns = {
+        "cleanup_intent": enron_capacity._CLEANUP_INTENT_TEMP_RE,
+        "cleanup_inventory": enron_capacity._CLEANUP_INVENTORY_TEMP_RE,
+        "stage_binding": enron_capacity._STAGE_BINDING_TEMP_RE,
+        "marker": enron_capacity._INFLIGHT_TEMP_RE,
+    }
+
+    def truncate_temp_then_interrupt(
+        directory_fd: int,
+        name: str,
+        descriptor: int,
+        expected_identity: tuple[int, int],
+    ) -> str:
+        nonlocal interrupted
+        if not interrupted and temp_patterns[kind].fullmatch(name) is not None:
+            assert (os.fstat(descriptor).st_dev, os.fstat(descriptor).st_ino) == expected_identity
+            os.ftruncate(descriptor, 0)
+            os.fsync(descriptor)
+            interrupted = True
+            raise KeyboardInterrupt("interrupt after removal staging and truncation")
+        return real_remove(directory_fd, name, descriptor, expected_identity)
+
+    monkeypatch.setattr(enron_capacity, "_wipe_and_quarantine_private_file_at", truncate_temp_then_interrupt)
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._recover_worker_inflight(options)
+
+    assert raised.value.code == "production_worker_failed"
+    assert interrupted is True
+    assert len(list(options.attempt_ledger_dir.glob("attempt-*.json"))) == 1
+    matching_temps = [
+        path for path in options.attempt_ledger_dir.iterdir() if temp_patterns[kind].fullmatch(path.name) is not None
+    ]
+    assert len(matching_temps) == 1
+    assert matching_temps[0].read_bytes() == b""
+    monkeypatch.setattr(enron_capacity, "_wipe_and_quarantine_private_file_at", real_remove)
+
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert receipt["retained_private_tombstone_count"] == 1
+    assert not [path for path in options.attempt_ledger_dir.iterdir() if path.name.startswith(".attempt-inflight")]
+
+
+def test_crash_recovery_reserves_ledger_tombstone_headroom_before_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    for index in range(2):
+        tombstone = options.attempt_ledger_dir / f".nerb-cleanup-{index:048x}"
+        tombstone.write_bytes(b"")
+        tombstone.chmod(0o600)
+    real_limit = enron_capacity.MAX_LEDGER_TOMBSTONES
+    monkeypatch.setattr(enron_capacity, "MAX_LEDGER_TOMBSTONES", 5)
+
+    for _ in range(2):
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert len(list(options.attempt_ledger_dir.glob(".nerb-cleanup-*"))) == 2
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+    monkeypatch.setattr(enron_capacity, "MAX_LEDGER_TOMBSTONES", real_limit)
+    enron_capacity._recover_worker_inflight(options)
+
+    receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+    assert receipt["sensitive_content_wiped"] is False
+    assert len(list(options.attempt_ledger_dir.glob(".nerb-cleanup-*"))) == 6
+    assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+
+def test_crash_recovery_preserves_a_committed_name_collision_and_downgrades_after_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    assert os.pread(secret_fd, 1, 0)
+    output_info = options.output_dir.stat()
+    output_identity = int(output_info.st_dev), int(output_info.st_ino)
+    real_wipe = enron_capacity._private_io._wipe_and_quarantine_pinned_private_directory_with_inventory
+    collision: Path | None = None
+
+    def collide_then_wipe(*args: Any, **kwargs: Any) -> Any:
+        nonlocal collision
+        if collision is None:
+            collision = tmp_path / cast(str, kwargs["complete_quarantine_name"])
+            collision.mkdir(mode=0o700)
+            sentinel = collision / "preserve.bin"
+            sentinel.write_bytes(b"unrelated")
+            sentinel.chmod(0o600)
+        return real_wipe(*args, **kwargs)
+
+    monkeypatch.setattr(
+        enron_capacity._private_io,
+        "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+        collide_then_wipe,
+    )
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert collision is not None
+        assert (collision / "preserve.bin").read_bytes() == b"unrelated"
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert not options.output_dir.exists()
+        bound_tombstones = [
+            path
+            for path in tmp_path.glob(".nerb-cleanup-*")
+            if (path.stat().st_dev, path.stat().st_ino) == output_identity
+        ]
+        assert len(bound_tombstones) == 1
+        assert all(path.is_dir() or path.read_bytes() == b"" for path in bound_tombstones[0].rglob("*"))
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        (collision / "preserve.bin").unlink()
+        collision.rmdir()
+        monkeypatch.setattr(
+            enron_capacity._private_io,
+            "_wipe_and_quarantine_pinned_private_directory_with_inventory",
+            real_wipe,
+        )
+
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert not options.output_dir.exists()
+    finally:
+        os.close(secret_fd)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Descriptor-bound inaccessible-mode repair uses Linux O_PATH."
+)
+def test_linux_crash_recovery_wipes_inaccessible_bound_output_before_rejecting_mode_drift(tmp_path: Path) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    assert os.pread(secret_fd, 1, 0)
+    options.output_dir.chmod(0o077)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert not options.output_dir.exists()
+        tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+        assert len(tombstones) == 1
+        assert stat.S_IMODE(tombstones[0].stat().st_mode) == 0o700
+        assert (tombstones[0] / "phases" / "preparation" / "crash-secret.bin").read_bytes() == b""
+
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["path_tree_removed"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert not options.output_dir.exists()
+        assert list(tmp_path.glob(".nerb-cleanup-*")) == tombstones
+    finally:
+        os.close(secret_fd)
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("linux"), reason="Linux supplies descriptor-bound inaccessible-mode repair."
+)
+def test_inaccessible_bound_output_recovery_fails_without_name_based_mutation(tmp_path: Path) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    expected = os.pread(secret_fd, 1024, 0)
+    output_info = options.output_dir.stat()
+    output_identity = int(output_info.st_dev), int(output_info.st_ino)
+    options.output_dir.chmod(0o077)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert os.pread(secret_fd, 1024, 0) == expected
+        assert (options.output_dir.stat().st_dev, options.output_dir.stat().st_ino) == output_identity
+        assert stat.S_IMODE(options.output_dir.stat().st_mode) == 0o077
+        assert not list(tmp_path.glob(".nerb-cleanup-*"))
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        options.output_dir.chmod(0o700)
+        os.close(secret_fd)
+
+
+def test_inaccessible_bound_output_substitution_before_repair_mutates_neither_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    expected = os.pread(secret_fd, 1024, 0)
+    options.output_dir.chmod(0o077)
+    parked = tmp_path / "parked-before-repair"
+    real_repair = enron_capacity._repair_and_open_owned_recovery_directory_descriptor
+    substituted = False
+    sentinel_identity: tuple[int, int] | None = None
+
+    def substitute_then_repair(*args: Any, **kwargs: Any) -> Any:
+        nonlocal sentinel_identity, substituted
+        if not substituted:
+            options.output_dir.rename(parked)
+            options.output_dir.mkdir(mode=0o700)
+            sentinel = options.output_dir / "preserve.bin"
+            sentinel.write_bytes(b"unrelated")
+            sentinel.chmod(0o600)
+            info = sentinel.stat()
+            sentinel_identity = int(info.st_dev), int(info.st_ino)
+            substituted = True
+        return real_repair(*args, **kwargs)
+
+    monkeypatch.setattr(
+        enron_capacity,
+        "_repair_and_open_owned_recovery_directory_descriptor",
+        substitute_then_repair,
+    )
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        sentinel = options.output_dir / "preserve.bin"
+        assert raised.value.code == "production_worker_failed"
+        assert substituted is True
+        assert os.pread(secret_fd, 1024, 0) == expected
+        assert stat.S_IMODE(parked.stat().st_mode) == 0o077
+        assert sentinel.read_bytes() == b"unrelated"
+        assert (sentinel.stat().st_dev, sentinel.stat().st_ino) == sentinel_identity
+        assert stat.S_IMODE(sentinel.stat().st_mode) == 0o600
+        assert stat.S_IMODE(options.output_dir.stat().st_mode) == 0o700
+        assert not list(tmp_path.glob(".nerb-cleanup-*"))
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        parked.chmod(0o700)
+        os.close(secret_fd)
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Descriptor-bound inaccessible-mode repair uses Linux O_PATH."
+)
+def test_linux_crash_recovery_wipes_repaired_bound_inode_after_name_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    assert os.pread(secret_fd, 1, 0)
+    options.output_dir.chmod(0o077)
+    moved = tmp_path / "moved-repaired-bound-output"
+    real_repair = enron_capacity._native_engine._repair_and_open_directory_fd_once
+    swapped = False
+    sentinel_identity: tuple[int, int] | None = None
+
+    def repair_then_swap(*args: Any) -> int:
+        nonlocal sentinel_identity, swapped
+        result = real_repair(*args)
+        if result == 0 and not swapped:
+            options.output_dir.rename(moved)
+            options.output_dir.mkdir(mode=0o700)
+            sentinel = options.output_dir / "preserve.bin"
+            sentinel.write_bytes(b"unrelated")
+            sentinel.chmod(0o600)
+            info = sentinel.stat()
+            sentinel_identity = int(info.st_dev), int(info.st_ino)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(enron_capacity._native_engine, "_repair_and_open_directory_fd_once", repair_then_swap)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        sentinel = options.output_dir / "preserve.bin"
+        assert raised.value.code == "production_worker_failed"
+        assert swapped is True
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert (moved / "phases" / "preparation" / "crash-secret.bin").read_bytes() == b""
+        assert sentinel.read_bytes() == b"unrelated"
+        assert (sentinel.stat().st_dev, sentinel.stat().st_ino) == sentinel_identity
+        assert stat.S_IMODE(sentinel.stat().st_mode) == 0o600
+        assert stat.S_IMODE(options.output_dir.stat().st_mode) == 0o700
+        assert not list(tmp_path.glob(".nerb-cleanup-*"))
+    finally:
+        os.close(secret_fd)
+
+
+def test_crash_recovery_wipes_bound_output_before_rejecting_unrelated_stage_sibling(tmp_path: Path) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    assert os.pread(secret_fd, 1, 0)
+    marker = next(
+        path
+        for path in options.attempt_ledger_dir.glob(".attempt-inflight-*.json")
+        if not path.name.endswith((".stage.json", ".cleanup.json"))
+    )
+    record = json.loads(marker.read_text(encoding="utf-8"))
+    unrelated_stage = tmp_path / f".{options.output_dir.name}.stage-{record['stage_token']}"
+    unrelated_stage.mkdir(mode=0o700)
+    sentinel = unrelated_stage / "preserve.bin"
+    sentinel.write_bytes(b"unrelated")
+    sentinel.chmod(0o600)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert sentinel.read_bytes() == b"unrelated"
+        assert not options.output_dir.exists()
+        tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+        assert len(tombstones) == 1
+        assert (tombstones[0] / "phases" / "preparation" / "crash-secret.bin").read_bytes() == b""
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+        sentinel.unlink()
+        unrelated_stage.rmdir()
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["path_tree_removed"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert not options.output_dir.exists()
+        assert list(tmp_path.glob(".nerb-cleanup-*")) == tombstones
+        assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        os.close(secret_fd)
+
+
+def test_crash_recovery_wipes_bound_stage_before_rejecting_unrelated_final_sibling(tmp_path: Path) -> None:
+    process, _ready = _start_crashing_capacity_attempt(tmp_path, name="bound-stage-with-final-sibling")
+    process.kill()
+    process.wait(timeout=5)
+    options = _options(tmp_path, "bound-stage-with-final-sibling")
+    stage = next(tmp_path.glob(f".{options.output_dir.name}.stage-*"))
+    secret = stage / "private.bin"
+    secret.write_bytes(b"private")
+    secret.chmod(0o600)
+    secret_fd = os.open(secret, os.O_RDONLY)
+    options.output_dir.mkdir(mode=0o700)
+    sentinel = options.output_dir / "preserve.bin"
+    sentinel.write_bytes(b"unrelated")
+    sentinel.chmod(0o600)
+    sentinel_identity = sentinel.stat().st_dev, sentinel.stat().st_ino
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+        assert raised.value.code == "production_worker_failed"
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert sentinel.read_bytes() == b"unrelated"
+        assert (sentinel.stat().st_dev, sentinel.stat().st_ino) == sentinel_identity
+        assert stat.S_IMODE(sentinel.stat().st_mode) == 0o600
+        assert not stage.exists()
+        tombstones = list(tmp_path.glob(".nerb-cleanup-*"))
+        assert len(tombstones) == 1
+        assert (tombstones[0] / "private.bin").read_bytes() == b""
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+
+        sentinel.unlink()
+        options.output_dir.rmdir()
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["path_tree_removed"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert not stage.exists()
+        assert list(tmp_path.glob(".nerb-cleanup-*")) == tombstones
+        assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        os.close(secret_fd)
+
+
+def test_crash_recovery_wipes_arbitrarily_renamed_bound_root_and_retains_binding(tmp_path: Path) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(source, os.O_RDONLY)
+    parked = tmp_path / "parked-bound-output"
+    options.output_dir.rename(parked)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+
+        assert raised.value.code == "production_worker_failed"
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert parked.is_dir()
+        parked_fd = os.open(parked, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            assert enron_capacity._logical_tree_bytes(parked_fd, depth=0, entries=[0]) == 0  # noqa: SLF001
+        finally:
+            os.close(parked_fd)
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.stage.json"))
+    finally:
+        os.close(secret_fd)
+
+
+@pytest.mark.parametrize("retain_inventory", [False, True], ids=["without-inventory", "with-inventory"])
+def test_crash_recovery_terminalizes_an_uncommitted_valid_tombstone_without_installing_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retain_inventory: bool,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    relative_source = source.relative_to(options.output_dir)
+    secret_fd = os.open(source, os.O_RDONLY)
+    root_info = options.output_dir.stat()
+    tombstone = tmp_path / f".nerb-cleanup-{secrets.token_hex(24)}"
+    options.output_dir.rename(tombstone)
+    inventory_paths = list(options.attempt_ledger_dir.glob(".attempt-inflight-*.cleanup.json"))
+    assert len(inventory_paths) == 1
+    if not retain_inventory:
+        inventory_paths[0].unlink()
+    monkeypatch.setattr(
+        enron_capacity,
+        "_install_cleanup_intent_locked",
+        lambda *_args, **_kwargs: pytest.fail("an already valid tombstone must not install cleanup intent"),
+    )
+
+    try:
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["sensitive_content_wiped"] is False
+        assert receipt["path_tree_removed"] is False
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert (receipt["promoted_root_device"], receipt["promoted_root_inode"]) == (
+            root_info.st_dev,
+            root_info.st_ino,
+        )
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert (tombstone / relative_source).read_bytes() == b""
+        assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        os.close(secret_fd)
+
+
+def test_recovery_scan_uses_inode_prefilter_for_unrelated_parent_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bound = tmp_path / "bound-under-arbitrary-name"
+    bound.mkdir(mode=0o700)
+    expected = bound.stat().st_dev, bound.stat().st_ino
+    for index in range(128):
+        (tmp_path / f"unrelated-{index:03d}").write_bytes(b"")
+    observed: list[str] = []
+    real_snapshot = enron_capacity._recovery_entry_snapshot_at
+
+    def record_snapshot(parent_fd: int, name: str) -> Any:
+        observed.append(name)
+        return real_snapshot(parent_fd, name)
+
+    monkeypatch.setattr(enron_capacity, "_recovery_entry_snapshot_at", record_snapshot)
+    descriptor = os.open(tmp_path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        _complete, _incomplete, scan_valid, bound_names = enron_capacity._recovery_tombstone_names(  # noqa: SLF001
+            descriptor,
+            None,
+            expected,
+            canonical_names=("missing-stage", "missing-final"),
+        )
+    finally:
+        os.close(descriptor)
+
+    assert scan_valid is True
+    assert bound_names == (bound.name,)
+    assert observed == [bound.name]
+
+
+def test_crash_recovery_fails_closed_when_bound_inode_has_left_the_recorded_parent(tmp_path: Path) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    source = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    expected = source.read_bytes()
+    outside_parent = tmp_path.parent / f"{tmp_path.name}-outside-{secrets.token_hex(8)}"
+    outside_parent.mkdir(mode=0o700)
+    parked = outside_parent / "parked-bound-root"
+    options.output_dir.rename(parked)
+
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+
+        assert raised.value.code == "production_worker_failed"
+        assert (parked / source.relative_to(options.output_dir)).read_bytes() == expected
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.stage.json"))
+    finally:
+        parked.rename(options.output_dir)
+        outside_parent.rmdir()
+
+
+def test_parent_witness_change_wipes_bound_root_before_recovery_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    secret_fd = os.open(secret, os.O_RDONLY)
+    root_info = options.output_dir.stat()
+    expected = root_info.st_dev, root_info.st_ino
+    witness_entry = tmp_path / "parent-witness-mutated"
+    real_snapshot = enron_capacity._recovery_entry_snapshot_at
+    mutated = False
+
+    def mutate_parent_after_bound_snapshot(parent_fd: int, name: str) -> Any:
+        nonlocal mutated
+        snapshot = real_snapshot(parent_fd, name)
+        if not mutated and snapshot is not None and snapshot.identity == expected:
+            witness_entry.write_bytes(b"")
+            mutated = True
+        return snapshot
+
+    monkeypatch.setattr(enron_capacity, "_recovery_entry_snapshot_at", mutate_parent_after_bound_snapshot)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+
+        assert raised.value.code == "production_worker_failed"
+        assert mutated is True
+        assert os.pread(secret_fd, 1, 0) == b""
+        assert not list(options.attempt_ledger_dir.glob("attempt-*.json"))
+        assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.stage.json"))
+    finally:
+        os.close(secret_fd)
+
+
+def test_existing_failed_receipt_rewipes_repopulated_bound_tombstone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    real_remove = enron_capacity._remove_inflight_files_locked
+    interrupted = False
+
+    def interrupt_before_sidecar_removal(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("leave the durable receipt with its binding")
+        real_remove(*_args, **_kwargs)
+
+    monkeypatch.setattr(enron_capacity, "_remove_inflight_files_locked", interrupt_before_sidecar_removal)
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._recover_worker_inflight(options)
+    receipt_path = next(options.attempt_ledger_dir.glob("attempt-*.json"))
+    original_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    expected = original_receipt["promoted_root_device"], original_receipt["promoted_root_inode"]
+    tombstone = next(
+        path for path in tmp_path.glob(".nerb-cleanup-*") if (path.stat().st_dev, path.stat().st_ino) == expected
+    )
+    repopulated = tombstone / "repopulated-private.bin"
+    repopulated.write_bytes(b"private bytes after durable receipt")
+    repopulated.chmod(0o600)
+    repopulated_fd = os.open(repopulated, os.O_RDONLY)
+    monkeypatch.setattr(enron_capacity, "_remove_inflight_files_locked", real_remove)
+
+    try:
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt == original_receipt
+        assert os.pread(repopulated_fd, 1, 0) == b""
+        assert repopulated.read_bytes() == b""
+        assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        os.close(repopulated_fd)
+
+
+def test_failed_receipt_identity_survives_binding_retirement_and_rewipes_on_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    real_retire = enron_capacity._retire_inflight_file_at
+    binding_retired = False
+
+    def retire_binding_then_interrupt(*args: Any, **kwargs: Any) -> None:
+        nonlocal binding_retired
+        real_retire(*args, **kwargs)
+        if kwargs["kind"] == "stage_binding" and not binding_retired:
+            binding_retired = True
+            raise KeyboardInterrupt("crash after binding retirement and before marker retirement")
+
+    monkeypatch.setattr(enron_capacity, "_retire_inflight_file_at", retire_binding_then_interrupt)
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._recover_worker_inflight(options)
+    assert binding_retired is True
+    assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.stage.json"))
+    assert list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    receipt_path = next(options.attempt_ledger_dir.glob("attempt-*.json"))
+    original_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    expected = original_receipt["promoted_root_device"], original_receipt["promoted_root_inode"]
+    assert all(type(value) is int for value in expected)
+    tombstone = next(
+        path for path in tmp_path.glob(".nerb-cleanup-*") if (path.stat().st_dev, path.stat().st_ino) == expected
+    )
+    repopulated = tombstone / "post-binding-retirement-private.bin"
+    repopulated.write_bytes(b"private bytes after binding retirement")
+    repopulated.chmod(0o600)
+    repopulated_fd = os.open(repopulated, os.O_RDONLY)
+    monkeypatch.setattr(enron_capacity, "_retire_inflight_file_at", real_retire)
+
+    try:
+        enron_capacity._recover_worker_inflight(options)
+
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt == original_receipt
+        assert os.pread(repopulated_fd, 1, 0) == b""
+        assert repopulated.read_bytes() == b""
+        assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        os.close(repopulated_fd)
+
+
+def test_recovered_failed_receipt_is_reverified_immediately_and_before_marker_retirement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    real_verify = enron_capacity._verify_recovered_failed_output_absent
+    verification_count = 0
+    injected_fd: int | None = None
+
+    def verify_and_repopulate_between_boundaries(*args: Any, **kwargs: Any) -> None:
+        nonlocal injected_fd, verification_count
+        real_verify(*args, **kwargs)
+        verification_count += 1
+        if verification_count == 1:
+            receipt = cast(dict[str, Any], args[3])
+            parent = args[1].path
+            expected = receipt["promoted_root_device"], receipt["promoted_root_inode"]
+            tombstone = next(
+                path for path in parent.glob(".nerb-cleanup-*") if (path.stat().st_dev, path.stat().st_ino) == expected
+            )
+            injected = tombstone / "between-verification-private.bin"
+            injected.write_bytes(b"private bytes between receipt checks")
+            injected.chmod(0o600)
+            injected_fd = os.open(injected, os.O_RDONLY)
+
+    monkeypatch.setattr(
+        enron_capacity,
+        "_verify_recovered_failed_output_absent",
+        verify_and_repopulate_between_boundaries,
+    )
+    try:
+        enron_capacity._recover_worker_inflight(options)
+
+        assert verification_count == 2
+        assert injected_fd is not None
+        assert os.pread(injected_fd, 1, 0) == b""
+        receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
+        assert receipt["retained_private_tombstone_count"] == 1
+        assert not list(options.attempt_ledger_dir.glob(".attempt-inflight-*.json"))
+    finally:
+        if injected_fd is not None:
+            os.close(injected_fd)
+
+
+def test_crash_recovery_opens_authenticated_child_relative_to_pinned_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion_payload")
+    secret = options.output_dir / "phases" / "preparation" / "crash-secret.bin"
+    assert secret.read_bytes()
+    moved_parent = tmp_path.with_name(f"{tmp_path.name}-moved-parent")
+    real_open = enron_capacity._open_owned_directory_descriptor
+    parent_moved = False
+
+    def move_parent_before_child_open(path: str | bytes, *, dir_fd: int | None = None) -> Any:
+        nonlocal parent_moved
+        if not parent_moved and dir_fd is not None and os.fsdecode(path) == options.output_dir.name:
+            tmp_path.rename(moved_parent)
+            tmp_path.mkdir(mode=0o700)
+            parent_moved = True
+        return real_open(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(enron_capacity, "_open_owned_directory_descriptor", move_parent_before_child_open)
+    try:
+        with pytest.raises(EnronCapacityError) as raised:
+            enron_capacity._recover_worker_inflight(options)
+    finally:
+        if parent_moved:
+            tmp_path.rmdir()
+            moved_parent.rename(tmp_path)
+
+    assert parent_moved is True
+    assert raised.value.code == "production_worker_failed"
+    assert secret.read_bytes() == b""
+    assert not list(tmp_path.glob(".nerb-cleanup-*"))
+
+
 def test_crash_after_promotion_before_receipt_removes_bound_output_and_records_one_interruption(tmp_path: Path) -> None:
     _process, options, _ready = _start_terminal_crash_attempt(tmp_path, crash_point="post_promotion")
     assert options.output_dir.is_dir()
@@ -4243,7 +6444,7 @@ def test_crash_after_promotion_before_receipt_removes_bound_output_and_records_o
     assert len(receipts) == 1
     assert receipts[0]["outcome"] == "interrupted"
     assert receipts[0]["recovered_from_inflight"] is True
-    assert receipts[0]["sensitive_content_wiped"] is True
+    assert receipts[0]["sensitive_content_wiped"] is False
     assert receipts[0]["path_tree_removed"] is False
     assert receipts[0]["retained_private_tombstone_count"] == 1
     assert not options.output_dir.exists()
@@ -4283,7 +6484,8 @@ def test_crash_recovery_retained_inventory_fd_wipes_child_moved_after_authentica
         nonlocal moved
         if not moved:
             moved = True
-            source.replace(parked)
+            active = next(tmp_path.glob(".nerb-cleanup-*"))
+            (active / source.relative_to(options.output_dir)).replace(parked)
         return original_wipe(identity, descriptor)
 
     monkeypatch.setattr(
@@ -4296,7 +6498,7 @@ def test_crash_recovery_retained_inventory_fd_wipes_child_moved_after_authentica
     receipt = verify_capacity_attempt_ledger(options.attempt_ledger_dir)[0]
     assert moved is True
     assert receipt["outcome"] == "interrupted"
-    assert receipt["sensitive_content_wiped"] is True
+    assert receipt["sensitive_content_wiped"] is False
     assert parked.read_bytes() == b""
     assert not options.output_dir.exists()
 
@@ -4317,7 +6519,8 @@ def test_crash_recovery_parks_failed_moved_inventory_until_later_recovery(
         nonlocal moved
         if not moved:
             moved = True
-            source.replace(parked)
+            active_stage = next(tmp_path.glob(".nerb-cleanup-*"))
+            (active_stage / source.relative_to(options.output_dir)).replace(parked)
         if fail_wipe:
             return False
         return original_wipe(identity, descriptor)
@@ -4384,7 +6587,7 @@ def test_crash_inventory_helper_return_interruption_keeps_map_owned_authority(
         )
         if name == source.name and not interrupted:
             interrupted = True
-            source.replace(parked)
+            (directory_path / name).replace(parked)
             raise control_error("injected crash inventory helper return interruption")
 
     monkeypatch.setattr(enron_capacity._private_io, "_open_cleanup_descriptor_at", open_then_interrupt)
@@ -4437,7 +6640,7 @@ def test_crash_inventory_line_interruption_after_durable_retention_keeps_global_
             == enron_capacity._private_io._UNRESOLVED_CLEANUP_FDS.get(source_identity)  # noqa: SLF001
         ):
             interrupted = True
-            source.replace(parked)
+            (Path(frame.f_locals["directory_path"]) / source.name).replace(parked)
             raise control_error("injected crash inventory durable-retention line interruption")
         return interrupt_after_durable_retention
 
@@ -5006,6 +7209,278 @@ def test_native_close_commit_retries_control_before_the_syscall_is_entered(
     decision = verify_capacity_run(options.output_dir, options.attempt_ledger_dir, require_production=False)
     assert decision["report"] == completed.report
     assert decision["terminal_attempt"]["outcome"] == "passed"
+
+
+def test_recovery_pinned_directory_keeps_accessible_bound_parent_private_and_pinned(tmp_path: Path) -> None:
+    target = tmp_path / "accessible-recovery-parent"
+    target.mkdir(mode=0o700)
+    info = target.stat()
+    identity = int(info.st_dev), int(info.st_ino)
+    before_descriptors = _process_descriptor_inventory()
+
+    pinned = enron_capacity._PinnedDirectory(  # noqa: SLF001
+        target,
+        recovery_final_identity=identity,
+    )
+    try:
+        assert (pinned.identity.device, pinned.identity.inode) == identity
+        assert stat.S_IMODE(os.fstat(pinned.fd).st_mode) == 0o700
+        pinned.assert_current()
+    finally:
+        pinned.close()
+
+    gc.collect()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert _process_descriptor_inventory() == before_descriptors
+
+
+def test_recovery_pinned_directory_never_repairs_an_inaccessible_intermediate_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    intermediate = tmp_path / "inaccessible-intermediate"
+    target = intermediate / "bound-final-parent"
+    target.mkdir(parents=True, mode=0o700)
+    intermediate.chmod(0o700)
+    info = target.stat()
+    identity = int(info.st_dev), int(info.st_ino)
+    repair_calls = 0
+    fchmod_calls = 0
+    before_descriptors = _process_descriptor_inventory()
+
+    def forbidden_repair(*args: Any, **kwargs: Any) -> Any:
+        nonlocal repair_calls
+        del args, kwargs
+        repair_calls += 1
+        raise AssertionError("an intermediate component must never use recovery repair")
+
+    def forbidden_fchmod(*args: Any, **kwargs: Any) -> Any:
+        nonlocal fchmod_calls
+        del args, kwargs
+        fchmod_calls += 1
+        raise AssertionError("an unauthenticated intermediate component must never be chmodded")
+
+    monkeypatch.setattr(enron_capacity, "_open_owned_recovery_directory_descriptor", forbidden_repair)
+    monkeypatch.setattr(enron_capacity.os, "fchmod", forbidden_fchmod)
+    intermediate.chmod(0o077)
+    try:
+        with pytest.raises(EnronCapacityError):
+            enron_capacity._PinnedDirectory(  # noqa: SLF001
+                target,
+                recovery_final_identity=identity,
+            )
+        assert repair_calls == 0
+        assert fchmod_calls == 0
+        gc.collect()
+        assert _process_descriptor_inventory() == before_descriptors
+    finally:
+        intermediate.chmod(0o700)
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_recovery_parent_mode_restore_interruption_settles_pinned_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_error: type[BaseException],
+) -> None:
+    target = tmp_path / "interrupted-recovery-parent"
+    target.mkdir(mode=0o755)
+    info = target.stat()
+    identity = int(info.st_dev), int(info.st_ino)
+    real_fchmod = enron_capacity.os.fchmod
+    restored_descriptor: int | None = None
+    before_descriptors = _process_descriptor_inventory()
+
+    def restore_then_interrupt(descriptor: int, mode: int) -> None:
+        nonlocal restored_descriptor
+        real_fchmod(descriptor, mode)
+        restored_descriptor = descriptor
+        raise control_error("injected recovery-parent mode-restore control")
+
+    monkeypatch.setattr(enron_capacity.os, "fchmod", restore_then_interrupt)
+    with pytest.raises(EnronCapacityError):
+        enron_capacity._PinnedDirectory(  # noqa: SLF001
+            target,
+            recovery_final_identity=identity,
+        )
+
+    assert restored_descriptor is not None
+    with pytest.raises(OSError) as closed:
+        os.fstat(restored_descriptor)
+    assert closed.value.errno == errno.EBADF
+    gc.collect()
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert _process_descriptor_inventory() == before_descriptors
+
+
+@pytest.mark.skipif(sys.platform.startswith("linux"), reason="Linux supplies descriptor-bound O_PATH repair.")
+def test_inaccessible_recovery_directory_repair_fails_without_name_based_mutation(tmp_path: Path) -> None:
+    target = tmp_path / "inaccessible"
+    target.mkdir(mode=0o700)
+    info = target.stat()
+    identity = int(info.st_dev), int(info.st_ino)
+    target.chmod(0o077)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    try:
+        with pytest.raises(OSError) as raised:
+            enron_capacity._open_owned_recovery_directory_descriptor(  # noqa: SLF001
+                target.name,
+                dir_fd=parent_fd,
+                expected_identity=identity,
+            )
+        assert raised.value.errno in {errno.ENOTSUP, errno.EOPNOTSUPP}
+        assert (target.stat().st_dev, target.stat().st_ino) == identity
+        assert stat.S_IMODE(target.stat().st_mode) == 0o077
+    finally:
+        os.close(parent_fd)
+        target.chmod(0o700)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="The O_PATH repair primitive is Linux-specific.")
+def test_linux_inaccessible_recovery_directory_repair_rejects_substitute_without_mutation(tmp_path: Path) -> None:
+    target = tmp_path / "substitute"
+    target.mkdir(mode=0o700)
+    info = target.stat()
+    target.chmod(0o077)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    before_descriptors = _process_descriptor_inventory()
+
+    try:
+        with pytest.raises(OSError) as raised:
+            enron_capacity._open_owned_recovery_directory_descriptor(  # noqa: SLF001
+                target.name,
+                dir_fd=parent_fd,
+                expected_identity=(int(info.st_dev), int(info.st_ino) + 1),
+            )
+        assert raised.value.errno == errno.ESTALE
+        assert stat.S_IMODE(target.stat().st_mode) == 0o077
+        gc.collect()
+        assert _process_descriptor_inventory() == before_descriptors
+    finally:
+        os.close(parent_fd)
+        target.chmod(0o700)
+
+
+def test_readable_recovery_directory_fast_path_rejects_wrong_bound_identity_without_leak(tmp_path: Path) -> None:
+    target = tmp_path / "readable-substitute"
+    target.mkdir(mode=0o700)
+    info = target.stat()
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    before_descriptors = _process_descriptor_inventory()
+
+    try:
+        with pytest.raises(OSError) as raised:
+            enron_capacity._open_owned_recovery_directory_descriptor(  # noqa: SLF001
+                target.name,
+                dir_fd=parent_fd,
+                expected_identity=(int(info.st_dev), int(info.st_ino) + 1),
+            )
+        assert raised.value.errno == errno.ESTALE
+        gc.collect()
+        assert _process_descriptor_inventory() == before_descriptors
+    finally:
+        os.close(parent_fd)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="The O_PATH repair primitive is Linux-specific.")
+def test_linux_inaccessible_recovery_directory_repair_success_closes_all_authority(tmp_path: Path) -> None:
+    target = tmp_path / "inaccessible-success"
+    target.mkdir(mode=0o700)
+    info = target.stat()
+    identity = int(info.st_dev), int(info.st_ino)
+    target.chmod(0o077)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    before_descriptors = _process_descriptor_inventory()
+
+    try:
+        owner = enron_capacity._open_owned_recovery_directory_descriptor(  # noqa: SLF001
+            target.name,
+            dir_fd=parent_fd,
+            expected_identity=identity,
+        )
+        assert owner.identity[:2] == identity
+        assert stat.S_IMODE(os.fstat(owner.fd).st_mode) == 0o700
+        owner.close()
+        gc.collect()
+        assert _process_descriptor_inventory() == before_descriptors
+    finally:
+        os.close(parent_fd)
+        target.chmod(0o700)
+
+
+def test_recovery_directory_nonpermission_open_failure_does_not_attempt_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repair_calls = 0
+
+    def fail_open(_path: str | bytes, *, dir_fd: int | None = None) -> Any:
+        del dir_fd
+        raise OSError(errno.EIO, "injected recovery open failure")
+
+    def forbidden_repair(*args: Any, **kwargs: Any) -> Any:
+        nonlocal repair_calls
+        del args, kwargs
+        repair_calls += 1
+        raise AssertionError("non-permission open failures must not trigger permission repair")
+
+    monkeypatch.setattr(enron_capacity, "_open_owned_directory_descriptor", fail_open)
+    monkeypatch.setattr(enron_capacity, "_repair_and_open_owned_recovery_directory_descriptor", forbidden_repair)
+
+    with pytest.raises(OSError) as raised:
+        enron_capacity._open_owned_recovery_directory_descriptor(  # noqa: SLF001
+            "candidate",
+            dir_fd=3,
+            expected_identity=(1, 2),
+        )
+
+    assert raised.value.errno == errno.EIO
+    assert repair_calls == 0
+
+
+@pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
+def test_recovery_directory_repair_closes_descriptor_after_post_native_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    control_error: type[BaseException],
+) -> None:
+    target = tmp_path / "post-native-repair-control"
+    target.mkdir(mode=0o700)
+    info = target.stat()
+    identity = int(info.st_dev), int(info.st_ino)
+    parent_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    real_open = enron_capacity._native_engine._open_directory_fd_once
+    opened_descriptor: int | None = None
+    before_descriptors = _process_descriptor_inventory()
+
+    def open_then_interrupt(opened_fd: bytearray, path: bytes, dir_fd: int, *_identity: int) -> int:
+        nonlocal opened_descriptor
+        real_open(opened_fd, path, dir_fd)
+        opened_descriptor = int.from_bytes(opened_fd, byteorder=sys.byteorder, signed=True)
+        raise control_error("injected recovery repair post-native control")
+
+    monkeypatch.setattr(enron_capacity._native_engine, "_repair_and_open_directory_fd_once", open_then_interrupt)
+    try:
+        with pytest.raises(control_error, match="post-native control"):
+            enron_capacity._repair_and_open_owned_recovery_directory_descriptor(  # noqa: SLF001
+                target.name,
+                dir_fd=parent_fd,
+                expected_identity=identity,
+            )
+        assert opened_descriptor is not None
+        with pytest.raises(OSError) as closed:
+            os.fstat(opened_descriptor)
+        assert closed.value.errno == errno.EBADF
+        gc.collect()
+        after_descriptors = _process_descriptor_inventory()
+        assert {key: value for key, value in after_descriptors.items() if key != opened_descriptor} == {
+            key: value for key, value in before_descriptors.items() if key != opened_descriptor
+        }
+        os.fstat(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 @pytest.mark.parametrize("control_error", [KeyboardInterrupt, SystemExit])
@@ -5626,7 +8101,7 @@ def test_ledger_and_promoted_directory_swaps_never_write_or_delete_substitutes(
     monkeypatch.setattr(enron_capacity, "_append_attempt_receipt", swap_ledger)
     with pytest.raises(EnronCapacityError) as ledger_error:
         _run(tmp_path, name="ledger-swap-run")
-    assert ledger_error.value.code == "attempt_ledger_write_failed"
+    assert ledger_error.value.code == "attempt_ledger_invalid"
     assert list(replacement_ledger.iterdir()) == []
     assert not (tmp_path / "ledger-swap-run").exists()
 
@@ -6231,9 +8706,9 @@ def test_watchdog_install_interruption_restores_handler_before_private_cleanup(
             raise OSError("watchdog restoration interrupted")
         return real_signal(signum, handler)
 
-    def observe_cleanup(directory_fd: int, directory_path: Path) -> bool:
+    def observe_cleanup(directory_fd: int, directory_path: Path, **kwargs: Any) -> bool:
         cleanup_handlers.append(signal.getsignal(signal.SIGUSR1))
-        return original_clear(directory_fd, directory_path)
+        return original_clear(directory_fd, directory_path, **kwargs)
 
     try:
         monkeypatch.setattr(enron_capacity.signal, "signal", interrupt_after_install)
@@ -6249,7 +8724,7 @@ def test_watchdog_install_interruption_restores_handler_before_private_cleanup(
         assert not (tmp_path / "capacity-run").exists()
         _assert_no_stage(tmp_path, "capacity-run")
         receipt = verify_capacity_attempt_ledger(tmp_path / "attempts")[-1]
-        assert receipt["sensitive_content_wiped"] is True
+        assert receipt["sensitive_content_wiped"] is False
         assert receipt["retained_private_tombstone_count"] == 1
     finally:
         real_signal(signal.SIGUSR1, original_handler)
@@ -6444,6 +8919,7 @@ def _install_fake_production_worker(
     observed: dict[str, Any] | None = None,
     *,
     observer_failure_code: str | None = None,
+    observer_failure_diagnostic: Mapping[str, Any] | None = None,
 ) -> None:
     captured = {} if observed is None else observed
 
@@ -6481,10 +8957,11 @@ def _install_fake_production_worker(
     class FakeObserver:
         started = response.get("ok") is True
         stop_acknowledged = response.get("ok") is True
-        failure_code = observer_failure_code
 
         def __init__(self, endpoint: socket.socket, *_args: Any, **_kwargs: Any) -> None:
             self.endpoint = endpoint
+            self.failure_code = observer_failure_code
+            self.failure_diagnostic = None if observer_failure_diagnostic is None else dict(observer_failure_diagnostic)
 
         def start(self) -> None:
             return None
@@ -6554,6 +9031,8 @@ def test_worker_response_binds_wall_gap_diagnostic_and_rejects_every_other_pairi
         {**response, "diagnostic": None},
         {**response, "code": "rss_limit"},
         {**response, "diagnostic": {**diagnostic, "path": "/private/sensitive@example.invalid"}},
+        {**response, "ok": None},
+        {**response, "report": {}},
         {"ok": True, "code": None, "diagnostic": diagnostic, "report": {}},
     )
     for index, invalid in enumerate(invalid_responses):
@@ -6620,6 +9099,159 @@ def test_worker_success_cannot_hide_the_launchers_exact_first_resource_failure(
 
     assert raised.value.code == "resource_acquisition_timeout"
     assert raised.value.diagnostic is None
+
+
+def test_failed_worker_uses_the_winning_launchers_resource_gap_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: Path.cwd())
+    monkeypatch.setattr(
+        enron_capacity,
+        "_validated_capacity_bootstrap",
+        lambda: (Path.cwd() / "src", (), (), None),
+    )
+    worker_diagnostic = _wall_gap_diagnostic()
+    launcher_diagnostic = {
+        **_resource_gap_diagnostic(),
+        "phase": None,
+        "sample_kind": "boundary",
+        "sequence": 18,
+    }
+    response = {
+        "ok": False,
+        "code": "checkpoint_wall_gap",
+        "diagnostic": worker_diagnostic,
+        "report": None,
+    }
+    _install_fake_production_worker(
+        monkeypatch,
+        response,
+        observer_failure_code="resource_observation_gap",
+        observer_failure_diagnostic=launcher_diagnostic,
+    )
+
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._spawn_production_worker(_options(tmp_path, "launcher-gap-wins"))
+
+    assert raised.value.code == "resource_observation_gap"
+    assert raised.value.diagnostic == launcher_diagnostic
+    assert raised.value.diagnostic != worker_diagnostic
+
+
+def test_worker_success_preserves_the_launchers_resource_gap_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: Path.cwd())
+    monkeypatch.setattr(
+        enron_capacity,
+        "_validated_capacity_bootstrap",
+        lambda: (Path.cwd() / "src", (), (), None),
+    )
+    launcher_diagnostic = {
+        **_resource_gap_diagnostic(),
+        "phase": None,
+        "sample_kind": "terminal",
+        "sequence": 19,
+    }
+    response = {"ok": True, "code": None, "diagnostic": None, "report": {}}
+    _install_fake_production_worker(
+        monkeypatch,
+        response,
+        observer_failure_code="resource_observation_gap",
+        observer_failure_diagnostic=launcher_diagnostic,
+    )
+
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._spawn_production_worker(_options(tmp_path, "successful-worker-launcher-gap"))
+
+    assert raised.value.code == "resource_observation_gap"
+    assert raised.value.diagnostic == launcher_diagnostic
+
+
+@pytest.mark.parametrize("worker_succeeded", [False, True], ids=["failed-worker", "successful-worker"])
+def test_selected_launcher_resource_gap_without_a_diagnostic_fails_the_worker_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_succeeded: bool,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: Path.cwd())
+    monkeypatch.setattr(
+        enron_capacity,
+        "_validated_capacity_bootstrap",
+        lambda: (Path.cwd() / "src", (), (), None),
+    )
+    response = (
+        {"ok": True, "code": None, "diagnostic": None, "report": {}}
+        if worker_succeeded
+        else {
+            "ok": False,
+            "code": "checkpoint_wall_gap",
+            "diagnostic": _wall_gap_diagnostic(),
+            "report": None,
+        }
+    )
+    _install_fake_production_worker(
+        monkeypatch,
+        response,
+        observer_failure_code="resource_observation_gap",
+    )
+
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._spawn_production_worker(
+            _options(tmp_path, f"missing-launcher-gap-diagnostic-{worker_succeeded}")
+        )
+
+    assert raised.value.code == "production_worker_failed"
+    assert raised.value.diagnostic is None
+
+
+@pytest.mark.parametrize(
+    ("worker_code", "worker_diagnostic_kind", "launcher_code", "expected_code", "retains_diagnostic"),
+    [
+        ("owned_disk_limit", None, "resource_acquisition_timeout", "resource_acquisition_timeout", False),
+        ("owned_disk_limit", None, "rss_limit", "rss_limit", False),
+        ("owned_disk_limit", None, "runtime_disk_floor", "runtime_disk_floor", False),
+        ("checkpoint_wall_gap", "progress", "runtime_disk_floor", "runtime_disk_floor", False),
+        ("resource_observation_gap", "resource", "runtime_limit", "resource_observation_gap", True),
+        ("checkpoint_wall_gap", "progress", None, "checkpoint_wall_gap", True),
+    ],
+)
+def test_failed_worker_and_launcher_resource_failures_use_one_precedence_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_code: str,
+    worker_diagnostic_kind: str | None,
+    launcher_code: str | None,
+    expected_code: str,
+    retains_diagnostic: bool,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: Path.cwd())
+    monkeypatch.setattr(
+        enron_capacity,
+        "_validated_capacity_bootstrap",
+        lambda: (Path.cwd() / "src", (), (), None),
+    )
+    diagnostic = (
+        _wall_gap_diagnostic()
+        if worker_diagnostic_kind == "progress"
+        else _resource_gap_diagnostic()
+        if worker_diagnostic_kind == "resource"
+        else None
+    )
+    response = {"ok": False, "code": worker_code, "diagnostic": diagnostic, "report": None}
+    _install_fake_production_worker(
+        monkeypatch,
+        response,
+        observer_failure_code=launcher_code,
+    )
+
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._spawn_production_worker(_options(tmp_path, f"collision-{expected_code}"))
+
+    assert raised.value.code == expected_code
+    assert raised.value.diagnostic == (diagnostic if retains_diagnostic else None)
 
 
 @pytest.mark.parametrize(
@@ -7021,6 +9653,7 @@ def test_tracked_launcher_ignores_site_hooks_and_valid_parent_bytecode(
     scripts.mkdir(parents=True)
     package.mkdir(parents=True)
     shutil.copy2(Path.cwd() / "scripts" / "run_enron_capacity.py", scripts / "run_enron_capacity.py")
+    (scripts / "soak_enron_resource_observer.py").write_text("def main():\n    return 0\n", encoding="utf-8")
     (package / "__init__.py").write_text("", encoding="utf-8")
     shutil.copy2(Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py", package / "_capacity_bootstrap.py")
     (package / "enron_capacity.py").write_text("", encoding="utf-8")
@@ -7133,6 +9766,163 @@ def test_tracked_launcher_ignores_site_hooks_and_valid_parent_bytecode(
         assert not hostile_marker.exists()
 
 
+@pytest.mark.parametrize(
+    "invalidation_mode",
+    [py_compile.PycInvalidationMode.TIMESTAMP, py_compile.PycInvalidationMode.UNCHECKED_HASH],
+    ids=["timestamp", "unchecked-hash"],
+)
+def test_resource_observer_dispatch_ignores_stale_bytecode_and_hostile_import_hooks(
+    tmp_path: Path,
+    invalidation_mode: py_compile.PycInvalidationMode,
+) -> None:
+    repository = tmp_path / "repository"
+    scripts = repository / "scripts"
+    package = repository / "src" / "nerb"
+    scripts.mkdir(parents=True)
+    package.mkdir(parents=True)
+    shutil.copy2(Path.cwd() / "scripts" / "run_enron_capacity.py", scripts / "run_enron_capacity.py")
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "cli.py").write_text(
+        "import os\nfrom pathlib import Path\nPath(os.environ['CLI_MARKER']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    def stale_payload(label: str, size: int) -> bytes:
+        prefix = f"raise RuntimeError({label!r})\n".encode()
+        assert len(prefix) + 2 <= size
+        return prefix + b"#" + (b"x" * (size - len(prefix) - 2)) + b"\n"
+
+    def install_stale_bytecode(path: Path, fresh: bytes, stale: bytes) -> None:
+        assert len(fresh) == len(stale)
+        path.write_bytes(stale)
+        source_stat = path.stat()
+        py_compile.compile(
+            os.fspath(path),
+            doraise=True,
+            invalidation_mode=invalidation_mode,
+        )
+        path.write_bytes(fresh)
+        os.utime(path, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+        assert path.stat().st_size == source_stat.st_size
+        assert path.stat().st_mtime_ns == source_stat.st_mtime_ns
+
+    guard = package / "_capacity_bootstrap.py"
+    guard_source = (Path.cwd() / "src" / "nerb" / "_capacity_bootstrap.py").read_bytes()
+    install_stale_bytecode(guard, guard_source, stale_payload("stale guard executed", len(guard_source)))
+
+    capacity = package / "enron_capacity.py"
+    capacity_source = b'RESULT = "safe"\n'
+    install_stale_bytecode(capacity, capacity_source, capacity_source.replace(b'"safe"', b'"evil"'))
+
+    soak = scripts / "soak_enron_resource_observer.py"
+    soak_source = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+
+        from nerb import enron_capacity
+
+        def main():
+            marker = getattr(sys, "_nerb_resource_observer_soak_bootstrap")
+            capacity_marker = getattr(sys, "_nerb_capacity_bootstrap")
+            print(json.dumps({
+                "bootstrap_schema": marker["schema"],
+                "capacity_marker_matches": (
+                    marker["source_root"] == capacity_marker["source_root"]
+                    and marker["dependency_roots"] == capacity_marker["dependency_roots"]
+                    and marker["baseline_path"] == capacity_marker["baseline_path"]
+                    and marker["pycache_root"] == capacity_marker["pycache_root"]
+                ),
+                "fresh_private_pycache": marker["fresh_private_pycache"],
+                "hostile_marker_exists": os.path.exists(os.environ["HOSTILE_MARKER"]),
+                "isolated": bool(sys.flags.isolated),
+                "no_bytecode": bool(sys.flags.dont_write_bytecode),
+                "no_site": bool(sys.flags.no_site),
+                "pycache_prefix_matches": sys.pycache_prefix == marker["pycache_root"],
+                "result": enron_capacity.RESULT,
+                "role": marker["role"],
+                "sitecustomize_loaded": "sitecustomize" in sys.modules,
+            }, sort_keys=True))
+            return 0
+        """
+    ).encode()
+    install_stale_bytecode(soak, soak_source, stale_payload("stale soak executed", len(soak_source)))
+
+    environment = tmp_path / "venv"
+    binary = environment / "bin" / "python"
+    dependency_root = environment / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    binary.parent.mkdir(parents=True)
+    dependency_root.mkdir(parents=True)
+    (environment / "lib64").symlink_to("lib", target_is_directory=True)
+    binary.symlink_to(Path(sys.executable))
+    (environment / "pyvenv.cfg").write_text(f"home = {sys.base_prefix}\n", encoding="utf-8")
+
+    hostile_marker = tmp_path / "hostile-hook-ran"
+    cli_marker = tmp_path / "capacity-cli-ran"
+    hostile = tmp_path / "hostile-pythonpath"
+    hostile.mkdir()
+    hostile_statement = f"from pathlib import Path; Path({os.fspath(hostile_marker)!r}).write_text('ran')\n"
+    (hostile / "sitecustomize.py").write_text(hostile_statement, encoding="utf-8")
+    (dependency_root / "sitecustomize.py").write_text(hostile_statement, encoding="utf-8")
+    hostile_package = hostile / "nerb"
+    hostile_package.mkdir()
+    (hostile_package / "__init__.py").write_text("raise RuntimeError('hostile nerb imported')\n", encoding="utf-8")
+    (hostile_package / "enron_capacity.py").write_text("RESULT = 'evil'\n", encoding="utf-8")
+
+    environment_variables = {
+        **os.environ,
+        "CLI_MARKER": os.fspath(cli_marker),
+        "HOSTILE_MARKER": os.fspath(hostile_marker),
+        "PYTHONPATH": os.fspath(hostile),
+    }
+    command = [
+        os.fspath(binary),
+        "-I",
+        "-S",
+        "-B",
+        os.fspath(scripts / "run_enron_capacity.py"),
+        "resource-observer-soak",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment_variables,
+        timeout=30,
+    )
+    assert json.loads(completed.stdout) == {
+        "bootstrap_schema": "nerb.resource_observer_soak.bootstrap",
+        "capacity_marker_matches": True,
+        "fresh_private_pycache": True,
+        "hostile_marker_exists": False,
+        "isolated": True,
+        "no_bytecode": True,
+        "no_site": True,
+        "pycache_prefix_matches": True,
+        "result": "safe",
+        "role": "resource_observer_soak",
+        "sitecustomize_loaded": False,
+    }
+    assert not hostile_marker.exists()
+    assert not cli_marker.exists()
+
+    unknown = subprocess.run(
+        [*command[:-1], "resource-observer-soak-unknown"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment_variables,
+        timeout=30,
+    )
+    assert unknown.returncode != 0
+    assert unknown.stdout == ""
+    assert "unsupported command" in unknown.stderr
+    assert not hostile_marker.exists()
+    assert not cli_marker.exists()
+
+
 def test_recorded_production_identity_verifier_does_not_require_current_head(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -7145,6 +9935,7 @@ def test_recorded_production_identity_verifier_does_not_require_current_head(
             "production_evidence": True,
             "fresh_worker": True,
             "git_tree_clean": True,
+            "process_containment": enron_capacity._process_containment_identity(production=True),
             "capacity_implementation_sha256": recorded_capacity,
             "native_extension_build_source_sha256": execution["native_build_source_sha256"],
             "monitor_interval_ns": enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
@@ -7189,6 +9980,82 @@ def test_recorded_production_identity_verifier_does_not_require_current_head(
     enron_capacity._verify_recorded_production_execution(execution)
 
 
+def test_current_production_execution_verification_is_subprocess_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _ = _run(tmp_path)
+    execution = copy.deepcopy(report["execution"])
+    mode = enron_capacity._expected_process_containment_mode()
+    execution.update(
+        {
+            "production_evidence": True,
+            "fresh_worker": True,
+            "git_tree_clean": True,
+            "process_containment": enron_capacity._process_containment_identity(production=True),
+            "monitor_interval_ns": enron_capacity.PRODUCTION_MONITOR_INTERVAL_NS,
+        }
+    )
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_PROCESS_CONTAINMENT", mode)
+    monkeypatch.setattr(
+        enron_capacity,
+        "_verify_recorded_production_execution",
+        lambda _execution: pytest.fail("current worker verification must not invoke Git-backed verification"),
+    )
+
+    enron_capacity._verify_execution(
+        execution,
+        require_production=True,
+        current_production_execution=copy.deepcopy(execution),
+    )
+
+    mismatched = copy.deepcopy(execution)
+    mismatched["native_extension_sha256"] = _hash("different-current-native")
+    with pytest.raises(EnronCapacityError, match="production implementation identity"):
+        enron_capacity._verify_execution(
+            execution,
+            require_production=True,
+            current_production_execution=mismatched,
+        )
+
+
+def test_production_reassert_after_containment_never_spawns_a_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report, _ = _run(tmp_path)
+    execution = copy.deepcopy(report["execution"])
+    mode = enron_capacity._expected_process_containment_mode()
+    execution.update(
+        {
+            "production_evidence": True,
+            "fresh_worker": True,
+            "git_tree_clean": True,
+            "process_containment": enron_capacity._process_containment_identity(production=True),
+        }
+    )
+    git_root = enron_capacity._git_root()
+    relevant_paths = enron_capacity._relevant_tracked_worktree_paths()
+    cpu_model = enron_capacity._cpu_model()
+    physical_memory = enron_capacity._SystemResourceProbe().physical_memory_bytes()
+    assert physical_memory is not None
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_GIT_ROOT", git_root)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_RELEVANT_WORKTREE_PATHS", relevant_paths)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_CPU_MODEL", cpu_model)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_PHYSICAL_MEMORY_BYTES", physical_memory)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_PROCESS_CONTAINMENT", mode)
+    monkeypatch.setattr(enron_capacity, "_PHASE_SCOPED_READER_LOADED", False)
+    monkeypatch.setattr(enron_capacity, "_assert_reader_modules_unloaded", lambda: None)
+    monkeypatch.setattr(enron_capacity._capacity_import_guard, "assert_installed", lambda _path: None)
+    monkeypatch.setattr(
+        enron_capacity.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("post-containment execution attempted to spawn a subprocess"),
+    )
+
+    enron_capacity._reassert_production_execution_current(execution)
+
+
 def test_execution_identity_accepts_the_matching_fresh_production_worker_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -7205,9 +10072,11 @@ def test_execution_identity_accepts_the_matching_fresh_production_worker_identit
             "production_evidence": True,
             "fresh_worker": True,
             "git_tree_clean": True,
+            "process_containment": enron_capacity._process_containment_identity(production=True),
         }
     )
     monkeypatch.setattr(enron_capacity, "_production_execution_identity", lambda: expected)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_GIT_COMMIT", expected["executable_git_commit"])
 
     execution = enron_capacity._execution_identity(
         runners,
@@ -7223,6 +10092,7 @@ def test_production_identity_rejects_a_native_extension_built_from_other_sources
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(enron_capacity, "_FRESH_PRODUCTION_WORKER", True)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_GIT_COMMIT", enron_capacity._git_head())
     monkeypatch.setattr(enron_capacity, "_require_globally_clean_checkout", lambda _commit: None)
     monkeypatch.setattr(enron_capacity, "_require_clean_head_sources", lambda _paths, _commit: None)
     monkeypatch.setattr(enron_capacity, "_root_process_peak_rss_bytes", lambda: 1)
@@ -7238,18 +10108,25 @@ def test_production_identity_rejects_a_native_extension_built_from_other_sources
 
 def test_production_reassert_rejects_import_guard_drift(monkeypatch: pytest.MonkeyPatch) -> None:
     observed: list[Path] = []
+    mode = enron_capacity._expected_process_containment_mode()
 
     def reject(path: Path) -> None:
         observed.append(path)
         raise ImportError("injected guard drift")
 
     monkeypatch.setattr(enron_capacity._capacity_import_guard, "assert_installed", reject)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_PROCESS_CONTAINMENT", mode)
 
     with pytest.raises(EnronCapacityError, match="production implementation identity"):
         enron_capacity._reassert_production_execution_current(
             {
                 "production_evidence": True,
                 "executable_git_commit": "a" * 40,
+                "process_containment": {
+                    "mode": mode,
+                    "installed_before_workload": True,
+                    "runtime_attested": True,
+                },
             }
         )
 
@@ -7332,6 +10209,51 @@ def test_relevant_module_identity_uses_only_the_closed_tracked_inventory(
         assert enron_capacity._relevant_module_sha256_at_commit(git_commit) == before
     finally:
         shutil.rmtree(generated)
+
+
+def test_production_subprocess_context_rejects_head_inventory_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_FRESH_PRODUCTION_WORKER", True)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_GIT_COMMIT", None)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_GIT_ROOT", None)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_RELEVANT_WORKTREE_PATHS", None)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_CPU_MODEL", None)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_PHYSICAL_MEMORY_BYTES", None)
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: tmp_path)
+    monkeypatch.setattr(enron_capacity, "_git_head", lambda: "a" * 40)
+    monkeypatch.setattr(enron_capacity, "_relevant_tracked_worktree_paths", lambda: ("src/nerb/present.py",))
+    monkeypatch.setattr(
+        enron_capacity,
+        "_relevant_module_paths_at_commit",
+        lambda _commit: ("src/nerb/new.py", "src/nerb/present.py"),
+    )
+
+    with pytest.raises(EnronCapacityError, match="production implementation identity"):
+        enron_capacity._prepare_production_subprocess_context()
+
+    assert enron_capacity._PRODUCTION_GIT_COMMIT is None
+    assert enron_capacity._PRODUCTION_RELEVANT_WORKTREE_PATHS is None
+
+
+def test_relevant_module_identity_rejects_a_missing_tracked_worktree_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_FRESH_PRODUCTION_WORKER", True)
+    monkeypatch.setattr(enron_capacity, "_PRODUCTION_GIT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        enron_capacity,
+        "_PRODUCTION_RELEVANT_WORKTREE_PATHS",
+        ("src/nerb/present.py", "src/nerb/sparse.py"),
+    )
+    present = tmp_path / "src" / "nerb" / "present.py"
+    present.parent.mkdir(parents=True)
+    present.write_text("PRESENT = True\n", encoding="utf-8")
+
+    with pytest.raises(EnronCapacityError, match="production implementation identity"):
+        enron_capacity._relevant_module_sha256()
 
 
 def test_native_extension_embeds_the_exact_closed_rust_build_source_inventory() -> None:

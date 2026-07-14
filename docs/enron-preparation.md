@@ -89,7 +89,9 @@ must report truncated/excluded coverage and must not claim recall over bytes it 
 
 ## Private transaction and artifacts
 
-The final directory must not already exist. Inside a Git workspace it must be ignored, normally beneath `.nerb/`.
+The final directory must not already exist. Its existing parent must be owned by the current user and grant no group or
+other access; parents created by the transaction use mode `0700`. Inside a Git workspace the output must be ignored,
+normally beneath `.nerb/`.
 `--allow-unignored-output` is an explicit escape hatch for a private location, but it never disables ancestor-symlink,
 no-follow, exclusive-create, or permission checks.
 
@@ -99,7 +101,9 @@ that cannot provide the same boundary; the cross-platform cleaner remains usable
 writer is not substituted silently.
 
 Preparation builds a random sibling staging directory with mode `0700`, creates files with mode `0600`, flushes and
-validates the tree, writes `COMMITTED` last, and atomically promotes the directory without replacement. On failure it
+validates the tree, writes `COMMITTED` last, and atomically promotes the directory without replacement. Adoption,
+pre-promotion validation, cleanup, and recovery share one aggregate stage-rooted limit of 1,000,000 entries and 64 levels;
+the pre-promotion walk reserves the final marker entry. On failure it
 uses retained descriptors to wipe sensitive payload bytes first, quarantines the path as an owner-only
 `.nerb-cleanup-*` tombstone, and never overwrites a previous run. Automatic cleanup deliberately does not claim that a
 same-UID path can be deleted without a substitution race: the normal residue is a verified payload-empty tombstone or

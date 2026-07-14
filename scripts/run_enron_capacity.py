@@ -20,6 +20,10 @@ from typing import Any, NoReturn
 _BOOTSTRAP_ATTRIBUTE = "_nerb_capacity_bootstrap"
 _BOOTSTRAP_SCHEMA = "nerb.enron_capacity.bootstrap.v1"
 _IMPORT_GUARD_MODULE = "_nerb_capacity_bootstrap_impl"
+_SOAK_BOOTSTRAP_ATTRIBUTE = "_nerb_resource_observer_soak_bootstrap"
+_SOAK_BOOTSTRAP_SCHEMA = "nerb.resource_observer_soak.bootstrap"
+_SOAK_DISPATCH = "resource-observer-soak"
+_SOAK_MODULE = "_nerb_resource_observer_soak"
 _SYSCONFIG_OVERRIDE_ENVIRONMENT = ("_PYTHON_SYSCONFIGDATA_NAME", "_PYTHON_SYSCONFIGDATA_PATH")
 
 
@@ -57,9 +61,10 @@ def _validated_source_root() -> Path:
         bootstrap = (package / "_capacity_bootstrap.py").lstat()
         capacity = (package / "enron_capacity.py").lstat()
         cli = (package / "cli.py").lstat()
+        soak = (root / "scripts" / "soak_enron_resource_observer.py").lstat()
     except OSError:
         _fail("tracked capacity sources are unavailable")
-    if any(not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode) for item in (bootstrap, capacity, cli)):
+    if any(not stat.S_ISREG(item.st_mode) or stat.S_ISLNK(item.st_mode) for item in (bootstrap, capacity, cli, soak)):
         _fail("tracked capacity sources are not regular files")
     return source
 
@@ -117,6 +122,55 @@ def _install_import_guard(source_root: Path) -> Any:
     return module
 
 
+def _run_resource_observer_soak(
+    source_root: Path,
+    dependency_roots: tuple[Path, ...],
+    baseline_path: tuple[str, ...],
+    pycache_root: Path,
+    import_guard: Any,
+) -> int:
+    repository_root = source_root.parent
+    soak_path = repository_root / "scripts" / "soak_enron_resource_observer.py"
+    loader = importlib.machinery.SourceFileLoader(_SOAK_MODULE, os.fspath(soak_path))
+    spec = importlib.util.spec_from_file_location(_SOAK_MODULE, soak_path, loader=loader)
+    if spec is None or _SOAK_MODULE in sys.modules or _SOAK_BOOTSTRAP_ATTRIBUTE in vars(sys):
+        _fail("the resource-observer soak dispatch is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    original_argv = tuple(sys.argv)
+    sys.modules[_SOAK_MODULE] = module
+    setattr(
+        sys,
+        _SOAK_BOOTSTRAP_ATTRIBUTE,
+        {
+            "schema": _SOAK_BOOTSTRAP_SCHEMA,
+            "role": "resource_observer_soak",
+            "source_root": os.fspath(source_root),
+            "dependency_roots": [os.fspath(path) for path in dependency_roots],
+            "baseline_path": list(baseline_path),
+            "pycache_root": os.fspath(pycache_root),
+            "fresh_private_pycache": True,
+        },
+    )
+    try:
+        sys.argv[:] = [os.fspath(soak_path), *original_argv[2:]]
+        loader.exec_module(module)
+        import_guard.assert_installed(source_root)
+        soak_main = getattr(module, "main", None)
+        if not callable(soak_main):
+            _fail("the resource-observer soak entry point is unavailable")
+        result = soak_main()
+        import_guard.assert_installed(source_root)
+        if type(result) is not int:
+            _fail("the resource-observer soak result is invalid")
+        return result
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
+        _fail("the resource-observer soak dispatch failed safely")
+    finally:
+        sys.argv[:] = original_argv
+        vars(sys).pop(_SOAK_BOOTSTRAP_ATTRIBUTE, None)
+        sys.modules.pop(_SOAK_MODULE, None)
+
+
 def main() -> None:
     if not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
         _fail("invoke with python -I -S -B")
@@ -149,9 +203,21 @@ def main() -> None:
                 "resource_observer_fd": None,
             },
         )
+        if len(sys.argv) >= 2 and sys.argv[1] == _SOAK_DISPATCH:
+            raise SystemExit(
+                _run_resource_observer_soak(
+                    source_root,
+                    dependency_roots,
+                    baseline_path,
+                    pycache_root,
+                    import_guard,
+                )
+            )
         supported_commands = {"run-enron-capacity", "verify-enron-capacity", "export-enron-capacity"}
-        if len(sys.argv) < 2 or sys.argv[1] not in supported_commands:
+        if len(sys.argv) < 2:
             sys.argv[1:1] = ["run-enron-capacity"]
+        elif sys.argv[1] not in supported_commands:
+            _fail("unsupported command")
         from nerb.cli import main as cli_main
 
         import_guard.assert_installed(source_root)

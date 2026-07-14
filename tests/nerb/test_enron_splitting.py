@@ -119,6 +119,7 @@ class SplitRun:
 
 def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
     path.write_text(
         "".join(
             json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"

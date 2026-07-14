@@ -14,11 +14,13 @@ import importlib
 import json
 import math
 import os
+import re
 import secrets
 import stat
 import subprocess
 import sys
 import threading
+import weakref
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, BinaryIO, TextIO, TypeVar, cast
@@ -32,13 +34,12 @@ _FILE_MODE = 0o600
 _JSONL_BUFFER_BYTES = 64 * 1024
 _MAX_JSON_INTEGER_DIGITS = 256
 _STAGE_TOKEN_HEX_LENGTH = 24
-_MAX_PRIVATE_TOMBSTONE_ENTRIES = 1_000_000
-_MAX_PRIVATE_TOMBSTONE_DEPTH = 64
+_PRIVATE_TOMBSTONE_NAME_RE = re.compile(r"^\.nerb-cleanup-[0-9a-f]{48}$")
+_MAX_PRIVATE_TREE_ENTRIES = 1_000_000
+_MAX_PRIVATE_TREE_DEPTH = 64
 _MAX_PINNED_CLEANUP_FILES = 128
-_MAX_PINNED_CLEANUP_TREE_ENTRIES = 4_096
-_MAX_PINNED_CLEANUP_TREE_DEPTH = 32
 _PRIVATE_RUN_PERSISTENT_FDS = 2
-_PINNED_CLEANUP_FD_RESERVE = _MAX_PRIVATE_TOMBSTONE_DEPTH + 8
+_PINNED_CLEANUP_FD_RESERVE = _MAX_PRIVATE_TREE_DEPTH + 8
 _CLEANUP_FD_ACCOUNTING_LOCK = threading.Lock()
 _CLEANUP_FD_ACQUISITION_LOCK = threading.Lock()
 _CLEANUP_TREE_ADOPTION_LOCK = threading.Lock()
@@ -48,6 +49,7 @@ _PENDING_CLEANUP_FDS = 0
 _PENDING_CLEANUP_RESERVATIONS: set[object] = set()
 _ACCOUNTED_CLEANUP_FDS: set[int] = set()
 _UNRESOLVED_CLEANUP_FDS: dict[tuple[int, ...], int] = {}
+_EFFECTIVE_WORKSPACE_UNSET = object()
 _LINUX_PROC_FD_CHMOD_AVAILABLE = (
     sys.platform.startswith("linux") and bool(getattr(os, "O_PATH", 0)) and Path("/proc/self/fd").is_dir()
 )
@@ -151,12 +153,241 @@ def ensure_private_output_allowed(
 ) -> Path:
     """Validate and return an absolute, non-existing private output directory."""
 
+    if type(allow_unignored_output) is not bool:
+        raise EnronPrivateIOError("Private output policy must be boolean.")
     final = _absolute_path_without_traversal(final_dir, description="Output")
     _reject_unsafe_existing_components(final, reject_target=True)
-    root = _workspace_for_path(final, workspace_root)
-    if root is not None and _is_within(final, root) and not allow_unignored_output:
+    root = None if allow_unignored_output else _workspace_for_path(final, workspace_root)
+    if root is not None and _is_within(final, root):
         _require_git_ignored(final, root)
     return final
+
+
+class _PrevalidatedCleanupBoundary:
+    parent: Path
+    device: int
+    inode: int
+    owner: int
+    mode: int
+    requested_workspace_root: Path | None
+    effective_workspace_root: Path | None
+    allow_unignored_output: bool
+    strict_parent_ignored: bool
+
+    __slots__ = (
+        "__weakref__",
+        "allow_unignored_output",
+        "device",
+        "effective_workspace_root",
+        "inode",
+        "mode",
+        "owner",
+        "parent",
+        "requested_workspace_root",
+        "strict_parent_ignored",
+    )
+
+    def __new__(cls, *_args: object, **_kwargs: object) -> _PrevalidatedCleanupBoundary:
+        raise EnronPrivateIOError("Private cleanup boundaries can only be created by prevalidation.")
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise EnronPrivateIOError("Private cleanup boundary attestations are immutable.")
+
+
+_CleanupBoundaryAttestation = tuple[Path, int, int, int, int, Path | None, Path | None, bool, bool]
+_PrivateParentState = tuple[int, int, int, int]
+_CLEANUP_BOUNDARY_REGISTRY_LOCK = threading.Lock()
+_CLEANUP_BOUNDARY_REGISTRY: dict[
+    int,
+    tuple[weakref.ReferenceType[_PrevalidatedCleanupBoundary], _CleanupBoundaryAttestation],
+] = {}
+
+
+def _normalized_requested_workspace_root(workspace_root: Path | None) -> Path | None:
+    return None if workspace_root is None else _absolute_path_without_traversal(workspace_root, description="Workspace")
+
+
+def _require_valid_cleanup_boundary(
+    boundary: _PrevalidatedCleanupBoundary,
+    *,
+    parent: Path,
+    parent_state: _PrivateParentState,
+    requested_workspace_root: Path | None,
+    effective_workspace_root: Path | None | object = _EFFECTIVE_WORKSPACE_UNSET,
+    allow_unignored_output: bool,
+) -> None:
+    """Validate the exact policy and pinned namespace attested before containment."""
+
+    if type(boundary) is not _PrevalidatedCleanupBoundary:
+        raise EnronPrivateIOError("Private cleanup boundary is invalid.")
+    try:
+        normalized_parent = _absolute_path_without_traversal(parent, description="Private cleanup parent")
+        normalized_requested_root = _normalized_requested_workspace_root(requested_workspace_root)
+        boundary_parent_raw = boundary.parent
+        boundary_parent = _absolute_path_without_traversal(
+            boundary_parent_raw,
+            description="Prevalidated private cleanup parent",
+        )
+        boundary_requested_root_raw = boundary.requested_workspace_root
+        boundary_effective_root_raw = boundary.effective_workspace_root
+        boundary_requested_root = boundary_requested_root_raw
+        boundary_effective_root = boundary_effective_root_raw
+        boundary_device = boundary.device
+        boundary_inode = boundary.inode
+        boundary_owner = boundary.owner
+        boundary_mode = boundary.mode
+        boundary_allow_unignored_output = boundary.allow_unignored_output
+        boundary_strict_parent_ignored = boundary.strict_parent_ignored
+        if boundary_requested_root is not None:
+            boundary_requested_root = _absolute_path_without_traversal(
+                boundary_requested_root,
+                description="Prevalidated workspace",
+            )
+        if boundary_effective_root is not None:
+            boundary_effective_root = _absolute_path_without_traversal(
+                boundary_effective_root,
+                description="Prevalidated effective workspace",
+            )
+    except (AttributeError, EnronPrivateIOError, OSError, RuntimeError, TypeError, ValueError):
+        raise EnronPrivateIOError("Private cleanup boundary is invalid.") from None
+
+    with _CLEANUP_BOUNDARY_REGISTRY_LOCK:
+        registration = _CLEANUP_BOUNDARY_REGISTRY.get(id(boundary))
+    registered_attestation = None
+    if registration is not None and registration[0]() is boundary:
+        registered_attestation = registration[1]
+    current_attestation = (
+        boundary_parent_raw,
+        boundary_device,
+        boundary_inode,
+        boundary_owner,
+        boundary_mode,
+        boundary_requested_root_raw,
+        boundary_effective_root_raw,
+        boundary_allow_unignored_output,
+        boundary_strict_parent_ignored,
+    )
+    if (
+        registered_attestation is None
+        or current_attestation != registered_attestation
+        or not isinstance(boundary_parent_raw, Path)
+        or (boundary_requested_root_raw is not None and not isinstance(boundary_requested_root_raw, Path))
+        or (boundary_effective_root_raw is not None and not isinstance(boundary_effective_root_raw, Path))
+        or type(boundary_device) is not int
+        or boundary_device < 0
+        or type(boundary_inode) is not int
+        or boundary_inode < 0
+        or type(boundary_owner) is not int
+        or boundary_owner < 0
+        or type(boundary_mode) is not int
+        or boundary_mode < 0
+        or type(boundary_allow_unignored_output) is not bool
+        or type(boundary_strict_parent_ignored) is not bool
+        or type(allow_unignored_output) is not bool
+        or not isinstance(parent_state, tuple)
+        or len(parent_state) != 4
+        or any(type(value) is not int or value < 0 for value in parent_state)
+        or boundary_parent != normalized_parent
+        or (boundary_device, boundary_inode, boundary_owner, boundary_mode) != parent_state
+        or boundary_requested_root != normalized_requested_root
+        or boundary_allow_unignored_output is not allow_unignored_output
+        or boundary_strict_parent_ignored is allow_unignored_output
+        or (boundary_effective_root is not None and not _is_within(normalized_parent, boundary_effective_root))
+        or (boundary_allow_unignored_output and boundary_effective_root is not None)
+    ):
+        raise EnronPrivateIOError("Private cleanup boundary policy or identity does not match this operation.")
+
+    if effective_workspace_root is not _EFFECTIVE_WORKSPACE_UNSET:
+        try:
+            normalized_effective_root = (
+                None
+                if effective_workspace_root is None
+                else _absolute_path_without_traversal(
+                    cast(Path, effective_workspace_root),
+                    description="Effective workspace",
+                )
+            )
+        except (EnronPrivateIOError, OSError, RuntimeError, TypeError, ValueError):
+            raise EnronPrivateIOError("Private cleanup effective workspace is invalid.") from None
+        if normalized_effective_root != boundary_effective_root:
+            raise EnronPrivateIOError("Private cleanup boundary effective workspace changed.")
+
+
+def _prevalidate_cleanup_boundary(
+    final_dir: Path,
+    *,
+    workspace_root: Path | None,
+    allow_unignored_output: bool,
+) -> _PrevalidatedCleanupBoundary:
+    """Bind an output parent whose whole namespace is safe for tombstones."""
+
+    if type(allow_unignored_output) is not bool:
+        raise EnronPrivateIOError("Private cleanup output policy is invalid.")
+    final = ensure_private_output_allowed(
+        final_dir,
+        workspace_root=workspace_root,
+        allow_unignored_output=allow_unignored_output,
+    )
+    parent = final.parent
+    requested_root = _normalized_requested_workspace_root(workspace_root)
+    effective_root = None if allow_unignored_output else _workspace_for_path(final, workspace_root)
+    if effective_root is not None:
+        if not _is_within(parent, effective_root):
+            raise EnronPrivateIOError("Private cleanup workspace does not contain the output parent.")
+        _require_git_ignored(parent, effective_root)
+    try:
+        info = parent.lstat()
+    except OSError:
+        raise EnronPrivateIOError("Private cleanup parent could not be bound safely.") from None
+    parent_state = _private_parent_state(info)
+    boundary = object.__new__(_PrevalidatedCleanupBoundary)
+    attestation: _CleanupBoundaryAttestation = (
+        parent,
+        int(info.st_dev),
+        int(info.st_ino),
+        int(info.st_uid),
+        stat.S_IMODE(info.st_mode),
+        requested_root,
+        effective_root,
+        allow_unignored_output,
+        not allow_unignored_output,
+    )
+    object.__setattr__(boundary, "parent", attestation[0])
+    object.__setattr__(boundary, "device", attestation[1])
+    object.__setattr__(boundary, "inode", attestation[2])
+    object.__setattr__(boundary, "owner", attestation[3])
+    object.__setattr__(boundary, "mode", attestation[4])
+    object.__setattr__(boundary, "requested_workspace_root", attestation[5])
+    object.__setattr__(boundary, "effective_workspace_root", attestation[6])
+    object.__setattr__(boundary, "allow_unignored_output", attestation[7])
+    object.__setattr__(boundary, "strict_parent_ignored", attestation[8])
+    registration_key = id(boundary)
+
+    def unregister(reference: weakref.ReferenceType[_PrevalidatedCleanupBoundary]) -> None:
+        with _CLEANUP_BOUNDARY_REGISTRY_LOCK:
+            current = _CLEANUP_BOUNDARY_REGISTRY.get(registration_key)
+            if current is not None and current[0] is reference:
+                del _CLEANUP_BOUNDARY_REGISTRY[registration_key]
+
+    registration = weakref.ref(boundary, unregister)
+    with _CLEANUP_BOUNDARY_REGISTRY_LOCK:
+        existing = _CLEANUP_BOUNDARY_REGISTRY.get(registration_key)
+        if existing is not None and existing[0]() is not None:
+            raise EnronPrivateIOError("Private cleanup boundary identity could not be issued safely.")
+        _CLEANUP_BOUNDARY_REGISTRY[registration_key] = registration, attestation
+    try:
+        _require_valid_cleanup_boundary(
+            boundary,
+            parent=parent,
+            parent_state=parent_state,
+            requested_workspace_root=workspace_root,
+            effective_workspace_root=effective_root,
+            allow_unignored_output=allow_unignored_output,
+        )
+    except BaseException:
+        unregister(registration)
+        raise
+    return boundary
 
 
 class PrivateRun:
@@ -170,7 +401,10 @@ class PrivateRun:
         allow_unignored_output: bool = False,
         stage_token: str | None = None,
         expected_parent_identity: tuple[int, int] | None = None,
+        cleanup_boundary: _PrevalidatedCleanupBoundary | None = None,
     ) -> None:
+        if type(allow_unignored_output) is not bool:
+            raise EnronPrivateIOError("Private output policy must be boolean.")
         if stage_token is not None and (
             not isinstance(stage_token, str)
             or len(stage_token) != _STAGE_TOKEN_HEX_LENGTH
@@ -183,16 +417,34 @@ class PrivateRun:
             or any(type(value) is not int or value < 0 for value in expected_parent_identity)
         ):
             raise EnronPrivateIOError("Expected private staging parent identity is invalid.")
+        if cleanup_boundary is not None and not isinstance(cleanup_boundary, _PrevalidatedCleanupBoundary):
+            raise EnronPrivateIOError("Private cleanup boundary is invalid.")
+        if cleanup_boundary is not None:
+            requested_final = _absolute_path_without_traversal(final_dir, description="Output")
+            try:
+                requested_parent_info = requested_final.parent.lstat()
+            except OSError:
+                raise EnronPrivateIOError("Private cleanup parent changed before construction.") from None
+            _require_valid_cleanup_boundary(
+                cleanup_boundary,
+                parent=requested_final.parent,
+                parent_state=_private_parent_state(requested_parent_info),
+                requested_workspace_root=workspace_root,
+                allow_unignored_output=allow_unignored_output,
+            )
         self._requested_final_dir = Path(final_dir)
         self._requested_workspace_root = workspace_root
         self._allow_unignored_output = allow_unignored_output
         self._requested_stage_token = stage_token
         self._expected_parent_identity = expected_parent_identity
+        self._cleanup_boundary = cleanup_boundary
         self._final_dir: Path | None = None
         self._workspace_root: Path | None = None
         self._stage_dir: Path | None = None
         self._stage_name: str | None = None
         self._parent_fd: int | None = None
+        self._parent_state: _PrivateParentState | None = None
+        self._sticky_shared_parent = False
         self._stage_fd: int | None = None
         self._directory_close_states: dict[str, tuple[int, bytearray]] = {}
         self._stage_identity: tuple[int, int] | None = None
@@ -256,7 +508,7 @@ class PrivateRun:
 
     @property
     def cleanup_sensitive_content_wiped(self) -> bool | None:
-        """Whether a failed transaction proved its pinned payload was wiped."""
+        """Whether failed cleanup proved sensitive content was fully removed."""
 
         return self._cleanup_sensitive_content_wiped
 
@@ -304,10 +556,23 @@ class PrivateRun:
                 workspace_root=self._requested_workspace_root,
                 allow_unignored_output=self._allow_unignored_output,
             )
-            root = _workspace_for_path(final, self._requested_workspace_root)
+            root = None if self._allow_unignored_output else _workspace_for_path(final, self._requested_workspace_root)
             self._workspace_root = root
             parent_fd = _open_or_create_private_directory(final.parent)
             parent_info = os.fstat(parent_fd)
+            if self._cleanup_boundary is not None:
+                try:
+                    _require_valid_cleanup_boundary(
+                        self._cleanup_boundary,
+                        parent=final.parent,
+                        parent_state=_private_parent_state(parent_info),
+                        requested_workspace_root=self._requested_workspace_root,
+                        effective_workspace_root=root,
+                        allow_unignored_output=self._allow_unignored_output,
+                    )
+                except EnronPrivateIOError:
+                    os.close(parent_fd)
+                    raise
             if (
                 self._expected_parent_identity is not None
                 and (
@@ -320,6 +585,13 @@ class PrivateRun:
                 raise EnronPrivateIOError("Private staging parent identity changed before allocation.")
             self._final_dir = final
             self._parent_fd = parent_fd
+            self._sticky_shared_parent = (
+                self._expected_parent_identity is not None and _is_safe_sticky_shared_private_parent(parent_info)
+            )
+            self._parent_state = _private_parent_state(
+                parent_info,
+                allow_sticky_shared=self._sticky_shared_parent,
+            )
             _require_absent_at(parent_fd, final.parent, final.name)
 
             attempts = 1 if self._requested_stage_token is not None else 128
@@ -327,7 +599,7 @@ class PrivateRun:
                 stage_token = self._requested_stage_token or secrets.token_hex(12)
                 stage_name = f".{final.name}.stage-{stage_token}"
                 stage = final.parent / stage_name
-                if root is not None and _is_within(stage, root) and not self._allow_unignored_output:
+                if root is not None and _is_within(stage, root):
                     _require_git_ignored(stage, root)
                 try:
                     _mkdir_at(parent_fd, final.parent, stage_name, _DIRECTORY_MODE)
@@ -564,7 +836,7 @@ class PrivateRun:
             assert self._stage_identity is not None
 
             _sync_private_tree(self._stage_fd, self._stage_dir, root=True)
-            self._require_cleanup_files_current()
+            self._require_cleanup_files_current(reserve_commit_marker=True)
             _write_commit_marker(self._stage_fd, self._stage_dir)
             os.fsync(self._stage_fd)
             self._require_cleanup_files_current()
@@ -839,7 +1111,7 @@ class PrivateRun:
                 succeeded = False
         return succeeded and not self._cleanup_file_fds
 
-    def _require_cleanup_files_current(self) -> None:
+    def _require_cleanup_files_current(self, *, reserve_commit_marker: bool = False) -> None:
         assert self._stage_fd is not None
         assert self._stage_identity is not None
         root_info = os.fstat(self._stage_fd)
@@ -853,8 +1125,10 @@ class PrivateRun:
             self._stage_fd,
             expected=expected,
             counts=counts,
+            directory_witnesses={},
+            require_commit_marker=False,
             depth=0,
-            entries=[0],
+            entries=[1 if reserve_commit_marker else 0],
             root=True,
         ) or any(count != 1 for count in counts.values()):
             raise EnronPrivateIOError("Pinned private output file changed before promotion completed.")
@@ -976,17 +1250,39 @@ class PrivateRun:
                     try:
                         if cleanup_failed:
                             raise EnronPrivateIOError("Private staging contents could not be wiped safely.")
+                        parent_path = self._final_dir.parent if self._final_dir else Path.cwd()
+                        parent_opened = os.fstat(parent_fd)
+                        if self._parent_state is None:
+                            raise EnronPrivateIOError("Private cleanup parent state is unavailable.")
+                        _require_current_private_parent(
+                            parent_path,
+                            parent_opened,
+                            self._parent_state,
+                            allow_sticky_shared=self._sticky_shared_parent,
+                        )
                         quarantine_name = f".nerb-cleanup-{secrets.token_hex(24)}"
-                        quarantine_path = (self._final_dir.parent if self._final_dir else Path.cwd()) / quarantine_name
+                        quarantine_path = parent_path / quarantine_name
+                        cleanup_boundary_validated = False
+                        if self._cleanup_boundary is not None:
+                            _require_valid_cleanup_boundary(
+                                self._cleanup_boundary,
+                                parent=parent_path,
+                                parent_state=_private_parent_state(parent_opened),
+                                requested_workspace_root=self._requested_workspace_root,
+                                effective_workspace_root=self._workspace_root,
+                                allow_unignored_output=self._allow_unignored_output,
+                            )
+                            cleanup_boundary_validated = True
                         if (
                             self._workspace_root is not None
                             and _is_within(quarantine_path, self._workspace_root)
                             and not self._allow_unignored_output
+                            and not cleanup_boundary_validated
                         ):
                             _require_git_ignored(quarantine_path, self._workspace_root)
                         _quarantine_verified_cleanup_entry(
                             parent_fd,
-                            self._final_dir.parent if self._final_dir else Path.cwd(),
+                            parent_path,
                             name,
                             expected_identity,
                             directory=True,
@@ -1040,9 +1336,10 @@ class PrivateRun:
             self._stage_dir = None
             self._workspace_root = None
             if stage_fd is not None:
-                self._cleanup_sensitive_content_wiped = content_wiped
+                cleanup_tombstone_count = 1 if retained_tombstone else 0
+                self._cleanup_sensitive_content_wiped = content_wiped and cleanup_tombstone_count == 0
                 self._cleanup_path_tree_removed = False
-                self._cleanup_tombstone_count = 1 if retained_tombstone else 0
+                self._cleanup_tombstone_count = cleanup_tombstone_count
         if cleanup_control_error is not None:
             raise cleanup_control_error
         if cleanup_failed:
@@ -2242,16 +2539,19 @@ def _collect_cleanup_tree_descriptors(
     depth: int,
     entries: list[int],
 ) -> None:
-    if depth > _MAX_PINNED_CLEANUP_TREE_DEPTH:
+    if depth > _MAX_PRIVATE_TREE_DEPTH:
         raise EnronPrivateIOError("Private cleanup tree exceeds its depth limit.")
     try:
-        names = sorted(os.listdir(directory_fd))
+        names = _bounded_directory_names(
+            directory_fd,
+            entries=entries,
+            maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
+        )
+    except _PrivateTreeEntryLimitExceeded:
+        raise EnronPrivateIOError("Private cleanup tree exceeds its entry limit.") from None
     except OSError:
         raise EnronPrivateIOError("Private cleanup tree could not be inspected safely.") from None
     for name in names:
-        entries[0] += 1
-        if entries[0] > _MAX_PINNED_CLEANUP_TREE_ENTRIES:
-            raise EnronPrivateIOError("Private cleanup tree exceeds its entry limit.")
         child_fd: int | None = None
         file_fd: int | None = None
         try:
@@ -2498,6 +2798,60 @@ def _private_directory_identity(info: os.stat_result) -> tuple[int, int]:
     return int(info.st_dev), int(info.st_ino)
 
 
+def _is_safe_sticky_shared_private_parent(info: os.stat_result) -> bool:
+    """Return whether a shared-temp parent safely protects owned child entries."""
+
+    owner = os.geteuid() if hasattr(os, "geteuid") else info.st_uid
+    mode = stat.S_IMODE(info.st_mode)
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid in {0, owner}
+        and mode & stat.S_ISVTX != 0
+        and mode & stat.S_IWOTH != 0
+        and mode & stat.S_IXOTH != 0
+    )
+
+
+def _private_parent_state(
+    info: os.stat_result,
+    *,
+    allow_sticky_shared: bool = False,
+) -> _PrivateParentState:
+    mode = stat.S_IMODE(info.st_mode)
+    owner_only = (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and is_owner_only_private_mode(mode)
+    )
+    if not owner_only and not (allow_sticky_shared and _is_safe_sticky_shared_private_parent(info)):
+        raise EnronPrivateIOError("Private cleanup parent is unsafe.")
+    return int(info.st_dev), int(info.st_ino), int(info.st_uid), mode
+
+
+def _require_current_private_parent(
+    parent_path: Path,
+    parent_opened: os.stat_result,
+    expected_state: _PrivateParentState,
+    *,
+    allow_sticky_shared: bool = False,
+) -> None:
+    """Require a pinned parent and its public path to retain the bound security state."""
+
+    try:
+        parent_current = parent_path.lstat()
+    except OSError:
+        raise EnronPrivateIOError("Private cleanup parent changed before quarantine.") from None
+    try:
+        opened_state = _private_parent_state(parent_opened, allow_sticky_shared=allow_sticky_shared)
+        current_state = _private_parent_state(parent_current, allow_sticky_shared=allow_sticky_shared)
+    except EnronPrivateIOError:
+        raise EnronPrivateIOError("Private cleanup parent changed before quarantine.") from None
+    if opened_state != expected_state or current_state != expected_state:
+        raise EnronPrivateIOError("Private cleanup parent changed before quarantine.")
+
+
 def _require_directory_entry_identity(
     parent_fd: int,
     parent_path: Path,
@@ -2534,9 +2888,25 @@ def _require_absent_at(parent_fd: int, parent_path: Path, name: str) -> None:
     raise EnronPrivateIOError("Private output target already exists.")
 
 
-def _sync_private_tree(directory_fd: int, directory_path: Path, *, root: bool) -> None:
+def _sync_private_tree(
+    directory_fd: int,
+    directory_path: Path,
+    *,
+    root: bool,
+    depth: int = 0,
+    entries: list[int] | None = None,
+) -> None:
+    if depth > _MAX_PRIVATE_TREE_DEPTH:
+        raise EnronPrivateIOError("Private staging tree exceeds its depth limit.")
+    resolved_entries = [1 if root else 0] if entries is None else entries
     try:
-        names = sorted(os.listdir(directory_fd if os.listdir in os.supports_fd else directory_path))
+        names = _bounded_directory_names(
+            directory_fd,
+            entries=resolved_entries,
+            maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
+        )
+    except _PrivateTreeEntryLimitExceeded:
+        raise EnronPrivateIOError("Private staging tree exceeds its entry limit.") from None
     except OSError:
         raise EnronPrivateIOError("Private staging directory could not be inspected safely.") from None
     if root and _COMMIT_MARKER in names:
@@ -2550,7 +2920,13 @@ def _sync_private_tree(directory_fd: int, directory_path: Path, *, root: bool) -
             if stat.S_ISDIR(before.st_mode):
                 child_fd = _open_directory_at(directory_fd, directory_path, name)
                 try:
-                    _sync_private_tree(child_fd, directory_path / name, root=False)
+                    _sync_private_tree(
+                        child_fd,
+                        directory_path / name,
+                        root=False,
+                        depth=depth + 1,
+                        entries=resolved_entries,
+                    )
                 finally:
                     os.close(child_fd)
                 continue
@@ -2790,10 +3166,50 @@ def _rename_noreplace_at(
     raise EnronPrivateIOError("Atomic no-replace directory promotion is unavailable on this platform.")
 
 
-def _clear_pinned_private_directory(directory_fd: int, directory_path: Path) -> bool:
+class _PrivateTreeEntryLimitExceeded(Exception):
+    """Internal signal that a descriptor-relative tree walk exceeded its cap."""
+
+
+def _bounded_directory_names(
+    directory_fd: int,
+    *,
+    entries: list[int],
+    maximum_entries: int,
+) -> tuple[str, ...]:
+    """Return deterministic names without materializing beyond the entry cap."""
+
+    names: list[str] = []
+    with os.scandir(directory_fd) as iterator:
+        for entry in iterator:
+            entries[0] += 1
+            if entries[0] > maximum_entries:
+                raise _PrivateTreeEntryLimitExceeded
+            names.append(entry.name)
+    names.sort()
+    return tuple(names)
+
+
+def _clear_pinned_private_directory(
+    directory_fd: int,
+    directory_path: Path,
+    *,
+    maximum_depth: int | None = None,
+    maximum_entries: int | None = None,
+    _depth: int = 0,
+    _entries: list[int] | None = None,
+) -> bool:
+    resolved_maximum_depth = _MAX_PRIVATE_TREE_DEPTH if maximum_depth is None else maximum_depth
+    resolved_maximum_entries = _MAX_PRIVATE_TREE_ENTRIES if maximum_entries is None else maximum_entries
+    entries = [0] if _entries is None else _entries
+    if _depth > resolved_maximum_depth:
+        return False
     try:
-        names = sorted(os.listdir(directory_fd if os.listdir in os.supports_fd else directory_path))
-    except OSError:
+        names = _bounded_directory_names(
+            directory_fd,
+            entries=entries,
+            maximum_entries=resolved_maximum_entries,
+        )
+    except (OSError, _PrivateTreeEntryLimitExceeded):
         return False
     succeeded = True
     for name in names:
@@ -2813,7 +3229,14 @@ def _clear_pinned_private_directory(directory_fd: int, directory_path: Path) -> 
                     raise EnronPrivateIOError("Private staging directory ownership changed during cleanup.")
                 child_identity = int(child_info.st_dev), int(child_info.st_ino)
                 os.fchmod(child_fd, _DIRECTORY_MODE)
-                child_cleared = _clear_pinned_private_directory(child_fd, directory_path / name)
+                child_cleared = _clear_pinned_private_directory(
+                    child_fd,
+                    directory_path / name,
+                    maximum_depth=resolved_maximum_depth,
+                    maximum_entries=resolved_maximum_entries,
+                    _depth=_depth + 1,
+                    _entries=entries,
+                )
                 after = os.fstat(child_fd)
                 if not child_cleared or (after.st_dev, after.st_ino) != child_identity:
                     succeeded = False
@@ -2871,17 +3294,27 @@ def _clear_pinned_private_directory(directory_fd: int, directory_path: Path) -> 
     return succeeded
 
 
-def _private_tree_payload_is_empty(directory_fd: int, *, depth: int, entries: list[int]) -> bool:
-    if depth > _MAX_PRIVATE_TOMBSTONE_DEPTH:
+def _private_tree_payload_is_empty(
+    directory_fd: int,
+    *,
+    depth: int,
+    entries: list[int],
+    maximum_depth: int | None = None,
+    maximum_entries: int | None = None,
+) -> bool:
+    resolved_maximum_depth = _MAX_PRIVATE_TREE_DEPTH if maximum_depth is None else maximum_depth
+    resolved_maximum_entries = _MAX_PRIVATE_TREE_ENTRIES if maximum_entries is None else maximum_entries
+    if depth > resolved_maximum_depth:
         return False
     try:
-        names = sorted(os.listdir(directory_fd))
-    except OSError:
+        names = _bounded_directory_names(
+            directory_fd,
+            entries=entries,
+            maximum_entries=resolved_maximum_entries,
+        )
+    except (OSError, _PrivateTreeEntryLimitExceeded):
         return False
     for name in names:
-        entries[0] += 1
-        if entries[0] > _MAX_PRIVATE_TOMBSTONE_ENTRIES:
-            return False
         child_fd: int | None = None
         try:
             info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -2894,6 +3327,8 @@ def _private_tree_payload_is_empty(directory_fd: int, *, depth: int, entries: li
                     child_fd,
                     depth=depth + 1,
                     entries=entries,
+                    maximum_depth=resolved_maximum_depth,
+                    maximum_entries=resolved_maximum_entries,
                 ):
                     return False
                 continue
@@ -2922,20 +3357,31 @@ def _count_registered_private_files(
     *,
     expected: set[tuple[int, int]],
     counts: dict[tuple[int, int], int],
+    directory_witnesses: dict[tuple[int, int], tuple[int, ...]],
+    require_commit_marker: bool,
     depth: int,
     entries: list[int],
     root: bool,
+    maximum_depth: int | None = None,
+    maximum_entries: int | None = None,
 ) -> bool:
-    if depth > _MAX_PRIVATE_TOMBSTONE_DEPTH:
+    resolved_maximum_depth = _MAX_PRIVATE_TREE_DEPTH if maximum_depth is None else maximum_depth
+    resolved_maximum_entries = _MAX_PRIVATE_TREE_ENTRIES if maximum_entries is None else maximum_entries
+    if depth > resolved_maximum_depth:
         return False
     try:
-        names = sorted(os.listdir(directory_fd))
-    except OSError:
-        return False
-    for name in names:
-        entries[0] += 1
-        if entries[0] > _MAX_PRIVATE_TOMBSTONE_ENTRIES:
+        directory_before = os.fstat(directory_fd)
+        if not stat.S_ISDIR(directory_before.st_mode) or directory_before.st_uid != os.geteuid():
             return False
+        names = _bounded_directory_names(
+            directory_fd,
+            entries=entries,
+            maximum_entries=resolved_maximum_entries,
+        )
+    except (OSError, _PrivateTreeEntryLimitExceeded):
+        return False
+    commit_marker_found = False
+    for name in names:
         child_fd: int | None = None
         file_fd: int | None = None
         try:
@@ -2953,9 +3399,13 @@ def _count_registered_private_files(
                         child_fd,
                         expected=expected,
                         counts=counts,
+                        directory_witnesses=directory_witnesses,
+                        require_commit_marker=require_commit_marker,
                         depth=depth + 1,
                         entries=entries,
                         root=False,
+                        maximum_depth=resolved_maximum_depth,
+                        maximum_entries=resolved_maximum_entries,
                     )
                 ):
                     return False
@@ -2984,8 +3434,10 @@ def _count_registered_private_files(
             elif not root or name != _COMMIT_MARKER or opened.st_size != len(_COMMIT_PAYLOAD):
                 return False
             else:
+                commit_marker_found = True
                 try:
-                    if os.pread(file_fd, len(_COMMIT_PAYLOAD) + 1, 0) != _COMMIT_PAYLOAD:
+                    payload = os.pread(file_fd, len(_COMMIT_PAYLOAD) + 1, 0)
+                    if payload != _COMMIT_PAYLOAD:
                         return False
                 except OSError:
                     return False
@@ -3002,14 +3454,28 @@ def _count_registered_private_files(
                     os.close(child_fd)
                 except OSError:
                     return False
-    return True
+    try:
+        directory_after = os.fstat(directory_fd)
+    except OSError:
+        return False
+    stable_fields = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(directory_before, field) != getattr(directory_after, field) for field in stable_fields):
+        return False
+    identity = int(directory_after.st_dev), int(directory_after.st_ino)
+    if identity in directory_witnesses:
+        return False
+    directory_witnesses[identity] = tuple(int(getattr(directory_after, field)) for field in stable_fields)
+    return not root or not require_commit_marker or commit_marker_found
 
 
-def _private_tree_matches_cleanup_inventory(
+_CleanupDirectoryWitness = tuple[tuple[tuple[int, int], tuple[int, ...]], ...]
+
+
+def _private_tree_cleanup_inventory_witness(
     directory_fd: int,
     expected: set[tuple[int, int]],
-) -> bool:
-    """Return whether a pinned private tree contains the complete registered inventory."""
+) -> _CleanupDirectoryWitness | None:
+    """Snapshot a complete inventory plus directory mutation witnesses."""
 
     if len(expected) > _MAX_PINNED_CLEANUP_FILES or any(
         not isinstance(identity, tuple)
@@ -3017,16 +3483,22 @@ def _private_tree_matches_cleanup_inventory(
         or any(type(value) is not int or value < 0 for value in identity)
         for identity in expected
     ):
-        return False
+        return None
     counts = {identity: 0 for identity in expected}
-    return _count_registered_private_files(
+    directory_witnesses: dict[tuple[int, int], tuple[int, ...]] = {}
+    complete = _count_registered_private_files(
         directory_fd,
         expected=expected,
         counts=counts,
+        directory_witnesses=directory_witnesses,
+        require_commit_marker=True,
         depth=0,
         entries=[0],
         root=True,
+        maximum_depth=_MAX_PRIVATE_TREE_DEPTH,
+        maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
     ) and all(count == 1 for count in counts.values())
+    return tuple(sorted(directory_witnesses.items())) if complete else None
 
 
 def _collect_cleanup_inventory_descriptors(
@@ -3039,17 +3511,21 @@ def _collect_cleanup_inventory_descriptors(
     entries: list[int],
     root: bool,
 ) -> bool:
-    if depth > _MAX_PINNED_CLEANUP_TREE_DEPTH:
+    if depth > _MAX_PRIVATE_TREE_DEPTH:
         raise EnronPrivateIOError("Private cleanup inventory exceeds its depth limit.")
     try:
-        names = sorted(os.listdir(directory_fd))
+        names = _bounded_directory_names(
+            directory_fd,
+            entries=entries,
+            maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
+        )
+    except _PrivateTreeEntryLimitExceeded:
+        raise EnronPrivateIOError("Private cleanup inventory exceeds its entry limit.") from None
     except OSError:
         raise EnronPrivateIOError("Private cleanup inventory could not be inspected safely.") from None
     complete = True
+    commit_marker_found = False
     for name in names:
-        entries[0] += 1
-        if entries[0] > _MAX_PINNED_CLEANUP_TREE_ENTRIES:
-            raise EnronPrivateIOError("Private cleanup inventory exceeds its entry limit.")
         child_fd: int | None = None
         file_fd: int | None = None
         try:
@@ -3128,8 +3604,10 @@ def _collect_cleanup_inventory_descriptors(
                 raise EnronPrivateIOError("Private cleanup inventory file changed while it was opened.")
             if not root or name != _COMMIT_MARKER or opened.st_size != len(_COMMIT_PAYLOAD):
                 complete = False
-            elif os.pread(file_fd, len(_COMMIT_PAYLOAD) + 1, 0) != _COMMIT_PAYLOAD:
-                complete = False
+            else:
+                commit_marker_found = True
+                if os.pread(file_fd, len(_COMMIT_PAYLOAD) + 1, 0) != _COMMIT_PAYLOAD:
+                    complete = False
         except EnronPrivateIOError:
             raise
         except (OSError, ValueError):
@@ -3139,7 +3617,7 @@ def _collect_cleanup_inventory_descriptors(
                 os.close(file_fd)
             if child_fd is not None:
                 os.close(child_fd)
-    return complete
+    return complete and (not root or commit_marker_found)
 
 
 def _wipe_and_quarantine_pinned_private_directory(
@@ -3151,8 +3629,16 @@ def _wipe_and_quarantine_pinned_private_directory(
     *,
     workspace_root: Path | None,
     allow_unignored_output: bool,
+    cleanup_boundary: _PrevalidatedCleanupBoundary | None = None,
+    effective_workspace_root: Path | None = None,
+    quarantine: bool = True,
+    quarantine_name: str | None = None,
+    cleanup_expected_files: set[tuple[int, int]] | None = None,
+    cleanup_directory_witness: _CleanupDirectoryWitness | None = None,
+    maximum_tree_depth: int | None = None,
+    maximum_tree_entries: int | None = None,
 ) -> tuple[bool, bool, int]:
-    """Wipe a pinned private tree and retain one verified payload-empty tombstone."""
+    """Wipe a pinned private tree and optionally retain it as a verified empty tombstone."""
 
     if (
         type(directory_fd) is not int
@@ -3166,17 +3652,29 @@ def _wipe_and_quarantine_pinned_private_directory(
         or not isinstance(expected_identity, tuple)
         or len(expected_identity) != 2
         or any(type(value) is not int or value < 0 for value in expected_identity)
+        or type(allow_unignored_output) is not bool
+        or type(quarantine) is not bool
+        or (not quarantine and quarantine_name is not None)
+        or ((cleanup_expected_files is None) != (cleanup_directory_witness is None))
+        or (cleanup_expected_files is not None and not isinstance(cleanup_expected_files, set))
+        or ((maximum_tree_depth is None) != (maximum_tree_entries is None))
+        or (maximum_tree_depth is not None and (type(maximum_tree_depth) is not int or maximum_tree_depth < 0))
+        or (maximum_tree_entries is not None and (type(maximum_tree_entries) is not int or maximum_tree_entries <= 0))
+        or (
+            quarantine_name is not None
+            and (not isinstance(quarantine_name, str) or _PRIVATE_TOMBSTONE_NAME_RE.fullmatch(quarantine_name) is None)
+        )
     ):
         raise EnronPrivateIOError("Pinned private cleanup arguments are invalid.")
+    resolved_maximum_depth = _MAX_PRIVATE_TREE_DEPTH if maximum_tree_depth is None else maximum_tree_depth
+    resolved_maximum_entries = _MAX_PRIVATE_TREE_ENTRIES if maximum_tree_entries is None else maximum_tree_entries
     parent = _absolute_path_without_traversal(parent_path, description="Private cleanup parent")
     try:
-        parent_opened = os.fstat(parent_fd)
-        if (
-            not stat.S_ISDIR(parent_opened.st_mode)
-            or parent_opened.st_uid != os.geteuid()
-            or not is_owner_only_private_mode(stat.S_IMODE(parent_opened.st_mode))
-        ):
-            raise EnronPrivateIOError("Pinned private cleanup parent is unsafe.")
+        try:
+            parent_opened = os.fstat(parent_fd)
+        except OSError:
+            parent_opened = None
+        cleanup_boundary_validated = False
         opened = os.fstat(directory_fd)
         if (
             not stat.S_ISDIR(opened.st_mode)
@@ -3184,23 +3682,61 @@ def _wipe_and_quarantine_pinned_private_directory(
             or (opened.st_dev, opened.st_ino) != expected_identity
         ):
             raise EnronPrivateIOError("Pinned private cleanup identity changed.")
+        if (
+            cleanup_expected_files is not None
+            and _private_tree_cleanup_inventory_witness(
+                directory_fd,
+                cleanup_expected_files,
+            )
+            != cleanup_directory_witness
+        ):
+            raise EnronPrivateIOError("Pinned private cleanup inventory changed before payload wiping.")
         os.fchmod(directory_fd, _DIRECTORY_MODE)
-        if not _clear_pinned_private_directory(directory_fd, parent / entry_name) or not _private_tree_payload_is_empty(
+        if not _clear_pinned_private_directory(
+            directory_fd,
+            parent / entry_name,
+            maximum_depth=resolved_maximum_depth,
+            maximum_entries=resolved_maximum_entries,
+        ) or not _private_tree_payload_is_empty(
             directory_fd,
             depth=0,
             entries=[0],
+            maximum_depth=resolved_maximum_depth,
+            maximum_entries=resolved_maximum_entries,
         ):
             raise EnronPrivateIOError("Pinned private cleanup payload could not be wiped safely.")
+        # Parent-policy failures cannot make authenticated private payloads
+        # ineligible for wiping. Bind the pre-wipe snapshot only after the
+        # payload is empty, then require the live fd and public path to match.
+        if parent_opened is None:
+            raise EnronPrivateIOError("Pinned private cleanup parent is unavailable after payload wipe.")
+        parent_state = _private_parent_state(parent_opened)
         # Check the public parent path only after the pinned payload has been
         # wiped. A same-UID rename/substitution must never preserve sensitive
         # bytes merely because the original parent is no longer at this name.
-        parent_current = parent.lstat()
-        if (parent_opened.st_dev, parent_opened.st_ino) != (parent_current.st_dev, parent_current.st_ino):
-            raise EnronPrivateIOError("Pinned private cleanup parent changed.")
+        _require_current_private_parent(parent, os.fstat(parent_fd), parent_state)
         _require_directory_entry_identity(parent_fd, parent, entry_name, expected_identity)
-        quarantine_name = f".nerb-cleanup-{secrets.token_hex(24)}"
+        if cleanup_boundary is not None:
+            _require_valid_cleanup_boundary(
+                cleanup_boundary,
+                parent=parent,
+                parent_state=parent_state,
+                requested_workspace_root=workspace_root,
+                effective_workspace_root=effective_workspace_root,
+                allow_unignored_output=allow_unignored_output,
+            )
+            cleanup_boundary_validated = True
+        if not quarantine:
+            os.fsync(directory_fd)
+            os.fsync(parent_fd)
+            return True, False, 0
+        quarantine_name = quarantine_name or f".nerb-cleanup-{secrets.token_hex(24)}"
         quarantine_path = parent / quarantine_name
-        root = _workspace_for_path(parent / entry_name, workspace_root)
+        root = (
+            _workspace_for_path(parent / entry_name, workspace_root)
+            if not cleanup_boundary_validated and not allow_unignored_output
+            else None
+        )
         if root is not None and _is_within(quarantine_path, root) and not allow_unignored_output:
             _require_git_ignored(quarantine_path, root)
         _quarantine_verified_cleanup_entry(
@@ -3211,7 +3747,13 @@ def _wipe_and_quarantine_pinned_private_directory(
             directory=True,
             quarantine_name=quarantine_name,
         )
-        if not _private_tree_payload_is_empty(directory_fd, depth=0, entries=[0]):
+        if not _private_tree_payload_is_empty(
+            directory_fd,
+            depth=0,
+            entries=[0],
+            maximum_depth=resolved_maximum_depth,
+            maximum_entries=resolved_maximum_entries,
+        ):
             raise EnronPrivateIOError("Pinned private cleanup tombstone payload is not empty.")
         os.fsync(parent_fd)
         return True, False, 1
@@ -3219,6 +3761,148 @@ def _wipe_and_quarantine_pinned_private_directory(
         raise
     except (OSError, ValueError):
         raise EnronPrivateIOError("Pinned private directory could not be wiped safely.") from None
+
+
+def _pessimistically_quarantine_pinned_private_directory(
+    directory_fd: int,
+    parent_fd: int,
+    parent_path: Path,
+    entry_name: str,
+    expected_identity: tuple[int, int],
+    *,
+    quarantine_name: str,
+    workspace_root: Path | None,
+    allow_unignored_output: bool,
+) -> Path:
+    """Durably publish an incomplete cleanup verdict before inspecting payloads."""
+
+    parent = _absolute_path_without_traversal(parent_path, description="Private cleanup parent")
+    try:
+        parent_opened = os.fstat(parent_fd)
+        opened = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or (opened.st_dev, opened.st_ino) != expected_identity
+        ):
+            raise EnronPrivateIOError("Pinned private cleanup identity changed.")
+        os.fchmod(directory_fd, _DIRECTORY_MODE)
+        parent_state = _private_parent_state(parent_opened)
+        _require_current_private_parent(parent, os.fstat(parent_fd), parent_state)
+        _require_directory_entry_identity(parent_fd, parent, entry_name, expected_identity)
+        quarantine_path = parent / quarantine_name
+        root = _workspace_for_path(parent / entry_name, workspace_root) if not allow_unignored_output else None
+        if root is not None and _is_within(quarantine_path, root):
+            _require_git_ignored(quarantine_path, root)
+        _quarantine_verified_cleanup_entry(
+            parent_fd,
+            parent,
+            entry_name,
+            expected_identity,
+            directory=True,
+            quarantine_name=quarantine_name,
+        )
+        _require_cleanup_entry_identity(
+            parent_fd,
+            parent,
+            quarantine_name,
+            expected_identity,
+            directory=True,
+        )
+        os.fsync(parent_fd)
+        return parent
+    except EnronPrivateIOError:
+        raise
+    except (OSError, ValueError):
+        raise EnronPrivateIOError("Pinned private directory could not be quarantined safely.") from None
+
+
+def _promote_completed_cleanup_tombstone(
+    directory_fd: int,
+    parent_fd: int,
+    parent_path: Path,
+    incomplete_name: str,
+    complete_name: str,
+    expected_identity: tuple[int, int],
+    expected_root_fields: tuple[int, ...],
+) -> bool:
+    """Atomically promote only an empty, unchanged incomplete cleanup tombstone."""
+
+    parent = _absolute_path_without_traversal(parent_path, description="Private cleanup parent")
+    try:
+        if not _private_tree_payload_is_empty(
+            directory_fd,
+            depth=0,
+            entries=[0],
+            maximum_depth=_MAX_PRIVATE_TREE_DEPTH,
+            maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
+        ):
+            return False
+        opened = os.fstat(directory_fd)
+        current_fields = (
+            int(opened.st_dev),
+            int(opened.st_ino),
+            int(opened.st_mode),
+            int(opened.st_uid),
+            int(opened.st_nlink),
+            int(opened.st_size),
+            int(opened.st_mtime_ns),
+            int(opened.st_ctime_ns),
+        )
+        if current_fields != expected_root_fields or (int(opened.st_dev), int(opened.st_ino)) != expected_identity:
+            return False
+        parent_opened = os.fstat(parent_fd)
+        parent_state = _private_parent_state(parent_opened)
+        _require_current_private_parent(parent, os.fstat(parent_fd), parent_state)
+        _require_cleanup_entry_identity(
+            parent_fd,
+            parent,
+            incomplete_name,
+            expected_identity,
+            directory=True,
+        )
+        os.fsync(directory_fd)
+        _rename_cleanup_entry_at(parent_fd, parent, incomplete_name, complete_name)
+        published = _stat_at(parent_fd, parent, complete_name)
+        if (
+            not stat.S_ISDIR(published.st_mode)
+            or stat.S_ISLNK(published.st_mode)
+            or published.st_uid != os.geteuid()
+            or (int(published.st_dev), int(published.st_ino)) != expected_identity
+        ):
+            substitute_directory = stat.S_ISDIR(published.st_mode) and not stat.S_ISLNK(published.st_mode)
+            if published.st_uid == os.geteuid() and substitute_directory:
+                _rollback_cleanup_quarantine(
+                    parent_fd,
+                    parent,
+                    complete_name,
+                    incomplete_name,
+                    (int(published.st_dev), int(published.st_ino)),
+                    directory=True,
+                )
+            raise EnronPrivateIOError("Completed private cleanup entry changed during publication.")
+        if not _private_tree_payload_is_empty(
+            directory_fd,
+            depth=0,
+            entries=[0],
+            maximum_depth=_MAX_PRIVATE_TREE_DEPTH,
+            maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
+        ):
+            _rollback_cleanup_quarantine(
+                parent_fd,
+                parent,
+                complete_name,
+                incomplete_name,
+                expected_identity,
+                directory=True,
+            )
+            return False
+        os.fsync(parent_fd)
+        return True
+    except EnronPrivateIOError:
+        raise
+    except (OSError, ValueError):
+        raise EnronPrivateIOError("Completed private cleanup entry could not be published safely.") from None
 
 
 def _wipe_and_quarantine_pinned_private_directory_with_inventory(
@@ -3231,21 +3915,74 @@ def _wipe_and_quarantine_pinned_private_directory_with_inventory(
     *,
     workspace_root: Path | None,
     allow_unignored_output: bool,
+    quarantine: bool,
+    complete_quarantine_name: str | None = None,
+    incomplete_quarantine_name: str | None = None,
+    allow_complete_quarantine: bool = True,
 ) -> tuple[bool, bool, int]:
-    """Pin, authenticate, and wipe an expected recovery inventory before quarantine."""
+    """Pin and wipe a recovery inventory, persisting its verdict in the quarantine name."""
 
+    quarantine_names = (complete_quarantine_name, incomplete_quarantine_name)
+    if (
+        type(allow_unignored_output) is not bool
+        or type(quarantine) is not bool
+        or type(allow_complete_quarantine) is not bool
+        or (not quarantine and not allow_complete_quarantine)
+        or (not quarantine and any(name is not None for name in quarantine_names))
+        or ((complete_quarantine_name is None) != (incomplete_quarantine_name is None))
+        or (quarantine and complete_quarantine_name is None)
+        or any(
+            name is not None and (not isinstance(name, str) or _PRIVATE_TOMBSTONE_NAME_RE.fullmatch(name) is None)
+            for name in quarantine_names
+        )
+        or (complete_quarantine_name is not None and complete_quarantine_name == incomplete_quarantine_name)
+    ):
+        raise EnronPrivateIOError("Pinned private cleanup arguments are invalid.")
     complete = False
     descriptors_wiped = True
-    removed = (False, False, 0)
+    in_place_wipe = (False, False, 0)
     deferred_control_error: BaseException | None = None
+    parent = _absolute_path_without_traversal(parent_path, description="Private cleanup parent")
+    active_entry_name = entry_name
+    if quarantine:
+        assert incomplete_quarantine_name is not None
+        try:
+            parent = _pessimistically_quarantine_pinned_private_directory(
+                directory_fd,
+                parent_fd,
+                parent,
+                entry_name,
+                expected_identity,
+                quarantine_name=incomplete_quarantine_name,
+                workspace_root=workspace_root,
+                allow_unignored_output=allow_unignored_output,
+            )
+        except EnronPrivateIOError:
+            # Parent-policy or destination races must not preserve authenticated
+            # payload bytes merely because pessimistic publication failed.
+            _wipe_and_quarantine_pinned_private_directory(
+                directory_fd,
+                parent_fd,
+                parent,
+                entry_name,
+                expected_identity,
+                workspace_root=workspace_root,
+                allow_unignored_output=allow_unignored_output,
+                quarantine=False,
+                maximum_tree_depth=_MAX_PRIVATE_TREE_DEPTH,
+                maximum_tree_entries=_MAX_PRIVATE_TREE_ENTRIES,
+            )
+            raise
+        active_entry_name = incomplete_quarantine_name
     with _UNRESOLVED_CLEANUP_LOCK:
         if _UNRESOLVED_CLEANUP_FDS:
             raise EnronPrivateIOError("Unresolved private cleanup authority blocks recovery inventory collection.")
         with _CLEANUP_TREE_ADOPTION_LOCK:
+            baseline_witness = _private_tree_cleanup_inventory_witness(directory_fd, expected_files)
             try:
                 complete = _collect_cleanup_inventory_descriptors(
                     directory_fd,
-                    parent_path / entry_name,
+                    parent / active_entry_name,
                     expected=expected_files,
                     retained=cast(dict[tuple[int, int], int], _UNRESOLVED_CLEANUP_FDS),
                     depth=0,
@@ -3254,8 +3991,9 @@ def _wipe_and_quarantine_pinned_private_directory_with_inventory(
                 )
                 complete = (
                     complete
+                    and baseline_witness is not None
                     and set(_UNRESOLVED_CLEANUP_FDS) == expected_files
-                    and _private_tree_matches_cleanup_inventory(directory_fd, expected_files)
+                    and _private_tree_cleanup_inventory_witness(directory_fd, expected_files) == baseline_witness
                 )
             except EnronPrivateIOError:
                 complete = False
@@ -3263,14 +4001,52 @@ def _wipe_and_quarantine_pinned_private_directory_with_inventory(
             identity = _cleanup_owner_identity(key)
             if not _wipe_authenticated_cleanup_descriptor(identity, descriptor):
                 descriptors_wiped = False
-        removed = _wipe_and_quarantine_pinned_private_directory(
-            directory_fd,
-            parent_fd,
-            parent_path,
-            entry_name,
-            expected_identity,
-            workspace_root=workspace_root,
-            allow_unignored_output=allow_unignored_output,
+        mutation_free = (
+            baseline_witness is not None
+            and _private_tree_cleanup_inventory_witness(directory_fd, expected_files) == baseline_witness
+        )
+        try:
+            in_place_wipe = _wipe_and_quarantine_pinned_private_directory(
+                directory_fd,
+                parent_fd,
+                parent,
+                active_entry_name,
+                expected_identity,
+                workspace_root=workspace_root,
+                allow_unignored_output=allow_unignored_output,
+                quarantine=False,
+                cleanup_expected_files=expected_files if mutation_free else None,
+                cleanup_directory_witness=baseline_witness if mutation_free else None,
+                maximum_tree_depth=_MAX_PRIVATE_TREE_DEPTH,
+                maximum_tree_entries=_MAX_PRIVATE_TREE_ENTRIES,
+            )
+        except EnronPrivateIOError:
+            if not quarantine:
+                raise
+            complete = False
+            mutation_free = False
+            in_place_wipe = _wipe_and_quarantine_pinned_private_directory(
+                directory_fd,
+                parent_fd,
+                parent,
+                active_entry_name,
+                expected_identity,
+                workspace_root=workspace_root,
+                allow_unignored_output=allow_unignored_output,
+                quarantine=False,
+                maximum_tree_depth=_MAX_PRIVATE_TREE_DEPTH,
+                maximum_tree_entries=_MAX_PRIVATE_TREE_ENTRIES,
+            )
+        cleared_info = os.fstat(directory_fd)
+        cleared_fields = (
+            int(cleared_info.st_dev),
+            int(cleared_info.st_ino),
+            int(cleared_info.st_mode),
+            int(cleared_info.st_uid),
+            int(cleared_info.st_nlink),
+            int(cleared_info.st_size),
+            int(cleared_info.st_mtime_ns),
+            int(cleared_info.st_ctime_ns),
         )
         for key, descriptor in tuple(_UNRESOLVED_CLEANUP_FDS.items()):
             identity = _cleanup_owner_identity(key)
@@ -3293,7 +4069,80 @@ def _wipe_and_quarantine_pinned_private_directory_with_inventory(
             raise deferred_control_error
         if _UNRESOLVED_CLEANUP_FDS:
             raise EnronPrivateIOError("Private cleanup inventory authority remains unresolved.")
-    return complete and descriptors_wiped and removed[0], removed[1], removed[2]
+        payload_empty = _private_tree_payload_is_empty(
+            directory_fd,
+            depth=0,
+            entries=[0],
+            maximum_depth=_MAX_PRIVATE_TREE_DEPTH,
+            maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
+        )
+        final_info = os.fstat(directory_fd)
+        final_fields = (
+            int(final_info.st_dev),
+            int(final_info.st_ino),
+            int(final_info.st_mode),
+            int(final_info.st_uid),
+            int(final_info.st_nlink),
+            int(final_info.st_size),
+            int(final_info.st_mtime_ns),
+            int(final_info.st_ctime_ns),
+        )
+        inventory_wiped = (
+            complete
+            and mutation_free
+            and descriptors_wiped
+            and in_place_wipe[0]
+            and cleared_fields == final_fields
+            and payload_empty
+        )
+        complete_published = inventory_wiped and allow_complete_quarantine
+        if quarantine:
+            selected_name = active_entry_name
+            if complete_published:
+                assert complete_quarantine_name is not None
+                complete_published = _promote_completed_cleanup_tombstone(
+                    directory_fd,
+                    parent_fd,
+                    parent,
+                    active_entry_name,
+                    complete_quarantine_name,
+                    expected_identity,
+                    cleared_fields,
+                )
+                if complete_published:
+                    selected_name = complete_quarantine_name
+                else:
+                    _wipe_and_quarantine_pinned_private_directory(
+                        directory_fd,
+                        parent_fd,
+                        parent,
+                        active_entry_name,
+                        expected_identity,
+                        workspace_root=workspace_root,
+                        allow_unignored_output=allow_unignored_output,
+                        quarantine=False,
+                        maximum_tree_depth=_MAX_PRIVATE_TREE_DEPTH,
+                        maximum_tree_entries=_MAX_PRIVATE_TREE_ENTRIES,
+                    )
+            _require_cleanup_entry_identity(
+                parent_fd,
+                parent,
+                selected_name,
+                expected_identity,
+                directory=True,
+            )
+            if not _private_tree_payload_is_empty(
+                directory_fd,
+                depth=0,
+                entries=[0],
+                maximum_depth=_MAX_PRIVATE_TREE_DEPTH,
+                maximum_entries=_MAX_PRIVATE_TREE_ENTRIES,
+            ):
+                raise EnronPrivateIOError("Pinned private cleanup tombstone payload is not empty.")
+            os.fsync(directory_fd)
+            os.fsync(parent_fd)
+            return complete_published, False, 1
+    return inventory_wiped and in_place_wipe[0], in_place_wipe[1], in_place_wipe[2]
 
 
 def _wipe_and_quarantine_pinned_private_file(
@@ -3320,17 +4169,15 @@ def _wipe_and_quarantine_pinned_private_file(
         or not isinstance(expected_identity, tuple)
         or len(expected_identity) != 2
         or any(type(value) is not int or value < 0 for value in expected_identity)
+        or type(allow_unignored_output) is not bool
     ):
         raise EnronPrivateIOError("Pinned private file cleanup arguments are invalid.")
     parent = _absolute_path_without_traversal(parent_path, description="Private cleanup parent")
     try:
-        parent_opened = os.fstat(parent_fd)
-        if (
-            not stat.S_ISDIR(parent_opened.st_mode)
-            or parent_opened.st_uid != os.geteuid()
-            or not is_owner_only_private_mode(stat.S_IMODE(parent_opened.st_mode))
-        ):
-            raise EnronPrivateIOError("Pinned private cleanup parent is unsafe.")
+        try:
+            parent_opened = os.fstat(parent_fd)
+        except OSError:
+            parent_opened = None
         opened = os.fstat(file_fd)
         if (
             not stat.S_ISREG(opened.st_mode)
@@ -3345,9 +4192,10 @@ def _wipe_and_quarantine_pinned_private_file(
         if os.fstat(file_fd).st_size != 0:
             raise EnronPrivateIOError("Pinned private cleanup file payload was not wiped.")
 
-        parent_current = parent.lstat()
-        if (parent_opened.st_dev, parent_opened.st_ino) != (parent_current.st_dev, parent_current.st_ino):
-            raise EnronPrivateIOError("Pinned private cleanup parent changed.")
+        if parent_opened is None:
+            raise EnronPrivateIOError("Pinned private cleanup parent is unavailable after payload wipe.")
+        parent_state = _private_parent_state(parent_opened)
+        _require_current_private_parent(parent, os.fstat(parent_fd), parent_state)
         current = _stat_at(parent_fd, parent, entry_name)
         if (
             not stat.S_ISREG(current.st_mode)
@@ -3359,7 +4207,7 @@ def _wipe_and_quarantine_pinned_private_file(
             raise EnronPrivateIOError("Pinned private cleanup file entry changed.")
         quarantine_name = f".nerb-cleanup-{secrets.token_hex(24)}"
         quarantine_path = parent / quarantine_name
-        root = _workspace_for_path(parent / entry_name, workspace_root)
+        root = None if allow_unignored_output else _workspace_for_path(parent / entry_name, workspace_root)
         if root is not None and _is_within(quarantine_path, root) and not allow_unignored_output:
             _require_git_ignored(quarantine_path, root)
         _quarantine_verified_cleanup_entry(
