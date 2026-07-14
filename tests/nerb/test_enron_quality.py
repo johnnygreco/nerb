@@ -78,13 +78,20 @@ def _bank(names: dict[str, tuple[str, str]] | None = None) -> dict[str, Any]:
         "unicode_normalization": "none",
         "default_regex_flags": [],
         "entities": {
+            "contact": {
+                "description": "Synthetic contacts.",
+                "status": "active",
+                "regex_flags": [],
+                "names": {"alice_email": _name("Alice email", "alice@example.com")},
+                "metadata": {},
+            },
             "person": {
                 "description": "Synthetic people.",
                 "status": "active",
                 "regex_flags": [],
                 "names": {name_id: _name(canonical, value) for name_id, (canonical, value) in names.items()},
                 "metadata": {},
-            }
+            },
         },
         "metadata": {},
     }
@@ -109,17 +116,18 @@ def _gold(
     *,
     catalog_name_id: str | None,
     catalog_pattern_id: str = "primary",
+    entity_class: str = "person",
 ) -> dict[str, Any]:
     return {
         "document_id": document_id,
-        "entity_class": "person",
+        "entity_class": entity_class,
         "start": start,
         "end": end,
         "catalog_identity": (
             None
             if catalog_name_id is None
             else {
-                "entity_id": "person",
+                "entity_id": entity_class,
                 "name_id": catalog_name_id,
                 "pattern_id": catalog_pattern_id,
             }
@@ -135,19 +143,22 @@ def _slice(
     cohort: str = "all",
     split_role: str = "validation",
     promotion_gate: bool = False,
+    entity_class: str = "person",
+    annotation_entity_classes: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    scope_classes = [entity_class] if annotation_entity_classes is None else list(annotation_entity_classes)
     return {
         "id": slice_id,
-        "label_artifact_id": "synthetic_person_labels",
+        "label_artifact_id": f"synthetic_{entity_class}_labels",
         "label_strength": label_strength,
         "annotation_scope": {
-            "entity_classes": ["person"],
+            "entity_classes": scope_classes,
             "document_regions": ["natural_body"],
             "span_policy_sha256": _SPAN_POLICY_SHA256,
             "exclusions": [],
         },
         "annotation_completeness": completeness,
-        "entity_class": "person",
+        "entity_class": entity_class,
         "cohort": cohort,
         "split_role": split_role,
         "text_view": "natural_body",
@@ -250,12 +261,13 @@ def _reference_slice(
     gold_by_document: Mapping[str, Sequence[Any]],
     predictions_by_document: Mapping[str, Sequence[Any]],
 ) -> dict[str, Any]:
+    entity_classes = set(quality_module._slice_entity_classes(spec))  # noqa: SLF001
     gold = sorted(
         (
             item
             for document_id in document_ids
             for item in gold_by_document.get(document_id, ())
-            if item.entity_class == spec.entity_class
+            if item.entity_class in entity_classes
         ),
         key=lambda item: item.key,
     )
@@ -264,7 +276,7 @@ def _reference_slice(
             item
             for document_id in document_ids
             for item in predictions_by_document.get(document_id, ())
-            if item.entity_class == spec.entity_class
+            if item.entity_class in entity_classes
         ),
         key=lambda item: (*item.key, item.entity_id, item.name_id, item.pattern_id),
     )
@@ -405,6 +417,7 @@ def _bulk_reference(
     documents: dict[str, Any] = {}
     gold: list[Any] = []
     predictions: list[Any] = []
+    prediction_payloads: list[dict[str, Any]] = []
     membership: dict[str, list[str]] = {spec.id: [] for spec in specs}
     for record in records:
         document = quality_module._prepare_stream_document(record["document"])
@@ -423,6 +436,7 @@ def _bulk_reference(
         documents[document.document_id] = document
         gold.extend(document_gold)
         predictions.extend(document_predictions)
+        prediction_payloads.extend(quality_module._prediction_payload(item) for item in document_predictions)
         for slice_id in slice_ids:
             membership[slice_id].append(document.document_id)
     if len(predictions) > DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL:
@@ -440,8 +454,9 @@ def _bulk_reference(
     unsupported_slices: list[dict[str, str]] = list(declared_unsupported)
     for spec in specs:
         document_ids = sorted(membership[spec.id])
+        entity_classes = set(quality_module._slice_entity_classes(spec))
         has_gold = any(
-            item.entity_class == spec.entity_class
+            item.entity_class in entity_classes
             for document_id in document_ids
             for item in gold_by_document.get(document_id, ())
         )
@@ -536,12 +551,14 @@ def _bulk_reference(
     }
     if any(spec.promotion_gate for spec in specs) and contract_validation["valid"] is not True:
         raise EnronQualityError("Promotion-gated quality output failed standalone contract validation.")
+    prediction_commitment = quality_module.hash_enron_quality_predictions(prediction_payloads)
     run_sha256 = quality_module._canonical_hash(
         {
             "protocol_sha256": protocol_sha256,
             "catalog_binding_sha256": catalog_binding_sha256,
             "canonical_bank_sha256": canonical_bank_sha256,
             "engine_bank_sha256": compiled.bank_hash,
+            "prediction_commitment": prediction_commitment,
             "quality": quality,
             "contract_validation": contract_validation,
             "unsupported_slices": unsupported_slices,
@@ -554,6 +571,7 @@ def _bulk_reference(
         "policy_sha256": policy_sha256,
         "protocol_sha256": protocol_sha256,
         "catalog_binding_sha256": catalog_binding_sha256,
+        "prediction_commitment": prediction_commitment,
         "run_sha256": run_sha256,
         "bank": {"canonical_sha256": canonical_bank_sha256, "engine_sha256": compiled.bank_hash},
         "evaluated": bool(evaluated_slices),
@@ -645,7 +663,7 @@ def test_streaming_matches_bulk_reference_for_empty_failure_states(
     assert _run(records, slices=plans) == _bulk_reference(_bank(), records, plans)
 
 
-def test_record_and_per_document_gold_order_do_not_change_any_output() -> None:
+def test_document_order_is_bound_only_by_prediction_commitment_and_run_hash() -> None:
     bank, records, slices = _complex_case()
     baseline = _run(records, bank=bank, slices=slices)
     reordered = copy.deepcopy(list(reversed(records)))
@@ -653,7 +671,13 @@ def test_record_and_per_document_gold_order_do_not_change_any_output() -> None:
         record["gold_spans"].reverse()
         record["slice_ids"].reverse()
 
-    assert _run(reordered, bank=bank, slices=slices) == baseline
+    changed = _run(reordered, bank=bank, slices=slices)
+
+    assert changed["protocol_sha256"] == baseline["protocol_sha256"]
+    assert changed["catalog_binding_sha256"] == baseline["catalog_binding_sha256"]
+    assert changed["quality"] == baseline["quality"]
+    assert changed["prediction_commitment"] != baseline["prediction_commitment"]
+    assert changed["run_sha256"] != baseline["run_sha256"]
 
 
 def test_protocol_excludes_catalog_adjudication_but_catalog_digest_binds_it() -> None:
@@ -800,6 +824,138 @@ def test_prepare_compiles_once_and_consume_never_recompiles(monkeypatch: pytest.
     session.finish()
 
     assert calls == 1
+
+
+def test_person_contact_panel_reuses_one_scan_and_accumulates_cross_class_unions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    combined = _slice(
+        slice_id="person_contact_all_test",
+        split_role="test",
+        promotion_gate=True,
+        entity_class="person_contact",
+        annotation_entity_classes=["contact", "person"],
+    )
+    person = _slice(slice_id="person_all_test", split_role="test")
+    contact = _slice(slice_id="contact_all_test", split_role="test", entity_class="contact")
+    actual_scan = quality_module._scan_document
+    scans = 0
+
+    def count_scan(*args: Any, **kwargs: Any) -> Any:
+        nonlocal scans
+        scans += 1
+        return actual_scan(*args, **kwargs)
+
+    monkeypatch.setattr(quality_module, "_scan_document", count_scan)
+    session = prepare_enron_quality(_bank(), slice_specs=[combined, person, contact])
+    memberships = [combined["id"], person["id"], contact["id"]]
+    session.consume(
+        _document("doc_1", "Alice alice@example.com", split_role="test"),
+        [
+            _gold("doc_1", 0, 5, catalog_name_id="alice"),
+            _gold("doc_1", 6, 23, catalog_name_id="alice_email", entity_class="contact"),
+        ],
+        memberships,
+    )
+    session.consume(_document("doc_2", "No sensitive value", split_role="test"), [], memberships)
+    for index in range(2, 100):
+        session.consume(_document(f"doc_{index + 1}", "No sensitive value", split_role="test"), [], memberships)
+
+    slices = {item["entity_class"]: item for item in session.finish()["quality"]["slices"]}
+
+    assert scans == 100
+    assert {item["documents"] for item in slices.values()} == {100}
+    assert slices["person_contact"]["gold_spans"] == 2
+    assert slices["person_contact"]["true_positive"] == 2
+    assert slices["person_contact"]["cataloged_true_positive"] == 2
+    assert slices["person_contact"]["sensitive_gold_characters"] == 22
+    assert slices["person_contact"]["sensitive_gold_characters"] == (
+        slices["contact"]["sensitive_gold_characters"] + slices["person"]["sensitive_gold_characters"]
+    )
+    assert slices["person_contact"]["negative_documents"] == 99
+    assert slices["person_contact"]["over_redacted_characters"] == 0
+    assert slices["person"]["promotion_gate"] is slices["contact"]["promotion_gate"] is False
+
+
+@pytest.mark.parametrize(
+    "slice_spec",
+    [
+        _slice(
+            slice_id="person_contact_all_test",
+            split_role="test",
+            promotion_gate=True,
+            entity_class="person_contact",
+            annotation_entity_classes=["person", "contact"],
+        ),
+        _slice(
+            slice_id="person_contact_all_test",
+            split_role="test",
+            promotion_gate=True,
+            entity_class="person_contact",
+            annotation_entity_classes=["person"],
+        ),
+        _slice(slice_id="person_all_test", split_role="test", promotion_gate=True),
+    ],
+)
+def test_person_contact_scope_and_promotion_identity_are_frozen(slice_spec: Mapping[str, Any]) -> None:
+    with pytest.raises(EnronQualityError, match=r"(?i)(person-contact|combined)"):
+        prepare_enron_quality(_bank(), slice_specs=[slice_spec])
+
+
+def test_consume_with_predictions_returns_the_exact_single_scan_audit_payload() -> None:
+    session = prepare_enron_quality(_bank(), slice_specs=[_slice()])
+
+    predictions = session.consume_with_predictions(
+        _document("doc_1", "Alice"),
+        [_gold("doc_1", 0, 5, catalog_name_id="alice")],
+        ["person_all_validation"],
+    )
+    result = session.finish()
+
+    assert predictions == (
+        {
+            "document_id": "doc_1",
+            "entity_class": "person",
+            "start": 0,
+            "end": 5,
+            "entity_id": "person",
+            "name_id": "alice",
+            "pattern_id": "primary",
+        },
+    )
+    assert "string" not in predictions[0]
+    assert result["quality"]["slices"][0]["true_positive"] == 1
+    assert session.retained_state["consumed_documents"] == 1
+
+
+def test_prediction_commitment_is_payload_independent_and_detects_artifact_changes() -> None:
+    document = _document("doc_1", "Alice alice@example.com")
+    gold = [_gold("doc_1", 0, 5, catalog_name_id="alice")]
+    memberships = ["person_all_validation"]
+
+    ordinary = prepare_enron_quality(_bank(), slice_specs=[_slice()])
+    ordinary.consume(document, gold, memberships)
+    ordinary_result = ordinary.finish()
+
+    audited = prepare_enron_quality(_bank(), slice_specs=[_slice()])
+    predictions = audited.consume_with_predictions(document, gold, memberships)
+    audited_result = audited.finish()
+
+    artifact_commitment = quality_module.hash_enron_quality_predictions(predictions)
+    assert len(predictions) == 2
+    assert ordinary_result == audited_result
+    assert audited_result["prediction_commitment"] == artifact_commitment
+
+    tampered = [dict(item) for item in predictions]
+    tampered[0]["pattern_id"] = "tampered"
+    reordered = list(reversed(predictions))
+    for changed in (tampered, reordered):
+        assert quality_module.hash_enron_quality_predictions(changed)["sha256"] != artifact_commitment["sha256"]
+
+    invalid = dict(predictions[0])
+    invalid["matched_text"] = "private"
+    with pytest.raises(EnronQualityError, match="closed quality schema"):
+        quality_module.hash_enron_quality_predictions([invalid])
 
 
 def test_exact_span_prefers_expected_canonical_identity_when_multiple_predictions_exist() -> None:
@@ -959,7 +1115,13 @@ def test_context_abandonment_and_duplicate_failure_clean_the_spool(tmp_path: Pat
 
 
 def test_promotion_membership_must_cover_every_matching_document() -> None:
-    promotion = _slice(split_role="test", promotion_gate=True)
+    promotion = _slice(
+        slice_id="person_contact_all_test",
+        split_role="test",
+        promotion_gate=True,
+        entity_class="person_contact",
+        annotation_entity_classes=["contact", "person"],
+    )
     support = _slice(slice_id="support_test", split_role="test", cohort="support")
     session = prepare_enron_quality(_bank(), slice_specs=[promotion, support])
 

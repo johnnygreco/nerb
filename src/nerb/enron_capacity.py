@@ -6186,10 +6186,19 @@ def _commitment_without_privacy_scan(value: Mapping[str, Any]) -> dict[str, Any]
 def _sealed_unbound_access(verification: Mapping[str, Any]) -> Mapping[str, Any]:
     access = _adapter_mapping(verification.get("access"))
     if (
-        access.get("status") != "sealed_unbound"
+        set(access)
+        != {
+            "status",
+            "access_count",
+            "accessed_at",
+            "audit_plan_sha256",
+            "audit_output_binding_sha256",
+        }
+        or access.get("status") != "sealed_unbound"
         or access.get("access_count") != 0
         or access.get("accessed_at") is not None
-        or access.get("aggregate_sha256") is not None
+        or access.get("audit_plan_sha256") is not None
+        or access.get("audit_output_binding_sha256") is not None
     ):
         raise _CapacityAbort("phase_commitment_invalid")
     return access

@@ -336,7 +336,7 @@ def _exact_development_admission(manifest: Mapping[str, Any]) -> EnronDevelopmen
 def _frozen_target(run: SplitRun) -> dict[str, str]:
     return {
         "frozen_at": "2026-01-01T00:00:00Z",
-        "manifest_sha256": "sha256:" + "1" * 64,
+        "audit_plan_sha256": "sha256:" + "7" * 64,
         "bank_hash": "sha256:" + "2" * 64,
         "evaluator_source_sha256": "sha256:" + "3" * 64,
         "split_manifest_sha256": _file_sha256(run.sealed / "manifest.json"),
@@ -347,17 +347,28 @@ def _frozen_target(run: SplitRun) -> dict[str, str]:
     }
 
 
+FINAL_TEST_AUDIT_OUTPUT_SHA256 = "sha256:" + "9" * 64
+
+
 def _bound_final_test_access(
     run: SplitRun,
     *,
     target: Mapping[str, str] | None = None,
 ) -> enron_splitting.EnronFinalTestAccess:
+    frozen_target = _frozen_target(run) if target is None else target
     access = enron_splitting.begin_enron_final_test_access(
         run.sealed,
-        frozen_target=_frozen_target(run) if target is None else target,
+        frozen_target=frozen_target,
     )
-    access.bind_evidence("sha256:" + "7" * 64)
+    access.bind_audit_plan(frozen_target["audit_plan_sha256"])
     return access
+
+
+def _bind_test_audit_output(access: enron_splitting.EnronFinalTestAccess) -> None:
+    assert access.bind_audit_output(FINAL_TEST_AUDIT_OUTPUT_SHA256) == {
+        "status": "audit_output_bound",
+        "audit_output_binding_sha256": FINAL_TEST_AUDIT_OUTPUT_SHA256,
+    }
 
 
 def _tree_bytes(root: Path) -> dict[str, bytes]:
@@ -1544,7 +1555,8 @@ def test_final_test_state_starts_explicitly_sealed_unbound(tmp_path: Path) -> No
         "status": "sealed_unbound",
         "access_count": 0,
         "accessed_at": None,
-        "aggregate_sha256": None,
+        "audit_plan_sha256": None,
+        "audit_output_binding_sha256": None,
     }
 
 
@@ -1562,7 +1574,7 @@ def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_pa
         enron_splitting.begin_enron_final_test_access(
             run.sealed,
             frozen_target=invalid_target,
-        ).bind_evidence("sha256:" + "7" * 64)
+        ).bind_audit_plan(invalid_target["audit_plan_sha256"])
     assert not claim_path.exists()
     assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
 
@@ -1570,6 +1582,7 @@ def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_pa
         assert claim_path.is_file()
         assert claim_path.stat().st_mode & 0o777 == 0o600
         accessed = tuple(access.iter_records())
+        _bind_test_audit_output(access)
     assert accessed == _role_rows(run)["test"]
     claim_aggregate = claim_path.read_text(encoding="utf-8")
     assert "@fixture.invalid" not in claim_aggregate
@@ -1577,6 +1590,7 @@ def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_pa
     verified = verify_enron_splits(run.development, run.sealed, seed=run.seed)
     assert verified["access"]["status"] == "completed"
     assert verified["access"]["access_count"] == 1
+    assert verified["access"]["audit_output_binding_sha256"] == FINAL_TEST_AUDIT_OUTPUT_SHA256
 
     with pytest.raises(EnronSplitError, match=r"(?i)(access|claim|once|already)"):
         with enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target):
@@ -1590,6 +1604,72 @@ def test_final_test_access_claim_is_written_before_one_shot_record_access(tmp_pa
     )
     with pytest.raises(EnronSplitError, match=r"(?i)(access|outcome|claim|bind|hash)"):
         verify_enron_splits(run.development, run.sealed, seed=run.seed)
+
+
+def test_exhausted_final_test_access_without_audit_output_binding_is_failed(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="missing-output-binding"))
+    run = _split(tmp_path, preparation)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(exhausted|output|binding)"):
+        with _bound_final_test_access(run) as active:
+            tuple(active.iter_records())
+
+    outcome = json.loads((run.sealed / "ACCESS_OUTCOME.json").read_text(encoding="utf-8"))
+    assert outcome["status"] == "failed"
+    assert outcome["audit_output_binding_sha256"] is None
+    verified = verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]
+    assert verified["status"] == "failed"
+    assert verified["audit_output_binding_sha256"] is None
+
+
+def test_completed_access_metadata_cross_check_never_reopens_sealed_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="output-binding-metadata"))
+    run = _split(tmp_path, preparation)
+    target = _frozen_target(run)
+    with _bound_final_test_access(run, target=target) as active:
+        tuple(active.iter_records_with_memberships())
+        _bind_test_audit_output(active)
+
+    actual_open = enron_splitting.open_private_binary_input_at
+
+    def reject_content_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        if name in {"test.jsonl", "memberships.jsonl"}:
+            pytest.fail("access-outcome verification reopened sealed content")
+        return actual_open(directory_fd, name, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "open_private_binary_input_at", reject_content_open)
+    result = enron_splitting.verify_enron_final_test_access_outcome(
+        run.sealed,
+        expected_audit_plan_sha256=target["audit_plan_sha256"],
+        expected_audit_output_binding_sha256=FINAL_TEST_AUDIT_OUTPUT_SHA256,
+    )
+    assert result["status"] == "completed"
+    assert result["audit_output_binding_sha256"] == FINAL_TEST_AUDIT_OUTPUT_SHA256
+
+
+def test_completed_access_metadata_rejects_tampered_output_binding(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="tampered-output-binding"))
+    run = _split(tmp_path, preparation)
+    target = _frozen_target(run)
+    with _bound_final_test_access(run, target=target) as active:
+        tuple(active.iter_records())
+        _bind_test_audit_output(active)
+
+    outcome_path = run.sealed / "ACCESS_OUTCOME.json"
+    outcome = json.loads(outcome_path.read_text(encoding="utf-8"))
+    outcome["audit_output_binding_sha256"] = "sha256:" + "8" * 64
+    outcome_path.write_bytes(enron_splitting._canonical_line(outcome))  # noqa: SLF001
+    outcome_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(expected|audit output|match)"):
+        enron_splitting.verify_enron_final_test_access_outcome(
+            run.sealed,
+            expected_audit_plan_sha256=target["audit_plan_sha256"],
+            expected_audit_output_binding_sha256=FINAL_TEST_AUDIT_OUTPUT_SHA256,
+        )
 
 
 def test_evidence_binding_and_claim_precede_the_only_test_content_open(
@@ -1615,9 +1695,101 @@ def test_evidence_binding_and_claim_precede_the_only_test_content_open(
     monkeypatch.setattr(enron_splitting, "open_private_binary_input_at", checked_open)
     with access as active:
         assert tuple(active.iter_records()) == _role_rows(run)["test"]
+        _bind_test_audit_output(active)
 
     assert opened == 1
     assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "completed"
+
+
+def test_final_test_access_pairs_records_with_bound_memberships_once(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="paired-access"))
+    run = _split(tmp_path, preparation)
+    expected = tuple(zip(_role_rows(run)["test"], _read_jsonl(run.sealed / "memberships.jsonl"), strict=True))
+
+    with _bound_final_test_access(run) as active:
+        assert tuple(active.iter_records_with_memberships()) == expected
+        with pytest.raises(EnronSplitError, match=r"(?i)(only once|iterated)"):
+            tuple(active.iter_records())
+        _bind_test_audit_output(active)
+
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "completed"
+
+
+def test_partial_paired_final_test_stream_is_aborted(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="paired-partial"))
+    run = _split(tmp_path, preparation)
+
+    with _bound_final_test_access(run) as active:
+        first_record, first_membership = next(active.iter_records_with_memberships())
+        assert first_record["document_id"] == first_membership["document_id"]
+
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "aborted"
+
+
+@pytest.mark.parametrize("failure_kind", ["canonical", "schema", "role", "order", "alignment", "hash", "bytes"])
+def test_paired_final_test_stream_rejects_invalid_memberships(tmp_path: Path, failure_kind: str) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix=f"paired-{failure_kind}"))
+    run = _split(tmp_path, preparation)
+    access = _bound_final_test_access(run)
+    membership_path = run.sealed / "memberships.jsonl"
+    original = membership_path.read_bytes()
+    rows = list(_read_jsonl(membership_path))
+
+    if failure_kind == "canonical":
+        rows[0] = dict(reversed(tuple(rows[0].items())))
+        changed = b"".join(
+            (json.dumps(row, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+            for row in rows
+        )
+    elif failure_kind == "schema":
+        rows[0]["schema_version"] = rows[0]["schema_version"][:-1] + "x"
+        changed = b"".join(enron_splitting._canonical_line(row) for row in rows)  # noqa: SLF001
+    elif failure_kind == "role":
+        rows[0]["role"] = "fail"
+        changed = b"".join(enron_splitting._canonical_line(row) for row in rows)  # noqa: SLF001
+    elif failure_kind == "order":
+        rows[1]["document_id"] = rows[0]["document_id"]
+        changed = b"".join(enron_splitting._canonical_line(row) for row in rows)  # noqa: SLF001
+    elif failure_kind == "alignment":
+        rows[0]["document_id"] = "doc_" + "0" * 64
+        changed = b"".join(enron_splitting._canonical_line(row) for row in rows)  # noqa: SLF001
+    elif failure_kind == "hash":
+        group_id = str(rows[0]["group_id"])
+        rows[0]["group_id"] = group_id[:7] + ("0" if group_id[7] != "0" else "1") + group_id[8:]
+        changed = b"".join(enron_splitting._canonical_line(row) for row in rows)  # noqa: SLF001
+    else:
+        changed = original + b"\n"
+
+    if failure_kind != "bytes":
+        assert len(changed) == len(original)
+    membership_path.write_bytes(changed)
+    membership_path.chmod(0o600)
+
+    with access as active:
+        with pytest.raises(
+            EnronSplitError, match=r"(?i)(membership|aligned|canonical|schema|descriptor|changed|ordered)"
+        ):
+            tuple(active.iter_records_with_memberships())
+
+    outcome = json.loads((run.sealed / "ACCESS_OUTCOME.json").read_text(encoding="utf-8"))
+    assert outcome["status"] == "failed"
+    assert outcome["audit_output_binding_sha256"] is None
+    if failure_kind != "bytes":
+        assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "failed"
+
+
+def test_paired_final_test_stream_requires_membership_descriptor_count(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="paired-descriptor-count"))
+    run = _split(tmp_path, preparation)
+
+    with _bound_final_test_access(run) as active:
+        descriptor = dict(active._membership_descriptor)  # noqa: SLF001
+        descriptor["records"] += 1
+        active._membership_descriptor = descriptor  # noqa: SLF001
+        with pytest.raises(EnronSplitError, match=r"(?i)(descriptor|count|membership)"):
+            tuple(active.iter_records_with_memberships())
+
+    assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "failed"
 
 
 def test_claim_rechecks_every_transition_receipt_identity_before_test_open(
@@ -1695,6 +1867,7 @@ def test_transition_uses_the_directory_pinned_before_validation(
     monkeypatch.setattr(enron_splitting, "_read_json_object_snapshot_at", rename_after_manifest)
     with access as active:
         assert tuple(active.iter_records())
+        _bind_test_audit_output(active)
 
     assert renamed_once is True
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
@@ -1716,19 +1889,24 @@ def test_final_access_requires_one_nonreplayable_evidence_binding(tmp_path: Path
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
 
     bound = enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target)
-    binding = bound.bind_evidence("sha256:" + "7" * 64)
+    with pytest.raises(EnronSplitError, match=r"(?i)(audit plan|frozen target|match)"):
+        bound.bind_audit_plan("sha256:" + "8" * 64)
+    assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
+
+    binding = bound.bind_audit_plan(target["audit_plan_sha256"])
     assert binding["status"] == "evidence_bound"
     assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"] == {
         "status": "evidence_bound",
         "access_count": 0,
         "accessed_at": None,
-        "aggregate_sha256": "sha256:" + "7" * 64,
+        "audit_plan_sha256": target["audit_plan_sha256"],
+        "audit_output_binding_sha256": None,
     }
     with pytest.raises(EnronSplitError, match=r"(?i)(bound|replay)"):
         enron_splitting.begin_enron_final_test_access(
             run.sealed,
             frozen_target=target,
-        ).bind_evidence("sha256:" + "7" * 64)
+        ).bind_audit_plan(target["audit_plan_sha256"])
 
 
 def test_failure_opening_test_after_claim_consumes_access(
@@ -1798,7 +1976,7 @@ def test_future_binding_timestamp_is_rejected_before_publication(
     monkeypatch.setattr(enron_splitting, "_utc_now", lambda: "2100-01-01T00:00:00.000000Z")
 
     with pytest.raises(EnronSplitError, match=r"(?i)(timestamp|wall clock|future)"):
-        access.bind_evidence("sha256:" + "7" * 64)
+        access.bind_audit_plan(_frozen_target(run)["audit_plan_sha256"])
 
     assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
@@ -1836,6 +2014,7 @@ def test_future_claim_timestamp_is_rejected_even_when_chain_is_rehashed(tmp_path
     run = _split(tmp_path, preparation)
     with _bound_final_test_access(run) as active:
         tuple(active.iter_records())
+        _bind_test_audit_output(active)
     claim_path = run.sealed / "ACCESS_CLAIMED.json"
     outcome_path = run.sealed / "ACCESS_OUTCOME.json"
     claim = json.loads(claim_path.read_text(encoding="utf-8"))
@@ -1867,7 +2046,7 @@ def test_malformed_nested_manifest_is_sanitized_for_binding(tmp_path: Path) -> N
     manifest_path.chmod(0o600)
 
     with pytest.raises(EnronSplitError, match=r"(?i)(role|structur|invalid)") as error:
-        access.bind_evidence("sha256:" + "7" * 64)
+        access.bind_audit_plan(_frozen_target(run)["audit_plan_sha256"])
 
     assert str(tmp_path) not in str(error.value)
     assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
@@ -1908,6 +2087,7 @@ def test_malformed_nested_manifest_is_sanitized_for_crash_finalizer(tmp_path: Pa
     run = _split(tmp_path, preparation)
     with _bound_final_test_access(run) as active:
         tuple(active.iter_records())
+        _bind_test_audit_output(active)
     (run.sealed / "ACCESS_OUTCOME.json").unlink()
     manifest_path = run.sealed / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1946,6 +2126,7 @@ def test_partial_or_unused_claimed_stream_is_aborted(tmp_path: Path) -> None:
 
     outcome = json.loads((run.sealed / "ACCESS_OUTCOME.json").read_text(encoding="utf-8"))
     assert outcome["status"] == "aborted"
+    assert outcome["audit_output_binding_sha256"] is None
     assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "aborted"
 
 
@@ -1985,6 +2166,7 @@ def test_live_access_owner_blocks_crash_finalization(tmp_path: Path) -> None:
             enron_splitting.finalize_aborted_enron_final_test_access(run.sealed)
         assert not (run.sealed / "ACCESS_OUTCOME.json").exists()
         tuple(active.iter_records())
+        _bind_test_audit_output(active)
 
     assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "completed"
 
@@ -2014,9 +2196,10 @@ def test_rehashed_evidence_binding_substitution_breaks_claim_chain(tmp_path: Pat
     run = _split(tmp_path, preparation)
     with _bound_final_test_access(run) as active:
         tuple(active.iter_records())
+        _bind_test_audit_output(active)
     binding_path = run.sealed / "EVIDENCE_BOUND.json"
     binding = json.loads(binding_path.read_text(encoding="utf-8"))
-    binding["aggregate_sha256"] = "sha256:" + "8" * 64
+    binding["audit_plan_sha256"] = "sha256:" + "8" * 64
     binding_core = {key: value for key, value in binding.items() if key != "binding_sha256"}
     binding["binding_sha256"] = (
         "sha256:"
@@ -2039,6 +2222,7 @@ def test_rehashed_claim_cannot_change_the_evidence_bound_target(tmp_path: Path) 
     run = _split(tmp_path, preparation)
     with _bound_final_test_access(run) as active:
         tuple(active.iter_records())
+        _bind_test_audit_output(active)
     claim_path = run.sealed / "ACCESS_CLAIMED.json"
     outcome_path = run.sealed / "ACCESS_OUTCOME.json"
     claim = json.loads(claim_path.read_text(encoding="utf-8"))
@@ -2099,6 +2283,7 @@ def test_final_test_access_pins_directory_across_rename_and_cwd_change(
         accessed = tuple(access.iter_records())
         run.sealed.rename(renamed)
         monkeypatch.chdir(other)
+        _bind_test_audit_output(access)
 
     assert accessed == expected
     assert (renamed / "ACCESS_CLAIMED.json").is_file()
@@ -2117,7 +2302,7 @@ def test_hard_linked_sealed_clone_is_not_an_independent_access_capability(tmp_pa
         enron_splitting.begin_enron_final_test_access(
             clone,
             frozen_target=_frozen_target(run),
-        ).bind_evidence("sha256:" + "7" * 64)
+        ).bind_audit_plan(_frozen_target(run)["audit_plan_sha256"])
     assert not (clone / "ACCESS_CLAIMED.json").exists()
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
 
@@ -2379,6 +2564,7 @@ def test_crash_stranded_claim_can_be_finalized_as_aborted_without_reopening_test
     run = _split(tmp_path, preparation)
     with _bound_final_test_access(run) as access:
         tuple(access.iter_records())
+        _bind_test_audit_output(access)
     (run.sealed / "ACCESS_OUTCOME.json").unlink()
     assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["access"]["status"] == "claimed"
     actual_open_at = enron_splitting.open_private_binary_input_at
@@ -2404,7 +2590,9 @@ def test_process_exit_releases_claim_liveness_lock_for_aborted_finalization(tmp_
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="process-stranded-claim"))
     run = _split(tmp_path, preparation)
     target = _frozen_target(run)
-    enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target).bind_evidence("sha256:" + "7" * 64)
+    enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target).bind_audit_plan(
+        target["audit_plan_sha256"]
+    )
     script = """
 import json
 import os
@@ -2438,7 +2626,7 @@ def test_missing_pair_commit_receipt_blocks_sealed_access_without_creating_claim
         enron_splitting.begin_enron_final_test_access(
             run.sealed,
             frozen_target=_frozen_target(run),
-        ).bind_evidence("sha256:" + "7" * 64)
+        ).bind_audit_plan(_frozen_target(run)["audit_plan_sha256"])
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
 
 
