@@ -12,6 +12,8 @@ progress, private-tree validation, and the durable attempt receipt all pass.
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import fcntl
 import hashlib
 import importlib
@@ -22,8 +24,10 @@ import platform
 import re
 import resource
 import secrets
+import select
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -80,6 +84,7 @@ CAPACITY_ATTEMPT_SCHEMA_VERSION = "nerb.enron_capacity_attempt.v1"
 CAPACITY_INFLIGHT_SCHEMA_VERSION = "nerb.enron_capacity_inflight"
 CAPACITY_STAGE_BINDING_SCHEMA_VERSION = "nerb.enron_capacity_stage_binding"
 CAPACITY_CLEANUP_INVENTORY_SCHEMA_VERSION = "nerb.enron_capacity_cleanup_inventory"
+CAPACITY_CLEANUP_INTENT_SCHEMA_VERSION = "nerb.enron_capacity_cleanup_intent"
 CAPACITY_PORTABLE_DECISION_SCHEMA_VERSION = "nerb.enron_capacity_portable_decision"
 
 ENRON_DATASET_ID = "corbt/enron-emails"
@@ -109,26 +114,34 @@ MAX_PROGRESS_SIGNALS_PER_PHASE = 2_048
 MAX_RESOURCE_SAMPLES_PER_PHASE = 256
 PRODUCTION_MONITOR_INTERVAL_NS = 100_000_000
 MAX_RESOURCE_OBSERVATION_WALL_GAP_NS = 500_000_000
+MAX_RESOURCE_ACQUISITION_DURATION_NS = 500_000_000
+RESOURCE_OBSERVER_START_TIMEOUT_NS = 5_000_000_000
+RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS = 2_000_000_000
+PRODUCTION_WORKER_CLEANUP_GRACE_NS = 60_000_000_000
+MAX_RESOURCE_OBSERVER_FRAME_BYTES = 4 * 1024
 _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS = 3
 _DARWIN_PS_TIMEOUT_SECONDS = 0.1
 MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS = 30_000_000_000
-ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS = 5_000_000_000
+ACTIVITY_PRIVATE_TREE_VALIDATION_INTERVAL_NS = 5_000_000_000
 MAX_CAPACITY_REPORT_BYTES = 4 * 1024 * 1024
+MAX_PRODUCTION_WORKER_RESPONSE_BYTES = MAX_CAPACITY_REPORT_BYTES + 64 * 1024
 MAX_ATTEMPT_RECEIPT_BYTES = 64 * 1024
 MAX_INFLIGHT_RECORD_BYTES = 16 * 1024
-MAX_PRIVATE_TREE_ENTRIES = 1_000_000
-MAX_PRIVATE_TREE_DEPTH = 64
+MAX_PRIVATE_TREE_ENTRIES = _private_io._MAX_PRIVATE_TREE_ENTRIES  # noqa: SLF001
+MAX_PRIVATE_TREE_DEPTH = _private_io._MAX_PRIVATE_TREE_DEPTH  # noqa: SLF001
 MAX_RETAINED_PRIVATE_TOMBSTONES = 1_024
+MAX_CLEANUP_INTENT_GENERATIONS = 128
+MAX_RECOVERY_OUTPUT_PARENT_ENTRIES = 1_000_000
 MAX_PORTABLE_DECISION_BYTES = 16 * 1024 * 1024
 MAX_PORTABLE_ATTEMPTS = 1_024
-MAX_LEDGER_TOMBSTONES = 4 * MAX_PORTABLE_ATTEMPTS
+MAX_LEDGER_TOMBSTONES = (MAX_CLEANUP_INTENT_GENERATIONS + 3) * MAX_PORTABLE_ATTEMPTS
 MAX_READER_DISTRIBUTIONS = 4_096
 MAX_DATASETS_DISTRIBUTION_FILES = 16_384
 MAX_DATASETS_DISTRIBUTION_BYTES = 512 * 1024 * 1024
 
 _REPORT_FILENAME = "capacity-report.json"
 _COMMIT_FILENAME = "COMMITTED"
-_COMMIT_PAYLOAD = b"nerb.enron.private-run.v2\n"
+_COMMIT_PAYLOAD = _private_io._COMMIT_PAYLOAD  # noqa: SLF001
 _REPORT_MEASUREMENT_BOUNDARY = "resource_observations_through_phase_execution_and_pre_report_staging_tree_scan"
 _ATTEMPT_MEASUREMENT_BOUNDARY = (
     "resource_observations_through_report_write_fsync_staging_scan_atomic_promotion_and_promoted_final_tree_scan_"
@@ -148,6 +161,8 @@ _STAGE_BINDING_NAME_RE = re.compile(r"^\.attempt-inflight-([0-9a-f]{64})\.stage\
 _STAGE_BINDING_TEMP_RE = re.compile(r"^\.attempt-inflight-stage-binding-([0-9a-f]{64})-[0-9a-f]{64}\.tmp$")
 _CLEANUP_INVENTORY_NAME_RE = re.compile(r"^\.attempt-inflight-([0-9a-f]{64})\.cleanup\.json$")
 _CLEANUP_INVENTORY_TEMP_RE = re.compile(r"^\.attempt-inflight-cleanup-inventory-([0-9a-f]{64})-[0-9a-f]{64}\.tmp$")
+_CLEANUP_INTENT_NAME_RE = re.compile(r"^\.attempt-inflight-([0-9a-f]{64})\.cleanup-intent-([0-9a-f]{64})\.json$")
+_CLEANUP_INTENT_TEMP_RE = re.compile(r"^\.attempt-inflight-cleanup-intent-([0-9a-f]{64})-[0-9a-f]{64}\.tmp$")
 _STAGE_TOKEN_RE = re.compile(r"^[0-9a-f]{24}$")
 _PRIVATE_TOMBSTONE_RE = re.compile(r"^\.nerb-cleanup-[0-9a-f]{48}$")
 _MAX_JSON_INTEGER_DIGITS = 256
@@ -161,6 +176,11 @@ _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES = 512 * 1024 + len(CAPACITY_PHASES) 
 assert _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES < MAX_CAPACITY_REPORT_BYTES
 _PRODUCTION_WORKER_ARGUMENT = "--nerb-capacity-production-worker"
 _PRODUCTION_WORKER_ENV = "NERB_CAPACITY_FRESH_WORKER"
+_DARWIN_PROCESS_FORK_SANDBOX_PROFILE = b"(version 1) (allow default) (deny process-fork)"
+_DARWIN_PROCESS_CONTAINMENT = "darwin_sandbox_deny_process_fork"
+_LINUX_PROCESS_CONTAINMENT = "linux_seccomp_deny_process_creation"
+_FIXTURE_PROCESS_CONTAINMENT = "fixture_uncontained"
+_RESOURCE_OBSERVER_PROTOCOL = "nerb.enron_capacity.resource_observer"
 _BOOTSTRAP_ATTRIBUTE = "_nerb_capacity_bootstrap"
 _BOOTSTRAP_SCHEMA = "nerb.enron_capacity.bootstrap.v1"
 _CAPACITY_LAUNCHER_PATH = "scripts/run_enron_capacity.py"
@@ -168,6 +188,7 @@ _PRODUCTION_WORKER_BOOTSTRAP = (
     "import importlib.machinery,importlib.util,os,sys;"
     "source=sys.argv.pop(1);count=int(sys.argv.pop(1));"
     "roots=[sys.argv.pop(1) for _ in range(count)];"
+    "observer_fd=int(sys.argv.pop(1));"
     "baseline=list(sys.path);"
     "path=os.path.join(source,'nerb','_capacity_bootstrap.py');"
     "loader=importlib.machinery.SourceFileLoader('_nerb_capacity_bootstrap_impl',path);"
@@ -177,11 +198,17 @@ _PRODUCTION_WORKER_BOOTSTRAP = (
     "sys.path[:]=[*baseline,*roots,source];"
     "setattr(sys,'_nerb_capacity_bootstrap',"
     "{'schema':'nerb.enron_capacity.bootstrap.v1','source_root':source,'dependency_roots':roots,"
-    "'baseline_path':baseline,'pycache_root':sys.pycache_prefix});"
+    "'baseline_path':baseline,'pycache_root':sys.pycache_prefix,'resource_observer_fd':observer_fd});"
     "sys.exit(module.run(source) "
     "if sys.argv==[sys.argv[0],'--nerb-capacity-production-worker'] else 2)"
 )
 _FRESH_PRODUCTION_WORKER = False
+_PRODUCTION_PROCESS_CONTAINMENT: str | None = None
+_PRODUCTION_GIT_COMMIT: str | None = None
+_PRODUCTION_GIT_ROOT: Path | None = None
+_PRODUCTION_RELEVANT_WORKTREE_PATHS: tuple[str, ...] | None = None
+_PRODUCTION_CPU_MODEL: str | None = None
+_PRODUCTION_PHYSICAL_MEMORY_BYTES: int | None = None
 _PHASE_SCOPED_READER_LOADED = False
 _PRODUCTION_CORE_SOURCE_NAMES = (
     "_capacity_bootstrap.py",
@@ -300,6 +327,7 @@ _ERROR_MESSAGES = {
     "checkpoint_limit": "Capacity phase exceeds its checkpoint limit.",
     "checkpoint_wall_gap": "Capacity phase progress-checkpoint wall gap exceeds the frozen limit.",
     "resource_observation_gap": "Capacity resource-observation wall gap exceeds the frozen limit.",
+    "resource_acquisition_timeout": "Capacity resource acquisition exceeds the frozen limit.",
     "watchdog_unsupported": "Capacity watchdog interruption is unsupported.",
     "rss_limit": "Capacity process-tree RSS exceeds the frozen limit.",
     "runtime_disk_floor": "Capacity filesystem free space fell below the frozen abort floor.",
@@ -327,6 +355,7 @@ _ERROR_MESSAGES = {
     "runtime_filesystem_changed": "Capacity owned or evidence filesystem identity changed during execution.",
     "decision_invalid": "Capacity decision evidence is invalid.",
     "production_worker_failed": "Capacity production worker failed safely.",
+    "worker_process_leak": "Capacity worker processes remained live at the terminal boundary.",
     "portable_decision_invalid": "Portable capacity decision evidence is invalid.",
     "portable_write_failed": "Portable capacity decision evidence could not be written safely.",
 }
@@ -368,9 +397,65 @@ _FAILURE_ATTEMPT_BY_ORIGIN = {
     "activity_call": "activity",
     "phase_finish": "phase_finish",
 }
+_RESOURCE_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "diagnostic_kind",
+        "phase",
+        "sample_kind",
+        "sequence",
+        "observed_resource_gap_ns",
+        "maximum_resource_gap_ns",
+        "acquisition_duration_ns",
+        "rss_duration_ns",
+        "filesystem_duration_ns",
+        "acquisition_retry_count",
+        "scheduler_lateness_ns",
+    }
+)
+_RESOURCE_SAMPLE_KINDS = frozenset(
+    {"startup", "continuous", "boundary", "checkpoint", "heartbeat", "activity", "terminal"}
+)
+
+
+def _validated_resource_failure_diagnostic(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != _RESOURCE_FAILURE_DIAGNOSTIC_FIELDS:
+        return None
+    candidate = cast(dict[str, Any], value)
+    if (
+        candidate.get("diagnostic_kind") != "resource_observation_gap"
+        or (candidate.get("phase") is not None and candidate.get("phase") not in CAPACITY_PHASES)
+        or candidate.get("sample_kind") not in _RESOURCE_SAMPLE_KINDS
+        or candidate.get("maximum_resource_gap_ns") != MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+    ):
+        return None
+    for field in (
+        "sequence",
+        "observed_resource_gap_ns",
+        "maximum_resource_gap_ns",
+        "acquisition_duration_ns",
+        "rss_duration_ns",
+        "filesystem_duration_ns",
+        "acquisition_retry_count",
+        "scheduler_lateness_ns",
+    ):
+        field_value = candidate.get(field)
+        if type(field_value) is not int or field_value < 0 or field_value > _MAX_RESOURCE_INTEGER:
+            return None
+    if (
+        int(candidate["sequence"]) <= 0
+        or int(candidate["observed_resource_gap_ns"]) <= MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+        or int(candidate["rss_duration_ns"]) + int(candidate["filesystem_duration_ns"])
+        != int(candidate["acquisition_duration_ns"])
+        or int(candidate["acquisition_retry_count"]) > 2 * (_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1)
+    ):
+        return None
+    return dict(candidate)
 
 
 def _validated_failure_diagnostic(value: object) -> dict[str, Any] | None:
+    resource = _validated_resource_failure_diagnostic(value)
+    if resource is not None:
+        return resource
     if not isinstance(value, dict) or set(value) != _FAILURE_DIAGNOSTIC_FIELDS:
         return None
     candidate = cast(dict[str, Any], value)
@@ -417,7 +502,11 @@ class EnronCapacityError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.code = code
-        self.diagnostic = _validated_failure_diagnostic(diagnostic) if code == "checkpoint_wall_gap" else None
+        self.diagnostic = (
+            _validated_failure_diagnostic(diagnostic)
+            if code in {"checkpoint_wall_gap", "resource_observation_gap"}
+            else None
+        )
 
 
 class _CapacityAbort(BaseException):
@@ -427,11 +516,26 @@ class _CapacityAbort(BaseException):
         self.code = code if code in _ERROR_MESSAGES else "capacity_failed"
 
 
+class _ProductionWorkerExchangeFailure(EnronCapacityError):
+    """Bounded parent/worker exchange failure with cleanup-grace state."""
+
+    def __init__(
+        self,
+        *,
+        cleanup_deadline_ns: int | None = None,
+        cleanup_grace_consumed: bool = False,
+    ) -> None:
+        super().__init__(_ERROR_MESSAGES["production_worker_failed"], code="production_worker_failed")
+        self.cleanup_deadline_ns = cleanup_deadline_ns
+        self.cleanup_grace_consumed = cleanup_grace_consumed
+
+
 class _RuntimeDiskFloor(Exception):
     """Internal aggregate-only signal for a bracketed below-floor disk reading."""
 
-    def __init__(self, minimum_free: int, retry_count: int) -> None:
+    def __init__(self, minimum_free: int, output_disk: CapacityDiskUsage | None, retry_count: int) -> None:
         self.minimum_free = minimum_free
+        self.output_disk = output_disk
         self.retry_count = retry_count
 
 
@@ -601,6 +705,9 @@ CapacityPhaseRunner = Callable[[EnronCapacityPhaseContext], EnronCapacityPhaseRe
 
 class _SystemResourceProbe:
     def physical_memory_bytes(self) -> int | None:
+        if _PRODUCTION_PROCESS_CONTAINMENT is not None:
+            value = _PRODUCTION_PHYSICAL_MEMORY_BYTES
+            return value if type(value) is int and value > 0 else None
         try:
             pages = os.sysconf("SC_PHYS_PAGES")
             page_size = os.sysconf("SC_PAGE_SIZE")
@@ -627,7 +734,15 @@ class _SystemResourceProbe:
         if sys.platform.startswith("linux"):
             current = _linux_process_tree_rss_bytes(root_pid)
         elif sys.platform == "darwin":
-            current = _darwin_process_tree_rss_bytes(root_pid)
+            # The production worker cannot have descendants after its
+            # process-creation fence is installed.  Avoid spawning ``ps``
+            # from that fenced process; the launcher independently measures
+            # the complete launcher/worker tree throughout the run.
+            current = (
+                _root_process_peak_rss_bytes()
+                if _PRODUCTION_PROCESS_CONTAINMENT is not None and root_pid == os.getpid()
+                else _darwin_process_tree_rss_bytes(root_pid)
+            )
         else:
             current = None
         if current is None:
@@ -771,6 +886,516 @@ def _root_process_peak_rss_bytes() -> int | None:
         return None
     scale = 1 if sys.platform == "darwin" else 1024
     return (root + reaped_children) * scale
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcessRecord:
+    parent_pid: int
+    process_group_id: int
+    start_identity: str
+    rss_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalProcessSnapshot:
+    worker_tree_rss_bytes: int
+    residuals: tuple[tuple[int, str], ...]
+
+
+def _process_descendants(processes: Mapping[int, _ProcessRecord], root_pid: int) -> set[int] | None:
+    if root_pid not in processes:
+        return None
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, record in processes.items():
+            if pid not in descendants and record.parent_pid in descendants:
+                descendants.add(pid)
+                changed = True
+    descendants.remove(root_pid)
+    return descendants
+
+
+def _linux_process_record(entry: Path, pid: int, *, page_size: int) -> _ProcessRecord | None:
+    try:
+        raw = (entry / "stat").read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _error("resource_measurement_failed") from None
+    opening = raw.find(b"(")
+    closing = raw.rfind(b")")
+    fields = raw[closing + 1 :].split() if opening > 0 and closing > opening else []
+    raw_pid = raw[:opening].strip() if opening > 0 else b""
+    numeric_fields = (fields[1], fields[2], fields[19], fields[21]) if len(fields) > 21 else ()
+    if (
+        not raw_pid.isascii()
+        or not raw_pid.isdigit()
+        or int(raw_pid) != pid
+        or len(numeric_fields) != 4
+        or any(not value.isascii() or not value.isdigit() for value in numeric_fields)
+    ):
+        raise _error("resource_measurement_failed")
+    parent, process_group_id, start_time, resident_pages = (int(value) for value in numeric_fields)
+    if (
+        min(parent, process_group_id, resident_pages) < 0
+        or start_time <= 0
+        or max(parent, process_group_id, start_time, resident_pages) > _MAX_RESOURCE_INTEGER
+        or resident_pages > _MAX_RESOURCE_INTEGER // page_size
+    ):
+        raise _error("resource_measurement_failed")
+    return _ProcessRecord(
+        parent_pid=parent,
+        process_group_id=process_group_id,
+        start_identity=str(start_time),
+        rss_bytes=resident_pages * page_size,
+    )
+
+
+def _linux_process_table() -> dict[int, _ProcessRecord] | None:
+    try:
+        process_entries = tuple(Path("/proc").iterdir())
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, TypeError, ValueError):
+        return None
+    if page_size <= 0 or page_size > _MAX_RESOURCE_INTEGER:
+        return None
+    processes: dict[int, _ProcessRecord] = {}
+    for entry in process_entries:
+        if not entry.name.isascii() or not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        if pid <= 0 or pid > _MAX_RESOURCE_INTEGER:
+            return None
+        try:
+            record = _linux_process_record(entry, pid, page_size=page_size)
+        except EnronCapacityError:
+            return None
+        if record is not None:
+            if pid in processes:
+                return None
+            processes[pid] = record
+    return processes
+
+
+def _darwin_process_table() -> dict[int, _ProcessRecord] | None:
+    process: subprocess.Popen[str] | None = None
+    try:
+        process = subprocess.Popen(
+            ["/bin/ps", "-axo", "pid=,ppid=,pgid=,rss=,lstart="],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            encoding="ascii",
+            env={"LC_ALL": "C"},
+            errors="strict",
+            text=True,
+        )
+        stdout, _stderr = process.communicate(timeout=_DARWIN_PS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        if process is not None:
+            try:
+                process.kill()
+                process.communicate(timeout=_DARWIN_PS_TIMEOUT_SECONDS)
+            except (OSError, subprocess.SubprocessError, UnicodeError):
+                pass
+        return None
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    if process.returncode != 0:
+        return None
+    return _parse_darwin_process_table(stdout, excluded_pid=process.pid)
+
+
+def _parse_darwin_process_table(stdout: str, *, excluded_pid: int | None = None) -> dict[int, _ProcessRecord] | None:
+    processes: dict[int, _ProcessRecord] = {}
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 9 or any(
+            not value.isascii() or not value.isdecimal() or len(value) > len(str(_MAX_RESOURCE_INTEGER))
+            for value in fields[:4]
+        ):
+            return None
+        pid, parent, process_group_id, rss_kib = (int(value) for value in fields[:4])
+        start_identity = " ".join(fields[4:])
+        if (
+            pid <= 0
+            or parent < 0
+            or process_group_id <= 0
+            or rss_kib < 0
+            or max(pid, parent, process_group_id, rss_kib) > _MAX_RESOURCE_INTEGER
+            or rss_kib > _MAX_RESOURCE_INTEGER // 1024
+            or not start_identity.isascii()
+            or len(start_identity) > 64
+            or pid in processes
+        ):
+            return None
+        processes[pid] = _ProcessRecord(
+            parent_pid=parent,
+            process_group_id=process_group_id,
+            start_identity=start_identity,
+            rss_bytes=rss_kib * 1024,
+        )
+    if excluded_pid is not None:
+        processes.pop(excluded_pid, None)
+    return processes
+
+
+def _process_table() -> dict[int, _ProcessRecord] | None:
+    if sys.platform.startswith("linux"):
+        return _linux_process_table()
+    if sys.platform == "darwin":
+        return _darwin_process_table()
+    return None
+
+
+def _terminal_process_snapshot(worker_pid: int) -> _TerminalProcessSnapshot | None:
+    if type(worker_pid) is not int or worker_pid <= 1:
+        return None
+    processes = _process_table()
+    if processes is None:
+        return None
+    worker = processes.get(worker_pid)
+    worker_descendants = _process_descendants(processes, worker_pid)
+    if worker is None or worker_descendants is None or worker.process_group_id != worker_pid:
+        return None
+    residual = set(worker_descendants)
+    residual.update(
+        pid for pid, record in processes.items() if pid != worker_pid and record.process_group_id == worker_pid
+    )
+    measured_processes = {worker_pid, *worker_descendants, *residual}
+    worker_tree_rss = sum(processes[pid].rss_bytes for pid in measured_processes)
+    if worker_tree_rss <= 0 or worker_tree_rss > _MAX_RESOURCE_INTEGER:
+        return None
+    return _TerminalProcessSnapshot(
+        worker_tree_rss_bytes=worker_tree_rss,
+        residuals=tuple((pid, processes[pid].start_identity) for pid in sorted(residual)),
+    )
+
+
+def _terminal_residual_process_pids(worker_pid: int) -> tuple[int, ...] | None:
+    snapshot = _terminal_process_snapshot(worker_pid)
+    return None if snapshot is None else tuple(pid for pid, _identity in snapshot.residuals)
+
+
+def _expected_process_containment_mode() -> str:
+    if sys.platform.startswith("linux"):
+        return _LINUX_PROCESS_CONTAINMENT
+    if sys.platform == "darwin":
+        return _DARWIN_PROCESS_CONTAINMENT
+    raise _error("production_identity_invalid")
+
+
+class _LinuxSockFilter(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_ushort),
+        ("jt", ctypes.c_ubyte),
+        ("jf", ctypes.c_ubyte),
+        ("k", ctypes.c_uint32),
+    ]
+
+
+class _LinuxSockFprog(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_ushort),
+        ("filters", ctypes.POINTER(_LinuxSockFilter)),
+    ]
+
+
+def _linux_process_creation_filter(machine: str | None = None) -> tuple[Any, _LinuxSockFprog]:
+    machine = platform.machine().lower() if machine is None else machine.lower()
+    fork_numbers: tuple[int, ...]
+    reject_x32 = False
+    if machine in {"x86_64", "amd64"}:
+        audit_arch = 0xC000003E
+        clone_nr = 56
+        fork_numbers = (57, 58)
+        reject_x32 = True
+    elif machine in {"aarch64", "arm64"}:
+        audit_arch = 0xC00000B7
+        clone_nr = 220
+        fork_numbers = ()
+    else:
+        raise _error("production_identity_invalid")
+
+    bpf_load_word_absolute = 0x20
+    bpf_jump_equal_constant = 0x15
+    bpf_jump_greater_or_equal_constant = 0x35
+    bpf_and_constant = 0x54
+    bpf_return_constant = 0x06
+    seccomp_data_arch_offset = 4
+    seccomp_data_number_offset = 0
+    seccomp_data_first_argument_offset = 16
+    seccomp_return_kill_process = 0x80000000
+    seccomp_return_allow = 0x7FFF0000
+    seccomp_return_errno = 0x00050000
+    clone_thread = 0x00010000
+    clone3_nr = 435
+    x32_syscall_bit = 0x40000000
+
+    filters = [
+        _LinuxSockFilter(bpf_load_word_absolute, 0, 0, seccomp_data_arch_offset),
+        _LinuxSockFilter(bpf_jump_equal_constant, 1, 0, audit_arch),
+        _LinuxSockFilter(bpf_return_constant, 0, 0, seccomp_return_kill_process),
+        _LinuxSockFilter(bpf_load_word_absolute, 0, 0, seccomp_data_number_offset),
+    ]
+    if reject_x32:
+        filters.extend(
+            (
+                _LinuxSockFilter(bpf_jump_greater_or_equal_constant, 0, 1, x32_syscall_bit),
+                _LinuxSockFilter(bpf_return_constant, 0, 0, seccomp_return_errno | errno.EPERM),
+            )
+        )
+    for syscall_number in fork_numbers:
+        filters.extend(
+            (
+                _LinuxSockFilter(bpf_jump_equal_constant, 0, 1, syscall_number),
+                _LinuxSockFilter(bpf_return_constant, 0, 0, seccomp_return_errno | errno.EPERM),
+            )
+        )
+    filters.extend(
+        (
+            _LinuxSockFilter(bpf_jump_equal_constant, 0, 1, clone3_nr),
+            _LinuxSockFilter(bpf_return_constant, 0, 0, seccomp_return_errno | errno.ENOSYS),
+            _LinuxSockFilter(bpf_jump_equal_constant, 0, 4, clone_nr),
+            _LinuxSockFilter(bpf_load_word_absolute, 0, 0, seccomp_data_first_argument_offset),
+            _LinuxSockFilter(bpf_and_constant, 0, 0, clone_thread),
+            _LinuxSockFilter(bpf_jump_equal_constant, 1, 0, clone_thread),
+            _LinuxSockFilter(bpf_return_constant, 0, 0, seccomp_return_errno | errno.EPERM),
+            _LinuxSockFilter(bpf_return_constant, 0, 0, seccomp_return_allow),
+        )
+    )
+    array_type = _LinuxSockFilter * len(filters)
+    filter_array = array_type(*filters)
+    program = _LinuxSockFprog(
+        length=len(filters),
+        filters=ctypes.cast(filter_array, ctypes.POINTER(_LinuxSockFilter)),
+    )
+    return filter_array, program
+
+
+def _process_containment_policy_sha256(mode: str, architecture: str) -> str:
+    if mode == _FIXTURE_PROCESS_CONTAINMENT and architecture == "not_applicable":
+        policy: dict[str, Any] = {"mode": mode, "architecture": architecture}
+    elif mode == _LINUX_PROCESS_CONTAINMENT:
+        instructions, _program = _linux_process_creation_filter(architecture)
+        policy = {
+            "mode": mode,
+            "architecture": architecture,
+            "instructions": [
+                {"code": int(item.code), "jt": int(item.jt), "jf": int(item.jf), "k": int(item.k)}
+                for item in instructions
+            ],
+        }
+    elif mode == _DARWIN_PROCESS_CONTAINMENT and architecture in {"arm64", "aarch64", "x86_64"}:
+        policy = {
+            "mode": mode,
+            "architecture": architecture,
+            "sandbox_profile_sha256": _hash_bytes(_DARWIN_PROCESS_FORK_SANDBOX_PROFILE),
+        }
+    else:
+        raise _error("production_identity_invalid")
+    return _canonical_hash(policy)
+
+
+def _process_containment_identity(*, production: bool) -> dict[str, Any]:
+    if not production:
+        architecture = "not_applicable"
+        return {
+            "mode": _FIXTURE_PROCESS_CONTAINMENT,
+            "architecture": architecture,
+            "policy_sha256": _process_containment_policy_sha256(_FIXTURE_PROCESS_CONTAINMENT, architecture),
+            "installed_before_workload": False,
+            "runtime_attested": False,
+        }
+    mode = _expected_process_containment_mode()
+    architecture = platform.machine().lower()
+    return {
+        "mode": mode,
+        "architecture": architecture,
+        "policy_sha256": _process_containment_policy_sha256(mode, architecture),
+        "installed_before_workload": True,
+        "runtime_attested": True,
+    }
+
+
+def _install_linux_process_creation_filter() -> None:
+    if not sys.platform.startswith("linux"):
+        raise _error("production_identity_invalid")
+    try:
+        tasks = tuple((Path("/proc") / "self" / "task").iterdir())
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        raise _error("production_identity_invalid") from None
+    if len(tasks) != 1:
+        raise _error("production_identity_invalid")
+    _filter_array, program = _linux_process_creation_filter()
+    if libc.prctl(38, 1, 0, 0, 0) != 0 or libc.prctl(39, 0, 0, 0, 0) != 1:
+        raise _error("production_identity_invalid")
+    if libc.prctl(22, 2, ctypes.addressof(program), 0, 0) != 0 or libc.prctl(21, 0, 0, 0, 0) != 2:
+        raise _error("production_identity_invalid")
+    if platform.machine().lower() in {"x86_64", "amd64"}:
+        libc.syscall.restype = ctypes.c_long
+        ctypes.set_errno(0)
+        result = libc.syscall(ctypes.c_long(0x40000000 | 57))
+        if result != -1 or ctypes.get_errno() != errno.EPERM:
+            raise _error("production_identity_invalid")
+
+
+def _attest_process_creation_denied() -> None:
+    try:
+        child_pid = os.fork()
+    except OSError as exc:
+        if exc.errno != errno.EPERM:
+            raise _error("production_identity_invalid") from None
+    else:
+        if child_pid == 0:
+            os._exit(193)
+        try:
+            os.waitpid(child_pid, 0)
+        except OSError:
+            pass
+        raise _error("production_identity_invalid")
+    try:
+        spawned_pid = os.posix_spawn("/bin/true", ["/bin/true"], {})
+    except OSError as exc:
+        if exc.errno != errno.EPERM:
+            raise _error("production_identity_invalid") from None
+    else:
+        try:
+            os.waitpid(spawned_pid, 0)
+        except OSError:
+            pass
+        raise _error("production_identity_invalid")
+    try:
+        subprocess.run(
+            ["/bin/true"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+    except OSError as exc:
+        if exc.errno != errno.EPERM:
+            raise _error("production_identity_invalid") from None
+    else:
+        raise _error("production_identity_invalid")
+    thread = threading.Thread(target=lambda: None)
+    try:
+        thread.start()
+        thread.join(1)
+    except RuntimeError:
+        raise _error("production_identity_invalid") from None
+    if thread.is_alive():
+        raise _error("production_identity_invalid")
+
+
+def _prepare_production_subprocess_context() -> None:
+    """Cache subprocess-derived facts before the production process fence."""
+
+    global _PRODUCTION_CPU_MODEL
+    global _PRODUCTION_GIT_COMMIT
+    global _PRODUCTION_GIT_ROOT
+    global _PRODUCTION_PHYSICAL_MEMORY_BYTES
+    global _PRODUCTION_RELEVANT_WORKTREE_PATHS
+    if (
+        not _FRESH_PRODUCTION_WORKER
+        or _PRODUCTION_PROCESS_CONTAINMENT is not None
+        or _PRODUCTION_GIT_COMMIT is not None
+        or _PRODUCTION_GIT_ROOT is not None
+        or _PRODUCTION_RELEVANT_WORKTREE_PATHS is not None
+        or _PRODUCTION_CPU_MODEL is not None
+        or _PRODUCTION_PHYSICAL_MEMORY_BYTES is not None
+    ):
+        raise _error("production_identity_invalid")
+    git_root = _git_root()
+    git_commit = _git_head()
+    relevant_paths = _relevant_tracked_worktree_paths()
+    if relevant_paths != _relevant_module_paths_at_commit(git_commit):
+        raise _error("production_identity_invalid")
+    cpu_model = _cpu_model()
+    physical_memory = _SystemResourceProbe().physical_memory_bytes()
+    if not relevant_paths or type(physical_memory) is not int or physical_memory <= 0:
+        raise _error("production_identity_invalid")
+    _PRODUCTION_GIT_COMMIT = git_commit
+    _PRODUCTION_GIT_ROOT = git_root
+    _PRODUCTION_RELEVANT_WORKTREE_PATHS = relevant_paths
+    _PRODUCTION_CPU_MODEL = cpu_model
+    _PRODUCTION_PHYSICAL_MEMORY_BYTES = physical_memory
+
+
+def _install_production_process_containment(expected_mode: str) -> None:
+    global _PRODUCTION_PROCESS_CONTAINMENT
+    if _PRODUCTION_PROCESS_CONTAINMENT is not None or expected_mode != _expected_process_containment_mode():
+        raise _error("production_identity_invalid")
+    if _FRESH_PRODUCTION_WORKER and (
+        _PRODUCTION_GIT_COMMIT is None
+        or _PRODUCTION_GIT_ROOT is None
+        or _PRODUCTION_RELEVANT_WORKTREE_PATHS is None
+        or _PRODUCTION_CPU_MODEL is None
+        or _PRODUCTION_PHYSICAL_MEMORY_BYTES is None
+    ):
+        raise _error("production_identity_invalid")
+    if _FRESH_PRODUCTION_WORKER:
+        _require_globally_clean_checkout(cast(str, _PRODUCTION_GIT_COMMIT))
+    if _terminal_residual_process_pids(os.getpid()) != ():
+        raise _error("production_identity_invalid")
+    if sys.platform.startswith("linux"):
+        _install_linux_process_creation_filter()
+    elif sys.platform == "darwin":
+        try:
+            sandbox = ctypes.CDLL("/usr/lib/libsandbox.dylib", use_errno=True)
+            sandbox.sandbox_init.argtypes = [ctypes.c_char_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_char_p)]
+            sandbox.sandbox_init.restype = ctypes.c_int
+            sandbox.sandbox_free_error.argtypes = [ctypes.c_char_p]
+            sandbox.sandbox_free_error.restype = None
+        except (AttributeError, OSError):
+            raise _error("production_identity_invalid") from None
+        error_buffer = ctypes.c_char_p()
+        result = -1
+        try:
+            result = sandbox.sandbox_init(
+                _DARWIN_PROCESS_FORK_SANDBOX_PROFILE,
+                0,
+                ctypes.byref(error_buffer),
+            )
+        finally:
+            if error_buffer.value is not None:
+                sandbox.sandbox_free_error(error_buffer)
+        if result != 0:
+            raise _error("production_identity_invalid")
+    else:
+        raise _error("production_identity_invalid")
+    _attest_process_creation_denied()
+    _PRODUCTION_PROCESS_CONTAINMENT = expected_mode
+
+
+def _activate_process_creation_guard(
+    execution: Mapping[str, Any],
+    *,
+    production_evidence: bool,
+    process_creation_guard: Callable[[], None] | None,
+) -> None:
+    if not production_evidence:
+        if process_creation_guard is not None:
+            raise _error("capacity_failed")
+        return
+    if process_creation_guard is None:
+        raise _error("production_identity_invalid")
+    try:
+        process_creation_guard()
+    except EnronCapacityError:
+        raise
+    except BaseException:
+        raise _error("production_identity_invalid") from None
+    containment = execution.get("process_containment")
+    mode = containment.get("mode") if isinstance(containment, Mapping) else None
+    if _PRODUCTION_PROCESS_CONTAINMENT != mode:
+        raise _error("production_identity_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -993,6 +1618,98 @@ def _open_owned_directory_descriptor(path: str | bytes, *, dir_fd: int | None = 
         raise
 
 
+def _repair_and_open_owned_recovery_directory_descriptor(
+    path: str | bytes,
+    *,
+    dir_fd: int,
+    expected_identity: tuple[int, int],
+) -> _OwnedDescriptor:
+    """Repair access to, open, and pin only one durably bound recovery inode."""
+
+    if (
+        type(dir_fd) is not int
+        or dir_fd < 0
+        or not isinstance(expected_identity, tuple)
+        or len(expected_identity) != 2
+        or any(type(value) is not int or value < 0 for value in expected_identity)
+    ):
+        raise _error("attempt_ledger_invalid")
+    owner = _OwnedDescriptor()
+    first_control: KeyboardInterrupt | SystemExit | None = None
+    open_errno: int | None = None
+    try:
+        while owner.closed:
+            try:
+                open_errno = _native_engine._repair_and_open_directory_fd_once(
+                    owner._opened_fd,  # noqa: SLF001
+                    os.fsencode(path),
+                    dir_fd,
+                    expected_identity[0],
+                    expected_identity[1],
+                )
+            except (KeyboardInterrupt, SystemExit) as exc:
+                if first_control is None:
+                    first_control = exc
+            if not owner.closed:
+                break
+            if open_errno is not None:
+                if first_control is not None:
+                    raise first_control
+                if open_errno <= 0:
+                    raise _error("attempt_ledger_invalid")
+                raise OSError(open_errno, os.strerror(open_errno))
+        opened_identity = _descriptor_identity(os.fstat(owner.fd))
+        if opened_identity[:2] != expected_identity:
+            raise _error("attempt_ledger_invalid")
+        owner.bind_identity(opened_identity)
+        if first_control is not None:
+            raise first_control
+        return owner
+    except BaseException as active_error:
+        cleanup_control = _close_owned_descriptor_during_unwind(owner)
+        if first_control is not None:
+            raise first_control
+        if cleanup_control is not None and not isinstance(
+            active_error,
+            (KeyboardInterrupt, SystemExit, MemoryError),
+        ):
+            raise cleanup_control
+        raise
+
+
+def _open_owned_recovery_directory_descriptor(
+    path: str | bytes,
+    *,
+    dir_fd: int,
+    expected_identity: tuple[int, int],
+) -> _OwnedDescriptor:
+    """Open a bound recovery inode, repairing access only after permission denial."""
+
+    if (
+        type(dir_fd) is not int
+        or dir_fd < 0
+        or not isinstance(expected_identity, tuple)
+        or len(expected_identity) != 2
+        or any(type(value) is not int or value < 0 for value in expected_identity)
+    ):
+        raise _error("attempt_ledger_invalid")
+    try:
+        owner = _open_owned_directory_descriptor(path, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno not in {errno.EACCES, errno.EPERM}:
+            raise
+    else:
+        if owner.identity[:2] != expected_identity:
+            owner.close()
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return owner
+    return _repair_and_open_owned_recovery_directory_descriptor(
+        path,
+        dir_fd=dir_fd,
+        expected_identity=expected_identity,
+    )
+
+
 def _open_owned_private_file_descriptor(path: str | bytes, *, dir_fd: int) -> _OwnedDescriptor:
     owner = _OwnedDescriptor()
     cleanup_name = os.fsdecode(path)
@@ -1084,8 +1801,27 @@ class _PinnedComponent:
 class _PinnedDirectory:
     """No-follow component walk retained as one descriptor identity chain."""
 
-    def __init__(self, path: Path, *, create_final: bool = False) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        create_final: bool = False,
+        require_private_final: bool = True,
+        recovery_final_identity: tuple[int, int] | None = None,
+    ) -> None:
+        if type(require_private_final) is not bool or (
+            recovery_final_identity is not None
+            and (
+                create_final
+                or not require_private_final
+                or not isinstance(recovery_final_identity, tuple)
+                or len(recovery_final_identity) != 2
+                or any(type(value) is not int or value < 0 for value in recovery_final_identity)
+            )
+        ):
+            raise _error("private_tree_invalid")
         self.path = _absolute_private_path(path)
+        self._require_private_final = require_private_final
         self._base: _OwnedDescriptor | None = None
         self._components: list[_PinnedComponent] = []
         try:
@@ -1101,13 +1837,46 @@ class _PinnedDirectory:
                         os.mkdir(name, 0o700, dir_fd=parent_fd)
                     except FileExistsError:
                         pass
-                descriptor = _open_owned_directory_descriptor(name, dir_fd=parent_fd)
+                if final and recovery_final_identity is not None:
+                    descriptor = _open_owned_recovery_directory_descriptor(
+                        name,
+                        dir_fd=parent_fd,
+                        expected_identity=recovery_final_identity,
+                    )
+                    try:
+                        opened = os.fstat(descriptor.fd)
+                        owner = os.geteuid() if hasattr(os, "geteuid") else opened.st_uid
+                        if (
+                            not stat.S_ISDIR(opened.st_mode)
+                            or stat.S_ISLNK(opened.st_mode)
+                            or opened.st_uid != owner
+                            or (int(opened.st_dev), int(opened.st_ino)) != recovery_final_identity
+                        ):
+                            raise OSError
+                        os.fchmod(descriptor.fd, 0o700)
+                        repaired = os.fstat(descriptor.fd)
+                        if (
+                            not _same_directory(opened, repaired)
+                            or repaired.st_uid != owner
+                            or stat.S_IMODE(repaired.st_mode) != 0o700
+                        ):
+                            raise OSError
+                    except BaseException as active_error:
+                        cleanup_control = _close_owned_descriptor_during_unwind(descriptor)
+                        if cleanup_control is not None and not isinstance(
+                            active_error,
+                            (KeyboardInterrupt, SystemExit, MemoryError),
+                        ):
+                            raise cleanup_control
+                        raise
+                else:
+                    descriptor = _open_owned_directory_descriptor(name, dir_fd=parent_fd)
                 info = os.fstat(descriptor.fd)
                 before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                 if not _same_directory(before, info):
                     descriptor.close()
                     raise OSError
-                if final:
+                if final and self._require_private_final:
                     if not _safe_private_directory(info) or stat.S_IMODE(info.st_mode) != 0o700:
                         descriptor.close()
                         raise OSError
@@ -1154,7 +1923,7 @@ class _PinnedDirectory:
                     or _directory_identity(current) != component.identity
                 ):
                     raise OSError
-            if not _safe_private_directory(os.fstat(self.fd)):
+            if self._require_private_final and not _safe_private_directory(os.fstat(self.fd)):
                 raise OSError
         except OSError:
             raise _error(code) from None
@@ -1334,17 +2103,20 @@ def _safe_private_directory(info: os.stat_result) -> bool:
 
 
 def _logical_tree_bytes(directory_fd: int, *, depth: int, entries: list[int]) -> int:
-    if depth > MAX_PRIVATE_TREE_DEPTH:
+    if depth > _private_io._MAX_PRIVATE_TREE_DEPTH:  # noqa: SLF001
         raise _error("private_tree_invalid")
     try:
-        names = sorted(os.listdir(directory_fd))
+        names = _private_io._bounded_directory_names(  # noqa: SLF001
+            directory_fd,
+            entries=entries,
+            maximum_entries=_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+        )
+    except _private_io._PrivateTreeEntryLimitExceeded:  # noqa: SLF001
+        raise _error("private_tree_invalid") from None
     except OSError:
         raise _error("private_tree_invalid") from None
     total = 0
     for name in names:
-        entries[0] += 1
-        if entries[0] > MAX_PRIVATE_TREE_ENTRIES:
-            raise _error("private_tree_invalid")
         try:
             info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
@@ -1415,6 +2187,9 @@ class _Preflight:
     filesystems: tuple[_FilesystemPreflight, ...]
 
 
+_CleanupEvidence = tuple[bool | None, bool | None, int]
+
+
 @dataclass(slots=True)
 class _AttemptMetrics:
     started_ns: int | None = None
@@ -1432,9 +2207,7 @@ class _AttemptMetrics:
     promoted_parent_inode: int | None = None
     promoted_name_sha256: str | None = None
     preexisting_private_tombstone_count: int | None = None
-    sensitive_content_wiped: bool | None = None
-    path_tree_removed: bool | None = None
-    retained_private_tombstone_count: int = 0
+    cleanup_evidence: _CleanupEvidence = (None, None, 0)
 
 
 @dataclass(slots=True)
@@ -1447,6 +2220,7 @@ class _InflightAttempt:
     output_name: str
     stage_binding: dict[str, Any] | None = None
     cleanup_inventory: dict[str, Any] | None = None
+    cleanup_intent: dict[str, Any] | None = None
     receipt_appended: bool = False
     terminalized: bool = False
     transaction_owner: PrivateRun | None = None
@@ -1512,6 +2286,7 @@ def _wipe_promoted_capacity_run(
     workspace_root: Path | None,
     allow_unignored_output: bool,
     expected_identity: tuple[int, int] | None = None,
+    metrics: _AttemptMetrics | None = None,
 ) -> tuple[bool, bool, int]:
     """Wipe retained inodes across tree cleanup, parking failures for retry."""
 
@@ -1542,6 +2317,13 @@ def _wipe_promoted_capacity_run(
                 pinned,
                 workspace_root=workspace_root,
                 allow_unignored_output=allow_unignored_output,
+                cleanup_boundary=cleanup_owner._cleanup_boundary,  # noqa: SLF001
+                effective_workspace_root=cleanup_owner._workspace_root,  # noqa: SLF001
+                cleanup_result_observer=(
+                    None
+                    if metrics is None
+                    else lambda result: _publish_incomplete_promoted_cleanup_metrics(metrics, result)
+                ),
             )
         except BaseException as exc:
             if first_error is None:
@@ -1568,6 +2350,15 @@ def _wipe_promoted_capacity_run(
     return authority_wiped and tree_cleanup[0], tree_cleanup[1], tree_cleanup[2]
 
 
+def _open_promoted_capacity_pin(path: Path) -> _PinnedDirectory:
+    """Normalize a missing or unsafe promoted path to the promotion contract."""
+
+    try:
+        return _PinnedDirectory(path)
+    except EnronCapacityError:
+        raise _error("promotion_failed") from None
+
+
 @dataclass(slots=True)
 class _PhaseMeasurements:
     started_ns: int
@@ -1589,12 +2380,14 @@ class _PhaseMeasurements:
     owned_peak_sample: dict[str, Any] | None = None
     minimum_free_sample: dict[str, Any] | None = None
     maximum_wall_gap_sample: dict[str, Any] | None = None
+    maximum_acquisition_sample: dict[str, Any] | None = None
     last_sample: dict[str, Any] | None = None
     last_resource_wall_ns: int | None = None
     last_progress_wall_ns: int | None = None
     last_progress_kind: str = "phase_start"
     last_activity_observation_wall_ns: int | None = None
     maximum_resource_wall_gap_ns: int = 0
+    maximum_resource_acquisition_duration_ns: int = 0
     maximum_progress_wall_gap_ns: int = 0
     checkpoints: list[dict[str, int]] | None = None
     progress_signals: list[dict[str, Any]] | None = None
@@ -1619,6 +2412,7 @@ class _Watchdog:
         self._failure_code = failure_code
         self._previous: Any = None
         self._installed = False
+        self._abort_delivered = False
 
     def install(self) -> None:
         if (
@@ -1628,6 +2422,7 @@ class _Watchdog:
         ):
             raise _error("watchdog_unsupported")
         try:
+            self._abort_delivered = False
             self._previous = signal.getsignal(signal.SIGUSR1)
             # Publish restoration authority before installing the handler.
             # If control arrives after signal.signal changes process state,
@@ -1659,9 +2454,507 @@ class _Watchdog:
                 pass
 
     def _handle(self, _signum: int, _frame: Any) -> None:
+        if self._abort_delivered:
+            return
+        self._abort_delivered = True
         code = self._failure_code()
-        if code is not None:
-            raise _CapacityAbort(code)
+        # The supervising launcher may need to request cooperative unwinding
+        # after the response pipe fails before an observer failure frame can
+        # be delivered.  SIGUSR1 is private to this isolated worker while the
+        # watchdog is installed, so an otherwise-unclassified request still
+        # aborts through the normal cleanup owner.
+        raise _CapacityAbort(code or "production_worker_failed")
+
+
+def _resource_observer_preflight_payload(preflight: _Preflight) -> dict[str, Any]:
+    return {
+        "physical_memory_bytes": preflight.physical_memory_bytes,
+        "effective_rss_cap_bytes": preflight.effective_rss_cap_bytes,
+        "maximum_peak_rss_bytes": preflight.maximum_peak_rss_bytes,
+        "preflight_process_tree_rss_bytes": preflight.preflight_process_tree_rss_bytes,
+        "preflight_free_disk_bytes": preflight.preflight_free_disk_bytes,
+        "output_preflight_free_disk_bytes": preflight.output_preflight_free_disk_bytes,
+        "preexisting_private_tombstone_count": preflight.preexisting_private_tombstone_count,
+        "filesystems": [
+            {
+                "path": os.fspath(item.probe_path),
+                "device": item.device,
+                "preflight_free_disk_bytes": item.preflight_free_disk_bytes,
+                "includes_output": item.includes_output,
+            }
+            for item in preflight.filesystems
+        ],
+    }
+
+
+def _resource_sample_failure_code(
+    *,
+    process_tree_rss_bytes: int | None,
+    maximum_peak_rss_bytes: int,
+    minimum_free_disk_bytes: int | None,
+    acquisition_duration_ns: int,
+    observation_wall_gap_ns: int,
+    total_runtime_ns: int,
+    terminal_process_leak: bool,
+    fallback_failure_code: str | None,
+) -> str | None:
+    """Apply acquisition > RSS > disk > gap > runtime > terminal > fallback precedence."""
+
+    if acquisition_duration_ns > MAX_RESOURCE_ACQUISITION_DURATION_NS:
+        return "resource_acquisition_timeout"
+    if process_tree_rss_bytes is not None and process_tree_rss_bytes > maximum_peak_rss_bytes:
+        return "rss_limit"
+    if minimum_free_disk_bytes is not None and minimum_free_disk_bytes < MIN_RUNTIME_FREE_DISK_BYTES:
+        return "runtime_disk_floor"
+    if observation_wall_gap_ns > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
+        return "resource_observation_gap"
+    if total_runtime_ns > MAX_TOTAL_RUNTIME_NS:
+        return "runtime_limit"
+    if terminal_process_leak:
+        return "worker_process_leak"
+    if fallback_failure_code is None:
+        return None
+    return fallback_failure_code if fallback_failure_code in _ERROR_MESSAGES else "resource_measurement_failed"
+
+
+_RESOURCE_FAILURE_PRIORITY = {
+    "resource_acquisition_timeout": 0,
+    "rss_limit": 1,
+    "runtime_disk_floor": 2,
+    "owned_disk_limit": 3,
+    "resource_observation_gap": 4,
+    "runtime_limit": 5,
+    "worker_process_leak": 6,
+}
+
+
+def _combine_resource_failure_codes(local_code: str | None, launcher_code: str | None) -> str | None:
+    """Choose one resource failure without discarding worker-owned evidence."""
+
+    if local_code is None:
+        return launcher_code
+    if launcher_code is None:
+        return local_code
+    fallback_priority = len(_RESOURCE_FAILURE_PRIORITY)
+    if _RESOURCE_FAILURE_PRIORITY.get(launcher_code, fallback_priority) < _RESOURCE_FAILURE_PRIORITY.get(
+        local_code,
+        fallback_priority,
+    ):
+        return launcher_code
+    return local_code
+
+
+def _resource_gap_failure_diagnostic(
+    *,
+    phase: str | None,
+    sample_kind: str,
+    sequence: int,
+    observed_resource_gap_ns: int,
+    acquisition_duration_ns: int,
+    rss_duration_ns: int,
+    filesystem_duration_ns: int,
+    acquisition_retry_count: int,
+    scheduler_lateness_ns: int,
+) -> dict[str, Any]:
+    diagnostic = {
+        "diagnostic_kind": "resource_observation_gap",
+        "phase": phase,
+        "sample_kind": sample_kind,
+        "sequence": sequence,
+        "observed_resource_gap_ns": observed_resource_gap_ns,
+        "maximum_resource_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "acquisition_duration_ns": acquisition_duration_ns,
+        "rss_duration_ns": rss_duration_ns,
+        "filesystem_duration_ns": filesystem_duration_ns,
+        "acquisition_retry_count": acquisition_retry_count,
+        "scheduler_lateness_ns": scheduler_lateness_ns,
+    }
+    validated = _validated_resource_failure_diagnostic(diagnostic)
+    if validated is None:
+        raise _error("resource_measurement_failed")
+    return validated
+
+
+class _RemoteResourceObserver:
+    """Receive launcher-timestamped samples without sharing the workload GIL."""
+
+    def __init__(
+        self,
+        monitor: _ContinuousResourceMonitor,
+        endpoint: socket.socket,
+        nonce: str,
+    ) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            raise _error("production_identity_invalid")
+        self.monitor = monitor
+        self.endpoint = endpoint
+        self.nonce = nonce
+        self.reader = _ResourceObserverFrames(endpoint)
+        self.thread = threading.Thread(target=self._loop, name="nerb-capacity-resource-observer-receiver", daemon=True)
+        self.condition = threading.Condition()
+        self.command_lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        self.next_request_id = 1
+        self.expected: dict[int, str] = {}
+        self.completed: set[int] = set()
+        self.event_sequence = 0
+        self.last_frame_completed_ns: int | None = None
+        self.last_valid_completed_ns: int | None = None
+        self.started = False
+        self.stop_requested = False
+        self.stopped = False
+
+    def start(self) -> None:
+        # Publish receiver lifecycle state while holding the same condition
+        # used by stop().  The receiver can start running before
+        # Thread.start() returns, and Thread.start() can still raise after the
+        # native thread exists.  In either case stop() must observe a settled
+        # state instead of spinning forever on an unreported receiver.
+        with self.condition:
+            try:
+                self.thread.start()
+                self.started = True
+            except BaseException:
+                self.stopped = True
+                self.condition.notify_all()
+                raise
+        self._send(
+            {
+                "type": "init",
+                "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                "nonce": self.nonce,
+                "interval_ns": self.monitor.interval_ns,
+                "maximum_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+                "run_started_ns": self.monitor.run_started_ns,
+                "preflight": _resource_observer_preflight_payload(self.monitor.preflight),
+            },
+        )
+        deadline = time.monotonic_ns() + RESOURCE_OBSERVER_START_TIMEOUT_NS
+        with self.condition:
+            while self.event_sequence == 0 and self.monitor._failure_code is None:
+                remaining = deadline - time.monotonic_ns()
+                if remaining <= 0:
+                    self.monitor._record_remote_failure("resource_measurement_failed")
+                    break
+                self.condition.wait(remaining / 1_000_000_000)
+        self.monitor.raise_if_failed()
+
+    def force(self, kind: str, *, stop: bool = False) -> None:
+        if kind not in {"boundary", "checkpoint", "heartbeat", "activity", "terminal"} or (kind == "terminal") != stop:
+            raise _error("resource_measurement_failed")
+        with self.command_lock:
+            worker_peak_rss = _root_process_peak_rss_bytes()
+            if type(worker_peak_rss) is not int or worker_peak_rss <= 0 or worker_peak_rss > _MAX_RESOURCE_INTEGER:
+                self.monitor._record_remote_failure("resource_measurement_failed")
+                self.monitor.raise_if_failed()
+            with self.condition:
+                if not self.started or self.stopped or self.stop_requested:
+                    self.monitor._record_remote_failure("resource_measurement_failed")
+                    self.monitor.raise_if_failed()
+                if not stop:
+                    self.monitor.raise_if_failed()
+                request_id = self.next_request_id
+                self.next_request_id += 1
+                self.expected[request_id] = kind
+                if stop:
+                    self.stop_requested = True
+            command = {
+                "type": "stop" if stop else "force",
+                "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                "nonce": self.nonce,
+                "request_id": request_id,
+                "sample_kind": kind,
+                "worker_peak_rss_bytes": worker_peak_rss,
+            }
+            if stop:
+                self._send_final(command)
+            else:
+                self._send(command)
+            deadline = time.monotonic_ns() + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+            with self.condition:
+                while request_id not in self.completed and (stop or self.monitor._failure_code is None):
+                    remaining = deadline - time.monotonic_ns()
+                    if remaining <= 0:
+                        self.monitor._record_remote_failure("resource_measurement_failed")
+                        break
+                    self.condition.wait(remaining / 1_000_000_000)
+                self.expected.pop(request_id, None)
+        if not stop:
+            self.monitor.raise_if_failed()
+
+    def stop(self) -> None:
+        with self.condition:
+            if not self.started:
+                self.stopped = True
+                self.condition.notify_all()
+            settle_without_protocol = not self.started or self.stopped
+        if settle_without_protocol:
+            if self.thread.is_alive():
+                try:
+                    self.endpoint.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+            if self.thread.is_alive():
+                self.monitor._record_remote_failure("resource_measurement_failed")
+                raise _error("resource_measurement_failed")
+            return
+        first_error: BaseException | None = None
+        try:
+            self.force("terminal", stop=True)
+        except BaseException as exc:
+            first_error = exc
+        with self.condition:
+            self.stopped = True
+            self.condition.notify_all()
+        self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            self.monitor._record_remote_failure("resource_measurement_failed")
+            try:
+                self.endpoint.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            if first_error is None:
+                first_error = _error("resource_measurement_failed")
+        if first_error is not None:
+            raise first_error
+
+    def _loop(self) -> None:
+        failure_notified = False
+        try:
+            while True:
+                with self.condition:
+                    if self.stopped:
+                        return
+                frames = self.reader.receive(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS)
+                if not frames:
+                    self.monitor._record_remote_failure("resource_measurement_failed")
+                    self.monitor._watchdog.trigger()
+                    return
+                for frame_index, frame in enumerate(frames):
+                    if frame.get("type") == "observer_failure":
+                        _observer_closed(
+                            frame,
+                            {"type", "protocol", "nonce", "failure_code"},
+                        )
+                        code = frame.get("failure_code")
+                        if (
+                            frame.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+                            or frame.get("nonce") != self.nonce
+                            or code not in _ERROR_MESSAGES
+                        ):
+                            code = "resource_measurement_failed"
+                        self.monitor._record_remote_failure(cast(str, code))
+                        self.monitor._watchdog.trigger()
+                        return
+                    self._accept_sample(frame)
+                    request_id = int(cast(int, frame.get("request_id", 0)))
+                    with self.condition:
+                        terminal_sample = self.stop_requested and request_id > 0
+                    if terminal_sample:
+                        if frame_index != len(frames) - 1 or self.reader.buffer:
+                            raise _error("resource_measurement_failed")
+                        _require_resource_observer_eof(self.reader)
+                    with self.condition:
+                        if request_id:
+                            self.completed.add(request_id)
+                        self.condition.notify_all()
+                    if terminal_sample:
+                        return
+                    if self.monitor._failure_code is not None and not failure_notified:
+                        try:
+                            self._send(
+                                {
+                                    "type": "failure_ack",
+                                    "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                                    "nonce": self.nonce,
+                                },
+                            )
+                        except EnronCapacityError:
+                            pass
+                        self.monitor._watchdog.trigger()
+                        failure_notified = True
+        except _ResourceObserverEOF:
+            with self.condition:
+                expected_eof = self.stopped
+            if not expected_eof:
+                self.monitor._record_remote_failure("resource_measurement_failed")
+                self.monitor._watchdog.trigger()
+        except BaseException:
+            self.monitor._record_remote_failure("resource_measurement_failed")
+            self.monitor._watchdog.trigger()
+        finally:
+            with self.condition:
+                self.condition.notify_all()
+
+    def _send(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+
+    def _send_final(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+            _shutdown_resource_observer_write(self.endpoint)
+
+    def _accept_sample(self, frame: Mapping[str, Any]) -> None:
+        _observer_closed(
+            frame,
+            {
+                "type",
+                "protocol",
+                "nonce",
+                "event_sequence",
+                "request_id",
+                "sample_kind",
+                "valid",
+                "started_wall_ns",
+                "completed_wall_ns",
+                "resource_observation_wall_gap_ns",
+                "acquisition_duration_ns",
+                "rss_duration_ns",
+                "filesystem_duration_ns",
+                "scheduler_lateness_ns",
+                "process_tree_rss_bytes",
+                "minimum_free_disk_bytes",
+                "output_free_disk_bytes",
+                "rss_retry_count",
+                "filesystem_retry_count",
+                "failure_code",
+            },
+        )
+        event_sequence = _observer_int(frame.get("event_sequence"), minimum=1)
+        request_id = _observer_int(frame.get("request_id"), minimum=0)
+        started_ns = _observer_int(frame.get("started_wall_ns"), minimum=0)
+        completed_ns = _observer_int(frame.get("completed_wall_ns"), minimum=0)
+        gap_ns = _observer_int(frame.get("resource_observation_wall_gap_ns"), minimum=0)
+        acquisition_ns = _observer_int(frame.get("acquisition_duration_ns"), minimum=0)
+        rss_duration_ns = _observer_int(frame.get("rss_duration_ns"), minimum=0)
+        filesystem_duration_ns = _observer_int(frame.get("filesystem_duration_ns"), minimum=0)
+        scheduler_lateness_ns = _observer_int(frame.get("scheduler_lateness_ns"), minimum=0)
+        rss_retries = _observer_int(frame.get("rss_retry_count"), minimum=0)
+        filesystem_retries = _observer_int(frame.get("filesystem_retry_count"), minimum=0)
+        sample_kind = frame.get("sample_kind")
+        valid = frame.get("valid")
+        failure_code = frame.get("failure_code")
+        with self.condition:
+            expected_kind = self.expected.get(request_id) if request_id else None
+            request_completed = request_id in self.completed
+        if (
+            frame.get("type") != "sample"
+            or frame.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+            or frame.get("nonce") != self.nonce
+            or event_sequence != self.event_sequence + 1
+            or type(valid) is not bool
+            or sample_kind not in _RESOURCE_SAMPLE_KINDS
+            or (request_id == 0 and sample_kind not in {"startup", "continuous"})
+            or (sample_kind == "startup") != (event_sequence == 1 and request_id == 0)
+            or (request_id > 0 and (expected_kind != sample_kind or request_completed))
+            or completed_ns < started_ns
+            or acquisition_ns != completed_ns - started_ns
+            or rss_duration_ns + filesystem_duration_ns != acquisition_ns
+            or rss_retries >= _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS
+            or filesystem_retries >= _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS
+            or (failure_code is not None and failure_code not in _ERROR_MESSAGES)
+            or (valid is True and acquisition_ns > MAX_RESOURCE_ACQUISITION_DURATION_NS)
+        ):
+            raise _error("resource_measurement_failed")
+        if self.last_frame_completed_ns is not None and (
+            started_ns < self.last_frame_completed_ns or completed_ns < self.last_frame_completed_ns
+        ):
+            raise _error("clock_invalid")
+        expected_gap = 0 if self.last_valid_completed_ns is None else completed_ns - self.last_valid_completed_ns
+        if expected_gap < 0 or gap_ns != expected_gap:
+            raise _error("clock_invalid")
+        if not valid:
+            if (
+                failure_code is None
+                or (
+                    acquisition_ns > MAX_RESOURCE_ACQUISITION_DURATION_NS
+                    and failure_code != "resource_acquisition_timeout"
+                )
+                or (
+                    acquisition_ns <= MAX_RESOURCE_ACQUISITION_DURATION_NS
+                    and failure_code == "resource_acquisition_timeout"
+                )
+            ):
+                raise _error("resource_measurement_failed")
+            partial_rss = frame.get("process_tree_rss_bytes")
+            partial_minimum = frame.get("minimum_free_disk_bytes")
+            trusted_rss = (
+                self.monitor.preflight.preflight_process_tree_rss_bytes
+                if partial_rss is None
+                else _observer_int(partial_rss, minimum=1)
+            )
+            trusted_minimum = None if partial_minimum is None else _observer_int(partial_minimum, minimum=0)
+            self.event_sequence = event_sequence
+            self.last_frame_completed_ns = completed_ns
+            self.monitor._retain_partial_resource_extrema(
+                rss=trusted_rss,
+                minimum_free=trusted_minimum,
+                acquisition_retries=rss_retries + filesystem_retries,
+                acquisition_duration_ns=acquisition_ns,
+                now=completed_ns,
+                wall_now=completed_ns,
+            )
+            diagnostic = (
+                _resource_gap_failure_diagnostic(
+                    phase=None,
+                    sample_kind=cast(str, sample_kind),
+                    sequence=event_sequence,
+                    observed_resource_gap_ns=gap_ns,
+                    acquisition_duration_ns=acquisition_ns,
+                    rss_duration_ns=rss_duration_ns,
+                    filesystem_duration_ns=filesystem_duration_ns,
+                    acquisition_retry_count=rss_retries + filesystem_retries,
+                    scheduler_lateness_ns=scheduler_lateness_ns,
+                )
+                if failure_code == "resource_observation_gap"
+                else None
+            )
+            self.monitor._record_remote_failure(cast(str, failure_code), diagnostic=diagnostic)
+            return
+        rss = _observer_int(frame.get("process_tree_rss_bytes"), minimum=1)
+        minimum_free = _observer_int(frame.get("minimum_free_disk_bytes"), minimum=0)
+        output_free = _observer_int(frame.get("output_free_disk_bytes"), minimum=0)
+        terminal_sample = sample_kind == "terminal"
+        expected_failure = _resource_sample_failure_code(
+            process_tree_rss_bytes=rss,
+            maximum_peak_rss_bytes=self.monitor.preflight.maximum_peak_rss_bytes,
+            minimum_free_disk_bytes=minimum_free,
+            acquisition_duration_ns=acquisition_ns,
+            observation_wall_gap_ns=gap_ns,
+            total_runtime_ns=completed_ns - self.monitor.run_started_ns,
+            terminal_process_leak=terminal_sample and failure_code == "worker_process_leak",
+            fallback_failure_code=(
+                "resource_measurement_failed"
+                if terminal_sample and failure_code == "resource_measurement_failed"
+                else None
+            ),
+        )
+        if failure_code != expected_failure:
+            raise _error("resource_measurement_failed")
+        self.event_sequence = event_sequence
+        self.last_frame_completed_ns = completed_ns
+        self.last_valid_completed_ns = completed_ns
+        self.monitor._accept_remote_resource_sample(
+            kind=cast(str, sample_kind),
+            completed_records=None,
+            wall_now=completed_ns,
+            now=completed_ns,
+            rss=rss,
+            minimum_free=minimum_free,
+            output_free=output_free,
+            rss_retries=rss_retries,
+            filesystem_retries=filesystem_retries,
+            wall_gap=gap_ns,
+            acquisition_duration_ns=acquisition_ns,
+            rss_duration_ns=rss_duration_ns,
+            filesystem_duration_ns=filesystem_duration_ns,
+            scheduler_lateness_ns=scheduler_lateness_ns,
+            failure_code=cast(str | None, failure_code),
+        )
 
 
 class _ContinuousResourceMonitor:
@@ -1676,6 +2969,8 @@ class _ContinuousResourceMonitor:
         run_started_ns: int,
         interval_ns: int,
         wall_clock: Callable[[], int],
+        resource_observer_socket: socket.socket | None = None,
+        resource_observer_nonce: str | None = None,
     ) -> None:
         self.tree = tree
         self.probe = probe
@@ -1683,6 +2978,8 @@ class _ContinuousResourceMonitor:
         self.run_started_ns = run_started_ns
         self.interval_ns = interval_ns
         self.wall_clock = wall_clock
+        if (resource_observer_socket is None) != (resource_observer_nonce is None):
+            raise _error("production_identity_invalid")
         self._lock = threading.RLock()
         self._observation_lock = threading.Lock()
         self._stop = threading.Event()
@@ -1698,18 +2995,33 @@ class _ContinuousResourceMonitor:
         self._global_minimum_free = preflight.preflight_free_disk_bytes
         self._global_owned_high_water = 0
         self._global_maximum_resource_wall_gap_ns = 0
+        self._global_maximum_resource_acquisition_duration_ns = 0
         self._global_last_resource_wall_ns: int | None = None
         self._global_last_probe_ns = run_started_ns
+        self._latest_exact_owned = 0
         self._watchdog = _Watchdog(self._current_failure_code)
+        self._remote = (
+            None
+            if resource_observer_socket is None or resource_observer_nonce is None
+            else _RemoteResourceObserver(self, resource_observer_socket, resource_observer_nonce)
+        )
 
     def start(self) -> None:
         self._watchdog.install()
-        with self._lock:
-            self._global_last_resource_wall_ns = self.wall_clock()
-        self._observe("boundary")
-        thread = threading.Thread(target=self._loop, name="nerb-capacity-resource-monitor", daemon=True)
-        self._thread = thread
-        thread.start()
+        with self._observation_lock:
+            owned = self.tree.logical_bytes()
+            with self._lock:
+                self._latest_exact_owned = owned
+                self._global_owned_high_water = max(self._global_owned_high_water, owned)
+                self._global_last_resource_wall_ns = None if self._remote is not None else self.wall_clock()
+            if self._remote is not None:
+                self._remote.start()
+                self._remote.force("boundary")
+            else:
+                self._observe_serialized("boundary", logical_owned=owned)
+                thread = threading.Thread(target=self._loop, name="nerb-capacity-resource-monitor", daemon=True)
+                self._thread = thread
+                thread.start()
 
     def stop(self) -> None:
         first_error: BaseException | None = None
@@ -1738,7 +3050,13 @@ class _ContinuousResourceMonitor:
             raise _error("monitor_shutdown_failed") from None
 
     def _shutdown_is_settled(self) -> bool:
-        return self._stopped and self._thread is None and not self._watchdog._installed
+        remote = getattr(self, "_remote", None)
+        return (
+            self._stopped
+            and self._thread is None
+            and (remote is None or (remote.stopped and not remote.thread.is_alive()))
+            and not self._watchdog._installed
+        )
 
     def _stop_once(self) -> None:
         first_error: BaseException | None = None
@@ -1773,7 +3091,11 @@ class _ContinuousResourceMonitor:
                         remember(exc)
             self._thread = None
         try:
-            self._observe("boundary")
+            remote = getattr(self, "_remote", None)
+            if remote is not None:
+                remote.stop()
+            else:
+                self._observe("boundary")
         except BaseException as exc:
             remember(exc)
         finally:
@@ -1803,8 +3125,14 @@ class _ContinuousResourceMonitor:
                 )
                 self._current_phase = phase
                 self._global_owned_high_water = max(self._global_owned_high_water, owned)
-            self._observe_serialized("boundary")
+                self._latest_exact_owned = owned
+            self._observe_serialized("boundary", logical_owned=owned)
         self.raise_if_failed()
+
+    def _barrier_remote_before_progress_failure(self, kind: str) -> None:
+        remote = getattr(self, "_remote", None)
+        if remote is not None:
+            remote.force(kind)
 
     def checkpoint(self, phase: str, completed_records: int) -> None:
         with self._lock:
@@ -1817,50 +3145,63 @@ class _ContinuousResourceMonitor:
             self._record_failure("private_tree_invalid")
             self.raise_if_failed()
             raise _CapacityAbort("private_tree_invalid") from None
-        with self._lock:
-            self._raise_if_failed_locked()
-            state = self._states.get(phase)
-            if state is None or self._current_phase != phase:
-                raise _CapacityAbort("checkpoint_invalid")
-            gap = completed_records - state.last_completed
-            if gap <= 0:
-                raise _CapacityAbort("checkpoint_invalid")
-            if gap > MAX_CHECKPOINT_RECORD_GAP:
-                raise _CapacityAbort("checkpoint_gap")
-            if state.checkpoint_count >= MAX_CHECKPOINTS_PER_PHASE:
-                raise _CapacityAbort("checkpoint_limit")
-            wall_now = self.wall_clock()
-            previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
-            wall_gap = wall_now - previous_progress_wall
-            if wall_gap < 0:
-                raise _CapacityAbort("clock_invalid")
-            if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                self._record_progress_failure(
-                    phase,
-                    state,
-                    origin="checkpoint_call",
-                    attempted_kind="checkpoint",
-                    wall_now=wall_now,
-                    wall_gap=wall_gap,
-                )
+        barrier_completed = False
+        while True:
+            needs_barrier = False
+            with self._lock:
                 self._raise_if_failed_locked()
-                raise _CapacityAbort("checkpoint_wall_gap")
-            self._accept_progress(state, kind="checkpoint", wall_now=wall_now, wall_gap=wall_gap)
-            state.last_activity_observation_wall_ns = wall_now
-            state.checkpoint_count += 1
-            state.last_completed = completed_records
-            state.maximum_checkpoint_gap = max(state.maximum_checkpoint_gap, gap)
-            state.last_owned = owned
-            state.owned_high_water = max(state.owned_high_water, owned)
-            self._global_owned_high_water = max(self._global_owned_high_water, owned)
-            self._append_progress_signal(
-                state,
-                kind="checkpoint",
-                completed_records=completed_records,
-                wall_now=wall_now,
-                wall_gap=wall_gap,
-            )
-        self._observe("checkpoint", completed_records=completed_records)
+                state = self._states.get(phase)
+                if state is None or self._current_phase != phase:
+                    raise _CapacityAbort("checkpoint_invalid")
+                gap = completed_records - state.last_completed
+                if gap <= 0:
+                    raise _CapacityAbort("checkpoint_invalid")
+                if gap > MAX_CHECKPOINT_RECORD_GAP:
+                    raise _CapacityAbort("checkpoint_gap")
+                if state.checkpoint_count >= MAX_CHECKPOINTS_PER_PHASE:
+                    raise _CapacityAbort("checkpoint_limit")
+                state.last_owned = owned
+                state.owned_high_water = max(state.owned_high_water, owned)
+                self._global_owned_high_water = max(self._global_owned_high_water, owned)
+                self._latest_exact_owned = owned
+                wall_now = self.wall_clock()
+                previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
+                wall_gap = wall_now - previous_progress_wall
+                if wall_gap < 0:
+                    raise _CapacityAbort("clock_invalid")
+                if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
+                    if not barrier_completed and getattr(self, "_remote", None) is not None:
+                        needs_barrier = True
+                    else:
+                        self._record_progress_failure(
+                            phase,
+                            state,
+                            origin="checkpoint_call",
+                            attempted_kind="checkpoint",
+                            wall_now=wall_now,
+                            wall_gap=wall_gap,
+                        )
+                        self._raise_if_failed_locked()
+                        raise _CapacityAbort("checkpoint_wall_gap")
+                else:
+                    self._accept_progress(state, kind="checkpoint", wall_now=wall_now, wall_gap=wall_gap)
+                    state.last_activity_observation_wall_ns = wall_now
+                    state.checkpoint_count += 1
+                    state.last_completed = completed_records
+                    state.maximum_checkpoint_gap = max(state.maximum_checkpoint_gap, gap)
+                    self._append_progress_signal(
+                        state,
+                        kind="checkpoint",
+                        completed_records=completed_records,
+                        wall_now=wall_now,
+                        wall_gap=wall_gap,
+                    )
+            if needs_barrier:
+                self._barrier_remote_before_progress_failure("checkpoint")
+                barrier_completed = True
+                continue
+            break
+        self._observe("checkpoint", completed_records=completed_records, logical_owned=owned)
         now = _probe_monotonic_ns(self.probe)
         with self._lock:
             state = self._states[phase]
@@ -1877,76 +3218,105 @@ class _ContinuousResourceMonitor:
         self.raise_if_failed()
 
     def heartbeat(self, phase: str) -> None:
-        with self._lock:
-            self._raise_if_failed_locked()
-            wall_now = self.wall_clock()
-            state = self._states.get(phase)
-            if state is None or self._current_phase != phase:
-                raise _CapacityAbort("checkpoint_invalid")
-            previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
-            wall_gap = wall_now - previous_progress_wall
-            if wall_gap < 0:
-                raise _CapacityAbort("clock_invalid")
-            if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                self._record_progress_failure(
-                    phase,
-                    state,
-                    origin="heartbeat_call",
-                    attempted_kind="heartbeat",
-                    wall_now=wall_now,
-                    wall_gap=wall_gap,
-                )
+        barrier_completed = False
+        while True:
+            needs_barrier = False
+            with self._lock:
                 self._raise_if_failed_locked()
-                raise _CapacityAbort("checkpoint_wall_gap")
-            self._accept_progress(state, kind="heartbeat", wall_now=wall_now, wall_gap=wall_gap)
-            self._append_progress_signal(
-                state,
-                kind="heartbeat",
-                completed_records=state.last_completed,
-                wall_now=wall_now,
-                wall_gap=wall_gap,
-            )
-            state.last_activity_observation_wall_ns = wall_now
-        self._observe("heartbeat", completed_records=state.last_completed or None)
+                wall_now = self.wall_clock()
+                state = self._states.get(phase)
+                if state is None or self._current_phase != phase:
+                    raise _CapacityAbort("checkpoint_invalid")
+                previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
+                wall_gap = wall_now - previous_progress_wall
+                if wall_gap < 0:
+                    raise _CapacityAbort("clock_invalid")
+                if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
+                    if not barrier_completed and getattr(self, "_remote", None) is not None:
+                        needs_barrier = True
+                    else:
+                        self._record_progress_failure(
+                            phase,
+                            state,
+                            origin="heartbeat_call",
+                            attempted_kind="heartbeat",
+                            wall_now=wall_now,
+                            wall_gap=wall_gap,
+                        )
+                        self._raise_if_failed_locked()
+                        raise _CapacityAbort("checkpoint_wall_gap")
+                else:
+                    self._accept_progress(state, kind="heartbeat", wall_now=wall_now, wall_gap=wall_gap)
+                    self._append_progress_signal(
+                        state,
+                        kind="heartbeat",
+                        completed_records=state.last_completed,
+                        wall_now=wall_now,
+                        wall_gap=wall_gap,
+                    )
+                    state.last_activity_observation_wall_ns = wall_now
+                    latest_exact_owned = self._latest_exact_owned
+            if needs_barrier:
+                self._barrier_remote_before_progress_failure("heartbeat")
+                barrier_completed = True
+                continue
+            break
+        self._observe(
+            "heartbeat",
+            completed_records=state.last_completed or None,
+            logical_owned=latest_exact_owned,
+        )
         self.raise_if_failed()
 
     def activity(self, phase: str) -> None:
         observe_resources = False
         completed_records = 0
-        with self._lock:
-            self._raise_if_failed_locked()
-            wall_now = self.wall_clock()
-            state = self._states.get(phase)
-            if state is None or self._current_phase != phase:
-                raise _CapacityAbort("checkpoint_invalid")
-            previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
-            wall_gap = wall_now - previous_progress_wall
-            if wall_gap < 0:
-                raise _CapacityAbort("clock_invalid")
-            if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
-                self._record_progress_failure(
-                    phase,
-                    state,
-                    origin="activity_call",
-                    attempted_kind="activity",
-                    wall_now=wall_now,
-                    wall_gap=wall_gap,
-                )
+        barrier_completed = False
+        while True:
+            needs_barrier = False
+            with self._lock:
                 self._raise_if_failed_locked()
-                raise _CapacityAbort("checkpoint_wall_gap")
-            self._accept_progress(state, kind="activity", wall_now=wall_now, wall_gap=wall_gap)
-            self._append_progress_signal(
-                state,
-                kind="activity",
-                completed_records=state.last_completed,
-                wall_now=wall_now,
-                wall_gap=wall_gap,
-            )
-            last_observation = state.last_activity_observation_wall_ns or state.started_wall_ns
-            if wall_now - last_observation >= ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS:
-                state.last_activity_observation_wall_ns = wall_now
-                observe_resources = True
-                completed_records = state.last_completed
+                wall_now = self.wall_clock()
+                state = self._states.get(phase)
+                if state is None or self._current_phase != phase:
+                    raise _CapacityAbort("checkpoint_invalid")
+                previous_progress_wall = state.last_progress_wall_ns or state.started_wall_ns
+                wall_gap = wall_now - previous_progress_wall
+                if wall_gap < 0:
+                    raise _CapacityAbort("clock_invalid")
+                if wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
+                    if not barrier_completed and getattr(self, "_remote", None) is not None:
+                        needs_barrier = True
+                    else:
+                        self._record_progress_failure(
+                            phase,
+                            state,
+                            origin="activity_call",
+                            attempted_kind="activity",
+                            wall_now=wall_now,
+                            wall_gap=wall_gap,
+                        )
+                        self._raise_if_failed_locked()
+                        raise _CapacityAbort("checkpoint_wall_gap")
+                else:
+                    self._accept_progress(state, kind="activity", wall_now=wall_now, wall_gap=wall_gap)
+                    self._append_progress_signal(
+                        state,
+                        kind="activity",
+                        completed_records=state.last_completed,
+                        wall_now=wall_now,
+                        wall_gap=wall_gap,
+                    )
+                    last_observation = state.last_activity_observation_wall_ns or state.started_wall_ns
+                    if wall_now - last_observation >= ACTIVITY_PRIVATE_TREE_VALIDATION_INTERVAL_NS:
+                        state.last_activity_observation_wall_ns = wall_now
+                        observe_resources = True
+                        completed_records = state.last_completed
+            if needs_barrier:
+                self._barrier_remote_before_progress_failure("activity")
+                barrier_completed = True
+                continue
+            break
         if observe_resources:
             self._observe("activity", completed_records=completed_records or None)
         self.raise_if_failed()
@@ -1994,13 +3364,17 @@ class _ContinuousResourceMonitor:
     def observe_transaction_boundary(self, owned: int) -> None:
         with self._lock:
             self._global_owned_high_water = max(self._global_owned_high_water, owned)
+            self._latest_exact_owned = owned
             phase = self._current_phase
             if phase is not None:
                 state = self._states[phase]
                 state.last_owned = owned
                 state.owned_high_water = max(state.owned_high_water, owned)
-        self._enforce_owned(owned)
-        self._observe("boundary")
+        # Publish the exact transaction size before requesting the independent
+        # sample, but let that sample arbitrate every colliding resource limit.
+        # Pre-latching owned bytes here would make scheduler order decide
+        # whether a higher-priority launcher failure was retained.
+        self._observe("boundary", logical_owned=owned)
         self.raise_if_failed()
 
     def global_snapshot(self) -> dict[str, int]:
@@ -2012,6 +3386,7 @@ class _ContinuousResourceMonitor:
                 "minimum_free_disk_bytes": self._global_minimum_free,
                 "owned_disk_high_water_bytes": self._global_owned_high_water,
                 "maximum_resource_observation_wall_gap_ns": self._global_maximum_resource_wall_gap_ns,
+                "maximum_resource_acquisition_duration_ns": self._global_maximum_resource_acquisition_duration_ns,
             }
 
     def failure_diagnostic(self) -> dict[str, Any] | None:
@@ -2024,19 +3399,35 @@ class _ContinuousResourceMonitor:
         rss: int,
         minimum_free: int | None,
         acquisition_retries: int,
+        acquisition_duration_ns: int = 0,
+        now: int | None = None,
+        wall_now: int | None = None,
     ) -> None:
         """Retain valid hard-limit evidence from an intentionally incomplete sample."""
 
         with self._lock:
             self._global_peak_rss = max(self._global_peak_rss, rss)
             self._global_resource_acquisition_retries += acquisition_retries
+            self._global_maximum_resource_acquisition_duration_ns = max(
+                self._global_maximum_resource_acquisition_duration_ns,
+                acquisition_duration_ns,
+            )
             if minimum_free is not None:
                 self._global_minimum_free = min(self._global_minimum_free, minimum_free)
             phase = self._current_phase
             if phase is not None:
                 state = self._states[phase]
+                phase_eligible = (now is None or now >= state.started_ns) and (
+                    wall_now is None or wall_now >= state.started_wall_ns
+                )
+                if not phase_eligible:
+                    return
                 state.peak_rss = max(state.peak_rss, rss)
                 state.resource_acquisition_retry_count += acquisition_retries
+                state.maximum_resource_acquisition_duration_ns = max(
+                    state.maximum_resource_acquisition_duration_ns,
+                    acquisition_duration_ns,
+                )
                 if minimum_free is not None:
                     state.minimum_free = (
                         minimum_free if state.minimum_free is None else min(state.minimum_free, minimum_free)
@@ -2051,8 +3442,11 @@ class _ContinuousResourceMonitor:
             raise _CapacityAbort(self._failure_code)
 
     def _loop(self) -> None:
-        interval = self.interval_ns / 1_000_000_000
-        while not self._stop.wait(interval):
+        next_deadline_ns = time.monotonic_ns() + self.interval_ns
+        while True:
+            remaining_ns = max(0, next_deadline_ns - time.monotonic_ns())
+            if self._stop.wait(remaining_ns / 1_000_000_000):
+                return
             try:
                 self._observe("continuous")
             except _CapacityAbort as exc:
@@ -2061,14 +3455,41 @@ class _ContinuousResourceMonitor:
             except (KeyboardInterrupt, SystemExit, MemoryError):
                 self._record_failure("phase_interrupted")
                 return
+            next_deadline_ns += self.interval_ns
+            now_ns = time.monotonic_ns()
+            if next_deadline_ns <= now_ns:
+                next_deadline_ns = now_ns
 
-    def _observe(self, kind: str, *, completed_records: int | None = None) -> None:
+    def _observe(
+        self,
+        kind: str,
+        *,
+        completed_records: int | None = None,
+        logical_owned: int | None = None,
+    ) -> None:
         with self._observation_lock:
-            self._observe_serialized(kind, completed_records=completed_records)
+            self._observe_serialized(kind, completed_records=completed_records, logical_owned=logical_owned)
 
-    def _observe_serialized(self, kind: str, *, completed_records: int | None = None) -> None:
+    def _observe_serialized(
+        self,
+        kind: str,
+        *,
+        completed_records: int | None = None,
+        logical_owned: int | None = None,
+    ) -> None:
+        if logical_owned is None:
+            try:
+                logical_owned = self.tree.logical_bytes()
+            except EnronCapacityError as exc:
+                self._record_failure(exc.code if exc.code in _ERROR_MESSAGES else "private_tree_invalid")
+                return
+        with self._lock:
+            self._latest_exact_owned = logical_owned
+            self._global_owned_high_water = max(self._global_owned_high_water, logical_owned)
+        if self._remote is not None:
+            self._remote.force(kind)
+            return
         try:
-            logical_owned = self.tree.logical_bytes()
             now = _probe_monotonic_ns(self.probe)
             rss, rss_retries = _acquire_runtime_process_tree_rss(self.probe)
             if rss > self.preflight.maximum_peak_rss_bytes:
@@ -2112,23 +3533,112 @@ class _ContinuousResourceMonitor:
         except BaseException:
             self._record_failure("resource_measurement_failed")
             return
-        filesystem_delta = max(0, self.preflight.output_preflight_free_disk_bytes - output_disk.free)
+        try:
+            wall_now = self.wall_clock()
+        except (KeyboardInterrupt, SystemExit, MemoryError):
+            raise
+        except BaseException:
+            self._record_failure("clock_invalid")
+            return
+        self._accept_resource_sample(
+            kind=kind,
+            completed_records=completed_records,
+            logical_owned=logical_owned,
+            now=now,
+            wall_now=wall_now,
+            rss=rss,
+            minimum_free=minimum_free,
+            output_free=output_disk.free,
+            acquisition_retries=acquisition_retries,
+            provided_wall_gap=None,
+            acquisition_duration_ns=0,
+            rss_duration_ns=0,
+            filesystem_duration_ns=0,
+            scheduler_lateness_ns=0,
+            provided_failure_code=None,
+            provided_failure_code_is_authoritative=False,
+        )
+
+    def _accept_remote_resource_sample(
+        self,
+        *,
+        kind: str,
+        completed_records: int | None,
+        wall_now: int,
+        now: int,
+        rss: int,
+        minimum_free: int,
+        output_free: int,
+        rss_retries: int,
+        filesystem_retries: int,
+        wall_gap: int,
+        acquisition_duration_ns: int,
+        rss_duration_ns: int,
+        filesystem_duration_ns: int,
+        scheduler_lateness_ns: int,
+        failure_code: str | None,
+    ) -> None:
+        with self._lock:
+            logical_owned = self._latest_exact_owned
+        self._accept_resource_sample(
+            kind=kind,
+            completed_records=completed_records,
+            logical_owned=logical_owned,
+            now=now,
+            wall_now=wall_now,
+            rss=rss,
+            minimum_free=minimum_free,
+            output_free=output_free,
+            acquisition_retries=rss_retries + filesystem_retries,
+            provided_wall_gap=wall_gap,
+            acquisition_duration_ns=acquisition_duration_ns,
+            rss_duration_ns=rss_duration_ns,
+            filesystem_duration_ns=filesystem_duration_ns,
+            scheduler_lateness_ns=scheduler_lateness_ns,
+            provided_failure_code=failure_code,
+            provided_failure_code_is_authoritative=True,
+        )
+
+    def _accept_resource_sample(
+        self,
+        *,
+        kind: str,
+        completed_records: int | None,
+        logical_owned: int,
+        now: int,
+        wall_now: int,
+        rss: int,
+        minimum_free: int,
+        output_free: int,
+        acquisition_retries: int,
+        provided_wall_gap: int | None,
+        acquisition_duration_ns: int,
+        rss_duration_ns: int,
+        filesystem_duration_ns: int,
+        scheduler_lateness_ns: int,
+        provided_failure_code: str | None,
+        provided_failure_code_is_authoritative: bool,
+    ) -> None:
+        filesystem_delta = max(0, self.preflight.output_preflight_free_disk_bytes - output_free)
         owned = max(logical_owned, filesystem_delta)
         with self._lock:
-            try:
-                wall_now = self.wall_clock()
-            except (KeyboardInterrupt, SystemExit, MemoryError):
-                raise
-            except BaseException:
-                self._record_failure("clock_invalid")
-                return
             previous_global_wall = self._global_last_resource_wall_ns
             if previous_global_wall is None:
                 previous_global_wall = wall_now
             global_resource_wall_gap = wall_now - previous_global_wall
-            if now < self.run_started_ns or now < self._global_last_probe_ns or global_resource_wall_gap < 0:
+            if (
+                now < self.run_started_ns
+                or now < self._global_last_probe_ns
+                or global_resource_wall_gap < 0
+                or (provided_wall_gap is not None and provided_wall_gap != global_resource_wall_gap)
+            ):
                 self._record_failure("clock_invalid")
                 return
+            phase = self._current_phase
+            phase_state = None if phase is None else self._states[phase]
+            phase_eligible = bool(
+                phase_state is not None and now >= phase_state.started_ns and wall_now >= phase_state.started_wall_ns
+            )
             self._global_last_resource_wall_ns = wall_now
             self._global_last_probe_ns = now
             self._global_observations += 1
@@ -2140,25 +3650,63 @@ class _ContinuousResourceMonitor:
                 self._global_maximum_resource_wall_gap_ns,
                 global_resource_wall_gap,
             )
-            if global_resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
-                self._record_failure("resource_observation_gap")
-            phase = self._current_phase
-            if phase is not None:
-                state = self._states[phase]
-                if now < state.started_ns:
+            self._global_maximum_resource_acquisition_duration_ns = max(
+                self._global_maximum_resource_acquisition_duration_ns,
+                acquisition_duration_ns,
+            )
+            limit_failure: str | None = None
+            if acquisition_duration_ns > MAX_RESOURCE_ACQUISITION_DURATION_NS:
+                limit_failure = "resource_acquisition_timeout"
+            elif rss > self.preflight.maximum_peak_rss_bytes:
+                limit_failure = "rss_limit"
+            elif minimum_free < MIN_RUNTIME_FREE_DISK_BYTES:
+                limit_failure = "runtime_disk_floor"
+            elif owned > MAX_OWNED_DISK_BYTES:
+                limit_failure = "owned_disk_limit"
+            elif global_resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
+                limit_failure = "resource_observation_gap"
+            elif now - self.run_started_ns > MAX_TOTAL_RUNTIME_NS:
+                limit_failure = "runtime_limit"
+            if (
+                provided_failure_code_is_authoritative
+                and acquisition_duration_ns <= MAX_RESOURCE_ACQUISITION_DURATION_NS
+            ):
+                limit_failure = _combine_resource_failure_codes(limit_failure, provided_failure_code)
+            if limit_failure == "resource_observation_gap":
+                self._record_failure(
+                    limit_failure,
+                    diagnostic=_resource_gap_failure_diagnostic(
+                        phase=phase if phase_eligible else None,
+                        sample_kind=kind,
+                        sequence=self._global_observations,
+                        observed_resource_gap_ns=global_resource_wall_gap,
+                        acquisition_duration_ns=acquisition_duration_ns,
+                        rss_duration_ns=rss_duration_ns,
+                        filesystem_duration_ns=filesystem_duration_ns,
+                        acquisition_retry_count=acquisition_retries,
+                        scheduler_lateness_ns=scheduler_lateness_ns,
+                    ),
+                )
+            elif limit_failure is not None:
+                self._record_failure(limit_failure)
+            if phase is not None and phase_state is not None and phase_eligible:
+                state = phase_state
+                previous_resource_wall = state.last_resource_wall_ns or state.started_wall_ns
+                resource_wall_gap = wall_now - previous_resource_wall
+                progress_wall_gap = wall_now - (state.last_progress_wall_ns or state.started_wall_ns)
+                if resource_wall_gap < 0:
                     self._record_failure("clock_invalid")
                     return
                 state.observations += 1
                 state.resource_acquisition_retry_count += acquisition_retries
-                previous_resource_wall = state.last_resource_wall_ns or state.started_wall_ns
-                resource_wall_gap = wall_now - previous_resource_wall
-                progress_wall_gap = wall_now - (state.last_progress_wall_ns or state.started_wall_ns)
-                if resource_wall_gap < 0 or progress_wall_gap < 0:
-                    self._record_failure("clock_invalid")
-                    return
                 state.last_resource_wall_ns = wall_now
                 state.maximum_resource_wall_gap_ns = max(state.maximum_resource_wall_gap_ns, resource_wall_gap)
-                state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, progress_wall_gap)
+                state.maximum_resource_acquisition_duration_ns = max(
+                    state.maximum_resource_acquisition_duration_ns,
+                    acquisition_duration_ns,
+                )
+                if progress_wall_gap >= 0:
+                    state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, progress_wall_gap)
                 state.last_owned = owned
                 sample = {
                     "sequence": state.observations,
@@ -2169,6 +3717,11 @@ class _ContinuousResourceMonitor:
                     "process_tree_rss_bytes": rss,
                     "owned_disk_bytes": owned,
                     "free_disk_bytes": minimum_free,
+                    "resource_acquisition_duration_ns": acquisition_duration_ns,
+                    "rss_acquisition_duration_ns": rss_duration_ns,
+                    "filesystem_acquisition_duration_ns": filesystem_duration_ns,
+                    "resource_acquisition_retry_count": acquisition_retries,
+                    "scheduler_lateness_ns": scheduler_lateness_ns,
                 }
                 state.peak_rss = max(state.peak_rss, rss)
                 state.minimum_free = (
@@ -2189,11 +3742,28 @@ class _ContinuousResourceMonitor:
                     state.maximum_wall_gap_sample = sample
                 else:
                     sample["resource_observation_wall_gap_ns"] = resource_wall_gap
+                if state.maximum_acquisition_sample is None or acquisition_duration_ns >= int(
+                    state.maximum_acquisition_sample["resource_acquisition_duration_ns"]
+                ):
+                    state.maximum_acquisition_sample = sample
                 if state.owned_peak_sample is None or owned >= int(state.owned_peak_sample["owned_disk_bytes"]):
                     state.owned_peak_sample = sample
                 self._retain_sample(state, sample)
                 if resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
-                    self._record_failure("resource_observation_gap")
+                    self._record_failure(
+                        "resource_observation_gap",
+                        diagnostic=_resource_gap_failure_diagnostic(
+                            phase=phase,
+                            sample_kind=kind,
+                            sequence=state.observations,
+                            observed_resource_gap_ns=resource_wall_gap,
+                            acquisition_duration_ns=acquisition_duration_ns,
+                            rss_duration_ns=rss_duration_ns,
+                            filesystem_duration_ns=filesystem_duration_ns,
+                            acquisition_retry_count=acquisition_retries,
+                            scheduler_lateness_ns=scheduler_lateness_ns,
+                        ),
+                    )
                 if progress_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
                     self._record_progress_failure(
                         phase,
@@ -2203,14 +3773,6 @@ class _ContinuousResourceMonitor:
                         wall_now=wall_now,
                         wall_gap=progress_wall_gap,
                     )
-            if rss > self.preflight.maximum_peak_rss_bytes:
-                self._record_failure("rss_limit")
-            if minimum_free < MIN_RUNTIME_FREE_DISK_BYTES:
-                self._record_failure("runtime_disk_floor")
-            if owned > MAX_OWNED_DISK_BYTES:
-                self._record_failure("owned_disk_limit")
-            if now - self.run_started_ns > MAX_TOTAL_RUNTIME_NS:
-                self._record_failure("runtime_limit")
 
     def _phase_snapshot(self, state: _PhaseMeasurements, elapsed_ns: int) -> dict[str, Any]:
         retained = list(cast(list[dict[str, Any]], state.samples))
@@ -2221,6 +3783,7 @@ class _ContinuousResourceMonitor:
             state.owned_peak_sample,
             state.minimum_free_sample,
             state.maximum_wall_gap_sample,
+            state.maximum_acquisition_sample,
             state.last_sample,
         ):
             if sample is not None and all(item["sequence"] != sample["sequence"] for item in retained):
@@ -2244,6 +3807,7 @@ class _ContinuousResourceMonitor:
             "owned_disk_high_water_bytes": state.owned_high_water,
             "minimum_free_disk_bytes": 0 if state.minimum_free is None else state.minimum_free,
             "maximum_resource_observation_wall_gap_ns": state.maximum_resource_wall_gap_ns,
+            "maximum_resource_acquisition_duration_ns": state.maximum_resource_acquisition_duration_ns,
             "maximum_progress_checkpoint_wall_gap_ns": state.maximum_progress_wall_gap_ns,
             "resource_samples": retained,
             "checkpoint_count": state.checkpoint_count,
@@ -2281,13 +3845,34 @@ class _ContinuousResourceMonitor:
         }
         self._record_failure("checkpoint_wall_gap", diagnostic=diagnostic)
 
+    def _record_failure_locked(self, code: str, diagnostic: Mapping[str, Any] | None) -> bool:
+        if self._failure_code is not None:
+            return False
+        self._failure_code = code if code in _ERROR_MESSAGES else "resource_measurement_failed"
+        validated = _validated_failure_diagnostic(diagnostic)
+        if self._failure_code == "checkpoint_wall_gap" and validated is not None:
+            self._failure_diagnostic = validated if "origin" in validated else None
+        elif self._failure_code == "resource_observation_gap" and validated is not None:
+            self._failure_diagnostic = validated if validated.get("diagnostic_kind") else None
+        else:
+            self._failure_diagnostic = None
+        return True
+
     def _record_failure(self, code: str, *, diagnostic: Mapping[str, Any] | None = None) -> None:
-        newly_recorded = False
         with self._lock:
-            if self._failure_code is None:
-                self._failure_code = code if code in _ERROR_MESSAGES else "resource_measurement_failed"
-                self._failure_diagnostic = _validated_failure_diagnostic(diagnostic)
-                newly_recorded = True
+            newly_recorded = self._record_failure_locked(code, diagnostic)
+        if newly_recorded:
+            self._watchdog.trigger()
+
+    def _record_remote_failure(self, code: str, *, diagnostic: Mapping[str, Any] | None = None) -> None:
+        with self._lock:
+            remote_code = code if code in _ERROR_MESSAGES else "resource_measurement_failed"
+            owned_code = "owned_disk_limit" if self._latest_exact_owned > MAX_OWNED_DISK_BYTES else None
+            selected_code = _combine_resource_failure_codes(owned_code, remote_code)
+            if selected_code is None:
+                selected_code = "resource_measurement_failed"
+            selected_diagnostic = diagnostic if selected_code == remote_code else None
+            newly_recorded = self._record_failure_locked(selected_code, selected_diagnostic)
         if newly_recorded:
             self._watchdog.trigger()
 
@@ -2311,7 +3896,7 @@ class _ContinuousResourceMonitor:
         samples = cast(list[dict[str, Any]], state.samples)
         priorities = cast(list[int], state.sample_priorities)
         priority = int.from_bytes(hashlib.sha256(str(sequence).encode("ascii")).digest()[:8], "big")
-        reservoir_capacity = MAX_RESOURCE_SAMPLES_PER_PHASE - 64 - 6
+        reservoir_capacity = MAX_RESOURCE_SAMPLES_PER_PHASE - 64 - 7
         if len(samples) < reservoir_capacity:
             samples.append(sample)
             priorities.append(priority)
@@ -2394,6 +3979,7 @@ def capacity_policy() -> dict[str, Any]:
         "maximum_retained_resource_samples_per_phase": MAX_RESOURCE_SAMPLES_PER_PHASE,
         "production_monitor_interval_ns": PRODUCTION_MONITOR_INTERVAL_NS,
         "maximum_resource_observation_wall_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "maximum_resource_acquisition_duration_ns": MAX_RESOURCE_ACQUISITION_DURATION_NS,
         "runtime_resource_acquisition_max_attempts": _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS,
         "runtime_resource_acquisition_retry_delay_ns": 0,
         "runtime_filesystem_acquisition_order": ["device", "disk", "device"],
@@ -2404,7 +3990,32 @@ def capacity_policy() -> dict[str, Any]:
         "activity_interval_at_minimum_throughput_ns": (
             ACTIVITY_RECORD_INTERVAL * 1_000_000_000 // MIN_PHASE_RECORDS_PER_SECOND
         ),
-        "activity_resource_observation_interval_ns": ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS,
+        "activity_private_tree_validation_interval_ns": ACTIVITY_PRIVATE_TREE_VALIDATION_INTERVAL_NS,
+        "resource_observer_protocol": _RESOURCE_OBSERVER_PROTOCOL,
+        "resource_observer_role": "launcher_process_observing_complete_execution_tree",
+        "resource_observer_workload_gil_independent_required": True,
+        "resource_observer_included_in_measured_process_tree": True,
+        "production_process_containment": {
+            "linux": _LINUX_PROCESS_CONTAINMENT,
+            "darwin": _DARWIN_PROCESS_CONTAINMENT,
+        },
+        "production_process_creation_forbidden": True,
+        "production_process_containment_runtime_attested": True,
+        "terminal_process_snapshot_includes_rss": True,
+        "terminal_audit_never_signals_bare_pid": True,
+        "resource_observation_gap_semantics": "completed_valid_sample_to_completed_valid_sample",
+        "resource_acquisitions_serialized": True,
+        "startup_resource_acquisition_direct_deadline_supervision": True,
+        "terminal_resource_acquisition_bounded_by_completion_gap": True,
+        "partial_resource_sample_advances_cadence": False,
+        "private_tree_scan_in_fast_resource_lane": False,
+        "exact_private_tree_validation_at_checkpoints_and_boundaries_required": True,
+        "owned_disk_high_water_semantics": "sampled_exact_tree_plus_shared_filesystem_free_space_delta",
+        "strict_transient_private_tree_high_water_claimed": False,
+        "resource_observer_start_timeout_ns": RESOURCE_OBSERVER_START_TIMEOUT_NS,
+        "resource_observer_command_timeout_ns": RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS,
+        "production_worker_cleanup_grace_ns": PRODUCTION_WORKER_CLEANUP_GRACE_NS,
+        "maximum_resource_observer_frame_bytes": MAX_RESOURCE_OBSERVER_FRAME_BYTES,
         "maximum_capacity_report_bytes": MAX_CAPACITY_REPORT_BYTES,
         "maximum_capacity_report_structural_bound_bytes": _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES,
         "maximum_portable_decision_bytes": MAX_PORTABLE_DECISION_BYTES,
@@ -2474,7 +4085,7 @@ def _stable_bootstrap_directory(path: Path) -> Path:
     return resolved
 
 
-def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, ...]]:
+def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, ...], int | None]:
     """Validate the stdlib-only launcher/worker import state without running site hooks."""
 
     marker = getattr(sys, _BOOTSTRAP_ATTRIBUTE, None)
@@ -2484,10 +4095,12 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
         "dependency_roots",
         "baseline_path",
         "pycache_root",
+        "resource_observer_fd",
     }:
         raise _error("production_identity_invalid")
     raw_dependencies = marker.get("dependency_roots")
     raw_baseline = marker.get("baseline_path")
+    observer_fd = marker.get("resource_observer_fd")
     if (
         marker.get("schema") != _BOOTSTRAP_SCHEMA
         or not isinstance(marker.get("source_root"), str)
@@ -2497,6 +4110,7 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
         or any(not isinstance(value, str) for value in raw_dependencies)
         or not isinstance(raw_baseline, list)
         or any(not isinstance(value, str) or not value or not Path(value).is_absolute() for value in raw_baseline)
+        or (observer_fd is not None and (type(observer_fd) is not int or observer_fd < 3))
         or not sys.flags.isolated
         or not sys.flags.no_site
         or not sys.flags.dont_write_bytecode
@@ -2559,11 +4173,1004 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
     if sys.path != expected_path:
         raise _error("production_identity_invalid")
     layouts = tuple(allowed_dependencies[path] for path in dependencies)
-    return source_root, dependencies, layouts
+    if observer_fd is not None:
+        try:
+            observer_info = os.fstat(observer_fd)
+        except OSError:
+            raise _error("production_identity_invalid") from None
+        if not stat.S_ISSOCK(observer_info.st_mode):
+            raise _error("production_identity_invalid")
+    return source_root, dependencies, layouts, cast(int | None, observer_fd)
+
+
+class _ResourceObserverEOF(Exception):
+    """The private observer channel closed before its protocol completed."""
+
+
+def _observer_mapping(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _error("resource_measurement_failed")
+    return cast(Mapping[str, Any], value)
+
+
+def _observer_closed(value: Mapping[str, Any], fields: set[str]) -> None:
+    if set(value) != fields:
+        raise _error("resource_measurement_failed")
+
+
+def _observer_int(value: object, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum or value > _MAX_RESOURCE_INTEGER:
+        raise _error("resource_measurement_failed")
+    return value
+
+
+class _ResourceObserverFrames:
+    """Bounded newline-frame reader for one private socket endpoint."""
+
+    def __init__(self, endpoint: socket.socket) -> None:
+        self.endpoint = endpoint
+        self.buffer = bytearray()
+        self._partial_frame_deadline_ns: int | None = None
+
+    def receive(self, timeout_ns: int) -> list[dict[str, Any]]:
+        if type(timeout_ns) is not int or timeout_ns < 0:
+            raise _error("resource_measurement_failed")
+        deadline_ns = time.monotonic_ns() + timeout_ns
+        while True:
+            effective_deadline_ns = (
+                deadline_ns
+                if self._partial_frame_deadline_ns is None
+                else min(deadline_ns, self._partial_frame_deadline_ns)
+            )
+            now_ns = time.monotonic_ns()
+            remaining_ns = effective_deadline_ns - now_ns
+            if (
+                self.buffer
+                and self._partial_frame_deadline_ns is not None
+                and now_ns >= self._partial_frame_deadline_ns
+            ):
+                raise _error("resource_measurement_failed")
+            try:
+                ready, _, _ = select.select([self.endpoint], [], [], max(0, remaining_ns) / 1_000_000_000)
+            except (OSError, ValueError):
+                raise _error("resource_measurement_failed") from None
+            if not ready:
+                if (
+                    self.buffer
+                    and self._partial_frame_deadline_ns is not None
+                    and effective_deadline_ns == self._partial_frame_deadline_ns
+                ):
+                    raise _error("resource_measurement_failed")
+                return []
+            try:
+                payload = self.endpoint.recv(MAX_RESOURCE_OBSERVER_FRAME_BYTES + 1)
+            except OSError:
+                raise _error("resource_measurement_failed") from None
+            if not payload:
+                if self.buffer:
+                    raise _error("resource_measurement_failed")
+                raise _ResourceObserverEOF
+            self.buffer.extend(payload)
+            if len(self.buffer) > MAX_RESOURCE_OBSERVER_FRAME_BYTES * 2:
+                raise _error("resource_measurement_failed")
+            frames: list[dict[str, Any]] = []
+            while True:
+                try:
+                    boundary = self.buffer.index(0x0A)
+                except ValueError:
+                    break
+                if boundary <= 0 or boundary >= MAX_RESOURCE_OBSERVER_FRAME_BYTES:
+                    raise _error("resource_measurement_failed")
+                raw = bytes(self.buffer[:boundary])
+                del self.buffer[: boundary + 1]
+                try:
+                    value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+                except (UnicodeError, ValueError):
+                    raise _error("resource_measurement_failed") from None
+                if not isinstance(value, dict):
+                    raise _error("resource_measurement_failed")
+                frames.append(value)
+            if len(self.buffer) >= MAX_RESOURCE_OBSERVER_FRAME_BYTES:
+                raise _error("resource_measurement_failed")
+            if self.buffer:
+                if self._partial_frame_deadline_ns is None:
+                    self._partial_frame_deadline_ns = deadline_ns
+            else:
+                self._partial_frame_deadline_ns = None
+            if frames:
+                return frames
+
+
+def _send_resource_observer_frame(endpoint: socket.socket, frame: Mapping[str, Any]) -> None:
+    try:
+        payload = _canonical_json_bytes(frame) + b"\n"
+        if len(payload) > MAX_RESOURCE_OBSERVER_FRAME_BYTES:
+            raise OSError
+        endpoint.sendall(payload)
+    except (OSError, TypeError, ValueError):
+        raise _error("resource_measurement_failed") from None
+
+
+def _shutdown_resource_observer_write(endpoint: socket.socket) -> None:
+    """Half-close one observer endpoint after its final protocol frame."""
+
+    try:
+        endpoint.shutdown(socket.SHUT_WR)
+    except OSError:
+        raise _error("resource_measurement_failed") from None
+
+
+def _require_resource_observer_eof(reader: _ResourceObserverFrames) -> None:
+    """Accept only a clean EOF after the peer's final observer frame."""
+
+    deadline_ns = time.monotonic_ns() + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+    while True:
+        if reader.buffer:
+            raise _error("resource_measurement_failed")
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            raise _error("resource_measurement_failed")
+        try:
+            frames = reader.receive(remaining_ns)
+        except _ResourceObserverEOF:
+            return
+        if frames or reader.buffer:
+            raise _error("resource_measurement_failed")
+
+
+def _observer_init_preflight(
+    frame: Mapping[str, Any],
+    *,
+    nonce: str,
+    options: EnronCapacityOptions,
+) -> tuple[_Preflight, int, int]:
+    _observer_closed(
+        frame,
+        {
+            "type",
+            "protocol",
+            "nonce",
+            "interval_ns",
+            "maximum_gap_ns",
+            "run_started_ns",
+            "preflight",
+        },
+    )
+    if (
+        frame.get("type") != "init"
+        or frame.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+        or frame.get("nonce") != nonce
+        or frame.get("interval_ns") != PRODUCTION_MONITOR_INTERVAL_NS
+        or frame.get("maximum_gap_ns") != MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+    ):
+        raise _error("resource_measurement_failed")
+    run_started_ns = _observer_int(frame.get("run_started_ns"), minimum=0)
+    raw = _observer_mapping(frame.get("preflight"))
+    _observer_closed(
+        raw,
+        {
+            "physical_memory_bytes",
+            "effective_rss_cap_bytes",
+            "maximum_peak_rss_bytes",
+            "preflight_process_tree_rss_bytes",
+            "preflight_free_disk_bytes",
+            "output_preflight_free_disk_bytes",
+            "preexisting_private_tombstone_count",
+            "filesystems",
+        },
+    )
+    numeric = {
+        key: _observer_int(raw.get(key), minimum=0)
+        for key in (
+            "physical_memory_bytes",
+            "effective_rss_cap_bytes",
+            "maximum_peak_rss_bytes",
+            "preflight_process_tree_rss_bytes",
+            "preflight_free_disk_bytes",
+            "output_preflight_free_disk_bytes",
+            "preexisting_private_tombstone_count",
+        )
+    }
+    independent_probe = _SystemResourceProbe()
+    independent_physical = independent_probe.physical_memory_bytes()
+    if type(independent_physical) is not int or independent_physical <= 0:
+        raise _error("resource_measurement_failed")
+    independent_effective_cap = min(
+        MAX_ABSOLUTE_RSS_BYTES,
+        independent_physical * PHYSICAL_MEMORY_FRACTION_NUMERATOR // PHYSICAL_MEMORY_FRACTION_DENOMINATOR,
+    )
+    independent_maximum_peak = independent_effective_cap * PEAK_RSS_FRACTION_NUMERATOR // PEAK_RSS_FRACTION_DENOMINATOR
+    if (
+        numeric["physical_memory_bytes"] != independent_physical
+        or numeric["effective_rss_cap_bytes"] != independent_effective_cap
+        or numeric["maximum_peak_rss_bytes"] != independent_maximum_peak
+        or not 0 < numeric["preflight_process_tree_rss_bytes"] <= independent_maximum_peak
+    ):
+        raise _error("resource_measurement_failed")
+    raw_filesystems = raw.get("filesystems")
+    if not isinstance(raw_filesystems, list) or not 1 <= len(raw_filesystems) <= 2:
+        raise _error("resource_measurement_failed")
+    try:
+        output_path = _absolute_private_path(options.output_dir).parent
+        ledger_path = _absolute_private_path(options.attempt_ledger_dir)
+    except EnronCapacityError:
+        raise _error("resource_measurement_failed") from None
+    output_device = independent_probe.filesystem_device(output_path)
+    ledger_device = independent_probe.filesystem_device(ledger_path)
+    if type(output_device) is not int or type(ledger_device) is not int:
+        raise _error("resource_measurement_failed")
+    expected_filesystems = (
+        {output_device: (output_path, True)}
+        if output_device == ledger_device
+        else {output_device: (output_path, True), ledger_device: (ledger_path, False)}
+    )
+    if len(raw_filesystems) != len(expected_filesystems):
+        raise _error("resource_measurement_failed")
+    filesystems: list[_FilesystemPreflight] = []
+    for item in raw_filesystems:
+        filesystem = _observer_mapping(item)
+        _observer_closed(
+            filesystem,
+            {"path", "device", "preflight_free_disk_bytes", "includes_output"},
+        )
+        raw_path = filesystem.get("path")
+        if not isinstance(raw_path, str):
+            raise _error("resource_measurement_failed")
+        try:
+            path = _absolute_private_path(Path(raw_path))
+        except EnronCapacityError:
+            raise _error("resource_measurement_failed") from None
+        includes_output = filesystem.get("includes_output")
+        if type(includes_output) is not bool:
+            raise _error("resource_measurement_failed")
+        device = _observer_int(filesystem.get("device"), minimum=0)
+        if expected_filesystems.get(device) != (path, includes_output):
+            raise _error("resource_measurement_failed")
+        filesystems.append(
+            _FilesystemPreflight(
+                device=device,
+                probe_path=path,
+                preflight_free_disk_bytes=_observer_int(filesystem.get("preflight_free_disk_bytes"), minimum=0),
+                includes_output=includes_output,
+            )
+        )
+    if sum(item.includes_output for item in filesystems) != 1 or len({item.device for item in filesystems}) != len(
+        filesystems
+    ):
+        raise _error("resource_measurement_failed")
+    preflight = _Preflight(filesystems=tuple(filesystems), **numeric)
+    return preflight, run_started_ns, cast(int, frame["interval_ns"])
+
+
+@dataclass(frozen=True, slots=True)
+class _ResourceAcquisitionCompletion:
+    completed_ns: int
+    gap_ns: int
+    acquisition_duration_ns: int
+    rss_duration_ns: int
+    filesystem_duration_ns: int
+    scheduler_lateness_ns: int
+    valid: bool
+    failure_code: str | None
+    sample_failure_reserved: bool
+    external_failure_code: str | None
+
+
+class _LauncherResourceObserver:
+    """Observe the isolated workload from the already-supervising launcher process."""
+
+    def __init__(
+        self,
+        endpoint: socket.socket,
+        *,
+        worker_pid: int,
+        nonce: str,
+        options: EnronCapacityOptions,
+    ) -> None:
+        self.endpoint = endpoint
+        self.worker_pid = worker_pid
+        self.nonce = nonce
+        self.options = options
+        self.thread = threading.Thread(target=self._run, name="nerb-capacity-launcher-resource-observer", daemon=True)
+        self.supervisor = threading.Thread(
+            target=self._supervise_deadlines,
+            name="nerb-capacity-launcher-resource-supervisor",
+            daemon=True,
+        )
+        self.send_lock = threading.Lock()
+        self.state_condition = threading.Condition()
+        self.supervision_started_ns = time.monotonic_ns()
+        self.acquisition_started_ns: int | None = None
+        self.pending_publication_completed_ns: int | None = None
+        self.last_completed_ns: int | None = None
+        self.started = False
+        self.terminal_sample_sent = False
+        self.stop_acknowledged = False
+        self.failure_code: str | None = None
+        self.failure_diagnostic: dict[str, Any] | None = None
+        self.failure: BaseException | None = None
+        self.failure_event = threading.Event()
+        self.failure_publication_complete = False
+        self.failure_delivery_succeeded = False
+        self._finished = threading.Event()
+
+    def start(self) -> None:
+        self.supervisor.start()
+        try:
+            self.thread.start()
+        except BaseException:
+            self._finished.set()
+            with self.state_condition:
+                self.state_condition.notify_all()
+            self.supervisor.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+            raise
+
+    def join(self) -> None:
+        if self.thread.ident is not None:
+            self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            if self._reserve_failure("resource_measurement_failed"):
+                self._finish_failure_publication(delivered=False)
+            try:
+                self.endpoint.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            raise _error("resource_measurement_failed")
+        if self.supervisor.ident is not None:
+            self.supervisor.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.supervisor.is_alive():
+            raise _error("resource_measurement_failed")
+
+    def close(self) -> None:
+        try:
+            self.endpoint.close()
+        except OSError:
+            pass
+
+    def _reserve_failure_locked(
+        self,
+        code: str,
+        exc: BaseException | None = None,
+        *,
+        diagnostic: Mapping[str, Any] | None = None,
+    ) -> bool:
+        if self.failure_code is not None:
+            return False
+        safe_code = code if code in _ERROR_MESSAGES else "resource_measurement_failed"
+        validated_diagnostic = _validated_resource_failure_diagnostic(diagnostic)
+        if safe_code == "resource_observation_gap" and validated_diagnostic is None:
+            safe_code = "production_worker_failed"
+        if safe_code != "resource_observation_gap":
+            validated_diagnostic = None
+        self.failure_code = safe_code
+        self.failure_diagnostic = validated_diagnostic
+        if exc is not None:
+            self.failure = exc
+        self.failure_event.set()
+        self.state_condition.notify_all()
+        return True
+
+    def _reserve_failure(self, code: str, exc: BaseException | None = None) -> bool:
+        with self.state_condition:
+            return self._reserve_failure_locked(code, exc)
+
+    def _finish_failure_publication(self, *, delivered: bool) -> None:
+        with self.state_condition:
+            self.failure_delivery_succeeded = delivered
+            self.failure_publication_complete = True
+            self.state_condition.notify_all()
+
+    def _publish_failure(
+        self,
+        code: str,
+        exc: BaseException | None = None,
+        *,
+        already_delivered: bool = False,
+    ) -> bool:
+        if not self._reserve_failure(code, exc):
+            return False
+        self._deliver_reserved_failure(already_delivered=already_delivered)
+        return True
+
+    def _deliver_reserved_failure(self, *, already_delivered: bool = False) -> None:
+        delivered = already_delivered
+        try:
+            if not already_delivered:
+                self._send(
+                    {
+                        "type": "observer_failure",
+                        "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                        "nonce": self.nonce,
+                        "failure_code": self.failure_code,
+                    },
+                )
+                delivered = True
+        except BaseException:
+            delivered = False
+        finally:
+            self._finish_failure_publication(delivered=delivered)
+
+    def _complete_resource_acquisition(
+        self,
+        *,
+        started_ns: int,
+        previous_completed_ns: int | None,
+        run_started_ns: int,
+        sample_kind: str,
+        sequence: int,
+        scheduled_ns: int,
+        rss_finished_ns: int,
+        rss_retry_count: int,
+        filesystem_retry_count: int,
+        process_tree_rss_bytes: int | None,
+        maximum_peak_rss_bytes: int,
+        minimum_free_disk_bytes: int | None,
+        output_free_disk_bytes: int | None,
+        terminal_process_leak: bool,
+        fallback_failure_code: str | None,
+    ) -> _ResourceAcquisitionCompletion:
+        with self.state_condition:
+            completed_ns = time.monotonic_ns()
+            gap_ns = 0 if previous_completed_ns is None else completed_ns - previous_completed_ns
+            acquisition_duration_ns = completed_ns - started_ns
+            rss_duration_ns = rss_finished_ns - started_ns
+            filesystem_duration_ns = completed_ns - rss_finished_ns
+            scheduler_lateness_ns = max(0, started_ns - scheduled_ns)
+            valid = (
+                process_tree_rss_bytes is not None
+                and minimum_free_disk_bytes is not None
+                and output_free_disk_bytes is not None
+                and acquisition_duration_ns <= MAX_RESOURCE_ACQUISITION_DURATION_NS
+            )
+            failure_code: str | None
+            if gap_ns < 0 or completed_ns < started_ns or started_ns < run_started_ns:
+                valid = False
+                failure_code = "clock_invalid"
+            else:
+                failure_code = _resource_sample_failure_code(
+                    process_tree_rss_bytes=process_tree_rss_bytes,
+                    maximum_peak_rss_bytes=maximum_peak_rss_bytes,
+                    minimum_free_disk_bytes=minimum_free_disk_bytes,
+                    acquisition_duration_ns=acquisition_duration_ns,
+                    observation_wall_gap_ns=gap_ns,
+                    total_runtime_ns=completed_ns - run_started_ns,
+                    terminal_process_leak=terminal_process_leak,
+                    fallback_failure_code=fallback_failure_code,
+                )
+                if not valid and failure_code is None:
+                    failure_code = "resource_measurement_failed"
+            failure_diagnostic: dict[str, Any] | None = None
+            if failure_code == "resource_observation_gap":
+                try:
+                    failure_diagnostic = _resource_gap_failure_diagnostic(
+                        phase=None,
+                        sample_kind=sample_kind,
+                        sequence=sequence,
+                        observed_resource_gap_ns=gap_ns,
+                        acquisition_duration_ns=acquisition_duration_ns,
+                        rss_duration_ns=rss_duration_ns,
+                        filesystem_duration_ns=filesystem_duration_ns,
+                        acquisition_retry_count=rss_retry_count + filesystem_retry_count,
+                        scheduler_lateness_ns=scheduler_lateness_ns,
+                    )
+                except EnronCapacityError:
+                    valid = False
+                    failure_code = "production_worker_failed"
+            self.acquisition_started_ns = None
+            sample_failure_reserved = failure_code is not None and self._reserve_failure_locked(
+                failure_code,
+                diagnostic=failure_diagnostic,
+            )
+            external_failure_code = None if sample_failure_reserved else self.failure_code
+            if external_failure_code is None:
+                self.pending_publication_completed_ns = completed_ns
+                if valid:
+                    self.last_completed_ns = completed_ns
+            self.state_condition.notify_all()
+            return _ResourceAcquisitionCompletion(
+                completed_ns=completed_ns,
+                gap_ns=gap_ns,
+                acquisition_duration_ns=acquisition_duration_ns,
+                rss_duration_ns=rss_duration_ns,
+                filesystem_duration_ns=filesystem_duration_ns,
+                scheduler_lateness_ns=scheduler_lateness_ns,
+                valid=valid,
+                failure_code=failure_code,
+                sample_failure_reserved=sample_failure_reserved,
+                external_failure_code=external_failure_code,
+            )
+
+    def wait_for_failure_publication(self, timeout_ns: int) -> bool:
+        deadline_ns = time.monotonic_ns() + timeout_ns
+        with self.state_condition:
+            while self.failure_event.is_set() and not self.failure_publication_complete:
+                remaining_ns = deadline_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    break
+                self.state_condition.wait(remaining_ns / 1_000_000_000)
+            return self.failure_publication_complete and self.failure_delivery_succeeded
+
+    def _run(self) -> None:
+        try:
+            self._run_protocol()
+        except _ResourceObserverEOF:
+            if not self.stop_acknowledged:
+                self._publish_failure("resource_measurement_failed")
+        except BaseException as exc:
+            safe_code = (
+                exc.code
+                if isinstance(exc, EnronCapacityError) and exc.code in _ERROR_MESSAGES
+                else "resource_measurement_failed"
+            )
+            self._publish_failure(safe_code, exc)
+        finally:
+            self._finished.set()
+            with self.state_condition:
+                self.acquisition_started_ns = None
+                self.pending_publication_completed_ns = None
+                self.state_condition.notify_all()
+
+    def _send(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+
+    def _supervise_deadlines(self) -> None:
+        while not self._finished.is_set():
+            failure_code: str | None = None
+            failure_reserved = False
+            with self.state_condition:
+                if self.failure_code is not None:
+                    return
+                if self.terminal_sample_sent:
+                    return
+                now_ns = time.monotonic_ns()
+                if self.acquisition_started_ns is not None:
+                    deadline_ns = self.acquisition_started_ns + MAX_RESOURCE_ACQUISITION_DURATION_NS
+                    if now_ns > deadline_ns:
+                        failure_code = "resource_acquisition_timeout"
+                elif self.pending_publication_completed_ns is not None:
+                    deadline_ns = self.pending_publication_completed_ns + MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+                    if now_ns > deadline_ns:
+                        failure_code = "resource_measurement_failed"
+                elif self.last_completed_ns is not None:
+                    deadline_ns = self.last_completed_ns + MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+                    if now_ns > deadline_ns:
+                        failure_code = "resource_measurement_failed"
+                else:
+                    deadline_ns = self.supervision_started_ns + RESOURCE_OBSERVER_START_TIMEOUT_NS
+                    if now_ns > deadline_ns:
+                        failure_code = "resource_measurement_failed"
+                if failure_code is None:
+                    remaining_ns = max(1, deadline_ns - now_ns + 1)
+                    self.state_condition.wait(min(remaining_ns, 10_000_000) / 1_000_000_000)
+                    continue
+                failure_reserved = self._reserve_failure_locked(cast(str, failure_code))
+            if failure_reserved:
+                self._deliver_reserved_failure()
+            return
+
+    def _run_protocol(self) -> None:
+        reader = _ResourceObserverFrames(self.endpoint)
+        init_deadline = time.monotonic_ns() + RESOURCE_OBSERVER_START_TIMEOUT_NS
+        init: dict[str, Any] | None = None
+        while init is None:
+            remaining = init_deadline - time.monotonic_ns()
+            if remaining <= 0:
+                raise _error("resource_measurement_failed")
+            frames = reader.receive(remaining)
+            if len(frames) > 1:
+                raise _error("resource_measurement_failed")
+            if frames:
+                init = frames[0]
+        preflight, run_started_ns, interval_ns = _observer_init_preflight(
+            init,
+            nonce=self.nonce,
+            options=self.options,
+        )
+        self.started = True
+        with self.state_condition:
+            self.state_condition.notify_all()
+        probe = _SystemResourceProbe()
+        event_sequence = 0
+        last_completed_ns: int | None = None
+        next_deadline_ns = time.monotonic_ns()
+        last_request_id = 0
+        worker_peak_rss = preflight.preflight_process_tree_rss_bytes
+        failure_latched = False
+        failure_acknowledged = False
+
+        def observe(*, sample_kind: str, request_id: int, scheduled_ns: int) -> None:
+            nonlocal event_sequence, last_completed_ns, next_deadline_ns, failure_latched
+            event_sequence += 1
+            started_ns = time.monotonic_ns()
+            with self.state_condition:
+                self.acquisition_started_ns = started_ns
+                self.state_condition.notify_all()
+            rss: int | None = None
+            minimum_free: int | None = None
+            output_free: int | None = None
+            rss_retries = 0
+            disk_retries = 0
+            fallback_failure_code: str | None = None
+            terminal_process_leak = False
+            try:
+                if sample_kind == "terminal":
+                    terminal_snapshot = _terminal_process_snapshot(self.worker_pid)
+                    if terminal_snapshot is None:
+                        raise _error("resource_measurement_failed")
+                    rss = terminal_snapshot.worker_tree_rss_bytes
+                    if terminal_snapshot.residuals:
+                        terminal_process_leak = True
+                else:
+                    rss, rss_retries = _acquire_runtime_process_tree_rss(probe)
+                launcher_peak_rss = _root_process_peak_rss_bytes()
+                if type(launcher_peak_rss) is not int or launcher_peak_rss <= 0:
+                    raise _error("resource_measurement_failed")
+                combined_peak = worker_peak_rss + launcher_peak_rss
+                if combined_peak > _MAX_RESOURCE_INTEGER:
+                    raise _error("resource_measurement_failed")
+                rss = max(rss, combined_peak)
+            except EnronCapacityError as exc:
+                fallback_failure_code = exc.code if exc.code in _ERROR_MESSAGES else "resource_measurement_failed"
+            rss_finished_ns = time.monotonic_ns()
+            if fallback_failure_code is None:
+                try:
+                    minimum_free, output_disk, disk_retries = _sample_runtime_filesystems(probe, preflight)
+                    output_free = output_disk.free
+                except _RuntimeDiskFloor as exc:
+                    minimum_free = exc.minimum_free
+                    output_free = None if exc.output_disk is None else exc.output_disk.free
+                    disk_retries = exc.retry_count
+                except EnronCapacityError as exc:
+                    fallback_failure_code = exc.code if exc.code in _ERROR_MESSAGES else "resource_measurement_failed"
+            completion = self._complete_resource_acquisition(
+                started_ns=started_ns,
+                previous_completed_ns=last_completed_ns,
+                run_started_ns=run_started_ns,
+                sample_kind=sample_kind,
+                sequence=event_sequence,
+                scheduled_ns=scheduled_ns,
+                rss_finished_ns=rss_finished_ns,
+                rss_retry_count=rss_retries,
+                filesystem_retry_count=disk_retries,
+                process_tree_rss_bytes=rss,
+                maximum_peak_rss_bytes=preflight.maximum_peak_rss_bytes,
+                minimum_free_disk_bytes=minimum_free,
+                output_free_disk_bytes=output_free,
+                terminal_process_leak=terminal_process_leak,
+                fallback_failure_code=fallback_failure_code,
+            )
+            if completion.external_failure_code is not None:
+                raise _error(completion.external_failure_code)
+            completed_ns = completion.completed_ns
+            gap_ns = completion.gap_ns
+            valid = completion.valid
+            failure_code = completion.failure_code
+            sample_failure_reserved = completion.sample_failure_reserved
+            frame = {
+                "type": "sample",
+                "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                "nonce": self.nonce,
+                "event_sequence": event_sequence,
+                "request_id": request_id,
+                "sample_kind": sample_kind,
+                "valid": valid,
+                "started_wall_ns": started_ns,
+                "completed_wall_ns": completed_ns,
+                "resource_observation_wall_gap_ns": gap_ns,
+                "acquisition_duration_ns": completion.acquisition_duration_ns,
+                "rss_duration_ns": completion.rss_duration_ns,
+                "filesystem_duration_ns": completion.filesystem_duration_ns,
+                "scheduler_lateness_ns": completion.scheduler_lateness_ns,
+                "process_tree_rss_bytes": rss,
+                "minimum_free_disk_bytes": minimum_free,
+                "output_free_disk_bytes": output_free,
+                "rss_retry_count": rss_retries,
+                "filesystem_retry_count": disk_retries,
+                "failure_code": failure_code,
+            }
+            if valid:
+                last_completed_ns = completed_ns
+            try:
+                if sample_kind == "terminal":
+                    self._send_final(frame)
+                else:
+                    self._send(frame)
+            except BaseException:
+                if sample_failure_reserved:
+                    self._finish_failure_publication(delivered=False)
+                with self.state_condition:
+                    self.pending_publication_completed_ns = None
+                    self.state_condition.notify_all()
+                raise
+            if sample_failure_reserved:
+                self._finish_failure_publication(delivered=True)
+                failure_latched = True
+            with self.state_condition:
+                self.pending_publication_completed_ns = None
+                if sample_kind == "terminal":
+                    self.terminal_sample_sent = True
+                externally_failed = self.failure_code is not None and not sample_failure_reserved
+                external_failure_code = self.failure_code or "resource_measurement_failed"
+                self.state_condition.notify_all()
+            if externally_failed:
+                raise _error(external_failure_code)
+            next_deadline_ns = started_ns + interval_ns
+
+        observe(sample_kind="startup", request_id=0, scheduled_ns=next_deadline_ns)
+        while True:
+            now_ns = time.monotonic_ns()
+            wait_until = next_deadline_ns
+            frames = reader.receive(max(0, wait_until - now_ns))
+            for command_index, command in enumerate(frames):
+                command_type = command.get("type")
+                if command_type == "failure_ack":
+                    _observer_closed(command, {"type", "protocol", "nonce"})
+                    if (
+                        command.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+                        or command.get("nonce") != self.nonce
+                        or not failure_latched
+                        or failure_acknowledged
+                    ):
+                        raise _error("resource_measurement_failed")
+                    failure_acknowledged = True
+                    continue
+                _observer_closed(
+                    command,
+                    {"type", "protocol", "nonce", "request_id", "sample_kind", "worker_peak_rss_bytes"},
+                )
+                request_id = _observer_int(command.get("request_id"), minimum=1)
+                reported_worker_peak = _observer_int(command.get("worker_peak_rss_bytes"), minimum=1)
+                sample_kind = command.get("sample_kind")
+                if (
+                    command_type not in {"force", "stop"}
+                    or command.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+                    or command.get("nonce") != self.nonce
+                    or request_id <= last_request_id
+                    or sample_kind not in {"boundary", "checkpoint", "heartbeat", "activity", "terminal"}
+                    or (command_type == "stop") != (sample_kind == "terminal")
+                ):
+                    raise _error("resource_measurement_failed")
+                last_request_id = request_id
+                worker_peak_rss = max(worker_peak_rss, reported_worker_peak)
+                observe(sample_kind=cast(str, sample_kind), request_id=request_id, scheduled_ns=time.monotonic_ns())
+                if command_type == "stop":
+                    if command_index != len(frames) - 1 or reader.buffer:
+                        raise _error("resource_measurement_failed")
+                    _require_resource_observer_eof(reader)
+                    with self.state_condition:
+                        self.stop_acknowledged = True
+                        self.state_condition.notify_all()
+                    return
+            now_ns = time.monotonic_ns()
+            if now_ns >= next_deadline_ns:
+                if failure_latched:
+                    next_deadline_ns = now_ns + interval_ns
+                else:
+                    observe(sample_kind="continuous", request_id=0, scheduled_ns=next_deadline_ns)
+
+    def _send_final(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+            _shutdown_resource_observer_write(self.endpoint)
+
+
+def _terminate_worker_process_group(process: subprocess.Popen[bytes]) -> bool:
+    """Terminate residual isolated-worker processes and report whether any existed."""
+
+    process_group_id = process.pid
+    if type(process_group_id) is not int or process_group_id <= 1 or process_group_id == os.getpgrp():
+        raise _error("production_worker_failed")
+    group_existed = False
+    if process.poll() is None:
+        group_existed = True
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            group_existed = False
+        except PermissionError:
+            pass
+        except OSError:
+            raise _error("production_worker_failed") from None
+        try:
+            process.wait(timeout=RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        except (OSError, subprocess.TimeoutExpired):
+            raise _error("production_worker_failed") from None
+    deadline = time.monotonic_ns() + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+    while True:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            group_existed = True
+        except OSError:
+            raise _error("production_worker_failed") from None
+        else:
+            group_existed = True
+        if time.monotonic_ns() > deadline:
+            raise _error("production_worker_failed")
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            pass
+        except OSError:
+            raise _error("production_worker_failed") from None
+        time.sleep(0.01)
+    return group_existed
+
+
+def _request_worker_cooperative_cleanup(
+    process: subprocess.Popen[bytes],
+    observer: _LauncherResourceObserver,
+    *,
+    deadline_ns: int,
+) -> bool:
+    """Ask the live worker watchdog to unwind while its cleanup authority is retained."""
+
+    if process.poll() is not None or time.monotonic_ns() >= deadline_ns:
+        return False
+    with observer.state_condition:
+        watchdog_available = observer.started and not observer.stop_acknowledged
+    if not watchdog_available or not hasattr(signal, "SIGUSR1"):
+        return False
+    if observer.failure_event.is_set():
+        publication_wait_ns = min(50_000_000, max(0, deadline_ns - time.monotonic_ns()))
+        if publication_wait_ns and observer.wait_for_failure_publication(publication_wait_ns):
+            return True
+        if time.monotonic_ns() >= deadline_ns:
+            return False
+    if not observer.failure_event.is_set() and observer._reserve_failure("production_worker_failed"):
+        observer._finish_failure_publication(delivered=False)
+    try:
+        os.kill(process.pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        raise _error("production_worker_failed") from None
+    return True
+
+
+def _wait_for_worker_cleanup_until(process: subprocess.Popen[bytes], deadline_ns: int) -> bool:
+    """Wait until one absolute deadline for cooperative worker cleanup and root exit."""
+
+    while process.poll() is None:
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            return False
+        time.sleep(min(0.01, remaining_ns / 1_000_000_000))
+    return True
+
+
+def _read_production_worker_response(
+    process: subprocess.Popen[bytes],
+    request: bytes,
+    *,
+    timeout_seconds: int,
+    observer: _LauncherResourceObserver | None = None,
+    cooperative_abort: Callable[[int], bool] | None = None,
+) -> bytes:
+    """Exchange one bounded worker request/response without unbounded buffering."""
+
+    if process.stdin is None or process.stdout is None or not request or len(request) > 64 * 1024:
+        raise _error("production_worker_failed")
+    chunks: list[bytes] = []
+    total_bytes = 0
+    stdin_fd = process.stdin.fileno()
+    stdout_fd = process.stdout.fileno()
+    request_offset = 0
+    stdin_open = True
+    stdout_open = True
+    root_exit_deadline_ns: int | None = None
+    observer_failure_deadline_ns: int | None = None
+    deadline_ns = time.monotonic_ns() + timeout_seconds * 1_000_000_000
+
+    def exchange_failure(*, now_ns: int | None = None) -> _ProductionWorkerExchangeFailure:
+        nonlocal observer_failure_deadline_ns
+        failure_now_ns = time.monotonic_ns() if now_ns is None else now_ns
+        if observer_failure_deadline_ns is None and observer is not None and observer.failure_event.is_set():
+            observer_failure_deadline_ns = failure_now_ns + PRODUCTION_WORKER_CLEANUP_GRACE_NS
+        return _ProductionWorkerExchangeFailure(
+            cleanup_deadline_ns=observer_failure_deadline_ns,
+            cleanup_grace_consumed=(
+                observer_failure_deadline_ns is not None and failure_now_ns >= observer_failure_deadline_ns
+            ),
+        )
+
+    try:
+        os.set_blocking(stdin_fd, False)
+        os.set_blocking(stdout_fd, False)
+        while stdout_open or process.poll() is None:
+            now_ns = time.monotonic_ns()
+            if observer is not None and observer.failure_event.is_set() and observer_failure_deadline_ns is None:
+                observer_failure_deadline_ns = now_ns + PRODUCTION_WORKER_CLEANUP_GRACE_NS
+                publication_wait_ns = min(
+                    50_000_000,
+                    max(0, observer_failure_deadline_ns - time.monotonic_ns()),
+                )
+                try:
+                    delivered = observer.wait_for_failure_publication(publication_wait_ns)
+                    if not delivered and cooperative_abort is not None:
+                        cooperative_abort(observer_failure_deadline_ns)
+                except (KeyboardInterrupt, SystemExit, MemoryError):
+                    raise
+                except BaseException:
+                    raise exchange_failure() from None
+                now_ns = time.monotonic_ns()
+            if process.poll() is not None and stdout_open and root_exit_deadline_ns is None:
+                root_exit_deadline_ns = now_ns + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+            deadlines = [deadline_ns]
+            if root_exit_deadline_ns is not None:
+                deadlines.append(root_exit_deadline_ns)
+            if observer_failure_deadline_ns is not None:
+                deadlines.append(observer_failure_deadline_ns)
+            effective_deadline_ns = min(deadlines)
+            remaining_ns = effective_deadline_ns - now_ns
+            if remaining_ns <= 0:
+                raise exchange_failure(now_ns=now_ns)
+            try:
+                readable, writable, _exceptional = select.select(
+                    [stdout_fd] if stdout_open else [],
+                    [stdin_fd] if stdin_open else [],
+                    [],
+                    min(0.1, remaining_ns / 1_000_000_000),
+                )
+            except (OSError, ValueError):
+                raise exchange_failure() from None
+            if stdin_open and stdin_fd in writable:
+                try:
+                    written = os.write(stdin_fd, request[request_offset:])
+                except OSError as exc:
+                    if exc.errno not in {errno.EPIPE, errno.EBADF}:
+                        raise exchange_failure() from None
+                    written = 0
+                    request_offset = len(request)
+                if written < 0:
+                    raise exchange_failure()
+                request_offset += written
+                if request_offset == len(request):
+                    process.stdin.close()
+                    stdin_open = False
+            if stdout_open and stdout_fd in readable:
+                try:
+                    chunk = os.read(stdout_fd, 64 * 1024)
+                except OSError:
+                    raise exchange_failure() from None
+                if not chunk:
+                    process.stdout.close()
+                    stdout_open = False
+                else:
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_PRODUCTION_WORKER_RESPONSE_BYTES:
+                        raise exchange_failure()
+                    chunks.append(chunk)
+            if process.poll() is not None and stdin_open:
+                process.stdin.close()
+                stdin_open = False
+        return b"".join(chunks)
+    finally:
+        if stdin_open:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if stdout_open:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
 
 
 def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
-    source_root, dependency_roots, _layouts = _validated_capacity_bootstrap()
+    if not sys.platform.startswith("linux") and sys.platform != "darwin":
+        raise _error("production_identity_invalid")
+    source_root, dependency_roots, _layouts, observer_fd = _validated_capacity_bootstrap()
+    if observer_fd is not None:
+        raise _error("production_identity_invalid")
     nonce = secrets.token_hex(32)
     request = {
         "output_dir": os.fspath(_absolute_private_path(options.output_dir)),
@@ -2573,6 +5180,7 @@ def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
         else os.fspath(_absolute_private_path(options.workspace_root)),
         "allow_unignored_output": options.allow_unignored_output,
         "nonce": nonce,
+        "process_containment": _expected_process_containment_mode(),
     }
     environment = {
         key: value
@@ -2590,59 +5198,214 @@ def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
             "RUST_LOG": "off",
         }
     )
+    process: subprocess.Popen[bytes] | None = None
+    observer: _LauncherResourceObserver | None = None
+    completed_stdout = b""
+    residual_worker_group = False
+    quiescence_proven = False
+    cooperative_signal_sent = False
+
+    def request_cooperative_cleanup(cleanup_deadline_ns: int) -> bool:
+        nonlocal cooperative_signal_sent
+        if cooperative_signal_sent:
+            return True
+        if process is None or observer is None:
+            return False
+        requested = _request_worker_cooperative_cleanup(
+            process,
+            observer,
+            deadline_ns=cleanup_deadline_ns,
+        )
+        cooperative_signal_sent = cooperative_signal_sent or requested
+        return requested
+
     try:
         with tempfile.TemporaryDirectory(prefix="nerb-capacity-pycache-") as pycache_directory:
             pycache_root = Path(pycache_directory).resolve(strict=True)
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-I",
-                    "-S",
-                    "-B",
-                    "-X",
-                    f"pycache_prefix={pycache_root}",
-                    "-c",
-                    _PRODUCTION_WORKER_BOOTSTRAP,
-                    os.fspath(source_root),
-                    str(len(dependency_roots)),
-                    *(os.fspath(path) for path in dependency_roots),
-                    _PRODUCTION_WORKER_ARGUMENT,
-                ],
-                input=_canonical_json_bytes(request),
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=environment,
-                timeout=MAX_TOTAL_RUNTIME_NS // 1_000_000_000 + 300,
-            )
-    except (OSError, subprocess.SubprocessError):
+            launcher_endpoint, worker_endpoint = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            worker_error: BaseException | None = None
+            try:
+                try:
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            "-B",
+                            "-X",
+                            f"pycache_prefix={pycache_root}",
+                            "-c",
+                            _PRODUCTION_WORKER_BOOTSTRAP,
+                            os.fspath(source_root),
+                            str(len(dependency_roots)),
+                            *(os.fspath(path) for path in dependency_roots),
+                            str(worker_endpoint.fileno()),
+                            _PRODUCTION_WORKER_ARGUMENT,
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        env=environment,
+                        pass_fds=(worker_endpoint.fileno(),),
+                        start_new_session=True,
+                    )
+                    worker_endpoint.close()
+                    observer = _LauncherResourceObserver(
+                        launcher_endpoint,
+                        worker_pid=process.pid,
+                        nonce=nonce,
+                        options=options,
+                    )
+                    observer.start()
+                    completed_stdout = _read_production_worker_response(
+                        process,
+                        _canonical_json_bytes(request),
+                        timeout_seconds=MAX_TOTAL_RUNTIME_NS // 1_000_000_000 + 300,
+                        observer=observer,
+                        cooperative_abort=request_cooperative_cleanup,
+                    )
+                    observer.join()
+                except BaseException as exc:
+                    worker_error = exc
+            finally:
+                # Prove that the isolated process group is gone before closing
+                # its observer channel or deleting its private bytecode root.
+                # Recovery may inspect and wipe sensitive inflight state only
+                # after this proof succeeds.
+                if process is None:
+                    quiescence_proven = True
+                else:
+                    cleanup_deadline_ns = (
+                        worker_error.cleanup_deadline_ns
+                        if isinstance(worker_error, _ProductionWorkerExchangeFailure)
+                        else None
+                    )
+                    if worker_error is not None and process.poll() is None:
+                        if cleanup_deadline_ns is None:
+                            cleanup_deadline_ns = time.monotonic_ns() + PRODUCTION_WORKER_CLEANUP_GRACE_NS
+                        if time.monotonic_ns() < cleanup_deadline_ns:
+                            cooperative_cleanup_available = False
+                            if observer is not None and observer.failure_event.is_set():
+                                publication_wait_ns = min(
+                                    50_000_000,
+                                    max(0, cleanup_deadline_ns - time.monotonic_ns()),
+                                )
+                                if publication_wait_ns:
+                                    cooperative_cleanup_available = observer.wait_for_failure_publication(
+                                        publication_wait_ns
+                                    )
+                            if not cooperative_cleanup_available and time.monotonic_ns() < cleanup_deadline_ns:
+                                try:
+                                    cooperative_cleanup_available = request_cooperative_cleanup(cleanup_deadline_ns)
+                                except BaseException as exc:
+                                    if (
+                                        isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError))
+                                        or worker_error is None
+                                    ):
+                                        worker_error = exc
+                            if cooperative_cleanup_available and time.monotonic_ns() < cleanup_deadline_ns:
+                                try:
+                                    _wait_for_worker_cleanup_until(process, cleanup_deadline_ns)
+                                except BaseException as exc:
+                                    if (
+                                        isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError))
+                                        or worker_error is None
+                                    ):
+                                        worker_error = exc
+                    try:
+                        residual_worker_group = _terminate_worker_process_group(process)
+                    except EnronCapacityError as exc:
+                        quiescence_proven = False
+                        worker_error = exc
+                    else:
+                        quiescence_proven = True
+                if observer is not None:
+                    try:
+                        observer.join()
+                    except BaseException as exc:
+                        if worker_error is None:
+                            worker_error = exc
+                try:
+                    worker_endpoint.close()
+                except OSError:
+                    pass
+                if observer is not None:
+                    observer.close()
+                else:
+                    try:
+                        launcher_endpoint.close()
+                    except OSError:
+                        pass
+            if not quiescence_proven:
+                raise _error("production_worker_failed")
+            if worker_error is not None:
+                raise worker_error
+    except BaseException as exc:
+        if not quiescence_proven:
+            raise _error("production_worker_failed") from None
         _recover_worker_inflight(options)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+            raise
         raise _error("production_worker_failed") from None
     _recover_worker_inflight(options)
-    if completed.returncode != 0 or len(completed.stdout) > MAX_CAPACITY_REPORT_BYTES + 64 * 1024:
+    if (
+        process is None
+        or process.returncode != 0
+        or residual_worker_group
+        or len(completed_stdout) > MAX_PRODUCTION_WORKER_RESPONSE_BYTES
+    ):
         raise _error("production_worker_failed")
     try:
-        response = json.loads(completed.stdout.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+        response = json.loads(completed_stdout.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeError, ValueError):
         raise _error("production_worker_failed") from None
     if not isinstance(response, Mapping) or set(response) != {"ok", "code", "diagnostic", "report"}:
         raise _error("production_worker_failed")
+    if observer is None:
+        raise _error("production_worker_failed")
+    launcher_code = observer.failure_code
+    raw_launcher_diagnostic = observer.failure_diagnostic
+    launcher_diagnostic = _validated_resource_failure_diagnostic(raw_launcher_diagnostic)
+    if (
+        (launcher_code is not None and launcher_code not in _ERROR_MESSAGES)
+        or (launcher_code == "resource_observation_gap") != (raw_launcher_diagnostic is not None)
+        or (raw_launcher_diagnostic is not None and launcher_diagnostic is None)
+    ):
+        raise _error("production_worker_failed")
     if response.get("ok") is not True:
         code = response.get("code")
         diagnostic = response.get("diagnostic")
+        validated_diagnostic = _validated_failure_diagnostic(diagnostic)
         if (
-            not isinstance(code, str)
+            response.get("ok") is not False
+            or not isinstance(code, str)
             or code not in _ERROR_MESSAGES
-            or (code == "checkpoint_wall_gap") != (diagnostic is not None)
-            or (diagnostic is not None and _validated_failure_diagnostic(diagnostic) is None)
+            or response.get("report") is not None
+            or (code in {"checkpoint_wall_gap", "resource_observation_gap"}) != (diagnostic is not None)
+            or (diagnostic is not None and validated_diagnostic is None)
         ):
             raise _error("production_worker_failed")
-        raise _error(
-            code,
-            diagnostic=cast(Mapping[str, Any] | None, diagnostic),
-        )
+        selected_code = _combine_resource_failure_codes(code, launcher_code)
+        if selected_code is None:
+            raise _error("production_worker_failed")
+        selected_diagnostic = validated_diagnostic if selected_code == code else launcher_diagnostic
+        if selected_code == "resource_observation_gap":
+            selected_diagnostic = _validated_resource_failure_diagnostic(selected_diagnostic)
+            if selected_diagnostic is None:
+                raise _error("production_worker_failed")
+        raise _error(selected_code, diagnostic=selected_diagnostic)
+    if launcher_code is not None:
+        if launcher_code == "resource_observation_gap" and launcher_diagnostic is None:
+            raise _error("production_worker_failed")
+        raise _error(launcher_code, diagnostic=launcher_diagnostic)
     report = response.get("report")
-    if response.get("code") is not None or response.get("diagnostic") is not None or not isinstance(report, Mapping):
+    if (
+        response.get("code") is not None
+        or response.get("diagnostic") is not None
+        or not isinstance(report, Mapping)
+        or not observer.started
+        or not observer.stop_acknowledged
+    ):
         raise _error("production_worker_failed")
     return dict(report)
 
@@ -2668,8 +5431,21 @@ def _recover_worker_inflight(options: EnronCapacityOptions) -> None:
 def _production_worker_main() -> int:
     global _FRESH_PRODUCTION_WORKER
     response: dict[str, Any]
+    observer_endpoint: socket.socket | None = None
     try:
-        _validated_capacity_bootstrap()
+        _source_root, _dependency_roots, _layouts, observer_fd = _validated_capacity_bootstrap()
+        if observer_fd is None:
+            raise _error("production_identity_invalid")
+        observer_endpoint = socket.socket(fileno=observer_fd)
+        observer_endpoint.set_inheritable(False)
+
+        def close_observer_in_fork_child() -> None:
+            try:
+                observer_endpoint.close()
+            except OSError:
+                pass
+
+        os.register_at_fork(after_in_child=close_observer_in_fork_child)
         _set_production_worker_umask()
         payload = sys.stdin.buffer.read(64 * 1024 + 1)
         request = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
@@ -2679,6 +5455,7 @@ def _production_worker_main() -> int:
             "workspace_root",
             "allow_unignored_output",
             "nonce",
+            "process_containment",
         }:
             raise _error("options_invalid")
         nonce = request.get("nonce")
@@ -2688,6 +5465,10 @@ def _production_worker_main() -> int:
             or os.environ.get(_PRODUCTION_WORKER_ENV) != nonce
         ):
             raise _error("production_identity_invalid")
+        process_containment = request.get("process_containment")
+        if process_containment != _expected_process_containment_mode():
+            raise _error("production_identity_invalid")
+        del os.environ[_PRODUCTION_WORKER_ENV]
         workspace = request.get("workspace_root")
         options = EnronCapacityOptions(
             output_dir=Path(cast(str, request["output_dir"])),
@@ -2696,7 +5477,12 @@ def _production_worker_main() -> int:
             allow_unignored_output=cast(bool, request["allow_unignored_output"]),
         )
         _FRESH_PRODUCTION_WORKER = True
-        _preload_production_modules()
+        _prepare_production_subprocess_context()
+
+        def install_containment_and_preload() -> None:
+            _install_production_process_containment(cast(str, process_containment))
+            _preload_production_modules()
+
         report = _run_capacity_entry(
             options,
             phase_runners=_production_phase_runners(),
@@ -2704,6 +5490,9 @@ def _production_worker_main() -> int:
             production_evidence=True,
             monitor_interval_ns=PRODUCTION_MONITOR_INTERVAL_NS,
             wall_clock=time.monotonic_ns,
+            resource_observer_socket=observer_endpoint,
+            resource_observer_nonce=nonce,
+            process_creation_guard=install_containment_and_preload,
         )
         response = {"ok": True, "code": None, "diagnostic": None, "report": report}
     except BaseException as exc:
@@ -2713,7 +5502,7 @@ def _production_worker_main() -> int:
             else "production_worker_failed"
         )
         diagnostic = exc.diagnostic if isinstance(exc, EnronCapacityError) else None
-        if (code == "checkpoint_wall_gap") != (diagnostic is not None):
+        if (code in {"checkpoint_wall_gap", "resource_observation_gap"}) != (diagnostic is not None):
             code = "production_worker_failed"
             diagnostic = None
         response = {
@@ -2722,6 +5511,11 @@ def _production_worker_main() -> int:
             "diagnostic": diagnostic,
             "report": None,
         }
+    if observer_endpoint is not None:
+        try:
+            observer_endpoint.close()
+        except OSError:
+            response = {"ok": False, "code": "production_worker_failed", "diagnostic": None, "report": None}
     sys.stdout.buffer.write(_canonical_json_bytes(response))
     sys.stdout.buffer.flush()
     return 0
@@ -2790,7 +5584,7 @@ def _assert_reader_modules_unloaded() -> None:
 
 
 def _preload_production_modules() -> None:
-    """Import every tracked production-core module before identity capture."""
+    """Import every tracked production-core module under the process fence."""
 
     _assert_reader_modules_unloaded()
     try:
@@ -2809,6 +5603,14 @@ def _reassert_production_execution_current(execution: Mapping[str, Any]) -> None
     git_commit = execution.get("executable_git_commit")
     if not isinstance(git_commit, str) or _GIT_COMMIT_RE.fullmatch(git_commit) is None:
         raise _error("production_identity_invalid")
+    containment = execution.get("process_containment")
+    if (
+        not isinstance(containment, Mapping)
+        or containment.get("mode") != _PRODUCTION_PROCESS_CONTAINMENT
+        or containment.get("installed_before_workload") is not True
+        or containment.get("runtime_attested") is not True
+    ):
+        raise _error("production_identity_invalid")
     try:
         _capacity_import_guard.assert_installed(Path(__file__).parent.parent)
     except (ImportError, OSError, RuntimeError, TypeError, ValueError):
@@ -2817,10 +5619,8 @@ def _reassert_production_execution_current(execution: Mapping[str, Any]) -> None
         _assert_reader_modules_unloaded()
     elif any(import_name not in sys.modules for _name, import_name, _init, _version in _CRITICAL_READER_DISTRIBUTIONS):
         raise _error("production_identity_invalid")
-    _require_globally_clean_checkout(git_commit)
     if (
-        _git_head() != git_commit
-        or execution.get("capacity_implementation_sha256") != _implementation_sha256()
+        execution.get("capacity_implementation_sha256") != _implementation_sha256()
         or execution.get("core_source_sha256") != _core_source_sha256()
         or execution.get("relevant_module_sha256") != _relevant_module_sha256()
         or execution.get("native_extension_sha256") != _native_extension_sha256()
@@ -3469,6 +6269,9 @@ def _run_capacity_entry(
     production_evidence: bool,
     monitor_interval_ns: int,
     wall_clock: Callable[[], int],
+    resource_observer_socket: socket.socket | None = None,
+    resource_observer_nonce: str | None = None,
+    process_creation_guard: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     _validate_options(options)
     runners = _validated_phase_runners(phase_runners)
@@ -3483,6 +6286,7 @@ def _run_capacity_entry(
     outcome = "passed"
     deferred_finalization_control: KeyboardInterrupt | SystemExit | None = None
     receipt_failure_cleanup_started = False
+    cleanup_boundary: _private_io._PrevalidatedCleanupBoundary | None = None  # noqa: SLF001
 
     def remember_finalization_control(exc: KeyboardInterrupt | SystemExit) -> None:
         nonlocal deferred_finalization_control
@@ -3511,6 +6315,16 @@ def _run_capacity_entry(
             except BaseException:
                 raise _error("production_identity_invalid" if production_evidence else "capacity_failed") from None
             final_dir, output_parent = _prepare_capacity_output(options)
+            if production_evidence:
+                try:
+                    cleanup_boundary = _private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+                        final_dir,
+                        workspace_root=options.workspace_root,
+                        allow_unignored_output=options.allow_unignored_output,
+                    )
+                except EnronPrivateIOError:
+                    output_parent.close()
+                    raise _error("private_transaction_failed") from None
             try:
                 inflight = _begin_inflight_attempt(
                     ledger,
@@ -3533,6 +6347,11 @@ def _run_capacity_entry(
                 monitor_interval_ns=monitor_interval_ns,
                 metrics=metrics,
                 wall_clock=wall_clock,
+                resource_observer_socket=resource_observer_socket,
+                resource_observer_nonce=resource_observer_nonce,
+                production_evidence=production_evidence,
+                process_creation_guard=process_creation_guard,
+                cleanup_boundary=cleanup_boundary,
             )
             report = completed_run.report
         except BaseException as exc:
@@ -3568,6 +6387,7 @@ def _run_capacity_entry(
             _append_attempt_receipt(
                 ledger,
                 inflight=inflight,
+                options=options,
                 outcome=outcome,
                 failure_code=failure_code,
                 execution=execution,
@@ -3595,12 +6415,15 @@ def _run_capacity_entry(
                             completed_run.pinned,
                             workspace_root=options.workspace_root,
                             allow_unignored_output=options.allow_unignored_output,
+                            metrics=metrics,
                         )
                         cleanup_failed = not tree_cleanup[0]
                     except (EnronCapacityError, EnronPrivateIOError):
                         cleanup_failed = True
             if isinstance(exc, EnronCapacityError) and exc.code == "promotion_failed":
                 raise _error("promotion_failed") from None
+            if isinstance(exc, EnronCapacityError) and exc.code == "attempt_ledger_invalid" and not cleanup_failed:
+                raise _error("attempt_ledger_invalid") from None
             raise _error("promotion_failed" if cleanup_failed else "attempt_ledger_write_failed") from None
 
         if failure_code is not None:
@@ -3645,6 +6468,7 @@ def _run_capacity_entry(
                 _append_attempt_receipt(
                     ledger,
                     inflight=inflight,
+                    options=options,
                     outcome=outcome,
                     failure_code=failure_code,
                     execution=execution,
@@ -3738,9 +6562,17 @@ def _publish_promoted_cleanup_metrics(
     metrics: _AttemptMetrics,
     result: tuple[bool, bool, int],
 ) -> None:
-    metrics.sensitive_content_wiped = result[0]
-    metrics.path_tree_removed = result[1]
-    metrics.retained_private_tombstone_count = result[2]
+    _publish_incomplete_promoted_cleanup_metrics(metrics, result)
+    metrics.cleanup_evidence = result
+
+
+def _publish_incomplete_promoted_cleanup_metrics(
+    metrics: _AttemptMetrics,
+    result: tuple[bool, bool, int],
+) -> None:
+    """Publish path evidence without overstating an interruptible cleanup."""
+
+    metrics.cleanup_evidence = (False, result[1], result[2])
 
 
 def _inflight_promoted_identity(inflight: _InflightAttempt) -> tuple[int, int]:
@@ -3750,15 +6582,132 @@ def _inflight_promoted_identity(inflight: _InflightAttempt) -> tuple[int, int]:
     return cast(int, binding["stage_device"]), cast(int, binding["stage_inode"])
 
 
-def _inflight_output_absent(inflight: _InflightAttempt) -> bool:
+def _publish_private_root_receipt_identity(
+    metrics: _AttemptMetrics,
+    binding: Mapping[str, Any] | None,
+    output_parent: _PinnedDirectory,
+) -> None:
+    """Carry a durable cleanup-root identity across binding retirement."""
+
+    if binding is None:
+        return
+    output_parent.assert_current(code="attempt_ledger_invalid")
+    identity = cast(int, binding["stage_device"]), cast(int, binding["stage_inode"])
+    parent_identity = output_parent.identity.device, output_parent.identity.inode
+    existing = (
+        metrics.promoted_root_device,
+        metrics.promoted_root_inode,
+        metrics.promoted_parent_device,
+        metrics.promoted_parent_inode,
+    )
+    expected = (*identity, *parent_identity)
+    if any(value is not None and value != expected[index] for index, value in enumerate(existing)):
+        raise _error("attempt_ledger_invalid")
+    metrics.promoted_root_device, metrics.promoted_root_inode = identity
+    metrics.promoted_parent_device, metrics.promoted_parent_inode = parent_identity
+
+
+def _inflight_cleanup_root_settled(inflight: _InflightAttempt) -> bool:
+    """Verify canonical absence or one authenticated empty private tombstone."""
+
     inflight.output_parent.assert_current(code="promotion_failed")
+    stage_name = f".{inflight.output_name}.stage-{inflight.stage_token}"
+    expected = None if inflight.stage_binding is None else _inflight_promoted_identity(inflight)
     try:
-        os.stat(inflight.output_name, dir_fd=inflight.output_parent.fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return True
+        complete_name, incomplete_name, scan_valid, bound_names = _recovery_tombstone_names(
+            inflight.output_parent.fd,
+            inflight.cleanup_intent,
+            expected,
+            canonical_names=(stage_name, inflight.output_name),
+        )
+        if not scan_valid or len(bound_names) > 1:
+            raise _error("promotion_failed")
+        for name in tuple(
+            dict.fromkeys(
+                item for item in (stage_name, inflight.output_name, complete_name, incomplete_name) if item is not None
+            )
+        ):
+            snapshot = _recovery_entry_snapshot_at(inflight.output_parent.fd, name)
+            if snapshot is not None and (
+                name in {stage_name, inflight.output_name} or expected is None or snapshot.identity != expected
+            ):
+                return False
+        if not bound_names:
+            return True
+        name = bound_names[0]
+        if expected is None or _PRIVATE_TOMBSTONE_RE.fullmatch(name) is None:
+            return False
+        snapshot = _recovery_entry_snapshot_at(inflight.output_parent.fd, name)
+        candidate: _OwnedDescriptor | None = None
+        try:
+            candidate = _open_owned_directory_descriptor(name, dir_fd=inflight.output_parent.fd)
+            opened = os.fstat(candidate.fd)
+            return (
+                snapshot is not None
+                and snapshot.identity == expected
+                and snapshot.is_private_directory
+                and (int(opened.st_dev), int(opened.st_ino)) == expected
+                and _logical_tree_bytes(candidate.fd, depth=0, entries=[0]) == 0
+            )
+        finally:
+            if candidate is not None:
+                candidate.close()
+    except EnronCapacityError:
+        raise _error("promotion_failed") from None
+
+
+def _retained_inflight_private_tombstone_count(inflight: _InflightAttempt) -> int:
+    """Count the bound run inode only when it remains an empty private tombstone."""
+
+    expected_identity = _inflight_promoted_identity(inflight)
+    inflight.output_parent.assert_current(code="promotion_failed")
+    stage_name = f".{inflight.output_name}.stage-{inflight.stage_token}"
+    try:
+        complete_name, incomplete_name, scan_valid, bound_names = _recovery_tombstone_names(
+            inflight.output_parent.fd,
+            inflight.cleanup_intent,
+            expected_identity,
+            canonical_names=(stage_name, inflight.output_name),
+        )
+        if not scan_valid or len(bound_names) > 1:
+            raise _error("promotion_failed")
+        for name in tuple(
+            dict.fromkeys(
+                item for item in (stage_name, inflight.output_name, complete_name, incomplete_name) if item is not None
+            )
+        ):
+            snapshot = _recovery_entry_snapshot_at(inflight.output_parent.fd, name)
+            if snapshot is not None and snapshot.identity != expected_identity:
+                raise _error("promotion_failed")
+        if not bound_names:
+            return 0
+        name = bound_names[0]
+        if _PRIVATE_TOMBSTONE_RE.fullmatch(name) is None:
+            raise _error("promotion_failed")
+        before = _recovery_entry_snapshot_at(inflight.output_parent.fd, name)
+        if before is None or before.identity != expected_identity or not before.is_private_directory:
+            raise _error("promotion_failed")
+        candidate: _OwnedDescriptor | None = None
+        try:
+            candidate = _open_owned_directory_descriptor(name, dir_fd=inflight.output_parent.fd)
+            opened = os.fstat(candidate.fd)
+            current = _recovery_entry_snapshot_at(inflight.output_parent.fd, name)
+            if (
+                (int(opened.st_dev), int(opened.st_ino)) != expected_identity
+                or current is None
+                or current.identity != expected_identity
+                or not current.is_private_directory
+                or _logical_tree_bytes(candidate.fd, depth=0, entries=[0]) != 0
+            ):
+                raise _error("promotion_failed")
+        finally:
+            if candidate is not None:
+                candidate.close()
+    except EnronCapacityError:
+        raise _error("promotion_failed") from None
     except OSError:
         raise _error("promotion_failed") from None
-    return False
+    return 1
 
 
 def _recover_inflight_transaction(
@@ -3772,6 +6721,12 @@ def _recover_inflight_transaction(
     owner = inflight.transaction_owner
     if owner is None:
         return None
+    reported_cleanup_evidence = metrics.cleanup_evidence
+    metrics.cleanup_evidence = (
+        False,
+        False,
+        max(reported_cleanup_evidence[2], 1),
+    )
     exit_state = _PrivateRunExitState()
     recovery_error: BaseException | None = None
     recovered = False
@@ -3791,21 +6746,40 @@ def _recover_inflight_transaction(
         if owner.promoted or owner.cleanup_authority_retained:
             if owner.cleanup_authority_retained:
                 authority_wiped = owner.wipe_retained_cleanup_authority()
-                metrics.sensitive_content_wiped = authority_wiped
                 if not authority_wiped and recovery_error is None:
                     recovery_error = _error("promotion_failed")
-            if owner.cleanup_authority_wiped and _inflight_output_absent(inflight):
-                cleanup_result_was_published = metrics.path_tree_removed is not None
-                metrics.sensitive_content_wiped = True
+            cleanup_root_settled = owner.cleanup_authority_wiped and _inflight_cleanup_root_settled(inflight)
+            if cleanup_root_settled:
+                sensitive_content_wiped, path_tree_removed, reported_tombstones = reported_cleanup_evidence
+                retained_tombstones = max(
+                    reported_tombstones,
+                    _retained_inflight_private_tombstone_count(inflight),
+                )
+                if retained_tombstones > 0:
+                    path_tree_removed = False
+                metrics.cleanup_evidence = (
+                    sensitive_content_wiped,
+                    path_tree_removed,
+                    retained_tombstones,
+                )
+                cleanup_result_was_published = path_tree_removed is not None
                 if not cleanup_result_was_published:
-                    metrics.path_tree_removed = False
+                    sensitive_content_wiped = False
+                    path_tree_removed = False
+                metrics.cleanup_evidence = (
+                    sensitive_content_wiped,
+                    path_tree_removed,
+                    retained_tombstones,
+                )
                 recovered = True
-                if not cleanup_result_was_published and recovery_error is None:
+                if (
+                    not cleanup_result_was_published or metrics.cleanup_evidence[0] is not True
+                ) and recovery_error is None:
                     recovery_error = _error("promotion_failed")
             else:
                 pin = inflight.transaction_pin
                 if pin is None or pin.closed:
-                    pin = _PinnedDirectory(inflight.output_parent.path / inflight.output_name)
+                    pin = _open_promoted_capacity_pin(inflight.output_parent.path / inflight.output_name)
                     inflight.transaction_pin = pin
                 result = _wipe_promoted_capacity_run(
                     owner,
@@ -3813,6 +6787,7 @@ def _recover_inflight_transaction(
                     workspace_root=options.workspace_root,
                     allow_unignored_output=options.allow_unignored_output,
                     expected_identity=_inflight_promoted_identity(inflight),
+                    metrics=metrics,
                 )
                 inflight.transaction_pin = None
                 _publish_promoted_cleanup_metrics(metrics, result)
@@ -3820,16 +6795,30 @@ def _recover_inflight_transaction(
                 if not result[0] and recovery_error is None:
                     recovery_error = _error("promotion_failed")
         else:
-            metrics.sensitive_content_wiped = owner.cleanup_sensitive_content_wiped
-            metrics.path_tree_removed = owner.cleanup_path_tree_removed
-            metrics.retained_private_tombstone_count = owner.cleanup_tombstone_count
+            owner_cleanup_evidence: _CleanupEvidence = (
+                owner.cleanup_sensitive_content_wiped,
+                owner.cleanup_path_tree_removed,
+                owner.cleanup_tombstone_count,
+            )
+            if inflight.stage_binding is None:
+                retained_tombstones = max(owner_cleanup_evidence[2], 1)
+            else:
+                retained_tombstones = max(
+                    owner_cleanup_evidence[2],
+                    _retained_inflight_private_tombstone_count(inflight),
+                )
+            metrics.cleanup_evidence = (
+                False if retained_tombstones > 0 else owner_cleanup_evidence[0],
+                False if retained_tombstones > 0 else owner_cleanup_evidence[1],
+                retained_tombstones,
+            )
             recovered = _private_run_exit_is_settled(owner)
     except BaseException as exc:
         if recovery_error is None:
             recovery_error = exc
     finally:
-        if owner.cleanup_authority_wiped:
-            metrics.sensitive_content_wiped = True
+        if owner.cleanup_authority_wiped and metrics.cleanup_evidence[1] is None:
+            metrics.cleanup_evidence = (False, False, metrics.cleanup_evidence[2])
         if recovery_error is not None and owner.cleanup_authority_retained:
             try:
                 owner.park_unresolved_cleanup_authority()
@@ -3860,6 +6849,11 @@ def _execute_capacity_transaction(
     monitor_interval_ns: int,
     metrics: _AttemptMetrics,
     wall_clock: Callable[[], int],
+    resource_observer_socket: socket.socket | None,
+    resource_observer_nonce: str | None,
+    production_evidence: bool,
+    process_creation_guard: Callable[[], None] | None,
+    cleanup_boundary: _private_io._PrevalidatedCleanupBoundary | None,  # noqa: SLF001
 ) -> _CompletedCapacityRun:
     preflight = _resource_preflight(
         final_dir,
@@ -3895,6 +6889,7 @@ def _execute_capacity_transaction(
                 inflight.output_parent.identity.device,
                 inflight.output_parent.identity.inode,
             ),
+            cleanup_boundary=cleanup_boundary,
         )
         inflight.transaction_owner = private_run
         assert private_run is not None
@@ -3902,6 +6897,12 @@ def _execute_capacity_transaction(
         try:
             inflight.output_parent.assert_current(code="private_transaction_failed")
             _bind_inflight_stage(inflight, private_run.stage_dir)
+            _activate_process_creation_guard(
+                execution,
+                production_evidence=production_evidence,
+                process_creation_guard=process_creation_guard,
+            )
+            _reassert_production_execution_current(execution)
             tree = _PrivateTreeGuard(private_run.stage_dir)
             inflight.transaction_tree = tree
             active_tree = tree
@@ -3912,8 +6913,17 @@ def _execute_capacity_transaction(
                 run_started_ns=run_started_ns,
                 interval_ns=monitor_interval_ns,
                 wall_clock=wall_clock,
+                resource_observer_socket=resource_observer_socket,
+                resource_observer_nonce=resource_observer_nonce,
             )
-            private_run.register_cleanup_barrier(monitor.stop, monitor._shutdown_is_settled)
+            # The fixture monitor scans the private tree from its background
+            # thread and must settle before PrivateRun commits or cleans up.
+            # Production's launcher observer owns no private-tree descriptor;
+            # exact tree scans stay serialized in this workload process.  It
+            # therefore remains live through promotion and is reaped only
+            # after the promoted-tree terminal observation.
+            if monitor._remote is None:
+                private_run.register_cleanup_barrier(monitor.stop, monitor._shutdown_is_settled)
             monitor.start()
             phase_reports: list[dict[str, Any]] = []
             for phase, runner in runners:
@@ -4000,7 +7010,11 @@ def _execute_capacity_transaction(
                 pre_report_owned_bytes=pre_report_owned,
                 monitor_snapshot=report_snapshot,
             )
-            _verify_capacity_report(report, require_production=bool(execution["production_evidence"]))
+            _verify_capacity_report(
+                report,
+                require_production=bool(execution["production_evidence"]),
+                current_production_execution=execution if execution["production_evidence"] is True else None,
+            )
             metrics.report_sha256 = cast(str, report["run_sha256"])
             _reassert_production_execution_current(execution)
             _write_report_and_fsync(private_run, payload)
@@ -4009,10 +7023,11 @@ def _execute_capacity_transaction(
             if final_staging_owned + len(_COMMIT_PAYLOAD) != report["totals"]["final_owned_disk_bytes"]:
                 raise _error("report_invalid")
             monitor.observe_transaction_boundary(final_staging_owned)
-            monitor.stop()
-            monitor.raise_if_failed()
-            snapshot = monitor.global_snapshot()
-            _merge_monitor_metrics(metrics, snapshot)
+            if monitor._remote is None:
+                monitor.stop()
+                monitor.raise_if_failed()
+                snapshot = monitor.global_snapshot()
+                _merge_monitor_metrics(metrics, snapshot)
 
             _reassert_production_execution_current(execution)
             try:
@@ -4021,10 +7036,11 @@ def _execute_capacity_transaction(
                     before_promotion=lambda identities: _bind_inflight_cleanup_inventory(inflight, identities),
                 )
             except EnronPrivateIOError:
+                _raise_recorded_monitor_failure(monitor)
                 raise _error("private_transaction_failed") from None
             promoted = True
             tree.rebind(final_dir)
-            promoted_pin = _PinnedDirectory(final_dir)
+            promoted_pin = _open_promoted_capacity_pin(final_dir)
             inflight.transaction_pin = promoted_pin
             promoted_pin.assert_current(code="promotion_failed")
             metrics.promoted_root_device = promoted_pin.identity.device
@@ -4080,9 +7096,11 @@ def _execute_capacity_transaction(
         if exit_state.failure is not None:
             effective_error = exit_state.failure
         if private_run is not None:
-            metrics.sensitive_content_wiped = private_run.cleanup_sensitive_content_wiped
-            metrics.path_tree_removed = private_run.cleanup_path_tree_removed
-            metrics.retained_private_tombstone_count = private_run.cleanup_tombstone_count
+            metrics.cleanup_evidence = (
+                private_run.cleanup_sensitive_content_wiped,
+                private_run.cleanup_path_tree_removed,
+                private_run.cleanup_tombstone_count,
+            )
         if monitor is not None:
             try:
                 monitor.stop()
@@ -4094,19 +7112,20 @@ def _execute_capacity_transaction(
                 if private_run is None:
                     raise _error("promotion_failed")
                 if promoted_pin is None:
-                    promoted_pin = _PinnedDirectory(final_dir)
+                    promoted_pin = _open_promoted_capacity_pin(final_dir)
                 promoted_cleanup_result = _wipe_promoted_capacity_run(
                     private_run,
                     promoted_pin,
                     workspace_root=options.workspace_root,
                     allow_unignored_output=options.allow_unignored_output,
                     expected_identity=_inflight_promoted_identity(inflight),
+                    metrics=metrics,
                 )
                 promoted_cleanup_complete = True
                 promoted = False
                 promoted_pin = None
                 _publish_promoted_cleanup_metrics(metrics, promoted_cleanup_result)
-                if not metrics.sensitive_content_wiped:
+                if not metrics.cleanup_evidence[0]:
                     raise _error("promotion_failed")
             except EnronCapacityError:
                 raise
@@ -4145,19 +7164,20 @@ def _execute_capacity_transaction(
         ):
             try:
                 if promoted_pin is None or promoted_pin.closed:
-                    promoted_pin = _PinnedDirectory(final_dir)
+                    promoted_pin = _open_promoted_capacity_pin(final_dir)
                 promoted_cleanup_result = _wipe_promoted_capacity_run(
                     private_run,
                     promoted_pin,
                     workspace_root=options.workspace_root,
                     allow_unignored_output=options.allow_unignored_output,
                     expected_identity=_inflight_promoted_identity(inflight),
+                    metrics=metrics,
                 )
                 promoted_pin = None
                 promoted_cleanup_complete = True
                 promoted = False
                 _publish_promoted_cleanup_metrics(metrics, promoted_cleanup_result)
-                if not metrics.sensitive_content_wiped:
+                if not metrics.cleanup_evidence[0]:
                     raise _error("promotion_failed")
             except BaseException as exc:
                 fallback_error = exc
@@ -4772,6 +7792,9 @@ def _capacity_report(
             "maximum_resource_observation_wall_gap_ns": int(
                 monitor_snapshot["maximum_resource_observation_wall_gap_ns"]
             ),
+            "maximum_resource_acquisition_duration_ns": int(
+                monitor_snapshot["maximum_resource_acquisition_duration_ns"]
+            ),
             "peak_process_tree_rss_bytes": max(
                 preflight.preflight_process_tree_rss_bytes,
                 int(monitor_snapshot["peak_process_tree_rss_bytes"]),
@@ -4795,6 +7818,7 @@ def _capacity_report(
             "replay_equal": True,
             "continuous_resource_monitoring": True,
             "resource_observation_cadence": True,
+            "resource_acquisition_duration": True,
             "checkpoint_progress": True,
             "checkpoint_wall_cadence": True,
             "watchdog_interruption_supported": True,
@@ -4860,7 +7884,12 @@ def verify_capacity_report(report: Mapping[str, Any], *, require_production: boo
     return _verify_capacity_report(report, require_production=require_production)
 
 
-def _verify_capacity_report(report: Mapping[str, Any], *, require_production: bool) -> dict[str, Any]:
+def _verify_capacity_report(
+    report: Mapping[str, Any],
+    *,
+    require_production: bool,
+    current_production_execution: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     if not isinstance(report, Mapping):
         raise _error("report_invalid")
     _require_closed(
@@ -4892,9 +7921,14 @@ def _verify_capacity_report(report: Mapping[str, Any], *, require_production: bo
         raise _error("report_invalid")
 
     execution = _require_mapping(report.get("execution"), "execution")
-    _verify_execution(execution, require_production=require_production)
+    _verify_execution(
+        execution,
+        require_production=require_production,
+        current_production_execution=current_production_execution,
+    )
     environment = _require_mapping(report.get("environment"), "environment")
     _verify_environment(environment, require_current=execution.get("production_evidence") is False)
+    _verify_process_containment_runtime_binding(execution, environment)
     if execution.get("runtime_environment_sha256") != _canonical_hash(environment["runtime"]):
         raise _error("report_invalid")
     if (
@@ -4989,12 +8023,18 @@ def _verify_capacity_report(report: Mapping[str, Any], *, require_production: bo
     return dict(report)
 
 
-def _verify_execution(execution: Mapping[str, Any], *, require_production: bool) -> None:
+def _verify_execution(
+    execution: Mapping[str, Any],
+    *,
+    require_production: bool,
+    current_production_execution: Mapping[str, Any] | None = None,
+) -> None:
     _require_closed(
         execution,
         {
             "production_evidence",
             "fresh_worker",
+            "process_containment",
             "executable_git_commit",
             "git_tree_clean",
             "repository_tree_sha256",
@@ -5017,6 +8057,44 @@ def _verify_execution(execution: Mapping[str, Any], *, require_production: bool)
     )
     production = execution.get("production_evidence")
     if type(production) is not bool or (require_production and production is not True):
+        raise _error("report_invalid")
+    if current_production_execution is not None and production is not True:
+        raise _error("report_invalid")
+    containment = _require_mapping(execution.get("process_containment"), "process containment")
+    _require_closed(
+        containment,
+        {"mode", "architecture", "policy_sha256", "installed_before_workload", "runtime_attested"},
+        "process containment",
+    )
+    containment_mode = containment.get("mode")
+    containment_architecture = containment.get("architecture")
+    containment_sha256 = containment.get("policy_sha256")
+    if (
+        not isinstance(containment_mode, str)
+        or not isinstance(containment_architecture, str)
+        or not isinstance(containment_sha256, str)
+        or _HASH_RE.fullmatch(containment_sha256) is None
+        or type(containment.get("installed_before_workload")) is not bool
+        or type(containment.get("runtime_attested")) is not bool
+    ):
+        raise _error("report_invalid")
+    try:
+        expected_containment_sha256 = _process_containment_policy_sha256(
+            containment_mode,
+            containment_architecture,
+        )
+    except EnronCapacityError:
+        raise _error("report_invalid") from None
+    if containment_sha256 != expected_containment_sha256:
+        raise _error("report_invalid")
+    if production:
+        if (
+            containment_mode not in {_LINUX_PROCESS_CONTAINMENT, _DARWIN_PROCESS_CONTAINMENT}
+            or containment.get("installed_before_workload") is not True
+            or containment.get("runtime_attested") is not True
+        ):
+            raise _error("report_invalid")
+    elif containment != _process_containment_identity(production=False):
         raise _error("report_invalid")
     git_commit = execution.get("executable_git_commit")
     if not isinstance(git_commit, str) or not _GIT_COMMIT_RE.fullmatch(git_commit):
@@ -5060,7 +8138,14 @@ def _verify_execution(execution: Mapping[str, Any], *, require_production: bool)
     ):
         raise _error("report_invalid")
     if production:
-        _verify_recorded_production_execution(execution)
+        if current_production_execution is None:
+            _verify_recorded_production_execution(execution)
+        elif (
+            not require_production
+            or execution != current_production_execution
+            or _PRODUCTION_PROCESS_CONTAINMENT != containment_mode
+        ):
+            raise _error("production_identity_invalid")
     elif execution.get("git_tree_clean") is not False or execution.get("fresh_worker") is not False:
         raise _error("report_invalid")
     elif (
@@ -5119,6 +8204,35 @@ def _verify_environment(environment: Mapping[str, Any], *, require_current: bool
         raise _error("report_invalid")
 
 
+def _verify_process_containment_runtime_binding(
+    execution: Mapping[str, Any],
+    environment: Mapping[str, Any],
+) -> None:
+    """Bind a production containment claim to its recorded kernel and architecture."""
+
+    if execution.get("production_evidence") is not True:
+        return
+    containment = _require_mapping(execution.get("process_containment"), "process containment")
+    runtime = _require_mapping(environment.get("runtime"), "runtime environment")
+    kernel_system = runtime.get("kernel_system")
+    architecture = runtime.get("architecture")
+    expected_mode = (
+        {
+            "Darwin": _DARWIN_PROCESS_CONTAINMENT,
+            "Linux": _LINUX_PROCESS_CONTAINMENT,
+        }.get(kernel_system)
+        if isinstance(kernel_system, str)
+        else None
+    )
+    if (
+        expected_mode is None
+        or not isinstance(architecture, str)
+        or containment.get("mode") != expected_mode
+        or containment.get("architecture") != architecture.lower()
+    ):
+        raise _error("report_invalid")
+
+
 def _verify_phase_report(
     phase: Mapping[str, Any],
     expected_phase: str,
@@ -5143,6 +8257,7 @@ def _verify_phase_report(
             "owned_disk_high_water_bytes",
             "minimum_free_disk_bytes",
             "maximum_resource_observation_wall_gap_ns",
+            "maximum_resource_acquisition_duration_ns",
             "maximum_progress_checkpoint_wall_gap_ns",
             "resource_samples",
             "checkpoint_count",
@@ -5183,6 +8298,9 @@ def _verify_phase_report(
     maximum_resource_wall_gap = _bounded_int(
         phase.get("maximum_resource_observation_wall_gap_ns"), "resource wall gap", minimum=0
     )
+    maximum_resource_acquisition_duration = _bounded_int(
+        phase.get("maximum_resource_acquisition_duration_ns"), "resource acquisition duration", minimum=0
+    )
     maximum_progress_wall_gap = _bounded_int(
         phase.get("maximum_progress_checkpoint_wall_gap_ns"), "progress wall gap", minimum=0
     )
@@ -5211,6 +8329,11 @@ def _verify_phase_report(
                 "process_tree_rss_bytes",
                 "owned_disk_bytes",
                 "free_disk_bytes",
+                "resource_acquisition_duration_ns",
+                "rss_acquisition_duration_ns",
+                "filesystem_acquisition_duration_ns",
+                "resource_acquisition_retry_count",
+                "scheduler_lateness_ns",
             },
             "resource sample",
         )
@@ -5235,12 +8358,31 @@ def _verify_phase_report(
         _positive_int(sample.get("process_tree_rss_bytes"), "sample RSS")
         _bounded_int(sample.get("owned_disk_bytes"), "sample owned disk", minimum=0)
         _bounded_int(sample.get("free_disk_bytes"), "sample free disk", minimum=0)
+        acquisition_duration = _bounded_int(
+            sample.get("resource_acquisition_duration_ns"), "sample resource acquisition duration", minimum=0
+        )
+        rss_duration = _bounded_int(
+            sample.get("rss_acquisition_duration_ns"), "sample RSS acquisition duration", minimum=0
+        )
+        filesystem_duration = _bounded_int(
+            sample.get("filesystem_acquisition_duration_ns"), "sample filesystem acquisition duration", minimum=0
+        )
+        sample_retries = _bounded_int(
+            sample.get("resource_acquisition_retry_count"), "sample acquisition retry count", minimum=0
+        )
+        _bounded_int(sample.get("scheduler_lateness_ns"), "sample scheduler lateness", minimum=0)
+        if rss_duration + filesystem_duration != acquisition_duration or sample_retries > 2 * (
+            _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1
+        ):
+            raise _error("report_invalid")
         samples.append(sample)
     if (
         max(int(item["process_tree_rss_bytes"]) for item in samples) != peak
         or max(int(item["owned_disk_bytes"]) for item in samples) != owned
         or min(int(item["free_disk_bytes"]) for item in samples) != minimum_free
         or max(int(item["resource_observation_wall_gap_ns"]) for item in samples) != maximum_resource_wall_gap
+        or max(int(item["resource_acquisition_duration_ns"]) for item in samples)
+        != maximum_resource_acquisition_duration
     ):
         raise _error("report_invalid")
     retained_sequences = {int(item["sequence"]) for item in samples}
@@ -5349,6 +8491,7 @@ def _verify_phase_report(
         or phase.get("maximum_checkpoint_gap_records") != maximum_gap
         or maximum_gap > MAX_CHECKPOINT_RECORD_GAP
         or maximum_resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+        or maximum_resource_acquisition_duration > MAX_RESOURCE_ACQUISITION_DURATION_NS
         or maximum_progress_wall_gap != maximum_signal_wall_gap
         or maximum_progress_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS
     ):
@@ -5368,6 +8511,7 @@ def _verify_totals(
             "resource_observation_count",
             "resource_acquisition_retry_count",
             "maximum_resource_observation_wall_gap_ns",
+            "maximum_resource_acquisition_duration_ns",
             "peak_process_tree_rss_bytes",
             "pre_report_owned_disk_bytes",
             "report_bytes",
@@ -5409,6 +8553,8 @@ def _verify_totals(
         * (_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1)
         or totals["maximum_resource_observation_wall_gap_ns"]
         < max(int(phase["maximum_resource_observation_wall_gap_ns"]) for phase in phases)
+        or totals["maximum_resource_acquisition_duration_ns"]
+        < max(int(phase["maximum_resource_acquisition_duration_ns"]) for phase in phases)
         or totals["peak_process_tree_rss_bytes"]
         < max(
             int(environment["preflight_process_tree_rss_bytes"]),
@@ -5452,6 +8598,8 @@ def _expected_gates(
         "continuous_resource_monitoring": all(int(phase["resource_observation_count"]) > 0 for phase in phases),
         "resource_observation_cadence": int(totals["maximum_resource_observation_wall_gap_ns"])
         <= MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "resource_acquisition_duration": int(totals["maximum_resource_acquisition_duration_ns"])
+        <= MAX_RESOURCE_ACQUISITION_DURATION_NS,
         "checkpoint_progress": all(
             0 < int(phase["maximum_checkpoint_gap_records"]) <= MAX_CHECKPOINT_RECORD_GAP for phase in phases
         ),
@@ -5485,6 +8633,8 @@ def _execution_identity(
     monitor_interval_ns: int,
 ) -> dict[str, Any]:
     git_commit = _git_head()
+    if production_evidence and git_commit != _PRODUCTION_GIT_COMMIT:
+        raise _error("production_identity_invalid")
     runner_hashes = {
         phase: _callable_implementation_sha256(runner, role=f"phase:{phase}", git_commit=git_commit)
         for phase, runner in runners
@@ -5492,6 +8642,7 @@ def _execution_identity(
     execution = {
         "production_evidence": production_evidence,
         "fresh_worker": False,
+        "process_containment": _process_containment_identity(production=production_evidence),
         "executable_git_commit": git_commit,
         "git_tree_clean": False,
         "repository_tree_sha256": _repository_tree_sha256(git_commit),
@@ -5529,6 +8680,8 @@ def _production_execution_identity() -> dict[str, Any]:
     if _current_process_umask() != 0o077:
         raise _error("production_identity_invalid")
     git_commit = _git_head()
+    if git_commit != _PRODUCTION_GIT_COMMIT:
+        raise _error("production_identity_invalid")
     runners = _production_phase_runners()
     tracked_callables: list[object] = [*runners.values(), _SystemResourceProbe]
     source_paths = {_callable_source_path(value) for value in tracked_callables}
@@ -5554,9 +8707,10 @@ def _production_execution_identity() -> dict[str, Any]:
     ):
         raise _error("production_identity_invalid")
     _assert_reader_modules_unloaded()
-    return {
+    identity = {
         "production_evidence": True,
         "fresh_worker": True,
+        "process_containment": _process_containment_identity(production=True),
         "executable_git_commit": git_commit,
         "git_tree_clean": True,
         "repository_tree_sha256": _repository_tree_sha256(git_commit),
@@ -5580,6 +8734,8 @@ def _production_execution_identity() -> dict[str, Any]:
         "report_measurement_boundary": _REPORT_MEASUREMENT_BOUNDARY,
         "attempt_measurement_boundary": _ATTEMPT_MEASUREMENT_BOUNDARY,
     }
+    _verify_recorded_production_execution(identity)
+    return identity
 
 
 def _verify_recorded_production_execution(execution: Mapping[str, Any]) -> None:
@@ -5717,6 +8873,12 @@ def _relevant_module_paths_at_commit(git_commit: str) -> tuple[str, ...]:
 
 
 def _relevant_tracked_worktree_paths() -> tuple[str, ...]:
+    if _PRODUCTION_RELEVANT_WORKTREE_PATHS is not None and (
+        _FRESH_PRODUCTION_WORKER or _PRODUCTION_PROCESS_CONTAINMENT is not None
+    ):
+        return _PRODUCTION_RELEVANT_WORKTREE_PATHS
+    if _PRODUCTION_PROCESS_CONTAINMENT is not None:
+        raise _error("production_identity_invalid")
     root = _git_root()
     try:
         completed = subprocess.run(
@@ -5781,7 +8943,7 @@ def _relevant_module_sha256() -> dict[str, str]:
             try:
                 info = path.lstat()
             except FileNotFoundError:
-                continue
+                raise OSError from None
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 raise OSError
             result[relative] = _hash_bytes(path.read_bytes())
@@ -6974,7 +10136,7 @@ def _reader_lock_sha256_at_commit(git_commit: str) -> str:
 
 def _capacity_bootstrap_identity() -> dict[str, Any]:
     try:
-        _source_root, dependencies, layouts = _validated_capacity_bootstrap()
+        _source_root, dependencies, layouts, _observer_fd = _validated_capacity_bootstrap()
         launcher = _git_root() / _CAPACITY_LAUNCHER_PATH
         info = launcher.lstat()
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
@@ -7189,6 +10351,10 @@ def _verify_runtime_environment_shape(runtime: Mapping[str, Any]) -> None:
 
 
 def _cpu_model() -> str:
+    if _PRODUCTION_CPU_MODEL is not None and (_FRESH_PRODUCTION_WORKER or _PRODUCTION_PROCESS_CONTAINMENT is not None):
+        return _PRODUCTION_CPU_MODEL
+    if _PRODUCTION_PROCESS_CONTAINMENT is not None:
+        raise _error("production_identity_invalid")
     value = platform.processor().strip()
     if not value and sys.platform.startswith("linux"):
         try:
@@ -7233,6 +10399,10 @@ def _git_head() -> str:
 
 
 def _git_root() -> Path:
+    if _PRODUCTION_GIT_ROOT is not None and (_FRESH_PRODUCTION_WORKER or _PRODUCTION_PROCESS_CONTAINMENT is not None):
+        return _PRODUCTION_GIT_ROOT
+    if _PRODUCTION_PROCESS_CONTAINMENT is not None:
+        raise _error("production_identity_invalid")
     try:
         completed = subprocess.run(
             ["git", "-C", os.fspath(Path(__file__).parent), "rev-parse", "--show-toplevel"],
@@ -7601,12 +10771,12 @@ def _sample_runtime_filesystems(
             minimum_free_across_attempts = (
                 disk.free if minimum_free_across_attempts is None else min(minimum_free_across_attempts, disk.free)
             )
-            if disk.free < MIN_RUNTIME_FREE_DISK_BYTES:
-                raise _RuntimeDiskFloor(minimum_free_across_attempts, attempt)
             if filesystem.includes_output:
                 attempt_output_disk = disk
                 if output_disk_across_attempts is None or disk.free < output_disk_across_attempts.free:
                     output_disk_across_attempts = disk
+            if disk.free < MIN_RUNTIME_FREE_DISK_BYTES:
+                raise _RuntimeDiskFloor(minimum_free_across_attempts, output_disk_across_attempts, attempt)
         if acquired and attempt_minimum_free is not None and attempt_output_disk is not None:
             if minimum_free_across_attempts is None or output_disk_across_attempts is None:
                 raise _error("resource_measurement_failed")
@@ -7653,7 +10823,10 @@ def _post_promotion_enforce(
     monitor: _ContinuousResourceMonitor,
 ) -> None:
     monitor.observe_transaction_boundary(final_owned)
-    _merge_monitor_metrics(metrics, monitor.global_snapshot())
+    monitor.stop()
+    monitor.raise_if_failed()
+    terminal_snapshot = monitor.global_snapshot()
+    _merge_monitor_metrics(metrics, terminal_snapshot)
     now = _probe_monotonic_ns(probe)
     if now < run_started_ns:
         raise _error("clock_invalid")
@@ -7665,6 +10838,8 @@ def _post_promotion_enforce(
         raise _error("runtime_disk_floor")
     if (metrics.maximum_resource_observation_wall_gap_ns or 0) > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
         raise _error("resource_observation_gap")
+    if int(terminal_snapshot["maximum_resource_acquisition_duration_ns"]) > MAX_RESOURCE_ACQUISITION_DURATION_NS:
+        raise _error("resource_acquisition_timeout")
     if final_owned > MAX_OWNED_DISK_BYTES:
         raise _error("owned_disk_limit")
     if metrics.elapsed_ns > MAX_TOTAL_RUNTIME_NS:
@@ -8035,6 +11210,171 @@ def _wipe_and_quarantine_private_file_at(
         raise _error("attempt_ledger_invalid") from None
 
 
+def _wipe_authenticated_inflight_descriptor(descriptor: int, expected_identity: tuple[int, int]) -> None:
+    """Durably clear one retained inflight inode without trusting its public name."""
+
+    try:
+        opened = os.fstat(descriptor)
+        owner = os.geteuid() if hasattr(os, "geteuid") else opened.st_uid
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != owner
+            or opened.st_nlink != 1
+            or _regular_file_identity(opened) != expected_identity
+        ):
+            raise OSError
+        os.fchmod(descriptor, 0o600)
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+        cleared = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(cleared.st_mode)
+            or cleared.st_uid != owner
+            or cleared.st_nlink != 1
+            or stat.S_IMODE(cleared.st_mode) != 0o600
+            or cleared.st_size != 0
+            or _regular_file_identity(cleared) != expected_identity
+        ):
+            raise OSError
+    except OSError:
+        raise _error("attempt_ledger_invalid") from None
+
+
+def _preserve_mismatched_retirement_entry_at(
+    directory_fd: int,
+    temporary_name: str,
+    original_name: str,
+    expected_identity: tuple[int, int],
+) -> bool:
+    """Move a raced substitute out of auto-cleanup state without overwriting it."""
+
+    try:
+        current = os.stat(temporary_name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise _error("attempt_ledger_invalid") from None
+    observed_identity = _regular_file_identity(current)
+    if observed_identity == expected_identity:
+        return False
+    try:
+        _restore_mismatched_quarantine_at(
+            directory_fd,
+            temporary_name,
+            original_name,
+            observed_identity,
+        )
+    except EnronCapacityError:
+        preserved_name: str | None = None
+        for _ in range(128):
+            candidate = f".attempt-preserved-{secrets.token_hex(32)}.hold"
+            try:
+                _private_io._rename_noreplace_at(directory_fd, temporary_name, directory_fd, candidate)
+            except FileExistsError:
+                continue
+            preserved_name = candidate
+            break
+        if preserved_name is None:
+            raise
+        preserved = os.stat(preserved_name, dir_fd=directory_fd, follow_symlinks=False)
+        if _regular_file_identity(preserved) != observed_identity:
+            raise _error("attempt_ledger_invalid")
+        os.fsync(directory_fd)
+        raise _error("attempt_ledger_invalid") from None
+    return True
+
+
+def _retire_inflight_file_at(
+    directory_fd: int,
+    name: str,
+    descriptor: int,
+    expected_identity: tuple[int, int],
+    *,
+    nonce: str,
+    kind: str,
+) -> str:
+    """Move one inflight file out of the live grammar before destructive wiping."""
+
+    temp_specs = {
+        "marker": (f".attempt-inflight-stage-{nonce}-", _INFLIGHT_TEMP_RE),
+        "stage_binding": (f".attempt-inflight-stage-binding-{nonce}-", _STAGE_BINDING_TEMP_RE),
+        "cleanup_inventory": (f".attempt-inflight-cleanup-inventory-{nonce}-", _CLEANUP_INVENTORY_TEMP_RE),
+        "cleanup_intent": (f".attempt-inflight-cleanup-intent-{nonce}-", _CLEANUP_INTENT_TEMP_RE),
+    }
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{64}", nonce) is None or kind not in temp_specs:
+        raise _error("attempt_ledger_invalid")
+    try:
+        opened = _require_pinned_private_file_at(
+            directory_fd,
+            name,
+            descriptor,
+            expected_identity,
+            maximum=MAX_INFLIGHT_RECORD_BYTES,
+        )
+        parent = os.fstat(directory_fd)
+        owner = os.geteuid() if hasattr(os, "geteuid") else opened.st_uid
+        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != owner or stat.S_IMODE(parent.st_mode) != 0o700:
+            raise OSError
+        prefix, temp_pattern = temp_specs[kind]
+        temporary_name: str | None = None
+        for _ in range(128):
+            candidate = f"{prefix}{secrets.token_hex(32)}.tmp"
+            if temp_pattern.fullmatch(candidate) is None:
+                raise OSError
+            try:
+                _private_io._rename_noreplace_at(directory_fd, name, directory_fd, candidate)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_name is None:
+            raise OSError
+        moved = os.stat(temporary_name, dir_fd=directory_fd, follow_symlinks=False)
+        moved_mismatch = (
+            not stat.S_ISREG(moved.st_mode)
+            or stat.S_ISLNK(moved.st_mode)
+            or moved.st_uid != owner
+            or moved.st_nlink != 1
+            or stat.S_IMODE(moved.st_mode) != 0o600
+            or _regular_file_identity(moved) != expected_identity
+        )
+        if moved_mismatch:
+            _preserve_mismatched_retirement_entry_at(
+                directory_fd,
+                temporary_name,
+                name,
+                expected_identity,
+            )
+            _wipe_authenticated_inflight_descriptor(descriptor, expected_identity)
+            raise OSError
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError
+        os.fsync(directory_fd)
+        try:
+            return _wipe_and_quarantine_private_file_at(
+                directory_fd,
+                temporary_name,
+                descriptor,
+                expected_identity,
+            )
+        except BaseException:
+            substituted = _preserve_mismatched_retirement_entry_at(
+                directory_fd,
+                temporary_name,
+                name,
+                expected_identity,
+            )
+            if substituted:
+                _wipe_authenticated_inflight_descriptor(descriptor, expected_identity)
+            raise
+    except (EnronCapacityError, EnronPrivateIOError, OSError, ValueError):
+        raise _error("attempt_ledger_invalid") from None
+
+
 def _restore_mismatched_quarantine_at(
     directory_fd: int,
     quarantine_name: str,
@@ -8247,10 +11587,36 @@ def _prepare_attempt_ledger(options: EnronCapacityOptions) -> _AttemptLedger:
     return ledger
 
 
+def _require_inflight_retirement_headroom_locked(descriptor: int, nonce: str) -> None:
+    """Reserve every zero tombstone required to retire one inflight attempt."""
+
+    if not isinstance(nonce, str) or re.fullmatch(r"[0-9a-f]{64}", nonce) is None:
+        raise _error("attempt_ledger_invalid")
+    try:
+        names = os.listdir(descriptor)
+    except OSError:
+        raise _error("attempt_ledger_invalid") from None
+    marker_name = f".attempt-inflight-{nonce}.json"
+    if marker_name not in names:
+        raise _error("attempt_ledger_invalid")
+    pending = 1
+    pending += int(f".attempt-inflight-{nonce}.stage.json" in names)
+    pending += int(f".attempt-inflight-{nonce}.cleanup.json" in names)
+    pending += sum(
+        1
+        for name in names
+        if (match := _CLEANUP_INTENT_NAME_RE.fullmatch(name)) is not None and match.group(1) == nonce
+    )
+    existing = sum(1 for name in names if _PRIVATE_TOMBSTONE_RE.fullmatch(name))
+    if pending <= 0 or existing + pending > MAX_LEDGER_TOMBSTONES:
+        raise _error("attempt_ledger_invalid")
+
+
 def _append_attempt_receipt(
     ledger: _AttemptLedger,
     *,
     inflight: _InflightAttempt | None,
+    options: EnronCapacityOptions,
     outcome: str,
     failure_code: str | None,
     execution: Mapping[str, Any] | None,
@@ -8270,9 +11636,12 @@ def _append_attempt_receipt(
             identity: Mapping[str, Any] | None = execution
         else:
             _assert_inflight_marker_current(inflight)
+            _require_inflight_retirement_headroom_locked(descriptor, inflight.nonce)
             attempt_sequence = int(inflight.record["attempt_sequence"])
             attempt_nonce_sha256 = _hash_bytes(inflight.nonce.encode("ascii"))
             identity = inflight.record
+            if outcome != "passed":
+                _publish_private_root_receipt_identity(metrics, inflight.stage_binding, inflight.output_parent)
         receipt = _make_attempt_receipt(
             existing,
             attempt_sequence=attempt_sequence,
@@ -8291,6 +11660,7 @@ def _append_attempt_receipt(
                 inflight,
                 receipt,
                 durable_commit,
+                options=options,
             ):
                 raise _error("attempt_ledger_write_failed")
         ledger.assert_current()
@@ -8303,6 +11673,7 @@ def _append_attempt_receipt(
                     inflight,
                     receipt,
                     durable_commit,
+                    options=options,
                 )
             except BaseException:
                 pass
@@ -8321,6 +11692,8 @@ def _reconcile_published_attempt_receipt_locked(
     inflight: _InflightAttempt,
     receipt: Mapping[str, Any],
     durable_commit: bytearray,
+    *,
+    options: EnronCapacityOptions,
 ) -> bool:
     """Make a durably published receipt authoritative before cleanup can branch."""
 
@@ -8329,18 +11702,30 @@ def _reconcile_published_attempt_receipt_locked(
     receipts = _read_attempt_receipts_locked(descriptor)
     if not receipts or receipts[-1] != receipt:
         return False
-    if receipt.get("outcome") == "passed":
-        _verify_recovered_promoted_output(
-            inflight.output_parent.path / inflight.output_name,
-            inflight.output_parent,
-            inflight.record,
-            receipt,
-            inflight.stage_binding,
-        )
-    else:
-        _assert_owned_attempt_output_absent(inflight)
+
+    def verify_output_boundary() -> None:
+        if receipt.get("outcome") == "passed":
+            _verify_recovered_promoted_output(
+                inflight.output_parent.path / inflight.output_name,
+                inflight.output_parent,
+                inflight.record,
+                receipt,
+                inflight.stage_binding,
+            )
+        else:
+            _verify_recovered_failed_output_absent(
+                inflight.output_parent.path / inflight.output_name,
+                inflight.output_parent,
+                inflight.record,
+                receipt,
+                inflight.stage_binding,
+                inflight.cleanup_intent,
+                options=options,
+            )
+
+    verify_output_boundary()
     inflight.receipt_appended = True
-    _remove_inflight_files_locked(inflight)
+    _remove_inflight_files_locked(inflight, before_marker_retirement=verify_output_boundary)
     inflight.terminalized = True
     return True
 
@@ -8403,6 +11788,13 @@ def _make_attempt_receipt(
         if identity is not None and "execution_sha256" in identity
         else (_canonical_hash(execution) if execution is not None else None)
     )
+    sensitive_content_wiped, path_tree_removed, retained_tombstones = metrics.cleanup_evidence
+    if outcome != "passed" and (
+        sensitive_content_wiped is not True or path_tree_removed is not True or retained_tombstones != 0
+    ):
+        # Failed and interrupted attempts support a positive durable claim only
+        # after complete tree removal with no retained writable tombstone.
+        sensitive_content_wiped = False
     receipt: dict[str, Any] = {
         "schema_version": CAPACITY_ATTEMPT_SCHEMA_VERSION,
         "sequence": sequence,
@@ -8433,9 +11825,9 @@ def _make_attempt_receipt(
         "promoted_parent_inode": metrics.promoted_parent_inode,
         "promoted_name_sha256": metrics.promoted_name_sha256,
         "preexisting_private_tombstone_count": metrics.preexisting_private_tombstone_count,
-        "sensitive_content_wiped": metrics.sensitive_content_wiped,
-        "path_tree_removed": metrics.path_tree_removed,
-        "retained_private_tombstone_count": metrics.retained_private_tombstone_count,
+        "sensitive_content_wiped": sensitive_content_wiped,
+        "path_tree_removed": path_tree_removed,
+        "retained_private_tombstone_count": retained_tombstones,
         "previous_attempt_sha256": previous,
         "attempt_sha256": "",
     }
@@ -8449,6 +11841,12 @@ def _write_attempt_receipt_locked(
     receipt: Mapping[str, Any],
     durable_commit: bytearray,
 ) -> None:
+    if receipt.get("sensitive_content_wiped") is True and (
+        receipt.get("path_tree_removed") is not True
+        or type(receipt.get("retained_private_tombstone_count")) is not int
+        or cast(int, receipt["retained_private_tombstone_count"]) != 0
+    ):
+        raise _error("attempt_ledger_write_failed")
     payload = _pretty_json_bytes(receipt)
     if len(payload) > MAX_ATTEMPT_RECEIPT_BYTES:
         raise _error("attempt_ledger_write_failed")
@@ -8603,15 +12001,72 @@ def _open_pinned_private_file_at(
             os.close(descriptor)
 
 
-def _remove_inflight_files_locked(inflight: _InflightAttempt) -> None:
+def _remove_inflight_files_locked(
+    inflight: _InflightAttempt,
+    *,
+    before_marker_retirement: Callable[[], None] | None = None,
+) -> None:
     names = set(os.listdir(inflight.ledger.fd))
+    intent_names = {
+        name
+        for name in names
+        if (match := _CLEANUP_INTENT_NAME_RE.fullmatch(name)) is not None and match.group(1) == inflight.nonce
+    }
     if inflight.marker_name not in names:
-        if not inflight.receipt_appended or inflight.binding_name in names or inflight.cleanup_inventory_name in names:
+        if (
+            not inflight.receipt_appended
+            or inflight.binding_name in names
+            or inflight.cleanup_inventory_name in names
+            or intent_names
+        ):
             raise _error("attempt_ledger_invalid")
         return
     _assert_inflight_marker_current(inflight)
     marker_fd = inflight.marker_fd
     if marker_fd is None:
+        raise _error("attempt_ledger_invalid")
+    if intent_names:
+        if inflight.stage_binding is None:
+            raise _error("attempt_ledger_invalid")
+        chain = _read_cleanup_intent_chain(
+            inflight.ledger.fd,
+            inflight.record,
+            inflight.stage_binding,
+            inflight.cleanup_inventory,
+        )
+        if inflight.cleanup_intent is not None and chain[-1][1] != inflight.cleanup_intent:
+            raise _error("attempt_ledger_invalid")
+        for intent_name, expected_intent in reversed(chain):
+            intent_fd, payload, intent_identity = _open_pinned_private_file_at(
+                inflight.ledger.fd,
+                intent_name,
+                maximum=MAX_INFLIGHT_RECORD_BYTES,
+            )
+            try:
+                cleanup_intent = _load_closed_json(payload, description="capacity cleanup intent")
+                _verify_cleanup_intent(
+                    cleanup_intent,
+                    inflight.record,
+                    inflight.stage_binding,
+                    inflight.cleanup_inventory,
+                )
+                if cleanup_intent != expected_intent:
+                    raise _error("attempt_ledger_invalid")
+                _retire_inflight_file_at(
+                    inflight.ledger.fd,
+                    intent_name,
+                    intent_fd,
+                    intent_identity,
+                    nonce=inflight.nonce,
+                    kind="cleanup_intent",
+                )
+            finally:
+                try:
+                    fcntl.flock(intent_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(intent_fd)
+    elif inflight.cleanup_intent is not None and not inflight.receipt_appended:
         raise _error("attempt_ledger_invalid")
     if inflight.cleanup_inventory_name in names:
         if inflight.stage_binding is None:
@@ -8626,11 +12081,13 @@ def _remove_inflight_files_locked(inflight: _InflightAttempt) -> None:
             _verify_cleanup_inventory(cleanup_inventory, inflight.record, inflight.stage_binding)
             if inflight.cleanup_inventory is not None and cleanup_inventory != inflight.cleanup_inventory:
                 raise _error("attempt_ledger_invalid")
-            _wipe_and_quarantine_private_file_at(
+            _retire_inflight_file_at(
                 inflight.ledger.fd,
                 inflight.cleanup_inventory_name,
                 inventory_fd,
                 inventory_identity,
+                nonce=inflight.nonce,
+                kind="cleanup_inventory",
             )
         finally:
             try:
@@ -8651,11 +12108,13 @@ def _remove_inflight_files_locked(inflight: _InflightAttempt) -> None:
             _verify_stage_binding(binding, inflight.record)
             if inflight.stage_binding is not None and binding != inflight.stage_binding:
                 raise _error("attempt_ledger_invalid")
-            _wipe_and_quarantine_private_file_at(
+            _retire_inflight_file_at(
                 inflight.ledger.fd,
                 inflight.binding_name,
                 binding_fd,
                 binding_identity,
+                nonce=inflight.nonce,
+                kind="stage_binding",
             )
         finally:
             try:
@@ -8665,35 +12124,16 @@ def _remove_inflight_files_locked(inflight: _InflightAttempt) -> None:
             os.close(binding_fd)
     elif inflight.stage_binding is not None and not inflight.receipt_appended:
         raise _error("attempt_ledger_invalid")
-    _wipe_and_quarantine_private_file_at(
+    if before_marker_retirement is not None:
+        before_marker_retirement()
+    _retire_inflight_file_at(
         inflight.ledger.fd,
         inflight.marker_name,
         marker_fd,
         _regular_file_identity(os.fstat(marker_fd)),
+        nonce=inflight.nonce,
+        kind="marker",
     )
-
-
-def _assert_owned_attempt_output_absent(inflight: _InflightAttempt) -> None:
-    inflight.output_parent.assert_current(code="attempt_ledger_invalid")
-    stage_name = f".{inflight.output_name}.stage-{inflight.stage_token}"
-    expected = (
-        None
-        if inflight.stage_binding is None
-        else (
-            cast(int, inflight.stage_binding["stage_device"]),
-            cast(int, inflight.stage_binding["stage_inode"]),
-        )
-    )
-    for name in (stage_name, inflight.output_name):
-        try:
-            info = os.stat(name, dir_fd=inflight.output_parent.fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        except OSError:
-            raise _error("attempt_ledger_invalid") from None
-        identity = int(info.st_dev), int(info.st_ino)
-        if (expected is None and name == stage_name) or identity == expected:
-            raise _error("attempt_ledger_invalid")
 
 
 def verify_capacity_attempt_ledger(ledger_dir: Path) -> list[dict[str, Any]]:
@@ -8830,11 +12270,13 @@ def _validate_ledger_inventory_locked(descriptor: int, *, allow_temps: bool) -> 
     for name in names:
         binding = _STAGE_BINDING_NAME_RE.fullmatch(name)
         cleanup_inventory = _CLEANUP_INVENTORY_NAME_RE.fullmatch(name)
+        cleanup_intent = _CLEANUP_INTENT_NAME_RE.fullmatch(name)
         if (
             _ATTEMPT_NAME_RE.fullmatch(name)
             or _INFLIGHT_NAME_RE.fullmatch(name)
             or (binding is not None and binding.group(1) in markers)
             or (cleanup_inventory is not None and cleanup_inventory.group(1) in markers)
+            or (cleanup_intent is not None and cleanup_intent.group(1) in markers)
         ):
             continue
         if _PRIVATE_TOMBSTONE_RE.fullmatch(name):
@@ -8854,6 +12296,7 @@ def _validate_ledger_inventory_locked(descriptor: int, *, allow_temps: bool) -> 
             or _INFLIGHT_TEMP_RE.fullmatch(name)
             or _STAGE_BINDING_TEMP_RE.fullmatch(name)
             or _CLEANUP_INVENTORY_TEMP_RE.fullmatch(name)
+            or _CLEANUP_INTENT_TEMP_RE.fullmatch(name)
         ):
             continue
         raise _error("attempt_ledger_invalid")
@@ -9039,6 +12482,69 @@ def _verify_cleanup_inventory(
         raise _error("attempt_ledger_invalid")
 
 
+def _verify_cleanup_intent(
+    intent: Mapping[str, Any],
+    inflight: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    inventory: Mapping[str, Any] | None,
+) -> None:
+    _require_closed(
+        intent,
+        {
+            "schema_version",
+            "attempt_sequence",
+            "attempt_nonce_sha256",
+            "output_parent_device",
+            "output_parent_inode",
+            "output_name_sha256",
+            "stage_name_sha256",
+            "stage_device",
+            "stage_inode",
+            "cleanup_inventory_sha256",
+            "generation",
+            "previous_intent_sha256",
+            "complete_tombstone_name_sha256",
+            "incomplete_tombstone_name_sha256",
+            "intent_sha256",
+        },
+        "capacity cleanup intent",
+    )
+    if (
+        intent.get("schema_version") != CAPACITY_CLEANUP_INTENT_SCHEMA_VERSION
+        or intent.get("attempt_sequence") != inflight.get("attempt_sequence")
+        or intent.get("attempt_nonce_sha256") != _hash_bytes(cast(str, inflight.get("attempt_nonce")).encode("ascii"))
+        or intent.get("output_parent_device") != inflight.get("output_parent_device")
+        or intent.get("output_parent_inode") != inflight.get("output_parent_inode")
+        or intent.get("output_name_sha256") != inflight.get("output_name_sha256")
+        or intent.get("stage_name_sha256") != inflight.get("stage_name_sha256")
+        or intent.get("stage_device") != binding.get("stage_device")
+        or intent.get("stage_inode") != binding.get("stage_inode")
+        or intent.get("cleanup_inventory_sha256") != (None if inventory is None else inventory.get("inventory_sha256"))
+    ):
+        raise _error("attempt_ledger_invalid")
+    complete_name_hash = intent.get("complete_tombstone_name_sha256")
+    incomplete_name_hash = intent.get("incomplete_tombstone_name_sha256")
+    generation = intent.get("generation")
+    previous_intent_sha256 = intent.get("previous_intent_sha256")
+    if (
+        type(generation) is not int
+        or generation <= 0
+        or generation > _MAX_RESOURCE_INTEGER
+        or (
+            previous_intent_sha256 is not None
+            and (not isinstance(previous_intent_sha256, str) or _HASH_RE.fullmatch(previous_intent_sha256) is None)
+        )
+        or not isinstance(complete_name_hash, str)
+        or _HASH_RE.fullmatch(complete_name_hash) is None
+        or not isinstance(incomplete_name_hash, str)
+        or _HASH_RE.fullmatch(incomplete_name_hash) is None
+        or complete_name_hash == incomplete_name_hash
+        or intent.get("intent_sha256")
+        != _canonical_hash({key: value for key, value in intent.items() if key != "intent_sha256"})
+    ):
+        raise _error("attempt_ledger_invalid")
+
+
 def _read_inflight_records_locked(descriptor: int) -> list[tuple[str, dict[str, Any]]]:
     _validate_ledger_inventory_locked(descriptor, allow_temps=False)
     result: list[tuple[str, dict[str, Any]]] = []
@@ -9066,6 +12572,7 @@ def _read_inflight_records_locked(descriptor: int) -> list[tuple[str, dict[str, 
             binding = _load_closed_json(binding_payload, description="capacity stage binding")
             _verify_stage_binding(binding, record)
         cleanup_name = f".attempt-inflight-{match.group(1)}.cleanup.json"
+        cleanup_inventory: dict[str, Any] | None = None
         if cleanup_name in names:
             if binding is None:
                 raise _error("attempt_ledger_invalid")
@@ -9076,6 +12583,7 @@ def _read_inflight_records_locked(descriptor: int) -> list[tuple[str, dict[str, 
             )
             cleanup_inventory = _load_closed_json(cleanup_payload, description="capacity cleanup inventory")
             _verify_cleanup_inventory(cleanup_inventory, record, binding)
+        _read_cleanup_intent_chain(descriptor, record, binding, cleanup_inventory)
         result.append((name, record))
     return result
 
@@ -9088,6 +12596,7 @@ def _recover_ledger_temps_locked(descriptor: int) -> None:
         if _INFLIGHT_TEMP_RE.fullmatch(name)
         or _STAGE_BINDING_TEMP_RE.fullmatch(name)
         or _CLEANUP_INVENTORY_TEMP_RE.fullmatch(name)
+        or _CLEANUP_INTENT_TEMP_RE.fullmatch(name)
     )
     for name in names:
         stage_fd, _payload, identity = _open_pinned_private_file_at(
@@ -9137,6 +12646,12 @@ def _recover_stale_inflight_attempts_locked(ledger: _AttemptLedger, options: Enr
             final_dir, output_parent = _recovery_output_parent(options, record)
             binding = _read_stage_binding_if_present(descriptor, record)
             cleanup_inventory = _read_cleanup_inventory_if_present(descriptor, record, binding)
+            cleanup_intent = _read_cleanup_intent_if_present(
+                descriptor,
+                record,
+                binding,
+                cleanup_inventory,
+            )
             nonce_sha256 = _hash_bytes(cast(str, record["attempt_nonce"]).encode("ascii"))
             matching = [item for item in receipts if item["attempt_nonce_sha256"] == nonce_sha256]
             if len(matching) > 1:
@@ -9145,17 +12660,8 @@ def _recover_stale_inflight_attempts_locked(ledger: _AttemptLedger, options: Enr
                 terminal = matching[0]
                 if terminal["attempt_sequence"] != record["attempt_sequence"]:
                     raise _error("attempt_ledger_invalid")
-                if terminal["outcome"] == "passed":
-                    _verify_recovered_promoted_output(final_dir, output_parent, record, terminal, binding)
-                else:
-                    _cleanup_recovered_stage(
-                        final_dir,
-                        output_parent,
-                        record,
-                        binding,
-                        cleanup_inventory,
-                        options=options,
-                    )
+                if terminal["outcome"] == "passed" and cleanup_intent is not None:
+                    raise _error("attempt_ledger_invalid")
             else:
                 cleanup_evidence = _cleanup_recovered_stage(
                     final_dir,
@@ -9163,15 +12669,17 @@ def _recover_stale_inflight_attempts_locked(ledger: _AttemptLedger, options: Enr
                     record,
                     binding,
                     cleanup_inventory,
+                    cleanup_intent,
+                    attempt_ledger_fd=descriptor,
                     options=options,
                 )
                 metrics = _AttemptMetrics(
                     started_ns=cast(int, record["started_monotonic_ns"]),
                     elapsed_ns=max(0, time.monotonic_ns() - cast(int, record["started_wall_monotonic_ns"])),
-                    sensitive_content_wiped=cleanup_evidence[0],
-                    path_tree_removed=cleanup_evidence[1],
-                    retained_private_tombstone_count=cleanup_evidence[2],
+                    cleanup_evidence=cleanup_evidence,
                 )
+                _publish_private_root_receipt_identity(metrics, binding, output_parent)
+                _require_inflight_retirement_headroom_locked(descriptor, cast(str, record["attempt_nonce"]))
                 recovered = _make_attempt_receipt(
                     receipts,
                     attempt_sequence=cast(int, record["attempt_sequence"]),
@@ -9188,6 +12696,13 @@ def _recover_stale_inflight_attempts_locked(ledger: _AttemptLedger, options: Enr
                 if durable_commit != bytearray(b"\x01"):
                     raise _error("attempt_ledger_write_failed")
                 receipts.append(recovered)
+                terminal = recovered
+            cleanup_intent = _read_cleanup_intent_if_present(
+                descriptor,
+                record,
+                binding,
+                cleanup_inventory,
+            )
             recovered_attempt = _InflightAttempt(
                 ledger=ledger,
                 record=dict(record),
@@ -9197,11 +12712,37 @@ def _recover_stale_inflight_attempts_locked(ledger: _AttemptLedger, options: Enr
                 output_name=final_dir.name,
                 stage_binding=None if binding is None else dict(binding),
                 cleanup_inventory=None if cleanup_inventory is None else dict(cleanup_inventory),
+                cleanup_intent=None if cleanup_intent is None else dict(cleanup_intent),
             )
             marker = None
             output_parent = None
             try:
-                _remove_inflight_files_locked(recovered_attempt)
+
+                def verify_recovered_output_boundary() -> None:
+                    if terminal["outcome"] == "passed":
+                        _verify_recovered_promoted_output(
+                            final_dir,
+                            recovered_attempt.output_parent,
+                            record,
+                            terminal,
+                            recovered_attempt.stage_binding,
+                        )
+                    else:
+                        _verify_recovered_failed_output_absent(
+                            final_dir,
+                            recovered_attempt.output_parent,
+                            record,
+                            terminal,
+                            recovered_attempt.stage_binding,
+                            recovered_attempt.cleanup_intent,
+                            options=options,
+                        )
+
+                verify_recovered_output_boundary()
+                _remove_inflight_files_locked(
+                    recovered_attempt,
+                    before_marker_retirement=verify_recovered_output_boundary,
+                )
                 recovered_attempt.terminalized = True
             finally:
                 recovered_attempt.close()
@@ -9234,10 +12775,18 @@ def _recovery_output_parent(
     expected_stage_name = f".{final_dir.name}.stage-{record.get('stage_token')}"
     if _hash_bytes(expected_stage_name.encode("utf-8")) != record.get("stage_name_sha256"):
         raise _error("attempt_ledger_invalid")
-    parent = _PinnedDirectory(final_dir.parent)
-    if parent.identity.device != record.get("output_parent_device") or parent.identity.inode != record.get(
-        "output_parent_inode"
-    ):
+    # Recovery may find the recorded parent after permission drift. Open only
+    # its final component through the durable identity binding, restoring that
+    # authenticated inode to 0700 before any child is inspected or renamed.
+    expected_parent_identity = (
+        cast(int, record["output_parent_device"]),
+        cast(int, record["output_parent_inode"]),
+    )
+    parent = _PinnedDirectory(
+        final_dir.parent,
+        recovery_final_identity=expected_parent_identity,
+    )
+    if (parent.identity.device, parent.identity.inode) != expected_parent_identity:
         parent.close()
         raise _error("attempt_ledger_invalid")
     return final_dir, parent
@@ -9274,6 +12823,141 @@ def _read_cleanup_inventory_if_present(
     return inventory
 
 
+def _read_cleanup_intent_chain(
+    descriptor: int,
+    record: Mapping[str, Any],
+    binding: Mapping[str, Any] | None,
+    cleanup_inventory: Mapping[str, Any] | None,
+) -> list[tuple[str, dict[str, Any]]]:
+    nonce = cast(str, record["attempt_nonce"])
+    names = sorted(
+        name
+        for name in os.listdir(descriptor)
+        if (match := _CLEANUP_INTENT_NAME_RE.fullmatch(name)) is not None and match.group(1) == nonce
+    )
+    if not names:
+        return []
+    if binding is None:
+        raise _error("attempt_ledger_invalid")
+    if len(names) > MAX_CLEANUP_INTENT_GENERATIONS:
+        raise _error("attempt_ledger_invalid")
+    chain: list[tuple[str, dict[str, Any]]] = []
+    for name in names:
+        payload = _read_regular_private_file_at(descriptor, name, maximum=MAX_INFLIGHT_RECORD_BYTES)
+        intent = _load_closed_json(payload, description="capacity cleanup intent")
+        _verify_cleanup_intent(intent, record, binding, cleanup_inventory)
+        chain.append((name, intent))
+    chain.sort(key=lambda item: cast(int, item[1]["generation"]))
+    previous: str | None = None
+    for expected_generation, (_name, intent) in enumerate(chain, start=1):
+        if intent["generation"] != expected_generation or intent["previous_intent_sha256"] != previous:
+            raise _error("attempt_ledger_invalid")
+        previous = cast(str, intent["intent_sha256"])
+    return chain
+
+
+def _read_cleanup_intent_if_present(
+    descriptor: int,
+    record: Mapping[str, Any],
+    binding: Mapping[str, Any] | None,
+    cleanup_inventory: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    chain = _read_cleanup_intent_chain(descriptor, record, binding, cleanup_inventory)
+    return None if not chain else chain[-1][1]
+
+
+def _install_cleanup_intent_locked(
+    descriptor: int,
+    output_parent: _PinnedDirectory,
+    record: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    cleanup_inventory: Mapping[str, Any] | None,
+    prior_intent: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], str, str]:
+    """Commit unpredictable cleanup names before exposing either name in the output parent."""
+
+    if prior_intent is None:
+        generation = 1
+        previous_intent_sha256 = None
+    else:
+        _verify_cleanup_intent(prior_intent, record, binding, cleanup_inventory)
+        prior_generation = cast(int, prior_intent["generation"])
+        if prior_generation >= MAX_CLEANUP_INTENT_GENERATIONS:
+            raise _error("attempt_ledger_invalid")
+        generation = prior_generation + 1
+        previous_intent_sha256 = cast(str, prior_intent["intent_sha256"])
+    parent_info = os.fstat(output_parent.fd)
+    owner = os.geteuid() if hasattr(os, "geteuid") else parent_info.st_uid
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != owner
+        or (int(parent_info.st_dev), int(parent_info.st_ino))
+        != (output_parent.identity.device, output_parent.identity.inode)
+    ):
+        raise _error("attempt_ledger_invalid")
+    complete_name: str | None = None
+    incomplete_name: str | None = None
+    for _ in range(128):
+        candidate_complete = f".nerb-cleanup-{secrets.token_hex(24)}"
+        candidate_incomplete = f".nerb-cleanup-{secrets.token_hex(24)}"
+        if candidate_complete == candidate_incomplete:
+            continue
+        collision = False
+        for candidate in (candidate_complete, candidate_incomplete):
+            try:
+                os.stat(candidate, dir_fd=output_parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                raise _error("attempt_ledger_invalid") from None
+            collision = True
+            break
+        if not collision:
+            complete_name = candidate_complete
+            incomplete_name = candidate_incomplete
+            break
+    if complete_name is None or incomplete_name is None:
+        raise _error("attempt_ledger_invalid")
+    intent: dict[str, Any] = {
+        "schema_version": CAPACITY_CLEANUP_INTENT_SCHEMA_VERSION,
+        "attempt_sequence": record["attempt_sequence"],
+        "attempt_nonce_sha256": _hash_bytes(cast(str, record["attempt_nonce"]).encode("ascii")),
+        "output_parent_device": record["output_parent_device"],
+        "output_parent_inode": record["output_parent_inode"],
+        "output_name_sha256": record["output_name_sha256"],
+        "stage_name_sha256": record["stage_name_sha256"],
+        "stage_device": binding["stage_device"],
+        "stage_inode": binding["stage_inode"],
+        "cleanup_inventory_sha256": (None if cleanup_inventory is None else cleanup_inventory["inventory_sha256"]),
+        "generation": generation,
+        "previous_intent_sha256": previous_intent_sha256,
+        "complete_tombstone_name_sha256": _hash_bytes(complete_name.encode("ascii")),
+        "incomplete_tombstone_name_sha256": _hash_bytes(incomplete_name.encode("ascii")),
+        "intent_sha256": "",
+    }
+    intent["intent_sha256"] = _canonical_hash({key: value for key, value in intent.items() if key != "intent_sha256"})
+    _verify_cleanup_intent(intent, record, binding, cleanup_inventory)
+    payload = _pretty_json_bytes(intent)
+    if len(payload) > MAX_INFLIGHT_RECORD_BYTES:
+        raise _error("attempt_ledger_write_failed")
+    nonce = cast(str, record["attempt_nonce"])
+    intent_token = secrets.token_hex(32)
+    _write_atomic_private_file_at(
+        descriptor,
+        temporary_name=f".attempt-inflight-cleanup-intent-{nonce}-{intent_token}.tmp",
+        final_name=f".attempt-inflight-{nonce}.cleanup-intent-{intent_token}.json",
+        payload=payload,
+    )
+    after = os.fstat(output_parent.fd)
+    if (
+        not stat.S_ISDIR(after.st_mode)
+        or after.st_uid != owner
+        or (int(after.st_dev), int(after.st_ino)) != (output_parent.identity.device, output_parent.identity.inode)
+    ):
+        raise _error("attempt_ledger_invalid")
+    return intent, complete_name, incomplete_name
+
+
 def _entry_identity_at(parent_fd: int, name: str) -> tuple[int, int] | None:
     try:
         info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -9286,22 +12970,150 @@ def _entry_identity_at(parent_fd: int, name: str) -> tuple[int, int] | None:
     return int(info.st_dev), int(info.st_ino)
 
 
+@dataclass(frozen=True, slots=True)
+class _RecoveryEntrySnapshot:
+    identity: tuple[int, int]
+    is_owned_directory: bool
+    is_private_directory: bool
+
+
+def _recovery_entry_snapshot_at(parent_fd: int, name: str) -> _RecoveryEntrySnapshot | None:
+    """Classify one recovery name without making policy drift hide a bound inode."""
+
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _error("attempt_ledger_invalid") from None
+    owner = os.geteuid() if hasattr(os, "geteuid") else info.st_uid
+    is_owned_directory = stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == owner
+    return _RecoveryEntrySnapshot(
+        identity=(int(info.st_dev), int(info.st_ino)),
+        is_owned_directory=is_owned_directory,
+        is_private_directory=_safe_private_directory(info),
+    )
+
+
+def _recovery_tombstone_names(
+    parent_fd: int,
+    cleanup_intent: Mapping[str, Any] | None,
+    expected_identity: tuple[int, int] | None = None,
+    *,
+    canonical_names: tuple[str, ...] = (),
+) -> tuple[str | None, str | None, bool, tuple[str, ...]]:
+    """Stably discover committed names and every parent name bound to the stage inode."""
+
+    complete_hash = None if cleanup_intent is None else cast(str, cleanup_intent["complete_tombstone_name_sha256"])
+    incomplete_hash = None if cleanup_intent is None else cast(str, cleanup_intent["incomplete_tombstone_name_sha256"])
+    committed_hashes = frozenset(value for value in (complete_hash, incomplete_hash) if value is not None)
+    complete_name: str | None = None
+    incomplete_name: str | None = None
+    bound_names: list[str] = []
+    scan_valid = True
+
+    def parent_state() -> tuple[int, int, int, int, int, int, int, int]:
+        info = os.fstat(parent_fd)
+        owner = os.geteuid() if hasattr(os, "geteuid") else info.st_uid
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != owner:
+            raise OSError
+        return (
+            int(info.st_dev),
+            int(info.st_ino),
+            int(info.st_mode),
+            int(info.st_uid),
+            int(info.st_nlink),
+            int(info.st_size),
+            int(info.st_mtime_ns),
+            int(info.st_ctime_ns),
+        )
+
+    before_parent: tuple[int, ...] | None = None
+    try:
+        before_parent = parent_state()
+        with os.scandir(parent_fd) as entries:
+            for entry_count, entry in enumerate(entries, start=1):
+                if entry_count > MAX_RECOVERY_OUTPUT_PARENT_ENTRIES:
+                    scan_valid = False
+                    break
+                name = entry.name
+                tombstone_digest = (
+                    _hash_bytes(name.encode("ascii")) if _PRIVATE_TOMBSTONE_RE.fullmatch(name) is not None else None
+                )
+                committed_name = tombstone_digest in committed_hashes
+                possible_bound = False
+                if expected_identity is not None:
+                    try:
+                        possible_bound = int(entry.inode()) == expected_identity[1]
+                    except (OSError, TypeError, ValueError):
+                        scan_valid = False
+                        continue
+                if possible_bound or committed_name or name in canonical_names:
+                    try:
+                        snapshot = _recovery_entry_snapshot_at(parent_fd, name)
+                    except EnronCapacityError:
+                        scan_valid = False
+                        continue
+                    if snapshot is None:
+                        scan_valid = False
+                        continue
+                    if expected_identity is not None and snapshot.identity == expected_identity:
+                        if len(bound_names) < 2:
+                            bound_names.append(name)
+                        scan_valid = scan_valid and len(bound_names) == 1
+                if tombstone_digest is not None:
+                    if complete_hash is not None and tombstone_digest == complete_hash:
+                        if complete_name is not None:
+                            scan_valid = False
+                        else:
+                            complete_name = name
+                    if incomplete_hash is not None and tombstone_digest == incomplete_hash:
+                        if incomplete_name is not None:
+                            scan_valid = False
+                        else:
+                            incomplete_name = name
+    except EnronCapacityError:
+        scan_valid = False
+    except OSError:
+        scan_valid = False
+    try:
+        scan_valid = scan_valid and before_parent is not None and parent_state() == before_parent
+    except OSError:
+        scan_valid = False
+    return complete_name, incomplete_name, scan_valid, tuple(bound_names)
+
+
 def _cleanup_recovered_stage(
     final_dir: Path,
     output_parent: _PinnedDirectory,
     record: Mapping[str, Any],
     binding: Mapping[str, Any] | None,
     cleanup_inventory: Mapping[str, Any] | None,
+    cleanup_intent: Mapping[str, Any] | None,
     *,
+    attempt_ledger_fd: int,
     options: EnronCapacityOptions,
 ) -> tuple[bool | None, bool | None, int]:
-    output_parent.assert_current(code="attempt_ledger_invalid")
     stage_name = f".{final_dir.name}.stage-{record['stage_token']}"
-    stage_identity = _entry_identity_at(output_parent.fd, stage_name)
-    final_identity = _entry_identity_at(output_parent.fd, final_dir.name)
     expected = None if binding is None else (cast(int, binding["stage_device"]), cast(int, binding["stage_inode"]))
+    (
+        complete_tombstone_name,
+        incomplete_tombstone_name,
+        tombstone_inventory_valid,
+        bound_tombstone_names,
+    ) = _recovery_tombstone_names(
+        output_parent.fd,
+        cleanup_intent,
+        expected,
+        canonical_names=(stage_name, final_dir.name),
+    )
+    published_tombstone_names = tuple(
+        name for name in (complete_tombstone_name, incomplete_tombstone_name) if name is not None
+    )
     if binding is None:
-        if cleanup_inventory is not None:
+        stage_identity = _entry_identity_at(output_parent.fd, stage_name)
+        final_identity = _entry_identity_at(output_parent.fd, final_dir.name)
+        if cleanup_inventory is not None or cleanup_intent is not None:
             raise _error("attempt_ledger_invalid")
         if final_identity is not None:
             raise _error("attempt_ledger_invalid")
@@ -9313,55 +13125,197 @@ def _cleanup_recovered_stage(
                 options=options,
             )
         return None, None, 0
-    matching = [
-        name
-        for name, identity in ((stage_name, stage_identity), (final_dir.name, final_identity))
-        if identity == expected
-    ]
-    if (stage_identity is not None and stage_identity != expected) or (
-        final_identity is not None and final_identity != expected
-    ):
-        raise _error("attempt_ledger_invalid")
-    if len(matching) > 1:
-        raise _error("attempt_ledger_invalid")
-    if matching:
-        candidate: _PinnedDirectory | None = None
+    expected_identity = cast(tuple[int, int], expected)
+    expected_files = (
+        set()
+        if cleanup_inventory is None
+        else {
+            (cast(int, item["device"]), cast(int, item["inode"]))
+            for item in cast(Sequence[Mapping[str, Any]], cleanup_inventory["files"])
+        }
+    )
+    tracked_names = tuple(
+        dict.fromkeys(
+            (
+                stage_name,
+                final_dir.name,
+                *published_tombstone_names,
+                *bound_tombstone_names,
+            )
+        )
+    )
+    observed: list[tuple[str, _RecoveryEntrySnapshot]] = []
+    observation_failed = False
+    for name in tracked_names:
         try:
-            candidate = _PinnedDirectory(output_parent.path / matching[0])
-            output_parent.assert_current(code="attempt_ledger_invalid")
-            if (candidate.identity.device, candidate.identity.inode) != expected:
+            snapshot = _recovery_entry_snapshot_at(output_parent.fd, name)
+        except EnronCapacityError:
+            observation_failed = True
+            continue
+        if snapshot is not None:
+            observed.append((name, snapshot))
+    matching = [
+        (name, snapshot) for name, snapshot in observed if snapshot.identity == expected and snapshot.is_owned_directory
+    ]
+    policy_invalid = (
+        not tombstone_inventory_valid
+        or observation_failed
+        or len(matching) > 1
+        or any(snapshot.identity != expected or not snapshot.is_private_directory for _name, snapshot in observed)
+    )
+    if matching:
+        candidate: _OwnedDescriptor | None = None
+        try:
+            candidate_name, _snapshot = matching[0]
+            candidate_is_canonical = candidate_name in {stage_name, final_dir.name}
+            candidate_is_private_tombstone = _PRIVATE_TOMBSTONE_RE.fullmatch(candidate_name) is not None
+            candidate_is_committed_tombstone = candidate_name in published_tombstone_names
+            candidate = _open_owned_recovery_directory_descriptor(
+                candidate_name,
+                dir_fd=output_parent.fd,
+                expected_identity=expected_identity,
+            )
+            candidate_info = os.fstat(candidate.fd)
+            owner = os.geteuid() if hasattr(os, "geteuid") else candidate_info.st_uid
+            if (
+                not stat.S_ISDIR(candidate_info.st_mode)
+                or stat.S_ISLNK(candidate_info.st_mode)
+                or candidate_info.st_uid != owner
+                or (candidate_info.st_dev, candidate_info.st_ino) != expected_identity
+            ):
                 raise _error("attempt_ledger_invalid")
-            expected_files = (
-                set()
-                if cleanup_inventory is None
-                else {
-                    (cast(int, item["device"]), cast(int, item["inode"]))
-                    for item in cast(Sequence[Mapping[str, Any]], cleanup_inventory["files"])
-                }
+            policy_invalid = policy_invalid or not _safe_private_directory(candidate_info)
+            if not candidate_is_canonical:
+                # A valid uncommitted tombstone with no intent, or the exact
+                # tombstone committed by the current intent, can terminalize.
+                # Every other relabel is policy-invalid, but the authenticated
+                # inode is still wiped before that violation is reported.
+                removed = _private_io._wipe_and_quarantine_pinned_private_directory(  # noqa: SLF001
+                    candidate.fd,
+                    output_parent.fd,
+                    output_parent.path,
+                    candidate_name,
+                    expected_identity,
+                    workspace_root=options.workspace_root,
+                    allow_unignored_output=options.allow_unignored_output,
+                    quarantine=False,
+                    maximum_tree_depth=_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+                    maximum_tree_entries=_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+                )
+                selected_tombstone_name = candidate_name
+                policy_invalid = policy_invalid or removed[1] is not False or removed[2] != 0
+                policy_invalid = (
+                    policy_invalid
+                    or not candidate_is_private_tombstone
+                    or (cleanup_intent is not None and not candidate_is_committed_tombstone)
+                )
+            else:
+                # Cleanup intent generations never authorize an arbitrary
+                # source name. A canonical stage/final root may commit a new
+                # unpredictable destination and then move only that pinned
+                # inode into the committed namespace.
+                cleanup_intent, complete_name, incomplete_name = _install_cleanup_intent_locked(
+                    attempt_ledger_fd,
+                    output_parent,
+                    record,
+                    binding,
+                    cleanup_inventory,
+                    cleanup_intent,
+                )
+                complete_tombstone_name = complete_name
+                incomplete_tombstone_name = incomplete_name
+                tracked_names = tuple(
+                    dict.fromkeys(
+                        (
+                            stage_name,
+                            final_dir.name,
+                            *published_tombstone_names,
+                            complete_tombstone_name,
+                            incomplete_tombstone_name,
+                            *bound_tombstone_names,
+                        )
+                    )
+                )
+                if cleanup_inventory is None:
+                    removed = _private_io._wipe_and_quarantine_pinned_private_directory(  # noqa: SLF001
+                        candidate.fd,
+                        output_parent.fd,
+                        output_parent.path,
+                        candidate_name,
+                        expected_identity,
+                        workspace_root=options.workspace_root,
+                        allow_unignored_output=options.allow_unignored_output,
+                        quarantine=True,
+                        quarantine_name=complete_tombstone_name,
+                        maximum_tree_depth=_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+                        maximum_tree_entries=_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+                    )
+                    selected_tombstone_name = complete_tombstone_name
+                else:
+                    removed = _private_io._wipe_and_quarantine_pinned_private_directory_with_inventory(  # noqa: SLF001
+                        candidate.fd,
+                        output_parent.fd,
+                        output_parent.path,
+                        candidate_name,
+                        expected_identity,
+                        expected_files,
+                        workspace_root=options.workspace_root,
+                        allow_unignored_output=options.allow_unignored_output,
+                        quarantine=True,
+                        complete_quarantine_name=complete_tombstone_name,
+                        incomplete_quarantine_name=incomplete_tombstone_name,
+                        allow_complete_quarantine=cleanup_intent["generation"] == 1,
+                    )
+                    selected_tombstone_name = complete_tombstone_name if removed[0] else incomplete_tombstone_name
+                policy_invalid = policy_invalid or removed[1] is not False or removed[2] != 1
+            for name in tracked_names:
+                try:
+                    snapshot = _recovery_entry_snapshot_at(output_parent.fd, name)
+                except EnronCapacityError:
+                    policy_invalid = True
+                    continue
+                if name == selected_tombstone_name:
+                    policy_invalid = policy_invalid or (
+                        snapshot is None or snapshot.identity != expected_identity or not snapshot.is_private_directory
+                    )
+                else:
+                    policy_invalid = policy_invalid or snapshot is not None
+            _post_complete, _post_incomplete, post_scan_valid, post_bound_names = _recovery_tombstone_names(
+                output_parent.fd,
+                cleanup_intent,
+                expected_identity,
+                canonical_names=(stage_name, final_dir.name),
             )
-            removed = _private_io._wipe_and_quarantine_pinned_private_directory_with_inventory(  # noqa: SLF001
-                candidate.fd,
-                candidate.parent_fd,
-                candidate.path.parent,
-                candidate.name,
-                (candidate.identity.device, candidate.identity.inode),
-                expected_files,
-                workspace_root=options.workspace_root,
-                allow_unignored_output=options.allow_unignored_output,
-            )
+            policy_invalid = policy_invalid or not post_scan_valid or post_bound_names != (selected_tombstone_name,)
+            if policy_invalid:
+                raise _error("attempt_ledger_invalid")
             candidate.close()
             candidate = None
-            return removed[0] and cleanup_inventory is not None, removed[1], removed[2]
+            # Crash recovery retains a writable tombstone after this helper
+            # returns. Its empty state cannot be held through the separate
+            # durable receipt commit, so recovery must not publish positive
+            # wipe evidence even when this call completed every cleanup step.
+            return False, False, 1
         except EnronCapacityError:
             raise
         except EnronPrivateIOError:
             raise _error("attempt_ledger_invalid") from None
+        except OSError:
+            raise _error("attempt_ledger_invalid") from None
         finally:
             if candidate is not None:
                 candidate.close()
-    if cleanup_inventory is not None:
-        return False, None, 0
-    return None, None, 0
+    if policy_invalid:
+        raise _error("attempt_ledger_invalid")
+    if cleanup_intent is not None:
+        # A durable intent with neither its committed tombstone nor the bound
+        # source name is evidence of an external rename, not a clean absence.
+        raise _error("attempt_ledger_invalid")
+    # A durable stage binding remains authoritative even if its inode was
+    # renamed outside every bounded recovery name. Do not terminalize and
+    # discard the only durable identity needed for a later owner-controlled
+    # recovery.
+    raise _error("attempt_ledger_invalid")
 
 
 def _remove_empty_unbound_stage(
@@ -9375,14 +13329,22 @@ def _remove_empty_unbound_stage(
     try:
         candidate = _PinnedDirectory(output_parent.path / name)
         output_parent.assert_current(code="attempt_ledger_invalid")
-        if (candidate.identity.device, candidate.identity.inode) != expected_identity or os.listdir(candidate.fd):
+        try:
+            with os.scandir(candidate.fd) as entries:
+                has_entry = next(entries, None) is not None
+        except OSError:
+            raise _error("attempt_ledger_invalid") from None
+        if (candidate.identity.device, candidate.identity.inode) != expected_identity or has_entry:
             raise _error("attempt_ledger_invalid")
         candidate.assert_current(code="attempt_ledger_invalid")
-        return _remove_pinned_directory(
+        removed = _remove_pinned_directory(
             candidate,
             workspace_root=options.workspace_root,
             allow_unignored_output=options.allow_unignored_output,
+            maximum_tree_depth=_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+            maximum_tree_entries=_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
         )
+        return False, removed[1], removed[2]
     except EnronCapacityError:
         raise
     except OSError:
@@ -9401,14 +13363,16 @@ def _remove_recovery_directory(
 ) -> tuple[bool, bool, int]:
     candidate = _PinnedDirectory(output_parent.path / name)
     try:
-        output_parent.assert_current(code="attempt_ledger_invalid")
         if expected_identity is not None and (candidate.identity.device, candidate.identity.inode) != expected_identity:
             raise _error("attempt_ledger_invalid")
-        return _remove_pinned_directory(
+        removed = _remove_pinned_directory(
             candidate,
             workspace_root=options.workspace_root,
             allow_unignored_output=options.allow_unignored_output,
+            maximum_tree_depth=_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+            maximum_tree_entries=_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
         )
+        return False, removed[1], removed[2]
     except EnronCapacityError:
         candidate.close()
         raise _error("attempt_ledger_invalid") from None
@@ -9438,6 +13402,163 @@ def _verify_recovered_promoted_output(
         or receipt.get("promoted_name_sha256") != _hash_bytes(final_dir.name.encode("utf-8"))
     ):
         raise _error("attempt_ledger_invalid")
+
+
+def _verify_recovered_failed_output_absent(
+    final_dir: Path,
+    output_parent: _PinnedDirectory,
+    record: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    binding: Mapping[str, Any] | None,
+    cleanup_intent: Mapping[str, Any] | None,
+    *,
+    options: EnronCapacityOptions,
+) -> None:
+    """Re-wipe and verify the exact failed-attempt root before retirement."""
+
+    output_parent.assert_current(code="attempt_ledger_invalid")
+    stage_name = f".{final_dir.name}.stage-{record['stage_token']}"
+    receipt_identity_values = receipt.get("promoted_root_device"), receipt.get("promoted_root_inode")
+    receipt_parent_values = receipt.get("promoted_parent_device"), receipt.get("promoted_parent_inode")
+    receipt_identity_valid = all(type(value) is int and value >= 0 for value in receipt_identity_values)
+    receipt_parent_valid = all(type(value) is int and value >= 0 for value in receipt_parent_values)
+    receipt_identity = cast(tuple[int, int], receipt_identity_values) if receipt_identity_valid else None
+    binding_identity = (
+        None if binding is None else (cast(int, binding["stage_device"]), cast(int, binding["stage_inode"]))
+    )
+    policy_invalid = (
+        receipt_identity_valid != receipt_parent_valid
+        or (receipt_identity is None and receipt_identity_values != (None, None))
+        or (not receipt_parent_valid and receipt_parent_values != (None, None))
+        or (
+            receipt_parent_valid
+            and receipt_parent_values != (output_parent.identity.device, output_parent.identity.inode)
+        )
+        or (binding_identity is not None and receipt_identity != binding_identity)
+    )
+    expected_identity = binding_identity if binding_identity is not None else receipt_identity
+    complete_name, incomplete_name, scan_valid, bound_names = _recovery_tombstone_names(
+        output_parent.fd,
+        cleanup_intent,
+        expected_identity,
+        canonical_names=(stage_name, final_dir.name),
+    )
+    policy_invalid = policy_invalid or not scan_valid or len(bound_names) > 1
+    tracked_names = tuple(
+        dict.fromkeys(name for name in (stage_name, final_dir.name, complete_name, incomplete_name) if name is not None)
+    )
+    for name in tracked_names:
+        try:
+            snapshot = _recovery_entry_snapshot_at(output_parent.fd, name)
+        except EnronCapacityError:
+            policy_invalid = True
+            continue
+        if snapshot is None:
+            continue
+        if name in {stage_name, final_dir.name}:
+            policy_invalid = True
+        elif expected_identity is None or snapshot.identity != expected_identity:
+            policy_invalid = True
+    if expected_identity is None:
+        if policy_invalid:
+            raise _error("attempt_ledger_invalid")
+        return
+    if not bound_names:
+        if (
+            policy_invalid
+            or receipt.get("path_tree_removed") is not True
+            or receipt.get("retained_private_tombstone_count") != 0
+        ):
+            raise _error("attempt_ledger_invalid")
+        return
+
+    candidate_name = bound_names[0]
+    candidate: _OwnedDescriptor | None = None
+    try:
+        try:
+            initial = _recovery_entry_snapshot_at(output_parent.fd, candidate_name)
+        except EnronCapacityError:
+            initial = None
+            policy_invalid = True
+        if initial is None or initial.identity != expected_identity or not initial.is_owned_directory:
+            raise _error("attempt_ledger_invalid")
+        policy_invalid = policy_invalid or not initial.is_private_directory
+        policy_invalid = policy_invalid or _PRIVATE_TOMBSTONE_RE.fullmatch(candidate_name) is None
+        policy_invalid = policy_invalid or (
+            receipt.get("sensitive_content_wiped") is not False
+            or receipt.get("path_tree_removed") is not False
+            or receipt.get("retained_private_tombstone_count") != 1
+        )
+        candidate = _open_owned_recovery_directory_descriptor(
+            candidate_name,
+            dir_fd=output_parent.fd,
+            expected_identity=expected_identity,
+        )
+        opened = os.fstat(candidate.fd)
+        owner = os.geteuid() if hasattr(os, "geteuid") else opened.st_uid
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(opened.st_mode)
+            or opened.st_uid != owner
+            or (int(opened.st_dev), int(opened.st_ino)) != expected_identity
+        ):
+            raise _error("attempt_ledger_invalid")
+        removed = _private_io._wipe_and_quarantine_pinned_private_directory(  # noqa: SLF001
+            candidate.fd,
+            output_parent.fd,
+            output_parent.path,
+            candidate_name,
+            expected_identity,
+            workspace_root=options.workspace_root,
+            allow_unignored_output=options.allow_unignored_output,
+            quarantine=False,
+            maximum_tree_depth=_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+            maximum_tree_entries=_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+        )
+        policy_invalid = policy_invalid or removed != (True, False, 0)
+        post_complete, post_incomplete, post_scan_valid, post_bound_names = _recovery_tombstone_names(
+            output_parent.fd,
+            cleanup_intent,
+            expected_identity,
+            canonical_names=(stage_name, final_dir.name),
+        )
+        policy_invalid = policy_invalid or not post_scan_valid or post_bound_names != (candidate_name,)
+        post_tracked_names = tuple(
+            dict.fromkeys(
+                name for name in (stage_name, final_dir.name, post_complete, post_incomplete) if name is not None
+            )
+        )
+        for name in post_tracked_names:
+            try:
+                snapshot = _recovery_entry_snapshot_at(output_parent.fd, name)
+            except EnronCapacityError:
+                policy_invalid = True
+                continue
+            if snapshot is None:
+                continue
+            if name in {stage_name, final_dir.name} or snapshot.identity != expected_identity:
+                policy_invalid = True
+        try:
+            final_snapshot = _recovery_entry_snapshot_at(output_parent.fd, candidate_name)
+            payload_bytes = _logical_tree_bytes(candidate.fd, depth=0, entries=[0])
+        except EnronCapacityError:
+            final_snapshot = None
+            payload_bytes = -1
+        policy_invalid = policy_invalid or (
+            final_snapshot is None
+            or final_snapshot.identity != expected_identity
+            or not final_snapshot.is_private_directory
+            or payload_bytes != 0
+        )
+        if policy_invalid:
+            raise _error("attempt_ledger_invalid")
+    except EnronCapacityError:
+        raise
+    except (EnronPrivateIOError, OSError):
+        raise _error("attempt_ledger_invalid") from None
+    finally:
+        if candidate is not None:
+            candidate.close()
 
 
 def _verify_attempt_receipt(
@@ -9529,6 +13650,19 @@ def _verify_attempt_receipt(
         value = receipt.get(field)
         if value is not None and (type(value) is not int or value < 0):
             raise _error("attempt_ledger_invalid")
+    private_root_identity = tuple(
+        receipt.get(field)
+        for field in (
+            "promoted_root_device",
+            "promoted_root_inode",
+            "promoted_parent_device",
+            "promoted_parent_inode",
+        )
+    )
+    if any(value is None for value in private_root_identity) and any(
+        value is not None for value in private_root_identity
+    ):
+        raise _error("attempt_ledger_invalid")
     for field in ("sensitive_content_wiped", "path_tree_removed"):
         if receipt.get(field) is not None and type(receipt[field]) is not bool:
             raise _error("attempt_ledger_invalid")
@@ -9620,10 +13754,14 @@ def _remove_pinned_directory(
     *,
     workspace_root: Path | None,
     allow_unignored_output: bool,
+    cleanup_boundary: _private_io._PrevalidatedCleanupBoundary | None = None,  # noqa: SLF001
+    effective_workspace_root: Path | None = None,
+    maximum_tree_depth: int | None = None,
+    maximum_tree_entries: int | None = None,
+    cleanup_result_observer: Callable[[tuple[bool, bool, int]], None] | None = None,
 ) -> tuple[bool, bool, int]:
     try:
-        pinned.assert_current(code="promotion_failed")
-        return _private_io._wipe_and_quarantine_pinned_private_directory(  # noqa: SLF001
+        result = _private_io._wipe_and_quarantine_pinned_private_directory(  # noqa: SLF001
             pinned.fd,
             pinned.parent_fd,
             pinned.path.parent,
@@ -9631,7 +13769,14 @@ def _remove_pinned_directory(
             (pinned.identity.device, pinned.identity.inode),
             workspace_root=workspace_root,
             allow_unignored_output=allow_unignored_output,
+            cleanup_boundary=cleanup_boundary,
+            effective_workspace_root=effective_workspace_root,
+            maximum_tree_depth=maximum_tree_depth,
+            maximum_tree_entries=maximum_tree_entries,
         )
+        if cleanup_result_observer is not None:
+            cleanup_result_observer(result)
+        return result
     except EnronCapacityError:
         raise
     except EnronPrivateIOError:
@@ -10367,6 +14512,7 @@ def _portable_verification_scope() -> dict[str, Any]:
             "original_private_payload_bytes",
             "original_promoted_inode_or_private_filesystem_identity",
             "original_runtime_timing_rss_or_disk_observations",
+            "failed_attempt_cleanup_fields_or_durable_wipe_state",
             "recorded_native_binary_bytes_or_reproducible_binary_build",
             "observed_runtime_reader_distribution_file_bytes",
             "lower_http_dependency_file_bytes_beyond_critical_reader_set",

@@ -36,6 +36,83 @@ const PRIVATE_FILE_OPEN_FLAGS: i32 =
 #[cfg(unix)]
 const EXISTING_PRIVATE_FILE_OPEN_FLAGS: i32 = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
 
+#[cfg(target_os = "linux")]
+fn expected_owned_directory(info: &libc::stat, expected_device: u64, expected_inode: u64) -> bool {
+    (info.st_mode & libc::S_IFMT) == libc::S_IFDIR
+        && info.st_uid == unsafe { libc::geteuid() }
+        && info.st_dev as u64 == expected_device
+        && info.st_ino as u64 == expected_inode
+}
+
+#[cfg(target_os = "linux")]
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+#[cfg(target_os = "linux")]
+fn repair_and_open_directory_at(
+    path: &CString,
+    dir_fd: i32,
+    expected_device: u64,
+    expected_inode: u64,
+) -> (i32, i32) {
+    let authority = unsafe {
+        libc::openat(
+            dir_fd,
+            path.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if authority < 0 {
+        return (-1, last_errno());
+    }
+    let result = (|| {
+        let mut before = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(authority, &mut before) } != 0 {
+            return (-1, last_errno());
+        }
+        if !expected_owned_directory(&before, expected_device, expected_inode) {
+            return (-1, libc::ESTALE);
+        }
+        let proc_path = match CString::new(format!("/proc/self/fd/{authority}")) {
+            Ok(value) => value,
+            Err(_) => return (-1, libc::EINVAL),
+        };
+        if unsafe { libc::chmod(proc_path.as_ptr(), libc::S_IRWXU as libc::mode_t) } != 0 {
+            return (-1, last_errno());
+        }
+        let current_directory = c".";
+        let descriptor =
+            unsafe { libc::openat(authority, current_directory.as_ptr(), DIRECTORY_OPEN_FLAGS) };
+        if descriptor < 0 {
+            return (-1, last_errno());
+        }
+        let mut opened = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(descriptor, &mut opened) } != 0
+            || !expected_owned_directory(&opened, expected_device, expected_inode)
+            || opened.st_mode & 0o7777 != libc::S_IRWXU
+        {
+            unsafe { libc::close(descriptor) };
+            return (-1, libc::ESTALE);
+        }
+        (descriptor, 0)
+    })();
+    unsafe { libc::close(authority) };
+    result
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn repair_and_open_directory_at(
+    _path: &CString,
+    _dir_fd: i32,
+    _expected_device: u64,
+    _expected_inode: u64,
+) -> (i32, i32) {
+    (-1, libc::ENOTSUP)
+}
+
 fn ffi_boundary<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(result) => result,
@@ -163,6 +240,33 @@ fn _open_directory_fd_once(
 
 #[pyfunction]
 #[cfg(unix)]
+fn _repair_and_open_directory_fd_once(
+    opened_fd: &Bound<'_, PyByteArray>,
+    path: &[u8],
+    dir_fd: i32,
+    expected_device: u64,
+    expected_inode: u64,
+) -> PyResult<i32> {
+    ffi_boundary(|| {
+        if opened_fd.len() != std::mem::size_of::<i32>()
+            || opened_fd.to_vec() != (-1_i32).to_ne_bytes()
+        {
+            return Err(PyValueError::new_err(
+                "Native recovery directory status buffer must contain one negative descriptor",
+            ));
+        }
+        let path = CString::new(path).map_err(|_| {
+            PyValueError::new_err("Native recovery directory path contains a null byte")
+        })?;
+        let (descriptor, errno) =
+            repair_and_open_directory_at(&path, dir_fd, expected_device, expected_inode);
+        write_status_bytes(opened_fd, &descriptor.to_ne_bytes())?;
+        Ok(errno)
+    })
+}
+
+#[pyfunction]
+#[cfg(unix)]
 fn _open_private_file_fd_once(
     opened_fd: &Bound<'_, PyByteArray>,
     path: &[u8],
@@ -239,6 +343,20 @@ fn _open_directory_fd_once(
 ) -> PyResult<i32> {
     Err(PyOSError::new_err(
         "Native directory transactions require a Unix platform",
+    ))
+}
+
+#[pyfunction]
+#[cfg(not(unix))]
+fn _repair_and_open_directory_fd_once(
+    _opened_fd: &Bound<'_, PyByteArray>,
+    _path: &[u8],
+    _dir_fd: i32,
+    _expected_device: u64,
+    _expected_inode: u64,
+) -> PyResult<i32> {
+    Err(PyOSError::new_err(
+        "Native descriptor transactions require a Unix platform",
     ))
 }
 
@@ -755,6 +873,10 @@ fn _engine(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(_close_fd_once, module)?)?;
     module.add_function(wrap_pyfunction!(_fsync_fd_commit, module)?)?;
     module.add_function(wrap_pyfunction!(_open_directory_fd_once, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        _repair_and_open_directory_fd_once,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(_open_private_file_fd_once, module)?)?;
     module.add_function(wrap_pyfunction!(
         _open_existing_private_file_fd_once,

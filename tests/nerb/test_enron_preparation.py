@@ -459,6 +459,52 @@ def test_preparation_construction_spool_move_out_wipes_original_and_replacement(
     assert all(path.read_bytes() == b"" for path in temp_root.rglob("records.sqlite3"))
 
 
+def test_preparation_spool_accepts_pinned_sticky_shared_temp_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "shared-sticky-temp"
+    temp_root.mkdir(mode=0o700)
+    temp_root.chmod(0o1777)
+    monkeypatch.setattr(enron_preparation.tempfile, "tempdir", os.fspath(temp_root))
+
+    with enron_preparation._private_preparation_spool() as connection:
+        connection.execute("INSERT INTO source_items VALUES (?, ?)", ("private-source-digest", 1))
+        connection.commit()
+
+    _assert_cleanup_tombstones(temp_root, count=1)
+
+
+def test_preparation_spool_rejects_nonsticky_shared_temp_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_root = tmp_path / "unsafe-shared-temp"
+    temp_root.mkdir(mode=0o700)
+    temp_root.chmod(0o777)
+    monkeypatch.setattr(enron_preparation.tempfile, "tempdir", os.fspath(temp_root))
+
+    with pytest.raises(enron_preparation.EnronPreparationError, match="could not be cleaned safely"):
+        with enron_preparation._private_preparation_spool():
+            raise AssertionError("unsafe temp parent must fail before opening the spool")
+
+    assert not list(temp_root.iterdir())
+
+
+def test_preparation_spool_normalizes_missing_temp_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing_temp_root = tmp_path / "missing-temp"
+    monkeypatch.setattr(enron_preparation.tempfile, "tempdir", os.fspath(missing_temp_root))
+
+    with pytest.raises(enron_preparation.EnronPreparationError, match="could not be cleaned safely"):
+        with enron_preparation._private_preparation_spool():
+            raise AssertionError("missing temp parent must fail before opening the spool")
+
+    assert not missing_temp_root.exists()
+
+
 def test_preparation_spool_reports_scalar_sql_work_and_removes_handler_before_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

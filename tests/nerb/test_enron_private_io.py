@@ -141,6 +141,19 @@ def test_output_inside_workspace_requires_ignored_target(tmp_path: Path) -> None
     assert ensure_private_output_allowed(visible, allow_unignored_output=True) == visible
 
 
+@pytest.mark.parametrize("invalid_policy", ["false", 1])
+def test_unignored_output_policy_requires_an_exact_boolean(tmp_path: Path, invalid_policy: object) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / "visible" / "run"
+
+    with pytest.raises(EnronPrivateIOError, match="policy must be boolean"):
+        ensure_private_output_allowed(final, allow_unignored_output=cast(Any, invalid_policy))
+    with pytest.raises(EnronPrivateIOError, match="policy must be boolean"):
+        PrivateRun(final, allow_unignored_output=cast(Any, invalid_policy))
+
+    assert not final.parent.exists()
+
+
 def test_unrelated_workspace_hint_cannot_bypass_actual_workspace_policy(tmp_path: Path) -> None:
     root = _git_workspace(tmp_path)
     unrelated = _resolved(tmp_path / "unrelated")
@@ -163,6 +176,7 @@ def test_output_below_tracked_unignored_directory_is_rejected(tmp_path: Path) ->
 
 def test_private_run_requires_ignored_staging_sibling(tmp_path: Path) -> None:
     root = _git_workspace(tmp_path, ignore="/only-final\n")
+    root.chmod(0o700)
     final = root / "only-final"
 
     assert ensure_private_output_allowed(final) == final
@@ -401,7 +415,7 @@ def test_output_files_use_exclusive_nofollow_open(tmp_path: Path, monkeypatch: p
         assert any(flags & os.O_EXCL and flags & nofollow for flags in opened_flags)
 
 
-def test_private_run_cleans_stage_when_body_fails(tmp_path: Path) -> None:
+def test_private_run_retains_wiped_tombstone_without_claiming_sensitive_content_was_removed(tmp_path: Path) -> None:
     final = _resolved(tmp_path) / "run"
 
     with pytest.raises(RuntimeError, match="stop"):
@@ -421,7 +435,7 @@ def test_private_run_cleans_stage_when_body_fails(tmp_path: Path) -> None:
     assert _mode(tombstone / "nested") == 0o700
     assert _mode(tombstone / "nested" / "partial.txt") == 0o600
     assert (tombstone / "nested" / "partial.txt").read_bytes() == b""
-    assert run.cleanup_sensitive_content_wiped is True
+    assert run.cleanup_sensitive_content_wiped is False
     assert run.cleanup_path_tree_removed is False
     assert run.cleanup_tombstone_count == 1
 
@@ -643,7 +657,7 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (required, hard))
 try:
     with private_io.PrivateRun(final) as run:
         directory = run.stage_dir
-        for index in range(private_io._MAX_PRIVATE_TOMBSTONE_DEPTH):
+        for index in range(private_io._MAX_PRIVATE_TREE_DEPTH):
             directory = directory / f"depth-{index:02d}"
             directory.mkdir(mode=0o700)
             directory.chmod(0o700)
@@ -670,6 +684,296 @@ assert not private_io._UNRESOLVED_CLEANUP_FDS
     if completed.returncode == 77:
         pytest.skip("RLIMIT_NOFILE hard limit is below the cleanup regression requirement")
     assert completed.returncode == 0, completed.stderr
+
+
+def test_recovery_inventory_fanout_stops_at_n_plus_one_and_then_cleans_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _resolved(tmp_path) / "recovery-inventory"
+    directory.mkdir(mode=0o700)
+    marker = directory / enron_private_io._COMMIT_MARKER  # noqa: SLF001
+    marker.write_bytes(enron_private_io._COMMIT_PAYLOAD)  # noqa: SLF001
+    marker.chmod(0o600)
+    directory_fd = os.open(directory, enron_private_io._directory_open_flags())  # noqa: SLF001
+    real_scandir = enron_private_io.os.scandir
+    yielded: list[str] = []
+
+    class FakeEntry:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class FakeScandir:
+        def __init__(self) -> None:
+            self._index = 0
+
+        def __enter__(self) -> FakeScandir:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def __iter__(self) -> FakeScandir:
+            return self
+
+        def __next__(self) -> FakeEntry:
+            if self._index >= 10:
+                raise StopIteration
+            name = f"synthetic-{self._index}"
+            self._index += 1
+            yielded.append(name)
+            return FakeEntry(name)
+
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_ENTRIES", 2)
+    monkeypatch.setattr(enron_private_io.os, "scandir", lambda _directory: FakeScandir())
+    try:
+        assert enron_private_io._private_tree_cleanup_inventory_witness(directory_fd, set()) is None  # noqa: SLF001
+        assert yielded == ["synthetic-0", "synthetic-1", "synthetic-2"]
+
+        yielded.clear()
+        with pytest.raises(EnronPrivateIOError, match="entry limit"):
+            enron_private_io._collect_cleanup_inventory_descriptors(  # noqa: SLF001
+                directory_fd,
+                directory,
+                expected=set(),
+                retained={},
+                depth=0,
+                entries=[0],
+                root=True,
+            )
+        assert yielded == ["synthetic-0", "synthetic-1", "synthetic-2"]
+
+        monkeypatch.setattr(enron_private_io.os, "scandir", real_scandir)
+        monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_ENTRIES", 3)
+        assert enron_private_io._private_tree_cleanup_inventory_witness(directory_fd, set()) is not None  # noqa: SLF001
+        assert enron_private_io._collect_cleanup_inventory_descriptors(  # noqa: SLF001
+            directory_fd,
+            directory,
+            expected=set(),
+            retained={},
+            depth=0,
+            entries=[0],
+            root=True,
+        )
+        assert enron_private_io._clear_pinned_private_directory(  # noqa: SLF001
+            directory_fd,
+            directory,
+            maximum_depth=enron_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+            maximum_entries=enron_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+        )
+        assert marker.read_bytes() == b""
+    finally:
+        os.close(directory_fd)
+
+
+def test_recovery_inventory_depth_bound_fails_then_retry_wipes_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    directory = _resolved(tmp_path) / "recovery-depth"
+    nested = directory / "level-0" / "level-1"
+    nested.mkdir(parents=True, mode=0o700)
+    directory.chmod(0o700)
+    nested.parent.chmod(0o700)
+    nested.chmod(0o700)
+    marker = directory / enron_private_io._COMMIT_MARKER  # noqa: SLF001
+    marker.write_bytes(enron_private_io._COMMIT_PAYLOAD)  # noqa: SLF001
+    marker.chmod(0o600)
+    payload = nested / "secret.bin"
+    payload.write_bytes(b"private recovery payload")
+    payload.chmod(0o600)
+    payload_info = payload.stat()
+    expected = {(int(payload_info.st_dev), int(payload_info.st_ino))}
+    directory_fd = os.open(directory, enron_private_io._directory_open_flags())  # noqa: SLF001
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_DEPTH", 1)
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_ENTRIES", 16)
+    try:
+        assert enron_private_io._private_tree_cleanup_inventory_witness(directory_fd, expected) is None  # noqa: SLF001
+        assert not enron_private_io._clear_pinned_private_directory(  # noqa: SLF001
+            directory_fd,
+            directory,
+            maximum_depth=enron_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+            maximum_entries=enron_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+        )
+        assert payload.read_bytes() == b"private recovery payload"
+
+        monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_DEPTH", 3)
+        assert enron_private_io._clear_pinned_private_directory(  # noqa: SLF001
+            directory_fd,
+            directory,
+            maximum_depth=enron_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+            maximum_entries=enron_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+        )
+        assert payload.read_bytes() == b""
+        assert enron_private_io._private_tree_payload_is_empty(  # noqa: SLF001
+            directory_fd,
+            depth=0,
+            entries=[0],
+            maximum_depth=enron_private_io._MAX_PRIVATE_TREE_DEPTH,  # noqa: SLF001
+            maximum_entries=enron_private_io._MAX_PRIVATE_TREE_ENTRIES,  # noqa: SLF001
+        )
+    finally:
+        os.close(directory_fd)
+
+
+def test_independently_adopted_phase_roots_within_aggregate_bound_recover_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_ENTRIES", 6)
+    root = _resolved(tmp_path)
+    root.chmod(0o700)
+    final = root / "aggregate-recovery"
+    expected: list[tuple[int, int]] = []
+
+    with PrivateRun(final, allow_unignored_output=True) as run:
+        for phase in ("one", "two"):
+            phase_root = run.ensure_directory(Path("phases") / phase)
+            payload = phase_root / "secret.bin"
+            payload.write_bytes(f"private-{phase}".encode())
+            payload.chmod(0o600)
+            assert run.pin_cleanup_tree(Path("phases") / phase) == 1
+        run.commit(
+            retain_cleanup_authority=True,
+            before_promotion=lambda identities: expected.extend(identities),
+        )
+        run.release_cleanup_authority()
+
+    directory_fd = os.open(final, enron_private_io._directory_open_flags())  # noqa: SLF001
+    parent_fd = os.open(root, enron_private_io._directory_open_flags())  # noqa: SLF001
+    try:
+        info = os.fstat(directory_fd)
+        result = enron_private_io._wipe_and_quarantine_pinned_private_directory_with_inventory(  # noqa: SLF001
+            directory_fd,
+            parent_fd,
+            root,
+            final.name,
+            (int(info.st_dev), int(info.st_ino)),
+            set(expected),
+            workspace_root=None,
+            allow_unignored_output=True,
+            quarantine=True,
+            complete_quarantine_name=f".nerb-cleanup-{'a' * 48}",
+            incomplete_quarantine_name=f".nerb-cleanup-{'b' * 48}",
+        )
+    finally:
+        os.close(directory_fd)
+        os.close(parent_fd)
+
+    assert result == (True, False, 1)
+    tombstone = root / f".nerb-cleanup-{'a' * 48}"
+    assert not final.exists()
+    assert sorted(path.read_bytes() for path in tombstone.rglob("secret.bin")) == [b"", b""]
+
+
+def test_combined_phase_roots_exceeding_aggregate_entry_bound_are_rejected_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_ENTRIES", 5)
+    root = _resolved(tmp_path)
+    root.chmod(0o700)
+    final = root / "aggregate-rejected"
+
+    with pytest.raises(EnronPrivateIOError, match="entry limit"):
+        with PrivateRun(final, allow_unignored_output=True) as run:
+            for phase in ("one", "two"):
+                phase_root = run.ensure_directory(Path("phases") / phase)
+                payload = phase_root / "secret.bin"
+                payload.write_bytes(f"private-{phase}".encode())
+                payload.chmod(0o600)
+                assert run.pin_cleanup_tree(Path("phases") / phase) == 1
+            run.commit()
+
+    assert not final.exists()
+    tombstones = tuple(root.glob(".nerb-cleanup-*"))
+    assert len(tombstones) == 1
+    assert sorted(path.read_bytes() for path in tombstones[0].rglob("secret.bin")) == [b"", b""]
+
+
+def test_sync_private_tree_stops_at_shared_n_plus_one_without_promotion_or_positive_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    limit = 4
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_ENTRIES", limit)
+    real_bounded_names = enron_private_io._bounded_directory_names  # noqa: SLF001
+    maximum_counter = 0
+
+    def observed_bounded_names(
+        directory_fd: int,
+        *,
+        entries: list[int],
+        maximum_entries: int,
+    ) -> tuple[str, ...]:
+        nonlocal maximum_counter
+        try:
+            return real_bounded_names(
+                directory_fd,
+                entries=entries,
+                maximum_entries=maximum_entries,
+            )
+        finally:
+            maximum_counter = max(maximum_counter, entries[0])
+
+    monkeypatch.setattr(enron_private_io, "_bounded_directory_names", observed_bounded_names)
+    root = _resolved(tmp_path)
+    root.chmod(0o700)
+    final = root / "sync-overflow-rejected"
+    run: PrivateRun | None = None
+    stage: Path | None = None
+    payloads: list[Path] = []
+
+    with pytest.raises(EnronPrivateIOError, match="could not be cleaned up safely"):
+        with PrivateRun(final, allow_unignored_output=True) as active_run:
+            run = active_run
+            stage = run.stage_dir
+            for phase in ("one", "two"):
+                phase_root = run.ensure_directory(Path("phases") / phase)
+                payload = phase_root / "secret.bin"
+                payload.write_bytes(f"private-{phase}".encode())
+                payload.chmod(0o600)
+                payloads.append(payload)
+                assert run.pin_cleanup_tree(Path("phases") / phase) == 1
+            run.commit()
+
+    assert run is not None and stage is not None
+    assert maximum_counter == limit + 1
+    assert run.promoted is False
+    assert run.cleanup_sensitive_content_wiped is False
+    assert run.cleanup_path_tree_removed is False
+    assert run.cleanup_tombstone_count == 0
+    assert not final.exists()
+    assert not (stage / enron_private_io._COMMIT_MARKER).exists()  # noqa: SLF001
+    assert [payload.read_bytes() for payload in payloads] == [b"", b""]
+
+
+def test_phase_relative_depth_that_exceeds_stage_root_bound_is_rejected_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_DEPTH", 3)
+    monkeypatch.setattr(enron_private_io, "_MAX_PRIVATE_TREE_ENTRIES", 64)
+    root = _resolved(tmp_path)
+    root.chmod(0o700)
+    final = root / "aggregate-depth-rejected"
+    stage: Path | None = None
+    payload: Path | None = None
+
+    with pytest.raises(EnronPrivateIOError):
+        with PrivateRun(final, allow_unignored_output=True) as run:
+            stage = run.stage_dir
+            nested = run.ensure_directory(Path("phases") / "one" / "level-0" / "level-1")
+            payload = nested / "secret.bin"
+            payload.write_bytes(b"private-depth")
+            payload.chmod(0o600)
+            assert run.pin_cleanup_tree(Path("phases") / "one") == 1
+            run.commit()
+
+    assert stage is not None and payload is not None
+    assert not final.exists()
+    assert not (stage / enron_private_io._COMMIT_MARKER).exists()  # noqa: SLF001
+    assert payload.read_bytes() == b""
 
 
 def test_pin_cleanup_tree_adopts_direct_writer_files_once_and_wipes_moved_inode(tmp_path: Path) -> None:
@@ -904,6 +1208,8 @@ def test_retained_cleanup_authority_keeps_failed_descriptor_for_retry(
     monkeypatch.setattr(enron_private_io, "_wipe_authenticated_cleanup_descriptor", original)
     assert run.wipe_retained_cleanup_authority() is True
     assert run.cleanup_authority_retained is False
+    assert run.cleanup_authority_wiped is True
+    assert run.cleanup_tombstone_count == 0
     assert (final / "first.txt").read_bytes() == b""
     assert (final / "second.txt").read_bytes() == b""
 
@@ -2037,6 +2343,542 @@ def test_cleanup_tombstone_remains_inside_the_validated_git_ignore_boundary(tmp_
     assert (tombstone / "private-name.txt").read_bytes() == b""
 
 
+def test_prevalidated_private_run_and_cleanup_are_subprocess_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / ".private" / "run"
+    final.parent.mkdir(mode=0o700)
+    stage_token = "a" * 24
+    stage = final.parent / f".{final.name}.stage-{stage_token}"
+    assert ensure_private_output_allowed(final) == final
+    assert ensure_private_output_allowed(stage) == stage
+    boundary = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=False,
+    )
+    run = PrivateRun(final, stage_token=stage_token, cleanup_boundary=boundary)
+    run.__enter__()
+    monkeypatch.setattr(
+        enron_private_io.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("prevalidated private I/O attempted to spawn a subprocess"),
+    )
+
+    with run.open_text("private-name.txt") as handle:
+        handle.write("private")
+    failure = RuntimeError("stop")
+    run.__exit__(RuntimeError, failure, None)
+
+    tombstone = next(final.parent.glob(".nerb-cleanup-*"))
+    assert (tombstone / "private-name.txt").read_bytes() == b""
+
+
+def test_cleanup_boundary_rejects_exact_only_ignore_rules(tmp_path: Path) -> None:
+    stage_token = "a" * 24
+    root = _git_workspace(
+        tmp_path,
+        ignore=f"/private/run\n/private/.run.stage-{stage_token}\n",
+    )
+    final = root / "private" / "run"
+    final.parent.mkdir(mode=0o700)
+    stage = final.parent / f".{final.name}.stage-{stage_token}"
+    assert ensure_private_output_allowed(final) == final
+    assert ensure_private_output_allowed(stage) == stage
+
+    with pytest.raises(EnronPrivateIOError, match="must be ignored"):
+        enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+            final,
+            workspace_root=None,
+            allow_unignored_output=False,
+        )
+
+
+def test_cleanup_boundary_rejects_escape_hatch_to_strict_policy_replay(tmp_path: Path) -> None:
+    stage_token = "a" * 24
+    root = _git_workspace(
+        tmp_path,
+        ignore=f"/private/run\n/private/.run.stage-{stage_token}\n",
+    )
+    final = root / "private" / "run"
+    final.parent.mkdir(mode=0o700)
+    boundary = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=True,
+    )
+
+    with pytest.raises(EnronPrivateIOError, match="policy or identity"):
+        PrivateRun(
+            final,
+            stage_token=stage_token,
+            allow_unignored_output=False,
+            cleanup_boundary=boundary,
+        )
+
+
+def test_cleanup_boundary_rejects_strict_to_escape_hatch_policy_replay(tmp_path: Path) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / ".private" / "run"
+    final.parent.mkdir(mode=0o700)
+    boundary = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=False,
+    )
+
+    with pytest.raises(EnronPrivateIOError, match="policy or identity"):
+        PrivateRun(final, allow_unignored_output=True, cleanup_boundary=boundary)
+
+
+def test_cleanup_boundary_rejects_direct_construction_and_unregistered_clone(tmp_path: Path) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / ".private" / "run"
+    final.parent.mkdir(mode=0o700)
+    boundary_type = enron_private_io._PrevalidatedCleanupBoundary  # noqa: SLF001
+
+    with pytest.raises(EnronPrivateIOError, match="only be created by prevalidation"):
+        boundary_type()
+    assert not hasattr(boundary_type, "_mint")
+    assert not hasattr(enron_private_io, "_CLEANUP_BOUNDARY_PROVENANCE")  # noqa: SLF001
+
+    valid = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=False,
+    )
+    forged = object.__new__(boundary_type)
+    for field in (
+        "parent",
+        "device",
+        "inode",
+        "owner",
+        "mode",
+        "requested_workspace_root",
+        "effective_workspace_root",
+        "allow_unignored_output",
+        "strict_parent_ignored",
+    ):
+        object.__setattr__(forged, field, getattr(valid, field))
+
+    with pytest.raises(EnronPrivateIOError, match="policy or identity|boundary is invalid"):
+        PrivateRun(final, cleanup_boundary=forged)
+
+
+def test_cleanup_boundary_rejects_changed_effective_workspace(tmp_path: Path) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / ".private" / "run"
+    final.parent.mkdir(mode=0o700)
+    valid = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=False,
+    )
+    run = PrivateRun(final, cleanup_boundary=valid)
+    object.__setattr__(valid, "effective_workspace_root", root.parent)
+
+    with pytest.raises(EnronPrivateIOError, match="policy or identity"):
+        run.__enter__()
+
+
+def test_cleanup_boundary_rejects_safe_parent_mode_drift_before_entry(tmp_path: Path) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / ".private" / "run"
+    final.parent.mkdir(mode=0o700)
+    boundary = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=False,
+    )
+    run = PrivateRun(final, cleanup_boundary=boundary)
+    final.parent.chmod(0o1700)
+
+    try:
+        with pytest.raises(EnronPrivateIOError, match="policy or identity"):
+            run.__enter__()
+    finally:
+        final.parent.chmod(0o700)
+
+    assert not list(final.parent.glob(".run.stage-*"))
+    assert not list(final.parent.glob(".nerb-cleanup-*"))
+
+
+def test_promoted_cleanup_rejects_cross_policy_boundary_replay(tmp_path: Path) -> None:
+    stage_token = "a" * 24
+    root = _git_workspace(
+        tmp_path,
+        ignore=f"/private/run\n/private/.run.stage-{stage_token}\n",
+    )
+    final = root / "private" / "run"
+    final.parent.mkdir(mode=0o700)
+    boundary = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=True,
+    )
+    final.mkdir(mode=0o700)
+    private_file = final / "private-name.txt"
+    private_file.write_bytes(b"private")
+    private_file.chmod(0o600)
+    parent_fd = os.open(final.parent, enron_private_io._directory_open_flags())  # noqa: SLF001
+    directory_fd = os.open(final, enron_private_io._directory_open_flags())  # noqa: SLF001
+    identity = final.stat().st_dev, final.stat().st_ino
+    try:
+        with pytest.raises(EnronPrivateIOError, match="policy or identity"):
+            enron_private_io._wipe_and_quarantine_pinned_private_directory(  # noqa: SLF001
+                directory_fd,
+                parent_fd,
+                final.parent,
+                final.name,
+                identity,
+                workspace_root=None,
+                allow_unignored_output=False,
+                cleanup_boundary=boundary,
+                effective_workspace_root=root,
+            )
+    finally:
+        os.close(directory_fd)
+        os.close(parent_fd)
+
+    assert private_file.read_bytes() == b""
+    assert not list(final.parent.glob(".nerb-cleanup-*"))
+
+
+@pytest.mark.parametrize("invalid_policy", ["false", 1])
+@pytest.mark.parametrize("entry_kind", ["directory", "file"])
+def test_pinned_cleanup_rejects_non_boolean_unignored_policy_without_publishing(
+    tmp_path: Path,
+    invalid_policy: object,
+    entry_kind: str,
+) -> None:
+    parent = _resolved(tmp_path / "private")
+    parent.mkdir(mode=0o700)
+    parent_fd = os.open(parent, enron_private_io._directory_open_flags())  # noqa: SLF001
+    if entry_kind == "directory":
+        entry = parent / "run"
+        entry.mkdir(mode=0o700)
+        private_file = entry / "private-customer-name.txt"
+        private_file.write_bytes(b"private")
+        private_file.chmod(0o600)
+        entry_fd = os.open(entry, enron_private_io._directory_open_flags())  # noqa: SLF001
+        cleanup = enron_private_io._wipe_and_quarantine_pinned_private_directory  # noqa: SLF001
+    else:
+        entry = parent / "private-customer-name.txt"
+        entry.write_bytes(b"private")
+        entry.chmod(0o600)
+        private_file = entry
+        entry_fd = os.open(entry, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        cleanup = enron_private_io._wipe_and_quarantine_pinned_private_file  # noqa: SLF001
+    identity = entry.stat().st_dev, entry.stat().st_ino
+    try:
+        with pytest.raises(EnronPrivateIOError, match="cleanup arguments are invalid"):
+            cleanup(
+                entry_fd,
+                parent_fd,
+                parent,
+                entry.name,
+                identity,
+                workspace_root=None,
+                allow_unignored_output=cast(Any, invalid_policy),
+            )
+    finally:
+        os.close(entry_fd)
+        os.close(parent_fd)
+
+    assert private_file.read_bytes() == b"private"
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+@pytest.mark.parametrize("entry_kind", ["directory", "file"])
+def test_pinned_cleanup_wipes_before_rejecting_an_unsafe_parent(tmp_path: Path, entry_kind: str) -> None:
+    parent = _resolved(tmp_path / "private")
+    parent.mkdir(mode=0o700)
+    parent_fd = os.open(parent, enron_private_io._directory_open_flags())  # noqa: SLF001
+    if entry_kind == "directory":
+        entry = parent / "run"
+        entry.mkdir(mode=0o700)
+        private_file = entry / "private-customer-name.txt"
+        private_file.write_bytes(b"private")
+        private_file.chmod(0o600)
+        entry_fd = os.open(entry, enron_private_io._directory_open_flags())  # noqa: SLF001
+        cleanup = enron_private_io._wipe_and_quarantine_pinned_private_directory  # noqa: SLF001
+    else:
+        entry = parent / "private-customer-name.txt"
+        entry.write_bytes(b"private")
+        entry.chmod(0o600)
+        private_file = entry
+        entry_fd = os.open(entry, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        cleanup = enron_private_io._wipe_and_quarantine_pinned_private_file  # noqa: SLF001
+    identity = entry.stat().st_dev, entry.stat().st_ino
+    parent.chmod(0o755)
+    try:
+        with pytest.raises(EnronPrivateIOError, match="parent is unsafe"):
+            cleanup(
+                entry_fd,
+                parent_fd,
+                parent,
+                entry.name,
+                identity,
+                workspace_root=None,
+                allow_unignored_output=True,
+            )
+    finally:
+        os.close(entry_fd)
+        os.close(parent_fd)
+        parent.chmod(0o700)
+
+    assert private_file.read_bytes() == b""
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+@pytest.mark.parametrize("entry_kind", ["directory", "file"])
+def test_pinned_cleanup_wipes_before_rejecting_a_closed_parent_descriptor(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    parent = _resolved(tmp_path / "private")
+    parent.mkdir(mode=0o700)
+    parent_fd = os.open(parent, enron_private_io._directory_open_flags())  # noqa: SLF001
+    if entry_kind == "directory":
+        entry = parent / "run"
+        entry.mkdir(mode=0o700)
+        private_file = entry / "private-customer-name.txt"
+        private_file.write_bytes(b"private")
+        private_file.chmod(0o600)
+        entry_fd = os.open(entry, enron_private_io._directory_open_flags())  # noqa: SLF001
+        cleanup = enron_private_io._wipe_and_quarantine_pinned_private_directory  # noqa: SLF001
+    else:
+        entry = parent / "private-customer-name.txt"
+        entry.write_bytes(b"private")
+        entry.chmod(0o600)
+        private_file = entry
+        entry_fd = os.open(entry, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        cleanup = enron_private_io._wipe_and_quarantine_pinned_private_file  # noqa: SLF001
+    identity = entry.stat().st_dev, entry.stat().st_ino
+    os.close(parent_fd)
+
+    try:
+        with pytest.raises(EnronPrivateIOError, match="parent is unavailable after payload wipe"):
+            cleanup(
+                entry_fd,
+                parent_fd,
+                parent,
+                entry.name,
+                identity,
+                workspace_root=None,
+                allow_unignored_output=True,
+            )
+    finally:
+        os.close(entry_fd)
+
+    assert private_file.read_bytes() == b""
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+def test_pinned_directory_cleanup_rechecks_parent_mode_after_payload_wipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _resolved(tmp_path / "private")
+    parent.mkdir(mode=0o700)
+    directory = parent / "run"
+    directory.mkdir(mode=0o700)
+    private_file = directory / "private-customer-name.txt"
+    private_file.write_bytes(b"private")
+    private_file.chmod(0o600)
+    parent_fd = os.open(parent, enron_private_io._directory_open_flags())  # noqa: SLF001
+    directory_fd = os.open(directory, enron_private_io._directory_open_flags())  # noqa: SLF001
+    identity = directory.stat().st_dev, directory.stat().st_ino
+    original_clear = enron_private_io._clear_pinned_private_directory  # noqa: SLF001
+
+    def clear_then_widen(directory_descriptor: int, directory_path: Path, **kwargs: Any) -> bool:
+        cleared = original_clear(directory_descriptor, directory_path, **kwargs)
+        parent.chmod(0o755)
+        return cleared
+
+    monkeypatch.setattr(enron_private_io, "_clear_pinned_private_directory", clear_then_widen)
+    try:
+        with pytest.raises(EnronPrivateIOError, match="parent changed before quarantine"):
+            enron_private_io._wipe_and_quarantine_pinned_private_directory(  # noqa: SLF001
+                directory_fd,
+                parent_fd,
+                parent,
+                directory.name,
+                identity,
+                workspace_root=None,
+                allow_unignored_output=True,
+            )
+    finally:
+        os.close(directory_fd)
+        os.close(parent_fd)
+        parent.chmod(0o700)
+
+    assert private_file.read_bytes() == b""
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+def test_pinned_file_cleanup_rechecks_parent_mode_after_payload_wipe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = _resolved(tmp_path / "private")
+    parent.mkdir(mode=0o700)
+    private_file = parent / "private-customer-name.txt"
+    private_file.write_bytes(b"private")
+    private_file.chmod(0o600)
+    parent_fd = os.open(parent, enron_private_io._directory_open_flags())  # noqa: SLF001
+    file_fd = os.open(private_file, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    identity = private_file.stat().st_dev, private_file.stat().st_ino
+    original_fsync = enron_private_io.os.fsync
+    widened = False
+
+    def fsync_then_widen(descriptor: int) -> None:
+        nonlocal widened
+        original_fsync(descriptor)
+        if descriptor == file_fd and not widened:
+            widened = True
+            parent.chmod(0o755)
+
+    monkeypatch.setattr(enron_private_io.os, "fsync", fsync_then_widen)
+    try:
+        with pytest.raises(EnronPrivateIOError, match="parent changed before quarantine"):
+            enron_private_io._wipe_and_quarantine_pinned_private_file(  # noqa: SLF001
+                file_fd,
+                parent_fd,
+                parent,
+                private_file.name,
+                identity,
+                workspace_root=None,
+                allow_unignored_output=True,
+            )
+    finally:
+        os.close(file_fd)
+        os.close(parent_fd)
+        parent.chmod(0o700)
+
+    assert widened is True
+    assert private_file.read_bytes() == b""
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+def test_prevalidated_cleanup_rejects_an_ignored_parent_moved_to_an_unignored_path(tmp_path: Path) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / ".private" / "run"
+    final.parent.mkdir(mode=0o700)
+    boundary = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=False,
+    )
+    run = PrivateRun(final, cleanup_boundary=boundary)
+    run.__enter__()
+    with run.open_text("private-customer-name.txt") as handle:
+        handle.write("private")
+    moved_parent = root / "public-output"
+    final.parent.rename(moved_parent)
+
+    failure = RuntimeError("stop")
+    with pytest.raises(EnronPrivateIOError, match="cleaned up safely"):
+        run.__exit__(RuntimeError, failure, None)
+
+    assert not list(moved_parent.glob(".nerb-cleanup-*"))
+    moved_stage = next(moved_parent.glob(".run.stage-*"))
+    assert (moved_stage / "private-customer-name.txt").read_bytes() == b""
+    ignored = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "-q", str(moved_stage)],
+        check=False,
+    )
+    assert ignored.returncode == 1
+
+
+def test_private_run_rejects_unchanged_non_private_parent_before_allocation(tmp_path: Path) -> None:
+    parent = _resolved(tmp_path / "public-parent")
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o755)
+
+    with pytest.raises(EnronPrivateIOError, match="parent is unsafe"):
+        PrivateRun(parent / "run", allow_unignored_output=True).__enter__()
+
+    assert not list(parent.glob(".run.stage-*"))
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+def test_private_run_accepts_unchanged_owner_only_sticky_parent(tmp_path: Path) -> None:
+    parent = _resolved(tmp_path / "private-sticky-parent")
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o1700)
+    run = PrivateRun(parent / "run", allow_unignored_output=True)
+    run.__enter__()
+    with run.open_text("private-customer-name.txt") as handle:
+        handle.write("private")
+
+    failure = RuntimeError("stop")
+    run.__exit__(RuntimeError, failure, None)
+
+    tombstone = next(parent.glob(".nerb-cleanup-*"))
+    assert (tombstone / "private-customer-name.txt").read_bytes() == b""
+
+
+def test_private_run_accepts_pinned_sticky_shared_parent(tmp_path: Path) -> None:
+    parent = _resolved(tmp_path / "shared-sticky-parent")
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o1777)
+    parent_info = parent.lstat()
+    run = PrivateRun(
+        parent / "run",
+        allow_unignored_output=True,
+        expected_parent_identity=(int(parent_info.st_dev), int(parent_info.st_ino)),
+    )
+    run.__enter__()
+    with run.open_text("private-customer-name.txt") as handle:
+        handle.write("private")
+
+    failure = RuntimeError("stop")
+    run.__exit__(RuntimeError, failure, None)
+
+    tombstone = next(parent.glob(".nerb-cleanup-*"))
+    assert stat.S_IMODE(tombstone.stat().st_mode) == 0o700
+    assert (tombstone / "private-customer-name.txt").read_bytes() == b""
+
+
+def test_private_run_rejects_an_unpinned_sticky_shared_parent(tmp_path: Path) -> None:
+    parent = _resolved(tmp_path / "shared-sticky-parent")
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o1777)
+
+    with pytest.raises(EnronPrivateIOError, match="parent is unsafe"):
+        PrivateRun(parent / "run", allow_unignored_output=True).__enter__()
+
+    assert not list(parent.glob(".run.stage-*"))
+    assert not list(parent.glob(".nerb-cleanup-*"))
+
+
+def test_prevalidated_cleanup_rejects_parent_permission_drift(tmp_path: Path) -> None:
+    root = _git_workspace(tmp_path)
+    final = root / ".private" / "run"
+    final.parent.mkdir(mode=0o700)
+    boundary = enron_private_io._prevalidate_cleanup_boundary(  # noqa: SLF001
+        final,
+        workspace_root=None,
+        allow_unignored_output=False,
+    )
+    run = PrivateRun(final, cleanup_boundary=boundary)
+    run.__enter__()
+    with run.open_text("private-customer-name.txt") as handle:
+        handle.write("private")
+    final.parent.chmod(0o1700)
+
+    failure = RuntimeError("stop")
+    with pytest.raises(EnronPrivateIOError, match="cleaned up safely"):
+        run.__exit__(RuntimeError, failure, None)
+
+    assert not list(final.parent.glob(".nerb-cleanup-*"))
+    stage = next(final.parent.glob(".run.stage-*"))
+    assert (stage / "private-customer-name.txt").read_bytes() == b""
+
+
 def test_commit_failure_after_marker_leaves_no_partial_final(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     final = _resolved(tmp_path) / "run"
     observed_marker: list[bytes] = []
@@ -2379,9 +3221,9 @@ def test_empty_child_directory_swap_after_pinned_wipe_is_not_removed(
     stage: Path | None = None
     swapped = False
 
-    def clear_then_swap(directory_fd: int, directory_path: Path) -> bool:
+    def clear_then_swap(directory_fd: int, directory_path: Path, **kwargs: Any) -> bool:
         nonlocal swapped
-        cleared = real_clear(directory_fd, directory_path)
+        cleared = real_clear(directory_fd, directory_path, **kwargs)
         if stage is not None and directory_path.name == "child" and not swapped:
             swapped = True
             directory_path.rename(stage / "moved-child")

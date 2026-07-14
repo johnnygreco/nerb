@@ -1029,6 +1029,57 @@ def test_enron_capacity_cli_emits_only_the_closed_wall_gap_diagnostic(monkeypatc
     assert sensitive not in rejected.output
 
 
+def test_enron_capacity_cli_emits_only_the_closed_resource_gap_diagnostic(monkeypatch, tmp_path):
+    from nerb import enron_capacity
+
+    monkeypatch.setattr(enron_capacity, "_validated_capacity_bootstrap", lambda: None)
+    diagnostic = {
+        "diagnostic_kind": "resource_observation_gap",
+        "phase": "build",
+        "sample_kind": "continuous",
+        "sequence": 17,
+        "observed_resource_gap_ns": enron_capacity.MAX_RESOURCE_OBSERVATION_WALL_GAP_NS + 1,
+        "maximum_resource_gap_ns": enron_capacity.MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "acquisition_duration_ns": 11,
+        "rss_duration_ns": 7,
+        "filesystem_duration_ns": 4,
+        "acquisition_retry_count": 0,
+        "scheduler_lateness_ns": 3,
+    }
+
+    def fail_with_diagnostic(_options):
+        raise enron_capacity._error("resource_observation_gap", diagnostic=diagnostic)
+
+    monkeypatch.setattr(enron_capacity, "run_enron_capacity", fail_with_diagnostic)
+    output = tmp_path / "capacity"
+    ledger = tmp_path / "attempts"
+    result = runner.invoke(
+        app,
+        ["run-enron-capacity", "--output-dir", str(output), "--attempt-ledger-dir", str(ledger)],
+    )
+    assert result.exit_code == 1
+    assert "Diagnostic:" in result.output
+    assert '"diagnostic_kind":"resource_observation_gap"' in result.output
+    assert '"sample_kind":"continuous"' in result.output
+
+    sensitive = "/private/person@example.invalid"
+
+    def fail_with_rejected_payload(_options):
+        raise enron_capacity._error(
+            "resource_observation_gap",
+            diagnostic={**diagnostic, "path": sensitive},
+        )
+
+    monkeypatch.setattr(enron_capacity, "run_enron_capacity", fail_with_rejected_payload)
+    rejected = runner.invoke(
+        app,
+        ["run-enron-capacity", "--output-dir", str(output), "--attempt-ledger-dir", str(ledger)],
+    )
+    assert rejected.exit_code == 1
+    assert "Diagnostic:" not in rejected.output
+    assert sensitive not in rejected.output
+
+
 def test_capacity_run_verify_and_export_cli_fail_closed_without_isolated_launcher(tmp_path: Path) -> None:
     output = tmp_path / "capacity"
     ledger = tmp_path / "attempts"

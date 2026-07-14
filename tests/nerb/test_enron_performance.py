@@ -921,7 +921,7 @@ def test_source_build_worker_uses_complete_immutable_snapshot_during_source_race
         "cmu_catalog_bindings": None,
     }
     temporary_root = tmp_path / "nerb-performance-build-race"
-    temporary_root.mkdir()
+    temporary_root.mkdir(mode=0o700)
     monkeypatch.setattr(performance_module.tempfile, "gettempdir", lambda: str(tmp_path))
     projection = {"safe": True}
     monkeypatch.setattr(performance_module, "_source_build_projection", lambda _card: projection)

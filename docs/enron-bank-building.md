@@ -316,28 +316,84 @@ The tracked launcher is the only production-capacity entry. It starts with isola
 and bytecode disabled; installs a fresh private pycache prefix before importing NERB; and adds the validated worktree
 source and virtual-environment dependency roots directly. It never calls `site.addsitedir`, so `.pth`, `sitecustomize`,
 and user-site hooks are not processed. Direct `nerb run-enron-capacity`, `nerb verify-enron-capacity`, and
-`nerb export-enron-capacity` invocations fail closed outside that bootstrap.
+`nerb export-enron-capacity` invocations fail closed outside that bootstrap. For a production run, that launcher remains
+resident as the resource supervisor while a separate isolated worker executes the capacity workload.
 
 The capacity decision uses these frozen resource gates:
 
 | Resource gate | Passing requirement |
 | --- | --- |
 | Preflight free space | At least 25 GiB on each distinct output and attempt-ledger filesystem |
-| Owned and temporary high-water | At most 20 GiB |
-| Runtime free-space floor | At least 5 GiB on every monitored filesystem |
+| Observed owned and temporary high-water | At most 20 GiB |
+| Sampled runtime free-space floor | At least 5 GiB on every monitored filesystem at every completed sample |
 | Total attempt runtime | At most 4 hours |
 | Phase throughput | At least 100 source rows per second in every phase |
 | Effective RSS cap | `min(8 GiB, 75% of physical memory)` |
 | Passing observed RSS | At most 75% of the effective RSS cap |
-| Resource-observation wall gap | At most 500 ms through report write, promotion, and the promoted final-tree scan |
+| Resource acquisition duration | At most 500 ms for each complete RSS and filesystem sample |
+| Resource-observation wall gap | At most 500 ms between completed valid samples through the terminal observation |
 | Verified-work liveness gap | At most 30 seconds during every phase |
 
-Reported RSS is the maximum, under the enforced cadence, of sampled current live-process-tree RSS and a conservative
-kernel high-water bound formed from the root process maximum plus the reaped-child maximum. Those two kernel maxima may
-come from different instants, so their sum can overestimate an instantaneous tree peak; the cadence still does not claim
-to capture every transient live-tree peak. The report freezes its resource totals before report serialization. The
-terminal attempt receipt strictly extends that envelope through report fsync, final staging inspection, atomic promotion,
-and the promoted final-tree observation.
+The launcher owns the nominal 100 ms RSS and filesystem sampling loop, so workload code holding the worker interpreter's
+GIL cannot delay the sampler. A sample advances the completion-to-completion cadence only after both acquisitions validate.
+Each acquisition and each gap between completed valid samples has its own exact 500 ms fail-closed limit; a partial or
+malformed sample advances neither cadence nor the successful-observation count. Forced samples serialize with the periodic
+loop at worker checkpoints and boundaries, and the terminal sample must be acknowledged before the launcher accepts a
+successful worker response. Probe acquisition ends before sample publication, so socket backpressure cannot be
+misreported as slow RSS or filesystem measurement; publication that prevents the next completed sample still fails the
+cadence as a protocol error. Terminal success requires the final frame and clean stream EOF in both directions. Parsed,
+partial, or later bytes after either terminal frame fail closed.
+
+An acquisition over 500 ms is an invalid sample and deterministically reports `resource_acquisition_timeout` before any
+RSS, disk, cadence, runtime, terminal-leak, or fallback failure observed by that acquisition. Acquisitions completed within
+the deadline retain RSS, runtime free-disk, worker-owned disk, cadence, runtime, terminal-leak, then fallback precedence.
+
+The fresh worker binds its clean immutable HEAD, tracked-file inventory, CPU/memory facts, resource preflight, attempt
+ledger, and private-output policy before installing the process fence. An output inside a Git workspace must use a wholly
+ignored parent directory; exact rules for only the final and staging names are insufficient because fail-closed cleanup
+may retain an owner-only tombstone containing wiped filenames. The worker validates the final path and that parent, creates
+and pins the still-empty ignored stage, then installs and runtime-attests the OS process-creation fence before it preloads
+tracked workload modules, reads private corpus inputs, writes corpus-derived bytes, or starts workload code. Linux uses a
+seccomp filter that allows thread clones but rejects process creation; macOS uses a literal `deny process-fork` sandbox
+profile. The macOS API is treated as a runtime-attested platform boundary: an unavailable profile or a failed
+fork/spawn canary fails closed. Every later workload thread inherits the fence, so no workload process can detach from
+both ancestry and the isolated group. Post-fence identity checks read the cached immutable inventory and current file
+bytes without spawning; the same identity is proven against the public recorded-commit verifier before containment.
+Portable verification also binds the attested containment mode and lowercase architecture to the recorded runtime kernel
+and architecture, so a self-consistent policy from another platform cannot be relabeled as this run's evidence.
+The ignored-parent capability binds its pre-fence policy, requested and effective workspace roots, and parent identity;
+it assumes a trusted, quiescent host does not concurrently change `.gitignore`, `.git/info/exclude`, global Git excludes,
+related Git configuration, or the bound output-parent namespace before cleanup. Cleanup rechecks the public parent path,
+ownership, and owner-only mode against its pinned descriptor and fails rather than publishing a tombstone after a rename,
+substitution, or permission change. Use an output parent outside every Git workspace when the Git-policy assumption cannot
+be guaranteed.
+
+Before terminal success can reach the worker, the launcher takes one process-table snapshot containing PID, parent,
+process group, start identity, and RSS. Any remaining worker descendant or isolated-group member produces
+`worker_process_leak`. The terminal audit never signals a bare PID after a racy identity check: the frozen residual RSS
+remains part of the terminal peak, the worker retains authority to wipe the staged run and append a failed receipt, and
+the launcher performs cooperative cleanup followed by isolated process-group escalation. That later cleanup is a
+backstop, not the first point at which a leak is judged.
+
+Reported RSS covers the complete launcher-root execution tree, including the launcher observer, isolated worker, and live
+worker descendants. Each sample takes the maximum of the current live-tree reading and a conservative kernel high-water
+bound that combines launcher and worker root/reaped-child maxima. Those maxima can come from different instants and can
+overestimate an instantaneous tree peak. Sampling also cannot prove that no shorter-lived RSS spike occurred between
+observations. The report freezes its resource totals before report serialization and is explicitly pre-terminal evidence,
+not a decision by itself. The terminal attempt receipt can therefore contain a higher, deliberately conservative RSS peak,
+lower free-space reading, larger valid-sample count, or larger cadence gap after report fsync and promotion; those values
+must still satisfy the same exact resource limits bound into the report policy.
+
+Private-tree measurement stays in the workload worker rather than the 100 ms launcher sampling lane. The worker performs
+descriptor-relative exact logical-byte and privacy/inode validation at semantic checkpoints, phase and transaction
+boundaries, the final staging boundary, and the promoted final-tree boundary; verified activity additionally triggers a
+rate-limited exact scan. The reported owned-disk high-water is the maximum of those exact observations, the exact
+report-bound final size, and the sampled decrease in free space on the shared output filesystem. The filesystem delta is
+conservative when unrelated activity consumes space, but it is not an attribution of every filesystem change to NERB.
+Neither 100 ms free-space sampling nor boundary/checkpoint tree scans establish a strict high-water for a private file
+created and removed entirely between observations. The evidence therefore makes no strict transient private-tree
+high-water claim. The terminal receipt binds the exact promoted final-tree byte count, while the report retains the
+broader observed high-water used by the 20 GiB gate.
 
 The run requires the exact locked reader set (`datasets==5.0.0`, `huggingface-hub==1.23.0`, `httpx==0.28.1`,
 `fsspec==2026.4.0`, and `pyarrow==25.0.0`). It records a path-free hash of the complete installed name/version inventory
@@ -372,17 +428,81 @@ response metadata, or content. A successful wrapper close immediately drops its 
 wrapped response stream and client must prove a successful delegated close before the Hub factory and session are
 restored; cleanup then removes the installed hooks and instance close wrapper and clears adapter-owned client/stream
 references. Any close exception fails the run even if the dependency already marks the object closed. Those activity
-calls can refresh liveness frequently while synchronous resource scans remain rate-limited
-to once every 5 seconds. Production phases do not use a timer-only heartbeat, so an operation with no verified work
-signal still fails the 30-second watchdog. Long SQLite work uses the connection's VM progress handler, so index
+calls can refresh liveness frequently while activity-triggered exact private-tree scans remain rate-limited to once every
+5 seconds; the separate launcher continues RSS and filesystem sampling at its nominal 100 ms cadence. Production phases
+do not use a timer-only heartbeat, so an operation with no verified work signal still fails the 30-second watchdog. Long
+SQLite work uses the connection's VM progress handler, so index
 construction and sorted joins report executed database work without a timer thread or an inferred filesystem signal.
 The handler must be removed successfully before its connection owner closes the spool; an unproven removal fails closed.
 
-When that liveness gate fails, the CLI appends one closed aggregate diagnostic to stderr: phase, fixed failure origin,
-last accepted progress kind, rejected progress kind, last completed-record count, checkpoint and progress-signal counts,
-phase wall time, and rejected gap. It cannot contain paths, exception text, identifiers, or document-derived values.
-Attempt receipts intentionally remain code-only; capture the one-time CLI stderr diagnostic when investigating a failed
-production attempt.
+When the liveness gate fails, the CLI appends one closed aggregate diagnostic to stderr: phase, fixed failure origin, last
+accepted progress kind, rejected progress kind, last completed-record count, checkpoint and progress-signal counts, phase
+wall time, and rejected gap. A resource-observation gap instead reports only its closed sample kind, sequence, measured
+gap and limit, acquisition/component durations and retries, and scheduler lateness. Neither diagnostic can contain paths,
+exception text, identifiers, or document-derived values. Attempt receipts intentionally remain code-only; capture the
+one-time CLI stderr diagnostic when investigating a failed production attempt.
+
+Observer or worker-channel failure first asks the isolated worker watchdog to unwind through the worker's retained
+transaction and cleanup authority. The launcher allows at most one absolute 60-second cooperative-cleanup interval from
+the first failure observation; later pipe, publication, or finalization handling cannot restart that allowance. It then
+terminates any residual isolated process group and proves the group is gone before recovery reads or removes private
+state. Hard termination is only a fail-safe escalation—it cannot recreate cleanup authority in a process that did not
+cooperate—so any unproven cleanup fails the attempt rather than producing decision evidence.
+
+Before a production capacity attempt, run the same-host observer soak from the exact candidate revision:
+
+```shell
+uv sync --locked --no-default-groups --group enron-capacity --python 3.13 --reinstall-package nerb
+uv run --locked --no-default-groups --group enron-capacity --no-sync --python 3.13 \
+  python -I -S -B scripts/run_enron_capacity.py resource-observer-soak --require-decision-grade
+```
+
+`--require-decision-grade` preserves the same aggregate JSON on standard output but exits successfully only when that
+report sets `decision_grade: true`. Omit the flag for shortened smoke runs whose exit status should reflect `ok` instead.
+If the aggregate report must be retained, redirect standard output to an ignored owner-only artifact while preserving the
+script's exit status; do not pipe it through a command that can mask a failed decision gate.
+
+Its default positive case runs for 30 minutes over an owner-only synthetic tree with at least 10,000 retained files while
+also exercising SQLite, PyArrow, native Rust scans, child/grandchild churn, and repeated 850 ms intervals
+where the worker holds the GIL in C. It reports aggregate-only p50/p95/p99/max acquisition, completion-gap, scheduler,
+CPU, memory, and cleanup evidence. A separate exact 501 ms injected acquisition must produce
+`resource_acquisition_timeout` and clean teardown. Both the requested and measured positive duration must reach 30
+minutes, PyArrow must be available and complete work, every positive and negative-control gate must pass, and cleanup
+must be proven before the report can set `decision_grade: true`. The unchanged production hard gates remain 500 ms, but
+decision-grade evidence uses stricter headroom ceilings: acquisition max at most 250 ms and completion-gap max at most
+400 ms. Those bounds leave at least 250 ms of acquisition margin and one complete 100 ms nominal sampling interval of
+completion-gap margin. A run between a decision ceiling and the hard gate can remain an operationally successful smoke
+result, but it cannot authorize the next immutable production attempt. A shorter `--duration-seconds` run is useful only
+as a smoke test.
+
+Decision-grade soak evidence is also bound to the exact clean commit and tree within a trusted-quiescent-worktree
+boundary. After initialization, the launcher reads canonical source files through no-follow descriptors bound to their
+observed path identities, compares those observed bytes with their `HEAD` blobs, monitors source-file and parent-directory
+identities throughout the run, and checks them again at completion. The inventory includes the shared launcher, import
+guard, soak implementation, every importable NERB Python source, native build inputs, and active reader lock. Both isolated
+workers must attest the same observed worktree source and bootstrap identities. The aggregate policy records this boundary
+as `trusted_quiescent_worktree_observation`; it does not claim that a process can retrospectively prove the bytes Python
+compiled before the first source snapshot.
+
+A `decision_grade: true` result is valid only when the operator uses a dedicated, clean, access-controlled checkout and
+keeps its source tree and Git metadata quiescent from interpreter startup through command completion. Editors, Git
+commands, checkout automation, and other writers must not mutate that checkout during the command. A same-UID or root
+actor that can swap and restore files between observations or modify the running process is outside this threat model. If
+that assumption cannot be guaranteed, the aggregate may still diagnose the observer but must not authorize a production
+attempt. The shared launcher installs a fresh owner-only bytecode root before loading any project or dependency code,
+disables site processing and hooks, and validates the exact worktree source and virtual-environment dependency roots.
+Invoking the soak script directly remains useful for smoke investigation but is categorically ineligible for
+`decision_grade: true`.
+
+A dirty, changed, differently imported, or mismatched source tree can still support a local smoke investigation but cannot
+produce decision-grade evidence. The aggregate report also attests the interpreter major/minor, installed PyArrow version,
+path-free distribution inventory hash, exact imported module origins, and current reader-lock hash without exposing
+interpreter, package, or module paths. Decision-grade evidence requires exactly Python 3.13 and PyArrow 25.0.0; the
+imported `pyarrow`, `pyarrow.compute`, and `pyarrow.ipc` modules must be the exact files listed by that distribution under
+the validated locked virtual-environment root; and the hash of the current `pyproject.toml` plus `uv.lock` reader lock must
+match the hash of those files at `HEAD`. Use the locked sync above before the exact `--no-sync` invocation; an environment,
+bootstrap, provenance, or reader-lock mismatch remains an explicitly limited smoke result and cannot authorize the next
+immutable production attempt.
 
 The full run has one cleanup owner for its complete lifetime. Preparation, split, and bank-build transactions transfer
 their retained payload descriptors to that outer transaction before their own commit handles close. After every phase
@@ -390,13 +510,29 @@ stops its writers, the outer transaction also performs a bounded no-follow adopt
 directly by the reader or another third-party component. Cleanup authority remains live through post-promotion gates and
 durable attempt terminalization, so an in-process later failure wipes authenticated payload inodes even if a same-user
 race moved a child outside the staging tree. Before promotion, the attempt ledger durably binds the complete inode
-inventory. Crash recovery retains every reachable expected inode while wiping it. A failed authenticated wipe is moved
+inventory. Phase adoption and every later cleanup operation share one stage-rooted envelope of 1,000,000 directory entries
+and 64 levels. The whole-stage pre-promotion walk is the aggregate gate across all phase roots and reserves the final
+`COMMITTED` entry; a phase-local walk cannot make a larger aggregate tree promotable. Crash recovery wipes every reachable
+expected inode that it can authenticate through a no-follow descriptor. Linux can recover an owner-inaccessible durably
+bound output parent or output/tombstone child with `O_PATH`, verify its recorded device/inode identity, repair that inode to
+mode `0700` through the descriptor, and reopen or retain the same inode for wiping. Readable bound parents are likewise
+restored through their verified descriptor. After every process holding the directory has terminated, unprivileged macOS
+has no equivalent identity-bound permission-repair primitive; if either the bound parent or child is inaccessible,
+recovery fails without applying a name-based chmod or touching a possible substitute and cannot claim that sensitive
+content was wiped. A failed authenticated wipe is moved
 to the bounded process retry registry and blocks terminalization until verified zero; a later in-process recovery retries
 that authority before writing a receipt. Recovery reports `sensitive_content_wiped: false` when inventory or path evidence
-is incomplete, and it does not claim that an inode moved before a new recovery process opened it can be recovered without
-a live descriptor. The process-wide limit is 128 retained files. Under `RLIMIT_NOFILE`, NERB also
-reserves the maximum 64-level cleanup walk plus 8 descriptors for the file and transaction overhead (72 total);
-exceeding either bound fails closed before promotion.
+is incomplete. It also reports `false` whenever recovery retains a writable tombstone: the verified empty state cannot
+be held through the separate durable receipt commit, so recovery does not turn that transient observation into positive
+wipe evidence. Ordinary in-process cleanup applies the same rule, and the receipt writer independently rejects positive
+wipe evidence whenever a retained tombstone remains. `false` means that durable positive wipe evidence is unavailable;
+it does not assert that sensitive bytes are known to remain. Cleanup fields on failed or interrupted attempts are
+operational records rather than decision-authoritative privacy evidence. The portable artifact preserves their exact
+hash-chain bytes while explicitly listing failed-attempt cleanup and durable wipe state as not independently attested.
+Recovery does not claim that an inode moved before a new process opened it can be recovered without a
+live descriptor. The process-wide limit is 128 retained files. Under `RLIMIT_NOFILE`, NERB also reserves the maximum
+64-level cleanup walk plus 8 descriptors for file and transaction overhead (72 total). Exceeding the 128-file cap or the
+aggregate 1,000,000-entry/64-level tree envelope fails closed before promotion.
 
 `verify-portable-enron-capacity --artifact capacity-decision.json` is a clean-clone verifier. It checks closed report
 arithmetic, the full attempt hash chain, terminal cross-bindings, the measured Git commit and root tree, tracked source
