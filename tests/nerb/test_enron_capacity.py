@@ -13,6 +13,7 @@ import py_compile
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -1588,6 +1589,16 @@ def test_successful_report_has_five_closed_chained_phases_and_durable_receipt(tm
     assert report["policy"]["processed_bytes_measurement_boundary"].startswith("deterministic_logical")
     assert report["phases"][4]["commitments"]["replay_equal"] is True
     assert all(phase["commitments"]["sealed_test_accessed"] is False for phase in report["phases"])
+    assert report["gates"]["resource_acquisition_duration"] is True
+    assert (
+        report["totals"]["maximum_resource_acquisition_duration_ns"]
+        <= enron_capacity.MAX_RESOURCE_ACQUISITION_DURATION_NS
+    )
+    assert all(
+        phase["maximum_resource_acquisition_duration_ns"]
+        == max(sample["resource_acquisition_duration_ns"] for sample in phase["resource_samples"])
+        for phase in report["phases"]
+    )
     assert report["execution"]["report_measurement_boundary"] == enron_capacity._REPORT_MEASUREMENT_BOUNDARY
     assert report["execution"]["attempt_measurement_boundary"] == enron_capacity._ATTEMPT_MEASUREMENT_BOUNDARY
     assert set(report["execution"]["core_source_sha256"]) == {
@@ -1606,6 +1617,7 @@ def test_successful_report_has_five_closed_chained_phases_and_durable_receipt(tm
     assert receipts[0]["sensitive_content_wiped"] is None
     assert receipts[0]["path_tree_removed"] is None
     assert receipts[0]["retained_private_tombstone_count"] == 0
+    assert "maximum_resource_acquisition_duration_ns" not in receipts[0]
     serialized = json.dumps({"report": report, "receipts": receipts}, sort_keys=True)
     assert os.fspath(tmp_path) not in serialized
     assert "@" not in serialized
@@ -1625,6 +1637,18 @@ def test_policy_freezes_streaming_monitoring_checkpoint_and_attempt_gates() -> N
     assert policy["runtime_filesystem_acquisition_order"] == ["device", "disk", "device"]
     assert policy["darwin_process_tree_rss_timeout_ns"] == 100_000_000
     assert policy["resource_acquisition_retry_count_required"] is True
+    assert policy["maximum_resource_acquisition_duration_ns"] == 500_000_000
+    assert policy["resource_observer_workload_gil_independent_required"] is True
+    assert policy["resource_observer_included_in_measured_process_tree"] is True
+    assert policy["resource_observation_gap_semantics"] == "completed_valid_sample_to_completed_valid_sample"
+    assert policy["resource_acquisitions_serialized"] is True
+    assert policy["startup_resource_acquisition_direct_deadline_supervision"] is True
+    assert policy["terminal_resource_acquisition_bounded_by_completion_gap"] is True
+    assert policy["production_worker_cleanup_grace_ns"] == 60_000_000_000
+    assert policy["partial_resource_sample_advances_cadence"] is False
+    assert policy["private_tree_scan_in_fast_resource_lane"] is False
+    assert policy["exact_private_tree_validation_at_checkpoints_and_boundaries_required"] is True
+    assert policy["strict_transient_private_tree_high_water_claimed"] is False
     assert policy["continuous_process_tree_rss_required"] is True
     assert policy["continuous_free_disk_required"] is True
     assert policy["append_only_attempt_receipt_required"] is True
@@ -2837,6 +2861,25 @@ def test_verifier_rejects_rehashed_commitment_identity_privacy_and_replay_tamper
     _rehash_report(private)
     with pytest.raises(EnronCapacityError):
         verify_capacity_report(private, require_production=False)
+
+    acquisition_maximum = copy.deepcopy(report)
+    acquisition_maximum["phases"][0]["maximum_resource_acquisition_duration_ns"] += 1
+    _rehash_report(acquisition_maximum)
+    with pytest.raises(EnronCapacityError):
+        verify_capacity_report(acquisition_maximum, require_production=False)
+
+    acquisition_limit = copy.deepcopy(report)
+    sample = acquisition_limit["phases"][0]["resource_samples"][0]
+    sample["resource_acquisition_duration_ns"] = enron_capacity.MAX_RESOURCE_ACQUISITION_DURATION_NS + 1
+    sample["rss_acquisition_duration_ns"] = enron_capacity.MAX_RESOURCE_ACQUISITION_DURATION_NS + 1
+    sample["filesystem_acquisition_duration_ns"] = 0
+    acquisition_limit["phases"][0]["maximum_resource_acquisition_duration_ns"] = sample[
+        "resource_acquisition_duration_ns"
+    ]
+    acquisition_limit["totals"]["maximum_resource_acquisition_duration_ns"] = sample["resource_acquisition_duration_ns"]
+    _rehash_report(acquisition_limit)
+    with pytest.raises(EnronCapacityError):
+        verify_capacity_report(acquisition_limit, require_production=False)
 
 
 def test_attempt_ledger_tampering_and_report_symlink_substitution_fail_closed(tmp_path: Path) -> None:
@@ -5698,6 +5741,22 @@ def _wall_gap_diagnostic() -> dict[str, Any]:
     }
 
 
+def _resource_gap_diagnostic() -> dict[str, Any]:
+    return {
+        "diagnostic_kind": "resource_observation_gap",
+        "phase": "build",
+        "sample_kind": "continuous",
+        "sequence": 17,
+        "observed_resource_gap_ns": enron_capacity.MAX_RESOURCE_OBSERVATION_WALL_GAP_NS + 1,
+        "maximum_resource_gap_ns": enron_capacity.MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "acquisition_duration_ns": 11,
+        "rss_duration_ns": 7,
+        "filesystem_duration_ns": 4,
+        "acquisition_retry_count": 0,
+        "scheduler_lateness_ns": 3,
+    }
+
+
 def test_wall_gap_diagnostic_schema_rejects_impossible_or_sensitive_payloads() -> None:
     valid = _wall_gap_diagnostic()
     assert enron_capacity._validated_failure_diagnostic(valid) == valid
@@ -5717,6 +5776,30 @@ def test_wall_gap_diagnostic_schema_rejects_impossible_or_sensitive_payloads() -
             **valid,
             "observed_progress_gap_ns": enron_capacity.MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS,
         }
+    )
+    assert all(enron_capacity._validated_failure_diagnostic(item) is None for item in invalid)
+    assert enron_capacity._error("rss_limit", diagnostic=valid).diagnostic is None
+
+
+def test_resource_gap_diagnostic_schema_is_closed_aggregate_only() -> None:
+    valid = _resource_gap_diagnostic()
+    assert enron_capacity._validated_failure_diagnostic(valid) == valid
+    assert enron_capacity._error("resource_observation_gap", diagnostic=valid).diagnostic == valid
+
+    invalid = (
+        {**valid, "private_path": "/private/sensitive@example.invalid"},
+        {**valid, "worker_pid": 1234},
+        {**valid, "phase": "private-phase"},
+        {**valid, "sample_kind": "timer_tick"},
+        {
+            **valid,
+            "observed_resource_gap_ns": enron_capacity.MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        },
+        {**valid, "filesystem_duration_ns": 5},
+        {
+            **valid,
+            "acquisition_retry_count": 2 * enron_capacity._RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS,
+        },
     )
     assert all(enron_capacity._validated_failure_diagnostic(item) is None for item in invalid)
     assert enron_capacity._error("rss_limit", diagnostic=valid).diagnostic is None
@@ -6038,6 +6121,7 @@ def test_concurrent_heartbeats_serialize_wall_clock_reads_with_progress_state() 
     }
     monitor._current_phase = "phase"
     monitor._failure_code = None
+    monitor._latest_exact_owned = 0
     monitor._observe = lambda _kind, **_kwargs: None
     errors: list[BaseException] = []
 
@@ -6354,6 +6438,69 @@ def test_privacy_scan_is_recomputed_from_closed_projection_and_violation_count(t
     assert raised.value.code == "phase_commitment_invalid"
 
 
+def _install_fake_production_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    response: Mapping[str, Any],
+    observed: dict[str, Any] | None = None,
+    *,
+    observer_failure_code: str | None = None,
+) -> None:
+    captured = {} if observed is None else observed
+
+    class FakeProcess:
+        pid = 999_999_999
+        returncode = 0
+
+        def communicate(self, *, input: bytes, timeout: int) -> tuple[bytes, bytes]:
+            captured["input"] = input
+            captured["timeout"] = timeout
+            return enron_capacity._canonical_json_bytes(response), b""
+
+        def poll(self) -> int:
+            return 0
+
+    def fake_popen(command: list[str], **kwargs: Any) -> FakeProcess:
+        captured["command"] = command
+        captured.update(kwargs)
+        return FakeProcess()
+
+    def fake_exchange(
+        _process: FakeProcess,
+        request: bytes,
+        *,
+        timeout_seconds: int,
+        observer: Any,
+        cooperative_abort: Any,
+    ) -> bytes:
+        captured["input"] = request
+        captured["timeout"] = timeout_seconds
+        captured["observer"] = observer
+        captured["cooperative_abort"] = cooperative_abort
+        return enron_capacity._canonical_json_bytes(response)
+
+    class FakeObserver:
+        started = response.get("ok") is True
+        stop_acknowledged = response.get("ok") is True
+        failure_code = observer_failure_code
+
+        def __init__(self, endpoint: socket.socket, *_args: Any, **_kwargs: Any) -> None:
+            self.endpoint = endpoint
+
+        def start(self) -> None:
+            return None
+
+        def join(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.endpoint.close()
+
+    monkeypatch.setattr(enron_capacity.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(enron_capacity, "_LauncherResourceObserver", FakeObserver)
+    monkeypatch.setattr(enron_capacity, "_read_production_worker_response", fake_exchange)
+    monkeypatch.setattr(enron_capacity, "_terminate_worker_process_group", lambda _pid: False)
+
+
 def test_worker_discards_benign_dependency_stderr_and_validates_only_canonical_stdout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6363,18 +6510,11 @@ def test_worker_discards_benign_dependency_stderr_and_validates_only_canonical_s
     monkeypatch.setattr(
         enron_capacity,
         "_validated_capacity_bootstrap",
-        lambda: (Path.cwd() / "src", (), ()),
+        lambda: (Path.cwd() / "src", (), (), None),
     )
 
-    def fake_run(*args: Any, **kwargs: Any) -> Any:
-        observed["command"] = args[0]
-        observed.update(kwargs)
-        response = {"ok": False, "code": "production_identity_invalid", "diagnostic": None, "report": None}
-        return subprocess.CompletedProcess(
-            args[0], 0, stdout=enron_capacity._canonical_json_bytes(response), stderr=b"benign"
-        )
-
-    monkeypatch.setattr(enron_capacity.subprocess, "run", fake_run)
+    response = {"ok": False, "code": "production_identity_invalid", "diagnostic": None, "report": None}
+    _install_fake_production_worker(monkeypatch, response, observed)
     with pytest.raises(EnronCapacityError) as raised:
         enron_capacity._spawn_production_worker(_options(tmp_path))
 
@@ -6394,7 +6534,7 @@ def test_worker_response_binds_wall_gap_diagnostic_and_rejects_every_other_pairi
     monkeypatch.setattr(
         enron_capacity,
         "_validated_capacity_bootstrap",
-        lambda: (Path.cwd() / "src", (), ()),
+        lambda: (Path.cwd() / "src", (), (), None),
     )
     diagnostic = _wall_gap_diagnostic()
     response: dict[str, Any] = {
@@ -6404,10 +6544,7 @@ def test_worker_response_binds_wall_gap_diagnostic_and_rejects_every_other_pairi
         "report": None,
     }
 
-    def fake_run(*args: Any, **_kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-        return subprocess.CompletedProcess(args[0], 0, stdout=enron_capacity._canonical_json_bytes(response))
-
-    monkeypatch.setattr(enron_capacity.subprocess, "run", fake_run)
+    _install_fake_production_worker(monkeypatch, response)
     with pytest.raises(EnronCapacityError) as raised:
         enron_capacity._spawn_production_worker(_options(tmp_path, "valid-diagnostic"))
     assert raised.value.code == "checkpoint_wall_gap"
@@ -6427,6 +6564,62 @@ def test_worker_response_binds_wall_gap_diagnostic_and_rejects_every_other_pairi
         assert rejected.value.code == "production_worker_failed"
         assert rejected.value.diagnostic is None
         assert "sensitive@example.invalid" not in str(rejected.value)
+
+
+def test_worker_response_preserves_only_a_closed_resource_gap_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: Path.cwd())
+    monkeypatch.setattr(
+        enron_capacity,
+        "_validated_capacity_bootstrap",
+        lambda: (Path.cwd() / "src", (), (), None),
+    )
+    diagnostic = _resource_gap_diagnostic()
+    response: dict[str, Any] = {
+        "ok": False,
+        "code": "resource_observation_gap",
+        "diagnostic": diagnostic,
+        "report": None,
+    }
+
+    _install_fake_production_worker(monkeypatch, response)
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._spawn_production_worker(_options(tmp_path, "valid-resource-diagnostic"))
+    assert raised.value.code == "resource_observation_gap"
+    assert raised.value.diagnostic == diagnostic
+
+    response["diagnostic"] = {**diagnostic, "private_path": "/private/sensitive@example.invalid"}
+    with pytest.raises(EnronCapacityError) as rejected:
+        enron_capacity._spawn_production_worker(_options(tmp_path, "invalid-resource-diagnostic"))
+    assert rejected.value.code == "production_worker_failed"
+    assert rejected.value.diagnostic is None
+    assert "sensitive@example.invalid" not in str(rejected.value)
+
+
+def test_worker_success_cannot_hide_the_launchers_exact_first_resource_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(enron_capacity, "_git_root", lambda: Path.cwd())
+    monkeypatch.setattr(
+        enron_capacity,
+        "_validated_capacity_bootstrap",
+        lambda: (Path.cwd() / "src", (), (), None),
+    )
+    response = {"ok": True, "code": None, "diagnostic": None, "report": {}}
+    _install_fake_production_worker(
+        monkeypatch,
+        response,
+        observer_failure_code="resource_acquisition_timeout",
+    )
+
+    with pytest.raises(EnronCapacityError) as raised:
+        enron_capacity._spawn_production_worker(_options(tmp_path, "observer-first-failure"))
+
+    assert raised.value.code == "resource_acquisition_timeout"
+    assert raised.value.diagnostic is None
 
 
 @pytest.mark.parametrize(
@@ -6512,6 +6705,7 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
             os.fspath(source_root),
             "1",
             os.fspath(dependency_root),
+            "-1",
             enron_capacity._PRODUCTION_WORKER_ARGUMENT,
         ],
         check=True,
@@ -6526,7 +6720,7 @@ def test_worker_ignores_valid_divergent_colocated_bytecode(
     monkeypatch.setattr(
         enron_capacity,
         "_validated_capacity_bootstrap",
-        lambda: (source_root, (), ()),
+        lambda: (source_root, (), (), None),
     )
     with pytest.raises(EnronCapacityError) as raised:
         enron_capacity._spawn_production_worker(_options(tmp_path, f"isolated-{invalidation_mode.name.lower()}"))
@@ -6593,6 +6787,7 @@ def test_worker_import_guard_rejects_native_and_package_shadows_of_tracked_sourc
             enron_capacity._PRODUCTION_WORKER_BOOTSTRAP,
             os.fspath(source_root),
             "0",
+            "-1",
             enron_capacity._PRODUCTION_WORKER_ARGUMENT,
         ],
         check=True,
@@ -6635,6 +6830,7 @@ def test_worker_import_guard_never_falls_back_to_a_same_name_package(tmp_path: P
             enron_capacity._PRODUCTION_WORKER_BOOTSTRAP,
             os.fspath(source_root),
             "0",
+            "-1",
             enron_capacity._PRODUCTION_WORKER_ARGUMENT,
         ],
         check=False,
@@ -6698,6 +6894,7 @@ def test_worker_import_guard_fails_closed_on_disallowed_resolution_and_drift(tmp
             enron_capacity._PRODUCTION_WORKER_BOOTSTRAP,
             os.fspath(source_root),
             "0",
+            "-1",
             enron_capacity._PRODUCTION_WORKER_ARGUMENT,
         ],
         check=False,

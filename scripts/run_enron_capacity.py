@@ -146,6 +146,7 @@ def main() -> None:
                 "dependency_roots": [os.fspath(path) for path in dependency_roots],
                 "baseline_path": list(baseline_path),
                 "pycache_root": os.fspath(pycache_root),
+                "resource_observer_fd": None,
             },
         )
         supported_commands = {"run-enron-capacity", "verify-enron-capacity", "export-enron-capacity"}

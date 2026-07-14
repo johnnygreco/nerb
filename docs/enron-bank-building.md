@@ -316,28 +316,53 @@ The tracked launcher is the only production-capacity entry. It starts with isola
 and bytecode disabled; installs a fresh private pycache prefix before importing NERB; and adds the validated worktree
 source and virtual-environment dependency roots directly. It never calls `site.addsitedir`, so `.pth`, `sitecustomize`,
 and user-site hooks are not processed. Direct `nerb run-enron-capacity`, `nerb verify-enron-capacity`, and
-`nerb export-enron-capacity` invocations fail closed outside that bootstrap.
+`nerb export-enron-capacity` invocations fail closed outside that bootstrap. For a production run, that launcher remains
+resident as the resource supervisor while a separate isolated worker executes the capacity workload.
 
 The capacity decision uses these frozen resource gates:
 
 | Resource gate | Passing requirement |
 | --- | --- |
 | Preflight free space | At least 25 GiB on each distinct output and attempt-ledger filesystem |
-| Owned and temporary high-water | At most 20 GiB |
-| Runtime free-space floor | At least 5 GiB on every monitored filesystem |
+| Observed owned and temporary high-water | At most 20 GiB |
+| Sampled runtime free-space floor | At least 5 GiB on every monitored filesystem at every completed sample |
 | Total attempt runtime | At most 4 hours |
 | Phase throughput | At least 100 source rows per second in every phase |
 | Effective RSS cap | `min(8 GiB, 75% of physical memory)` |
 | Passing observed RSS | At most 75% of the effective RSS cap |
-| Resource-observation wall gap | At most 500 ms through report write, promotion, and the promoted final-tree scan |
+| Resource acquisition duration | At most 500 ms for each complete RSS and filesystem sample |
+| Resource-observation wall gap | At most 500 ms between completed valid samples through the terminal observation |
 | Verified-work liveness gap | At most 30 seconds during every phase |
 
-Reported RSS is the maximum, under the enforced cadence, of sampled current live-process-tree RSS and a conservative
-kernel high-water bound formed from the root process maximum plus the reaped-child maximum. Those two kernel maxima may
-come from different instants, so their sum can overestimate an instantaneous tree peak; the cadence still does not claim
-to capture every transient live-tree peak. The report freezes its resource totals before report serialization. The
-terminal attempt receipt strictly extends that envelope through report fsync, final staging inspection, atomic promotion,
-and the promoted final-tree observation.
+The launcher owns the nominal 100 ms RSS and filesystem sampling loop, so workload code holding the worker interpreter's
+GIL cannot delay the sampler. A sample advances the completion-to-completion cadence only after both acquisitions validate.
+Each acquisition and each gap between completed valid samples has its own exact 500 ms fail-closed limit; a partial or
+malformed sample advances neither cadence nor the successful-observation count. Forced samples serialize with the periodic
+loop at worker checkpoints and boundaries, and the terminal sample must be acknowledged before the launcher accepts a
+successful worker response. Probe acquisition ends before sample publication, so socket backpressure cannot be
+misreported as slow RSS or filesystem measurement; publication that prevents the next completed sample still fails the
+cadence as a protocol error. Terminal success requires the final frame and clean stream EOF in both directions. Parsed,
+partial, or later bytes after either terminal frame fail closed.
+
+Reported RSS covers the complete launcher-root execution tree, including the launcher observer, isolated worker, and live
+worker descendants. Each sample takes the maximum of the current live-tree reading and a conservative kernel high-water
+bound that combines launcher and worker root/reaped-child maxima. Those maxima can come from different instants and can
+overestimate an instantaneous tree peak. Sampling also cannot prove that no shorter-lived RSS spike occurred between
+observations. The report freezes its resource totals before report serialization and is explicitly pre-terminal evidence,
+not a decision by itself. The terminal attempt receipt can therefore contain a higher, deliberately conservative RSS peak,
+lower free-space reading, larger valid-sample count, or larger cadence gap after report fsync and promotion; those values
+must still satisfy the same exact resource limits bound into the report policy.
+
+Private-tree measurement stays in the workload worker rather than the 100 ms launcher sampling lane. The worker performs
+descriptor-relative exact logical-byte and privacy/inode validation at semantic checkpoints, phase and transaction
+boundaries, the final staging boundary, and the promoted final-tree boundary; verified activity additionally triggers a
+rate-limited exact scan. The reported owned-disk high-water is the maximum of those exact observations, the exact
+report-bound final size, and the sampled decrease in free space on the shared output filesystem. The filesystem delta is
+conservative when unrelated activity consumes space, but it is not an attribution of every filesystem change to NERB.
+Neither 100 ms free-space sampling nor boundary/checkpoint tree scans establish a strict high-water for a private file
+created and removed entirely between observations. The evidence therefore makes no strict transient private-tree
+high-water claim. The terminal receipt binds the exact promoted final-tree byte count, while the report retains the
+broader observed high-water used by the 20 GiB gate.
 
 The run requires the exact locked reader set (`datasets==5.0.0`, `huggingface-hub==1.23.0`, `httpx==0.28.1`,
 `fsspec==2026.4.0`, and `pyarrow==25.0.0`). It records a path-free hash of the complete installed name/version inventory
@@ -372,17 +397,40 @@ response metadata, or content. A successful wrapper close immediately drops its 
 wrapped response stream and client must prove a successful delegated close before the Hub factory and session are
 restored; cleanup then removes the installed hooks and instance close wrapper and clears adapter-owned client/stream
 references. Any close exception fails the run even if the dependency already marks the object closed. Those activity
-calls can refresh liveness frequently while synchronous resource scans remain rate-limited
-to once every 5 seconds. Production phases do not use a timer-only heartbeat, so an operation with no verified work
-signal still fails the 30-second watchdog. Long SQLite work uses the connection's VM progress handler, so index
+calls can refresh liveness frequently while activity-triggered exact private-tree scans remain rate-limited to once every
+5 seconds; the separate launcher continues RSS and filesystem sampling at its nominal 100 ms cadence. Production phases
+do not use a timer-only heartbeat, so an operation with no verified work signal still fails the 30-second watchdog. Long
+SQLite work uses the connection's VM progress handler, so index
 construction and sorted joins report executed database work without a timer thread or an inferred filesystem signal.
 The handler must be removed successfully before its connection owner closes the spool; an unproven removal fails closed.
 
-When that liveness gate fails, the CLI appends one closed aggregate diagnostic to stderr: phase, fixed failure origin,
-last accepted progress kind, rejected progress kind, last completed-record count, checkpoint and progress-signal counts,
-phase wall time, and rejected gap. It cannot contain paths, exception text, identifiers, or document-derived values.
-Attempt receipts intentionally remain code-only; capture the one-time CLI stderr diagnostic when investigating a failed
-production attempt.
+When the liveness gate fails, the CLI appends one closed aggregate diagnostic to stderr: phase, fixed failure origin, last
+accepted progress kind, rejected progress kind, last completed-record count, checkpoint and progress-signal counts, phase
+wall time, and rejected gap. A resource-observation gap instead reports only its closed sample kind, sequence, measured
+gap and limit, acquisition/component durations and retries, and scheduler lateness. Neither diagnostic can contain paths,
+exception text, identifiers, or document-derived values. Attempt receipts intentionally remain code-only; capture the
+one-time CLI stderr diagnostic when investigating a failed production attempt.
+
+Observer or worker-channel failure first asks the isolated worker watchdog to unwind through the worker's retained
+transaction and cleanup authority. The launcher allows at most one absolute 60-second cooperative-cleanup interval from
+the first failure observation; later pipe, publication, or finalization handling cannot restart that allowance. It then
+terminates any residual isolated process group and proves the group is gone before recovery reads or removes private
+state. Hard termination is only a fail-safe escalation—it cannot recreate cleanup authority in a process that did not
+cooperate—so any unproven cleanup fails the attempt rather than producing decision evidence.
+
+Before a production capacity attempt, run the same-host observer soak from the exact candidate revision:
+
+```shell
+uv run python scripts/soak_enron_resource_observer.py
+```
+
+Its default positive case runs for 30 minutes over an owner-only synthetic tree with at least 10,000 retained files while
+also exercising SQLite, PyArrow when installed, native Rust scans, child/grandchild churn, and repeated 850 ms intervals
+where the worker holds the GIL in C. It reports aggregate-only p50/p95/p99/max acquisition, completion-gap, scheduler,
+CPU, memory, and cleanup evidence. A separate exact 501 ms injected acquisition must produce
+`resource_acquisition_timeout` and clean teardown. Both the requested and measured positive duration must reach 30
+minutes, every positive and negative-control gate must pass, and cleanup must be proven before the report can set
+`decision_grade: true`. A shorter `--duration-seconds` run is useful only as a smoke test.
 
 The full run has one cleanup owner for its complete lifetime. Preparation, split, and bank-build transactions transfer
 their retained payload descriptors to that outer transaction before their own commit handles close. After every phase

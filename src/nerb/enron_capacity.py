@@ -12,6 +12,7 @@ progress, private-tree validation, and the durable attempt receipt all pass.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import importlib
@@ -22,8 +23,10 @@ import platform
 import re
 import resource
 import secrets
+import select
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -109,11 +112,17 @@ MAX_PROGRESS_SIGNALS_PER_PHASE = 2_048
 MAX_RESOURCE_SAMPLES_PER_PHASE = 256
 PRODUCTION_MONITOR_INTERVAL_NS = 100_000_000
 MAX_RESOURCE_OBSERVATION_WALL_GAP_NS = 500_000_000
+MAX_RESOURCE_ACQUISITION_DURATION_NS = 500_000_000
+RESOURCE_OBSERVER_START_TIMEOUT_NS = 5_000_000_000
+RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS = 2_000_000_000
+PRODUCTION_WORKER_CLEANUP_GRACE_NS = 60_000_000_000
+MAX_RESOURCE_OBSERVER_FRAME_BYTES = 4 * 1024
 _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS = 3
 _DARWIN_PS_TIMEOUT_SECONDS = 0.1
 MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS = 30_000_000_000
-ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS = 5_000_000_000
+ACTIVITY_PRIVATE_TREE_VALIDATION_INTERVAL_NS = 5_000_000_000
 MAX_CAPACITY_REPORT_BYTES = 4 * 1024 * 1024
+MAX_PRODUCTION_WORKER_RESPONSE_BYTES = MAX_CAPACITY_REPORT_BYTES + 64 * 1024
 MAX_ATTEMPT_RECEIPT_BYTES = 64 * 1024
 MAX_INFLIGHT_RECORD_BYTES = 16 * 1024
 MAX_PRIVATE_TREE_ENTRIES = 1_000_000
@@ -161,6 +170,7 @@ _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES = 512 * 1024 + len(CAPACITY_PHASES) 
 assert _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES < MAX_CAPACITY_REPORT_BYTES
 _PRODUCTION_WORKER_ARGUMENT = "--nerb-capacity-production-worker"
 _PRODUCTION_WORKER_ENV = "NERB_CAPACITY_FRESH_WORKER"
+_RESOURCE_OBSERVER_PROTOCOL = "nerb.enron_capacity.resource_observer"
 _BOOTSTRAP_ATTRIBUTE = "_nerb_capacity_bootstrap"
 _BOOTSTRAP_SCHEMA = "nerb.enron_capacity.bootstrap.v1"
 _CAPACITY_LAUNCHER_PATH = "scripts/run_enron_capacity.py"
@@ -168,6 +178,7 @@ _PRODUCTION_WORKER_BOOTSTRAP = (
     "import importlib.machinery,importlib.util,os,sys;"
     "source=sys.argv.pop(1);count=int(sys.argv.pop(1));"
     "roots=[sys.argv.pop(1) for _ in range(count)];"
+    "observer_fd=int(sys.argv.pop(1));"
     "baseline=list(sys.path);"
     "path=os.path.join(source,'nerb','_capacity_bootstrap.py');"
     "loader=importlib.machinery.SourceFileLoader('_nerb_capacity_bootstrap_impl',path);"
@@ -177,7 +188,7 @@ _PRODUCTION_WORKER_BOOTSTRAP = (
     "sys.path[:]=[*baseline,*roots,source];"
     "setattr(sys,'_nerb_capacity_bootstrap',"
     "{'schema':'nerb.enron_capacity.bootstrap.v1','source_root':source,'dependency_roots':roots,"
-    "'baseline_path':baseline,'pycache_root':sys.pycache_prefix});"
+    "'baseline_path':baseline,'pycache_root':sys.pycache_prefix,'resource_observer_fd':observer_fd});"
     "sys.exit(module.run(source) "
     "if sys.argv==[sys.argv[0],'--nerb-capacity-production-worker'] else 2)"
 )
@@ -300,6 +311,7 @@ _ERROR_MESSAGES = {
     "checkpoint_limit": "Capacity phase exceeds its checkpoint limit.",
     "checkpoint_wall_gap": "Capacity phase progress-checkpoint wall gap exceeds the frozen limit.",
     "resource_observation_gap": "Capacity resource-observation wall gap exceeds the frozen limit.",
+    "resource_acquisition_timeout": "Capacity resource acquisition exceeds the frozen limit.",
     "watchdog_unsupported": "Capacity watchdog interruption is unsupported.",
     "rss_limit": "Capacity process-tree RSS exceeds the frozen limit.",
     "runtime_disk_floor": "Capacity filesystem free space fell below the frozen abort floor.",
@@ -327,6 +339,7 @@ _ERROR_MESSAGES = {
     "runtime_filesystem_changed": "Capacity owned or evidence filesystem identity changed during execution.",
     "decision_invalid": "Capacity decision evidence is invalid.",
     "production_worker_failed": "Capacity production worker failed safely.",
+    "worker_process_leak": "Capacity worker descendants remained live at the terminal boundary.",
     "portable_decision_invalid": "Portable capacity decision evidence is invalid.",
     "portable_write_failed": "Portable capacity decision evidence could not be written safely.",
 }
@@ -368,9 +381,65 @@ _FAILURE_ATTEMPT_BY_ORIGIN = {
     "activity_call": "activity",
     "phase_finish": "phase_finish",
 }
+_RESOURCE_FAILURE_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "diagnostic_kind",
+        "phase",
+        "sample_kind",
+        "sequence",
+        "observed_resource_gap_ns",
+        "maximum_resource_gap_ns",
+        "acquisition_duration_ns",
+        "rss_duration_ns",
+        "filesystem_duration_ns",
+        "acquisition_retry_count",
+        "scheduler_lateness_ns",
+    }
+)
+_RESOURCE_SAMPLE_KINDS = frozenset(
+    {"startup", "continuous", "boundary", "checkpoint", "heartbeat", "activity", "terminal"}
+)
+
+
+def _validated_resource_failure_diagnostic(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != _RESOURCE_FAILURE_DIAGNOSTIC_FIELDS:
+        return None
+    candidate = cast(dict[str, Any], value)
+    if (
+        candidate.get("diagnostic_kind") != "resource_observation_gap"
+        or (candidate.get("phase") is not None and candidate.get("phase") not in CAPACITY_PHASES)
+        or candidate.get("sample_kind") not in _RESOURCE_SAMPLE_KINDS
+        or candidate.get("maximum_resource_gap_ns") != MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+    ):
+        return None
+    for field in (
+        "sequence",
+        "observed_resource_gap_ns",
+        "maximum_resource_gap_ns",
+        "acquisition_duration_ns",
+        "rss_duration_ns",
+        "filesystem_duration_ns",
+        "acquisition_retry_count",
+        "scheduler_lateness_ns",
+    ):
+        field_value = candidate.get(field)
+        if type(field_value) is not int or field_value < 0 or field_value > _MAX_RESOURCE_INTEGER:
+            return None
+    if (
+        int(candidate["sequence"]) <= 0
+        or int(candidate["observed_resource_gap_ns"]) <= MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+        or int(candidate["rss_duration_ns"]) + int(candidate["filesystem_duration_ns"])
+        != int(candidate["acquisition_duration_ns"])
+        or int(candidate["acquisition_retry_count"]) > 2 * (_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1)
+    ):
+        return None
+    return dict(candidate)
 
 
 def _validated_failure_diagnostic(value: object) -> dict[str, Any] | None:
+    resource = _validated_resource_failure_diagnostic(value)
+    if resource is not None:
+        return resource
     if not isinstance(value, dict) or set(value) != _FAILURE_DIAGNOSTIC_FIELDS:
         return None
     candidate = cast(dict[str, Any], value)
@@ -417,7 +486,11 @@ class EnronCapacityError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.code = code
-        self.diagnostic = _validated_failure_diagnostic(diagnostic) if code == "checkpoint_wall_gap" else None
+        self.diagnostic = (
+            _validated_failure_diagnostic(diagnostic)
+            if code in {"checkpoint_wall_gap", "resource_observation_gap"}
+            else None
+        )
 
 
 class _CapacityAbort(BaseException):
@@ -425,6 +498,20 @@ class _CapacityAbort(BaseException):
 
     def __init__(self, code: str) -> None:
         self.code = code if code in _ERROR_MESSAGES else "capacity_failed"
+
+
+class _ProductionWorkerExchangeFailure(EnronCapacityError):
+    """Bounded parent/worker exchange failure with cleanup-grace state."""
+
+    def __init__(
+        self,
+        *,
+        cleanup_deadline_ns: int | None = None,
+        cleanup_grace_consumed: bool = False,
+    ) -> None:
+        super().__init__(_ERROR_MESSAGES["production_worker_failed"], code="production_worker_failed")
+        self.cleanup_deadline_ns = cleanup_deadline_ns
+        self.cleanup_grace_consumed = cleanup_grace_consumed
 
 
 class _RuntimeDiskFloor(Exception):
@@ -771,6 +858,84 @@ def _root_process_peak_rss_bytes() -> int | None:
         return None
     scale = 1 if sys.platform == "darwin" else 1024
     return (root + reaped_children) * scale
+
+
+def _worker_descendant_pids(root_pid: int) -> tuple[int, ...] | None:
+    """Return the live descendants of the isolated worker, or fail closed."""
+
+    if type(root_pid) is not int or root_pid <= 0:
+        return None
+    if sys.platform.startswith("linux"):
+        pending = [root_pid]
+        seen: set[int] = set()
+        while pending:
+            pid = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            task_root = Path("/proc") / str(pid) / "task"
+            try:
+                tasks = tuple(task_root.iterdir())
+            except FileNotFoundError:
+                if pid == root_pid:
+                    return None
+                continue
+            except OSError:
+                return None
+            if not tasks:
+                return None
+            for task in tasks:
+                try:
+                    raw_children = (task / "children").read_text(encoding="ascii", errors="strict")
+                    children = tuple(int(value) for value in raw_children.split())
+                except FileNotFoundError:
+                    continue
+                except (OSError, UnicodeError, ValueError):
+                    return None
+                if any(child <= 0 for child in children):
+                    return None
+                pending.extend(children)
+        return tuple(sorted(seen - {root_pid}))
+    if sys.platform == "darwin":
+        try:
+            completed = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,ppid="],
+                check=False,
+                capture_output=True,
+                encoding="ascii",
+                env={"LC_ALL": "C"},
+                errors="strict",
+                text=True,
+                timeout=_DARWIN_PS_TIMEOUT_SECONDS,
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            return None
+        if completed.returncode != 0:
+            return None
+        parents: dict[int, int] = {}
+        for line in completed.stdout.splitlines():
+            fields = line.split()
+            if len(fields) != 2 or any(
+                not value.isascii() or not value.isdecimal() or len(value) > len(str(_MAX_RESOURCE_INTEGER))
+                for value in fields
+            ):
+                return None
+            pid, parent = (int(value) for value in fields)
+            if pid <= 0 or parent < 0 or max(pid, parent) > _MAX_RESOURCE_INTEGER or pid in parents:
+                return None
+            parents[pid] = parent
+        if root_pid not in parents:
+            return None
+        descendants = {root_pid}
+        changed = True
+        while changed:
+            changed = False
+            for pid, parent in parents.items():
+                if pid not in descendants and parent in descendants:
+                    descendants.add(pid)
+                    changed = True
+        return tuple(sorted(descendants - {root_pid}))
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1589,12 +1754,14 @@ class _PhaseMeasurements:
     owned_peak_sample: dict[str, Any] | None = None
     minimum_free_sample: dict[str, Any] | None = None
     maximum_wall_gap_sample: dict[str, Any] | None = None
+    maximum_acquisition_sample: dict[str, Any] | None = None
     last_sample: dict[str, Any] | None = None
     last_resource_wall_ns: int | None = None
     last_progress_wall_ns: int | None = None
     last_progress_kind: str = "phase_start"
     last_activity_observation_wall_ns: int | None = None
     maximum_resource_wall_gap_ns: int = 0
+    maximum_resource_acquisition_duration_ns: int = 0
     maximum_progress_wall_gap_ns: int = 0
     checkpoints: list[dict[str, int]] | None = None
     progress_signals: list[dict[str, Any]] | None = None
@@ -1619,6 +1786,7 @@ class _Watchdog:
         self._failure_code = failure_code
         self._previous: Any = None
         self._installed = False
+        self._abort_delivered = False
 
     def install(self) -> None:
         if (
@@ -1628,6 +1796,7 @@ class _Watchdog:
         ):
             raise _error("watchdog_unsupported")
         try:
+            self._abort_delivered = False
             self._previous = signal.getsignal(signal.SIGUSR1)
             # Publish restoration authority before installing the handler.
             # If control arrives after signal.signal changes process state,
@@ -1659,9 +1828,365 @@ class _Watchdog:
                 pass
 
     def _handle(self, _signum: int, _frame: Any) -> None:
+        if self._abort_delivered:
+            return
+        self._abort_delivered = True
         code = self._failure_code()
-        if code is not None:
-            raise _CapacityAbort(code)
+        # The supervising launcher may need to request cooperative unwinding
+        # after the response pipe fails before an observer failure frame can
+        # be delivered.  SIGUSR1 is private to this isolated worker while the
+        # watchdog is installed, so an otherwise-unclassified request still
+        # aborts through the normal cleanup owner.
+        raise _CapacityAbort(code or "production_worker_failed")
+
+
+def _resource_observer_preflight_payload(preflight: _Preflight) -> dict[str, Any]:
+    return {
+        "physical_memory_bytes": preflight.physical_memory_bytes,
+        "effective_rss_cap_bytes": preflight.effective_rss_cap_bytes,
+        "maximum_peak_rss_bytes": preflight.maximum_peak_rss_bytes,
+        "preflight_process_tree_rss_bytes": preflight.preflight_process_tree_rss_bytes,
+        "preflight_free_disk_bytes": preflight.preflight_free_disk_bytes,
+        "output_preflight_free_disk_bytes": preflight.output_preflight_free_disk_bytes,
+        "preexisting_private_tombstone_count": preflight.preexisting_private_tombstone_count,
+        "filesystems": [
+            {
+                "path": os.fspath(item.probe_path),
+                "device": item.device,
+                "preflight_free_disk_bytes": item.preflight_free_disk_bytes,
+                "includes_output": item.includes_output,
+            }
+            for item in preflight.filesystems
+        ],
+    }
+
+
+class _RemoteResourceObserver:
+    """Receive launcher-timestamped samples without sharing the workload GIL."""
+
+    def __init__(
+        self,
+        monitor: _ContinuousResourceMonitor,
+        endpoint: socket.socket,
+        nonce: str,
+    ) -> None:
+        if not re.fullmatch(r"[0-9a-f]{64}", nonce):
+            raise _error("production_identity_invalid")
+        self.monitor = monitor
+        self.endpoint = endpoint
+        self.nonce = nonce
+        self.reader = _ResourceObserverFrames(endpoint)
+        self.thread = threading.Thread(target=self._loop, name="nerb-capacity-resource-observer-receiver", daemon=True)
+        self.condition = threading.Condition()
+        self.command_lock = threading.Lock()
+        self.send_lock = threading.Lock()
+        self.next_request_id = 1
+        self.expected: dict[int, str] = {}
+        self.completed: set[int] = set()
+        self.event_sequence = 0
+        self.last_valid_completed_ns: int | None = None
+        self.started = False
+        self.stop_requested = False
+        self.stopped = False
+
+    def start(self) -> None:
+        self.thread.start()
+        self.started = True
+        self._send(
+            {
+                "type": "init",
+                "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                "nonce": self.nonce,
+                "interval_ns": self.monitor.interval_ns,
+                "maximum_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+                "run_started_ns": self.monitor.run_started_ns,
+                "preflight": _resource_observer_preflight_payload(self.monitor.preflight),
+            },
+        )
+        deadline = time.monotonic_ns() + RESOURCE_OBSERVER_START_TIMEOUT_NS
+        with self.condition:
+            while self.event_sequence == 0 and self.monitor._failure_code is None:
+                remaining = deadline - time.monotonic_ns()
+                if remaining <= 0:
+                    self.monitor._record_failure("resource_measurement_failed")
+                    break
+                self.condition.wait(remaining / 1_000_000_000)
+        self.monitor.raise_if_failed()
+
+    def force(self, kind: str, *, stop: bool = False) -> None:
+        if kind not in {"boundary", "checkpoint", "heartbeat", "activity", "terminal"} or (kind == "terminal") != stop:
+            raise _error("resource_measurement_failed")
+        with self.command_lock:
+            worker_peak_rss = _root_process_peak_rss_bytes()
+            if type(worker_peak_rss) is not int or worker_peak_rss <= 0 or worker_peak_rss > _MAX_RESOURCE_INTEGER:
+                self.monitor._record_failure("resource_measurement_failed")
+                self.monitor.raise_if_failed()
+            with self.condition:
+                if not self.started or self.stopped or self.stop_requested:
+                    self.monitor._record_failure("resource_measurement_failed")
+                    self.monitor.raise_if_failed()
+                if not stop:
+                    self.monitor.raise_if_failed()
+                request_id = self.next_request_id
+                self.next_request_id += 1
+                self.expected[request_id] = kind
+                if stop:
+                    self.stop_requested = True
+            command = {
+                "type": "stop" if stop else "force",
+                "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                "nonce": self.nonce,
+                "request_id": request_id,
+                "sample_kind": kind,
+                "worker_peak_rss_bytes": worker_peak_rss,
+            }
+            if stop:
+                self._send_final(command)
+            else:
+                self._send(command)
+            deadline = time.monotonic_ns() + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+            with self.condition:
+                while request_id not in self.completed and (stop or self.monitor._failure_code is None):
+                    remaining = deadline - time.monotonic_ns()
+                    if remaining <= 0:
+                        self.monitor._record_failure("resource_measurement_failed")
+                        break
+                    self.condition.wait(remaining / 1_000_000_000)
+                self.expected.pop(request_id, None)
+        if not stop:
+            self.monitor.raise_if_failed()
+
+    def stop(self) -> None:
+        if not self.started:
+            return
+        if self.stopped:
+            if self.thread.is_alive():
+                try:
+                    self.endpoint.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+            if self.thread.is_alive():
+                self.monitor._record_failure("resource_measurement_failed")
+                raise _error("resource_measurement_failed")
+            return
+        first_error: BaseException | None = None
+        try:
+            self.force("terminal", stop=True)
+        except BaseException as exc:
+            first_error = exc
+        with self.condition:
+            self.stopped = True
+            self.condition.notify_all()
+        self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            self.monitor._record_failure("resource_measurement_failed")
+            try:
+                self.endpoint.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            if first_error is None:
+                first_error = _error("resource_measurement_failed")
+        if first_error is not None:
+            raise first_error
+
+    def _loop(self) -> None:
+        failure_notified = False
+        try:
+            while True:
+                with self.condition:
+                    if self.stopped:
+                        return
+                frames = self.reader.receive(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS)
+                if not frames:
+                    self.monitor._record_failure("resource_measurement_failed")
+                    self.monitor._watchdog.trigger()
+                    return
+                for frame_index, frame in enumerate(frames):
+                    if frame.get("type") == "observer_failure":
+                        _observer_closed(
+                            frame,
+                            {"type", "protocol", "nonce", "failure_code"},
+                        )
+                        code = frame.get("failure_code")
+                        if (
+                            frame.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+                            or frame.get("nonce") != self.nonce
+                            or code not in _ERROR_MESSAGES
+                        ):
+                            code = "resource_measurement_failed"
+                        self.monitor._record_failure(cast(str, code))
+                        self.monitor._watchdog.trigger()
+                        return
+                    self._accept_sample(frame)
+                    request_id = int(cast(int, frame.get("request_id", 0)))
+                    with self.condition:
+                        terminal_sample = self.stop_requested and request_id > 0
+                    if terminal_sample:
+                        if frame_index != len(frames) - 1 or self.reader.buffer:
+                            raise _error("resource_measurement_failed")
+                        _require_resource_observer_eof(self.reader)
+                    with self.condition:
+                        if request_id:
+                            self.completed.add(request_id)
+                        self.condition.notify_all()
+                    if terminal_sample:
+                        return
+                    if self.monitor._failure_code is not None and not failure_notified:
+                        try:
+                            self._send(
+                                {
+                                    "type": "failure_ack",
+                                    "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                                    "nonce": self.nonce,
+                                },
+                            )
+                        except EnronCapacityError:
+                            pass
+                        self.monitor._watchdog.trigger()
+                        failure_notified = True
+        except _ResourceObserverEOF:
+            with self.condition:
+                expected_eof = self.stopped
+            if not expected_eof:
+                self.monitor._record_failure("resource_measurement_failed")
+                self.monitor._watchdog.trigger()
+        except BaseException:
+            self.monitor._record_failure("resource_measurement_failed")
+            self.monitor._watchdog.trigger()
+        finally:
+            with self.condition:
+                self.condition.notify_all()
+
+    def _send(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+
+    def _send_final(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+            _shutdown_resource_observer_write(self.endpoint)
+
+    def _accept_sample(self, frame: Mapping[str, Any]) -> None:
+        _observer_closed(
+            frame,
+            {
+                "type",
+                "protocol",
+                "nonce",
+                "event_sequence",
+                "request_id",
+                "sample_kind",
+                "valid",
+                "started_wall_ns",
+                "completed_wall_ns",
+                "resource_observation_wall_gap_ns",
+                "acquisition_duration_ns",
+                "rss_duration_ns",
+                "filesystem_duration_ns",
+                "scheduler_lateness_ns",
+                "process_tree_rss_bytes",
+                "minimum_free_disk_bytes",
+                "output_free_disk_bytes",
+                "rss_retry_count",
+                "filesystem_retry_count",
+                "failure_code",
+            },
+        )
+        event_sequence = _observer_int(frame.get("event_sequence"), minimum=1)
+        request_id = _observer_int(frame.get("request_id"), minimum=0)
+        started_ns = _observer_int(frame.get("started_wall_ns"), minimum=0)
+        completed_ns = _observer_int(frame.get("completed_wall_ns"), minimum=0)
+        gap_ns = _observer_int(frame.get("resource_observation_wall_gap_ns"), minimum=0)
+        acquisition_ns = _observer_int(frame.get("acquisition_duration_ns"), minimum=0)
+        rss_duration_ns = _observer_int(frame.get("rss_duration_ns"), minimum=0)
+        filesystem_duration_ns = _observer_int(frame.get("filesystem_duration_ns"), minimum=0)
+        scheduler_lateness_ns = _observer_int(frame.get("scheduler_lateness_ns"), minimum=0)
+        rss_retries = _observer_int(frame.get("rss_retry_count"), minimum=0)
+        filesystem_retries = _observer_int(frame.get("filesystem_retry_count"), minimum=0)
+        sample_kind = frame.get("sample_kind")
+        valid = frame.get("valid")
+        failure_code = frame.get("failure_code")
+        expected_kind = self.expected.get(request_id) if request_id else None
+        if (
+            frame.get("type") != "sample"
+            or frame.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+            or frame.get("nonce") != self.nonce
+            or event_sequence != self.event_sequence + 1
+            or type(valid) is not bool
+            or sample_kind not in _RESOURCE_SAMPLE_KINDS
+            or (request_id == 0 and sample_kind not in {"startup", "continuous"})
+            or (sample_kind == "startup") != (event_sequence == 1 and request_id == 0)
+            or (request_id > 0 and expected_kind != sample_kind)
+            or completed_ns < started_ns
+            or acquisition_ns != completed_ns - started_ns
+            or rss_duration_ns + filesystem_duration_ns != acquisition_ns
+            or rss_retries >= _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS
+            or filesystem_retries >= _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS
+            or (failure_code is not None and failure_code not in _ERROR_MESSAGES)
+        ):
+            raise _error("resource_measurement_failed")
+        expected_gap = 0 if self.last_valid_completed_ns is None else completed_ns - self.last_valid_completed_ns
+        if expected_gap < 0 or gap_ns != expected_gap:
+            raise _error("clock_invalid")
+        self.event_sequence = event_sequence
+        if not valid:
+            if failure_code is None:
+                raise _error("resource_measurement_failed")
+            partial_rss = frame.get("process_tree_rss_bytes")
+            partial_minimum = frame.get("minimum_free_disk_bytes")
+            if partial_rss is not None or partial_minimum is not None:
+                trusted_rss = (
+                    self.monitor.preflight.preflight_process_tree_rss_bytes
+                    if partial_rss is None
+                    else _observer_int(partial_rss, minimum=1)
+                )
+                trusted_minimum = None if partial_minimum is None else _observer_int(partial_minimum, minimum=0)
+                self.monitor._retain_partial_resource_extrema(
+                    rss=trusted_rss,
+                    minimum_free=trusted_minimum,
+                    acquisition_retries=rss_retries + filesystem_retries,
+                )
+            self.monitor._record_failure(cast(str, failure_code))
+            return
+        rss = _observer_int(frame.get("process_tree_rss_bytes"), minimum=1)
+        minimum_free = _observer_int(frame.get("minimum_free_disk_bytes"), minimum=0)
+        output_free = _observer_int(frame.get("output_free_disk_bytes"), minimum=0)
+        expected_failure: str | None = None
+        if rss > self.monitor.preflight.maximum_peak_rss_bytes:
+            expected_failure = "rss_limit"
+        elif minimum_free < MIN_RUNTIME_FREE_DISK_BYTES:
+            expected_failure = "runtime_disk_floor"
+        elif acquisition_ns > MAX_RESOURCE_ACQUISITION_DURATION_NS:
+            expected_failure = "resource_acquisition_timeout"
+        elif gap_ns > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
+            expected_failure = "resource_observation_gap"
+        elif completed_ns - self.monitor.run_started_ns > MAX_TOTAL_RUNTIME_NS:
+            expected_failure = "runtime_limit"
+        elif sample_kind == "terminal" and failure_code in {"worker_process_leak", "resource_measurement_failed"}:
+            expected_failure = cast(str, failure_code)
+        if failure_code != expected_failure:
+            raise _error("resource_measurement_failed")
+        self.last_valid_completed_ns = completed_ns
+        self.monitor._accept_remote_resource_sample(
+            kind=cast(str, sample_kind),
+            completed_records=None,
+            wall_now=completed_ns,
+            now=completed_ns,
+            rss=rss,
+            minimum_free=minimum_free,
+            output_free=output_free,
+            rss_retries=rss_retries,
+            filesystem_retries=filesystem_retries,
+            wall_gap=gap_ns,
+            acquisition_duration_ns=acquisition_ns,
+            rss_duration_ns=rss_duration_ns,
+            filesystem_duration_ns=filesystem_duration_ns,
+            scheduler_lateness_ns=scheduler_lateness_ns,
+            failure_code=cast(str | None, failure_code),
+        )
 
 
 class _ContinuousResourceMonitor:
@@ -1676,6 +2201,8 @@ class _ContinuousResourceMonitor:
         run_started_ns: int,
         interval_ns: int,
         wall_clock: Callable[[], int],
+        resource_observer_socket: socket.socket | None = None,
+        resource_observer_nonce: str | None = None,
     ) -> None:
         self.tree = tree
         self.probe = probe
@@ -1683,6 +2210,8 @@ class _ContinuousResourceMonitor:
         self.run_started_ns = run_started_ns
         self.interval_ns = interval_ns
         self.wall_clock = wall_clock
+        if (resource_observer_socket is None) != (resource_observer_nonce is None):
+            raise _error("production_identity_invalid")
         self._lock = threading.RLock()
         self._observation_lock = threading.Lock()
         self._stop = threading.Event()
@@ -1698,18 +2227,33 @@ class _ContinuousResourceMonitor:
         self._global_minimum_free = preflight.preflight_free_disk_bytes
         self._global_owned_high_water = 0
         self._global_maximum_resource_wall_gap_ns = 0
+        self._global_maximum_resource_acquisition_duration_ns = 0
         self._global_last_resource_wall_ns: int | None = None
         self._global_last_probe_ns = run_started_ns
+        self._latest_exact_owned = 0
         self._watchdog = _Watchdog(self._current_failure_code)
+        self._remote = (
+            None
+            if resource_observer_socket is None or resource_observer_nonce is None
+            else _RemoteResourceObserver(self, resource_observer_socket, resource_observer_nonce)
+        )
 
     def start(self) -> None:
         self._watchdog.install()
-        with self._lock:
-            self._global_last_resource_wall_ns = self.wall_clock()
-        self._observe("boundary")
-        thread = threading.Thread(target=self._loop, name="nerb-capacity-resource-monitor", daemon=True)
-        self._thread = thread
-        thread.start()
+        with self._observation_lock:
+            owned = self.tree.logical_bytes()
+            with self._lock:
+                self._latest_exact_owned = owned
+                self._global_owned_high_water = max(self._global_owned_high_water, owned)
+                self._global_last_resource_wall_ns = None if self._remote is not None else self.wall_clock()
+            if self._remote is not None:
+                self._remote.start()
+                self._remote.force("boundary")
+            else:
+                self._observe_serialized("boundary", logical_owned=owned)
+                thread = threading.Thread(target=self._loop, name="nerb-capacity-resource-monitor", daemon=True)
+                self._thread = thread
+                thread.start()
 
     def stop(self) -> None:
         first_error: BaseException | None = None
@@ -1738,7 +2282,13 @@ class _ContinuousResourceMonitor:
             raise _error("monitor_shutdown_failed") from None
 
     def _shutdown_is_settled(self) -> bool:
-        return self._stopped and self._thread is None and not self._watchdog._installed
+        remote = getattr(self, "_remote", None)
+        return (
+            self._stopped
+            and self._thread is None
+            and (remote is None or (remote.stopped and not remote.thread.is_alive()))
+            and not self._watchdog._installed
+        )
 
     def _stop_once(self) -> None:
         first_error: BaseException | None = None
@@ -1773,7 +2323,11 @@ class _ContinuousResourceMonitor:
                         remember(exc)
             self._thread = None
         try:
-            self._observe("boundary")
+            remote = getattr(self, "_remote", None)
+            if remote is not None:
+                remote.stop()
+            else:
+                self._observe("boundary")
         except BaseException as exc:
             remember(exc)
         finally:
@@ -1803,7 +2357,8 @@ class _ContinuousResourceMonitor:
                 )
                 self._current_phase = phase
                 self._global_owned_high_water = max(self._global_owned_high_water, owned)
-            self._observe_serialized("boundary")
+                self._latest_exact_owned = owned
+            self._observe_serialized("boundary", logical_owned=owned)
         self.raise_if_failed()
 
     def checkpoint(self, phase: str, completed_records: int) -> None:
@@ -1853,6 +2408,7 @@ class _ContinuousResourceMonitor:
             state.last_owned = owned
             state.owned_high_water = max(state.owned_high_water, owned)
             self._global_owned_high_water = max(self._global_owned_high_water, owned)
+            self._latest_exact_owned = owned
             self._append_progress_signal(
                 state,
                 kind="checkpoint",
@@ -1860,7 +2416,7 @@ class _ContinuousResourceMonitor:
                 wall_now=wall_now,
                 wall_gap=wall_gap,
             )
-        self._observe("checkpoint", completed_records=completed_records)
+        self._observe("checkpoint", completed_records=completed_records, logical_owned=owned)
         now = _probe_monotonic_ns(self.probe)
         with self._lock:
             state = self._states[phase]
@@ -1907,7 +2463,12 @@ class _ContinuousResourceMonitor:
                 wall_gap=wall_gap,
             )
             state.last_activity_observation_wall_ns = wall_now
-        self._observe("heartbeat", completed_records=state.last_completed or None)
+            latest_exact_owned = self._latest_exact_owned
+        self._observe(
+            "heartbeat",
+            completed_records=state.last_completed or None,
+            logical_owned=latest_exact_owned,
+        )
         self.raise_if_failed()
 
     def activity(self, phase: str) -> None:
@@ -1943,7 +2504,7 @@ class _ContinuousResourceMonitor:
                 wall_gap=wall_gap,
             )
             last_observation = state.last_activity_observation_wall_ns or state.started_wall_ns
-            if wall_now - last_observation >= ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS:
+            if wall_now - last_observation >= ACTIVITY_PRIVATE_TREE_VALIDATION_INTERVAL_NS:
                 state.last_activity_observation_wall_ns = wall_now
                 observe_resources = True
                 completed_records = state.last_completed
@@ -1994,13 +2555,14 @@ class _ContinuousResourceMonitor:
     def observe_transaction_boundary(self, owned: int) -> None:
         with self._lock:
             self._global_owned_high_water = max(self._global_owned_high_water, owned)
+            self._latest_exact_owned = owned
             phase = self._current_phase
             if phase is not None:
                 state = self._states[phase]
                 state.last_owned = owned
                 state.owned_high_water = max(state.owned_high_water, owned)
         self._enforce_owned(owned)
-        self._observe("boundary")
+        self._observe("boundary", logical_owned=owned)
         self.raise_if_failed()
 
     def global_snapshot(self) -> dict[str, int]:
@@ -2012,6 +2574,7 @@ class _ContinuousResourceMonitor:
                 "minimum_free_disk_bytes": self._global_minimum_free,
                 "owned_disk_high_water_bytes": self._global_owned_high_water,
                 "maximum_resource_observation_wall_gap_ns": self._global_maximum_resource_wall_gap_ns,
+                "maximum_resource_acquisition_duration_ns": self._global_maximum_resource_acquisition_duration_ns,
             }
 
     def failure_diagnostic(self) -> dict[str, Any] | None:
@@ -2051,8 +2614,11 @@ class _ContinuousResourceMonitor:
             raise _CapacityAbort(self._failure_code)
 
     def _loop(self) -> None:
-        interval = self.interval_ns / 1_000_000_000
-        while not self._stop.wait(interval):
+        next_deadline_ns = time.monotonic_ns() + self.interval_ns
+        while True:
+            remaining_ns = max(0, next_deadline_ns - time.monotonic_ns())
+            if self._stop.wait(remaining_ns / 1_000_000_000):
+                return
             try:
                 self._observe("continuous")
             except _CapacityAbort as exc:
@@ -2061,14 +2627,41 @@ class _ContinuousResourceMonitor:
             except (KeyboardInterrupt, SystemExit, MemoryError):
                 self._record_failure("phase_interrupted")
                 return
+            next_deadline_ns += self.interval_ns
+            now_ns = time.monotonic_ns()
+            if next_deadline_ns <= now_ns:
+                next_deadline_ns = now_ns
 
-    def _observe(self, kind: str, *, completed_records: int | None = None) -> None:
+    def _observe(
+        self,
+        kind: str,
+        *,
+        completed_records: int | None = None,
+        logical_owned: int | None = None,
+    ) -> None:
         with self._observation_lock:
-            self._observe_serialized(kind, completed_records=completed_records)
+            self._observe_serialized(kind, completed_records=completed_records, logical_owned=logical_owned)
 
-    def _observe_serialized(self, kind: str, *, completed_records: int | None = None) -> None:
+    def _observe_serialized(
+        self,
+        kind: str,
+        *,
+        completed_records: int | None = None,
+        logical_owned: int | None = None,
+    ) -> None:
+        if logical_owned is None:
+            try:
+                logical_owned = self.tree.logical_bytes()
+            except EnronCapacityError as exc:
+                self._record_failure(exc.code if exc.code in _ERROR_MESSAGES else "private_tree_invalid")
+                return
+        with self._lock:
+            self._latest_exact_owned = logical_owned
+            self._global_owned_high_water = max(self._global_owned_high_water, logical_owned)
+        if self._remote is not None:
+            self._remote.force(kind)
+            return
         try:
-            logical_owned = self.tree.logical_bytes()
             now = _probe_monotonic_ns(self.probe)
             rss, rss_retries = _acquire_runtime_process_tree_rss(self.probe)
             if rss > self.preflight.maximum_peak_rss_bytes:
@@ -2112,21 +2705,105 @@ class _ContinuousResourceMonitor:
         except BaseException:
             self._record_failure("resource_measurement_failed")
             return
-        filesystem_delta = max(0, self.preflight.output_preflight_free_disk_bytes - output_disk.free)
+        try:
+            wall_now = self.wall_clock()
+        except (KeyboardInterrupt, SystemExit, MemoryError):
+            raise
+        except BaseException:
+            self._record_failure("clock_invalid")
+            return
+        self._accept_resource_sample(
+            kind=kind,
+            completed_records=completed_records,
+            logical_owned=logical_owned,
+            now=now,
+            wall_now=wall_now,
+            rss=rss,
+            minimum_free=minimum_free,
+            output_free=output_disk.free,
+            acquisition_retries=acquisition_retries,
+            provided_wall_gap=None,
+            acquisition_duration_ns=0,
+            rss_duration_ns=0,
+            filesystem_duration_ns=0,
+            scheduler_lateness_ns=0,
+            provided_failure_code=None,
+            provided_failure_code_is_authoritative=False,
+        )
+
+    def _accept_remote_resource_sample(
+        self,
+        *,
+        kind: str,
+        completed_records: int | None,
+        wall_now: int,
+        now: int,
+        rss: int,
+        minimum_free: int,
+        output_free: int,
+        rss_retries: int,
+        filesystem_retries: int,
+        wall_gap: int,
+        acquisition_duration_ns: int,
+        rss_duration_ns: int,
+        filesystem_duration_ns: int,
+        scheduler_lateness_ns: int,
+        failure_code: str | None,
+    ) -> None:
+        with self._lock:
+            logical_owned = self._latest_exact_owned
+        self._accept_resource_sample(
+            kind=kind,
+            completed_records=completed_records,
+            logical_owned=logical_owned,
+            now=now,
+            wall_now=wall_now,
+            rss=rss,
+            minimum_free=minimum_free,
+            output_free=output_free,
+            acquisition_retries=rss_retries + filesystem_retries,
+            provided_wall_gap=wall_gap,
+            acquisition_duration_ns=acquisition_duration_ns,
+            rss_duration_ns=rss_duration_ns,
+            filesystem_duration_ns=filesystem_duration_ns,
+            scheduler_lateness_ns=scheduler_lateness_ns,
+            provided_failure_code=failure_code,
+            provided_failure_code_is_authoritative=True,
+        )
+
+    def _accept_resource_sample(
+        self,
+        *,
+        kind: str,
+        completed_records: int | None,
+        logical_owned: int,
+        now: int,
+        wall_now: int,
+        rss: int,
+        minimum_free: int,
+        output_free: int,
+        acquisition_retries: int,
+        provided_wall_gap: int | None,
+        acquisition_duration_ns: int,
+        rss_duration_ns: int,
+        filesystem_duration_ns: int,
+        scheduler_lateness_ns: int,
+        provided_failure_code: str | None,
+        provided_failure_code_is_authoritative: bool,
+    ) -> None:
+        filesystem_delta = max(0, self.preflight.output_preflight_free_disk_bytes - output_free)
         owned = max(logical_owned, filesystem_delta)
         with self._lock:
-            try:
-                wall_now = self.wall_clock()
-            except (KeyboardInterrupt, SystemExit, MemoryError):
-                raise
-            except BaseException:
-                self._record_failure("clock_invalid")
-                return
             previous_global_wall = self._global_last_resource_wall_ns
             if previous_global_wall is None:
                 previous_global_wall = wall_now
             global_resource_wall_gap = wall_now - previous_global_wall
-            if now < self.run_started_ns or now < self._global_last_probe_ns or global_resource_wall_gap < 0:
+            if (
+                now < self.run_started_ns
+                or now < self._global_last_probe_ns
+                or global_resource_wall_gap < 0
+                or (provided_wall_gap is not None and provided_wall_gap != global_resource_wall_gap)
+            ):
                 self._record_failure("clock_invalid")
                 return
             self._global_last_resource_wall_ns = wall_now
@@ -2140,8 +2817,42 @@ class _ContinuousResourceMonitor:
                 self._global_maximum_resource_wall_gap_ns,
                 global_resource_wall_gap,
             )
-            if global_resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
-                self._record_failure("resource_observation_gap")
+            self._global_maximum_resource_acquisition_duration_ns = max(
+                self._global_maximum_resource_acquisition_duration_ns,
+                acquisition_duration_ns,
+            )
+            limit_failure: str | None = None
+            if rss > self.preflight.maximum_peak_rss_bytes:
+                limit_failure = "rss_limit"
+            elif minimum_free < MIN_RUNTIME_FREE_DISK_BYTES:
+                limit_failure = "runtime_disk_floor"
+            elif acquisition_duration_ns > MAX_RESOURCE_ACQUISITION_DURATION_NS:
+                limit_failure = "resource_acquisition_timeout"
+            elif global_resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
+                limit_failure = "resource_observation_gap"
+            elif owned > MAX_OWNED_DISK_BYTES:
+                limit_failure = "owned_disk_limit"
+            elif now - self.run_started_ns > MAX_TOTAL_RUNTIME_NS:
+                limit_failure = "runtime_limit"
+            if provided_failure_code_is_authoritative:
+                limit_failure = provided_failure_code or limit_failure
+            if limit_failure == "resource_observation_gap":
+                self._record_failure(
+                    limit_failure,
+                    diagnostic=self._resource_gap_diagnostic(
+                        phase=self._current_phase,
+                        kind=kind,
+                        sequence=self._global_observations,
+                        wall_gap=global_resource_wall_gap,
+                        acquisition_duration_ns=acquisition_duration_ns,
+                        rss_duration_ns=rss_duration_ns,
+                        filesystem_duration_ns=filesystem_duration_ns,
+                        acquisition_retries=acquisition_retries,
+                        scheduler_lateness_ns=scheduler_lateness_ns,
+                    ),
+                )
+            elif limit_failure is not None:
+                self._record_failure(limit_failure)
             phase = self._current_phase
             if phase is not None:
                 state = self._states[phase]
@@ -2158,6 +2869,10 @@ class _ContinuousResourceMonitor:
                     return
                 state.last_resource_wall_ns = wall_now
                 state.maximum_resource_wall_gap_ns = max(state.maximum_resource_wall_gap_ns, resource_wall_gap)
+                state.maximum_resource_acquisition_duration_ns = max(
+                    state.maximum_resource_acquisition_duration_ns,
+                    acquisition_duration_ns,
+                )
                 state.maximum_progress_wall_gap_ns = max(state.maximum_progress_wall_gap_ns, progress_wall_gap)
                 state.last_owned = owned
                 sample = {
@@ -2169,6 +2884,11 @@ class _ContinuousResourceMonitor:
                     "process_tree_rss_bytes": rss,
                     "owned_disk_bytes": owned,
                     "free_disk_bytes": minimum_free,
+                    "resource_acquisition_duration_ns": acquisition_duration_ns,
+                    "rss_acquisition_duration_ns": rss_duration_ns,
+                    "filesystem_acquisition_duration_ns": filesystem_duration_ns,
+                    "resource_acquisition_retry_count": acquisition_retries,
+                    "scheduler_lateness_ns": scheduler_lateness_ns,
                 }
                 state.peak_rss = max(state.peak_rss, rss)
                 state.minimum_free = (
@@ -2189,11 +2909,28 @@ class _ContinuousResourceMonitor:
                     state.maximum_wall_gap_sample = sample
                 else:
                     sample["resource_observation_wall_gap_ns"] = resource_wall_gap
+                if state.maximum_acquisition_sample is None or acquisition_duration_ns >= int(
+                    state.maximum_acquisition_sample["resource_acquisition_duration_ns"]
+                ):
+                    state.maximum_acquisition_sample = sample
                 if state.owned_peak_sample is None or owned >= int(state.owned_peak_sample["owned_disk_bytes"]):
                     state.owned_peak_sample = sample
                 self._retain_sample(state, sample)
                 if resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
-                    self._record_failure("resource_observation_gap")
+                    self._record_failure(
+                        "resource_observation_gap",
+                        diagnostic=self._resource_gap_diagnostic(
+                            phase=phase,
+                            kind=kind,
+                            sequence=state.observations,
+                            wall_gap=resource_wall_gap,
+                            acquisition_duration_ns=acquisition_duration_ns,
+                            rss_duration_ns=rss_duration_ns,
+                            filesystem_duration_ns=filesystem_duration_ns,
+                            acquisition_retries=acquisition_retries,
+                            scheduler_lateness_ns=scheduler_lateness_ns,
+                        ),
+                    )
                 if progress_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS:
                     self._record_progress_failure(
                         phase,
@@ -2203,14 +2940,33 @@ class _ContinuousResourceMonitor:
                         wall_now=wall_now,
                         wall_gap=progress_wall_gap,
                     )
-            if rss > self.preflight.maximum_peak_rss_bytes:
-                self._record_failure("rss_limit")
-            if minimum_free < MIN_RUNTIME_FREE_DISK_BYTES:
-                self._record_failure("runtime_disk_floor")
-            if owned > MAX_OWNED_DISK_BYTES:
-                self._record_failure("owned_disk_limit")
-            if now - self.run_started_ns > MAX_TOTAL_RUNTIME_NS:
-                self._record_failure("runtime_limit")
+
+    def _resource_gap_diagnostic(
+        self,
+        *,
+        phase: str | None,
+        kind: str,
+        sequence: int,
+        wall_gap: int,
+        acquisition_duration_ns: int,
+        rss_duration_ns: int,
+        filesystem_duration_ns: int,
+        acquisition_retries: int,
+        scheduler_lateness_ns: int,
+    ) -> dict[str, Any]:
+        return {
+            "diagnostic_kind": "resource_observation_gap",
+            "phase": phase,
+            "sample_kind": kind,
+            "sequence": sequence,
+            "observed_resource_gap_ns": wall_gap,
+            "maximum_resource_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+            "acquisition_duration_ns": acquisition_duration_ns,
+            "rss_duration_ns": rss_duration_ns,
+            "filesystem_duration_ns": filesystem_duration_ns,
+            "acquisition_retry_count": acquisition_retries,
+            "scheduler_lateness_ns": scheduler_lateness_ns,
+        }
 
     def _phase_snapshot(self, state: _PhaseMeasurements, elapsed_ns: int) -> dict[str, Any]:
         retained = list(cast(list[dict[str, Any]], state.samples))
@@ -2221,6 +2977,7 @@ class _ContinuousResourceMonitor:
             state.owned_peak_sample,
             state.minimum_free_sample,
             state.maximum_wall_gap_sample,
+            state.maximum_acquisition_sample,
             state.last_sample,
         ):
             if sample is not None and all(item["sequence"] != sample["sequence"] for item in retained):
@@ -2244,6 +3001,7 @@ class _ContinuousResourceMonitor:
             "owned_disk_high_water_bytes": state.owned_high_water,
             "minimum_free_disk_bytes": 0 if state.minimum_free is None else state.minimum_free,
             "maximum_resource_observation_wall_gap_ns": state.maximum_resource_wall_gap_ns,
+            "maximum_resource_acquisition_duration_ns": state.maximum_resource_acquisition_duration_ns,
             "maximum_progress_checkpoint_wall_gap_ns": state.maximum_progress_wall_gap_ns,
             "resource_samples": retained,
             "checkpoint_count": state.checkpoint_count,
@@ -2286,7 +3044,13 @@ class _ContinuousResourceMonitor:
         with self._lock:
             if self._failure_code is None:
                 self._failure_code = code if code in _ERROR_MESSAGES else "resource_measurement_failed"
-                self._failure_diagnostic = _validated_failure_diagnostic(diagnostic)
+                validated = _validated_failure_diagnostic(diagnostic)
+                if self._failure_code == "checkpoint_wall_gap" and validated is not None:
+                    self._failure_diagnostic = validated if "origin" in validated else None
+                elif self._failure_code == "resource_observation_gap" and validated is not None:
+                    self._failure_diagnostic = validated if validated.get("diagnostic_kind") else None
+                else:
+                    self._failure_diagnostic = None
                 newly_recorded = True
         if newly_recorded:
             self._watchdog.trigger()
@@ -2311,7 +3075,7 @@ class _ContinuousResourceMonitor:
         samples = cast(list[dict[str, Any]], state.samples)
         priorities = cast(list[int], state.sample_priorities)
         priority = int.from_bytes(hashlib.sha256(str(sequence).encode("ascii")).digest()[:8], "big")
-        reservoir_capacity = MAX_RESOURCE_SAMPLES_PER_PHASE - 64 - 6
+        reservoir_capacity = MAX_RESOURCE_SAMPLES_PER_PHASE - 64 - 7
         if len(samples) < reservoir_capacity:
             samples.append(sample)
             priorities.append(priority)
@@ -2394,6 +3158,7 @@ def capacity_policy() -> dict[str, Any]:
         "maximum_retained_resource_samples_per_phase": MAX_RESOURCE_SAMPLES_PER_PHASE,
         "production_monitor_interval_ns": PRODUCTION_MONITOR_INTERVAL_NS,
         "maximum_resource_observation_wall_gap_ns": MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "maximum_resource_acquisition_duration_ns": MAX_RESOURCE_ACQUISITION_DURATION_NS,
         "runtime_resource_acquisition_max_attempts": _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS,
         "runtime_resource_acquisition_retry_delay_ns": 0,
         "runtime_filesystem_acquisition_order": ["device", "disk", "device"],
@@ -2404,7 +3169,24 @@ def capacity_policy() -> dict[str, Any]:
         "activity_interval_at_minimum_throughput_ns": (
             ACTIVITY_RECORD_INTERVAL * 1_000_000_000 // MIN_PHASE_RECORDS_PER_SECOND
         ),
-        "activity_resource_observation_interval_ns": ACTIVITY_RESOURCE_OBSERVATION_INTERVAL_NS,
+        "activity_private_tree_validation_interval_ns": ACTIVITY_PRIVATE_TREE_VALIDATION_INTERVAL_NS,
+        "resource_observer_protocol": _RESOURCE_OBSERVER_PROTOCOL,
+        "resource_observer_role": "launcher_process_observing_complete_execution_tree",
+        "resource_observer_workload_gil_independent_required": True,
+        "resource_observer_included_in_measured_process_tree": True,
+        "resource_observation_gap_semantics": "completed_valid_sample_to_completed_valid_sample",
+        "resource_acquisitions_serialized": True,
+        "startup_resource_acquisition_direct_deadline_supervision": True,
+        "terminal_resource_acquisition_bounded_by_completion_gap": True,
+        "partial_resource_sample_advances_cadence": False,
+        "private_tree_scan_in_fast_resource_lane": False,
+        "exact_private_tree_validation_at_checkpoints_and_boundaries_required": True,
+        "owned_disk_high_water_semantics": "sampled_exact_tree_plus_shared_filesystem_free_space_delta",
+        "strict_transient_private_tree_high_water_claimed": False,
+        "resource_observer_start_timeout_ns": RESOURCE_OBSERVER_START_TIMEOUT_NS,
+        "resource_observer_command_timeout_ns": RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS,
+        "production_worker_cleanup_grace_ns": PRODUCTION_WORKER_CLEANUP_GRACE_NS,
+        "maximum_resource_observer_frame_bytes": MAX_RESOURCE_OBSERVER_FRAME_BYTES,
         "maximum_capacity_report_bytes": MAX_CAPACITY_REPORT_BYTES,
         "maximum_capacity_report_structural_bound_bytes": _MAX_CAPACITY_REPORT_STRUCTURAL_BOUND_BYTES,
         "maximum_portable_decision_bytes": MAX_PORTABLE_DECISION_BYTES,
@@ -2474,7 +3256,7 @@ def _stable_bootstrap_directory(path: Path) -> Path:
     return resolved
 
 
-def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, ...]]:
+def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, ...], int | None]:
     """Validate the stdlib-only launcher/worker import state without running site hooks."""
 
     marker = getattr(sys, _BOOTSTRAP_ATTRIBUTE, None)
@@ -2484,10 +3266,12 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
         "dependency_roots",
         "baseline_path",
         "pycache_root",
+        "resource_observer_fd",
     }:
         raise _error("production_identity_invalid")
     raw_dependencies = marker.get("dependency_roots")
     raw_baseline = marker.get("baseline_path")
+    observer_fd = marker.get("resource_observer_fd")
     if (
         marker.get("schema") != _BOOTSTRAP_SCHEMA
         or not isinstance(marker.get("source_root"), str)
@@ -2497,6 +3281,7 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
         or any(not isinstance(value, str) for value in raw_dependencies)
         or not isinstance(raw_baseline, list)
         or any(not isinstance(value, str) or not value or not Path(value).is_absolute() for value in raw_baseline)
+        or (observer_fd is not None and (type(observer_fd) is not int or observer_fd < 3))
         or not sys.flags.isolated
         or not sys.flags.no_site
         or not sys.flags.dont_write_bytecode
@@ -2559,11 +3344,869 @@ def _validated_capacity_bootstrap() -> tuple[Path, tuple[Path, ...], tuple[str, 
     if sys.path != expected_path:
         raise _error("production_identity_invalid")
     layouts = tuple(allowed_dependencies[path] for path in dependencies)
-    return source_root, dependencies, layouts
+    if observer_fd is not None:
+        try:
+            observer_info = os.fstat(observer_fd)
+        except OSError:
+            raise _error("production_identity_invalid") from None
+        if not stat.S_ISSOCK(observer_info.st_mode):
+            raise _error("production_identity_invalid")
+    return source_root, dependencies, layouts, cast(int | None, observer_fd)
+
+
+class _ResourceObserverEOF(Exception):
+    """The private observer channel closed before its protocol completed."""
+
+
+def _observer_mapping(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _error("resource_measurement_failed")
+    return cast(Mapping[str, Any], value)
+
+
+def _observer_closed(value: Mapping[str, Any], fields: set[str]) -> None:
+    if set(value) != fields:
+        raise _error("resource_measurement_failed")
+
+
+def _observer_int(value: object, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum or value > _MAX_RESOURCE_INTEGER:
+        raise _error("resource_measurement_failed")
+    return value
+
+
+class _ResourceObserverFrames:
+    """Bounded newline-frame reader for one private socket endpoint."""
+
+    def __init__(self, endpoint: socket.socket) -> None:
+        self.endpoint = endpoint
+        self.buffer = bytearray()
+
+    def receive(self, timeout_ns: int) -> list[dict[str, Any]]:
+        if type(timeout_ns) is not int or timeout_ns < 0:
+            raise _error("resource_measurement_failed")
+        try:
+            ready, _, _ = select.select([self.endpoint], [], [], timeout_ns / 1_000_000_000)
+        except (OSError, ValueError):
+            raise _error("resource_measurement_failed") from None
+        if not ready:
+            return []
+        try:
+            payload = self.endpoint.recv(MAX_RESOURCE_OBSERVER_FRAME_BYTES + 1)
+        except OSError:
+            raise _error("resource_measurement_failed") from None
+        if not payload:
+            if self.buffer:
+                raise _error("resource_measurement_failed")
+            raise _ResourceObserverEOF
+        self.buffer.extend(payload)
+        if len(self.buffer) > MAX_RESOURCE_OBSERVER_FRAME_BYTES * 2:
+            raise _error("resource_measurement_failed")
+        frames: list[dict[str, Any]] = []
+        while True:
+            try:
+                boundary = self.buffer.index(0x0A)
+            except ValueError:
+                break
+            if boundary <= 0 or boundary >= MAX_RESOURCE_OBSERVER_FRAME_BYTES:
+                raise _error("resource_measurement_failed")
+            raw = bytes(self.buffer[:boundary])
+            del self.buffer[: boundary + 1]
+            try:
+                value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+            except (UnicodeError, ValueError):
+                raise _error("resource_measurement_failed") from None
+            if not isinstance(value, dict):
+                raise _error("resource_measurement_failed")
+            frames.append(value)
+        if len(self.buffer) >= MAX_RESOURCE_OBSERVER_FRAME_BYTES:
+            raise _error("resource_measurement_failed")
+        return frames
+
+
+def _send_resource_observer_frame(endpoint: socket.socket, frame: Mapping[str, Any]) -> None:
+    try:
+        payload = _canonical_json_bytes(frame) + b"\n"
+        if len(payload) > MAX_RESOURCE_OBSERVER_FRAME_BYTES:
+            raise OSError
+        endpoint.sendall(payload)
+    except (OSError, TypeError, ValueError):
+        raise _error("resource_measurement_failed") from None
+
+
+def _shutdown_resource_observer_write(endpoint: socket.socket) -> None:
+    """Half-close one observer endpoint after its final protocol frame."""
+
+    try:
+        endpoint.shutdown(socket.SHUT_WR)
+    except OSError:
+        raise _error("resource_measurement_failed") from None
+
+
+def _require_resource_observer_eof(reader: _ResourceObserverFrames) -> None:
+    """Accept only a clean EOF after the peer's final observer frame."""
+
+    deadline_ns = time.monotonic_ns() + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+    while True:
+        if reader.buffer:
+            raise _error("resource_measurement_failed")
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            raise _error("resource_measurement_failed")
+        try:
+            frames = reader.receive(remaining_ns)
+        except _ResourceObserverEOF:
+            return
+        if frames or reader.buffer:
+            raise _error("resource_measurement_failed")
+
+
+def _observer_init_preflight(
+    frame: Mapping[str, Any],
+    *,
+    nonce: str,
+    options: EnronCapacityOptions,
+) -> tuple[_Preflight, int, int]:
+    _observer_closed(
+        frame,
+        {
+            "type",
+            "protocol",
+            "nonce",
+            "interval_ns",
+            "maximum_gap_ns",
+            "run_started_ns",
+            "preflight",
+        },
+    )
+    if (
+        frame.get("type") != "init"
+        or frame.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+        or frame.get("nonce") != nonce
+        or frame.get("interval_ns") != PRODUCTION_MONITOR_INTERVAL_NS
+        or frame.get("maximum_gap_ns") != MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+    ):
+        raise _error("resource_measurement_failed")
+    run_started_ns = _observer_int(frame.get("run_started_ns"), minimum=0)
+    raw = _observer_mapping(frame.get("preflight"))
+    _observer_closed(
+        raw,
+        {
+            "physical_memory_bytes",
+            "effective_rss_cap_bytes",
+            "maximum_peak_rss_bytes",
+            "preflight_process_tree_rss_bytes",
+            "preflight_free_disk_bytes",
+            "output_preflight_free_disk_bytes",
+            "preexisting_private_tombstone_count",
+            "filesystems",
+        },
+    )
+    numeric = {
+        key: _observer_int(raw.get(key), minimum=0)
+        for key in (
+            "physical_memory_bytes",
+            "effective_rss_cap_bytes",
+            "maximum_peak_rss_bytes",
+            "preflight_process_tree_rss_bytes",
+            "preflight_free_disk_bytes",
+            "output_preflight_free_disk_bytes",
+            "preexisting_private_tombstone_count",
+        )
+    }
+    independent_probe = _SystemResourceProbe()
+    independent_physical = independent_probe.physical_memory_bytes()
+    if type(independent_physical) is not int or independent_physical <= 0:
+        raise _error("resource_measurement_failed")
+    independent_effective_cap = min(
+        MAX_ABSOLUTE_RSS_BYTES,
+        independent_physical * PHYSICAL_MEMORY_FRACTION_NUMERATOR // PHYSICAL_MEMORY_FRACTION_DENOMINATOR,
+    )
+    independent_maximum_peak = independent_effective_cap * PEAK_RSS_FRACTION_NUMERATOR // PEAK_RSS_FRACTION_DENOMINATOR
+    if (
+        numeric["physical_memory_bytes"] != independent_physical
+        or numeric["effective_rss_cap_bytes"] != independent_effective_cap
+        or numeric["maximum_peak_rss_bytes"] != independent_maximum_peak
+        or not 0 < numeric["preflight_process_tree_rss_bytes"] <= independent_maximum_peak
+    ):
+        raise _error("resource_measurement_failed")
+    raw_filesystems = raw.get("filesystems")
+    if not isinstance(raw_filesystems, list) or not 1 <= len(raw_filesystems) <= 2:
+        raise _error("resource_measurement_failed")
+    try:
+        output_path = _absolute_private_path(options.output_dir).parent
+        ledger_path = _absolute_private_path(options.attempt_ledger_dir)
+    except EnronCapacityError:
+        raise _error("resource_measurement_failed") from None
+    output_device = independent_probe.filesystem_device(output_path)
+    ledger_device = independent_probe.filesystem_device(ledger_path)
+    if type(output_device) is not int or type(ledger_device) is not int:
+        raise _error("resource_measurement_failed")
+    expected_filesystems = (
+        {output_device: (output_path, True)}
+        if output_device == ledger_device
+        else {output_device: (output_path, True), ledger_device: (ledger_path, False)}
+    )
+    if len(raw_filesystems) != len(expected_filesystems):
+        raise _error("resource_measurement_failed")
+    filesystems: list[_FilesystemPreflight] = []
+    for item in raw_filesystems:
+        filesystem = _observer_mapping(item)
+        _observer_closed(
+            filesystem,
+            {"path", "device", "preflight_free_disk_bytes", "includes_output"},
+        )
+        raw_path = filesystem.get("path")
+        if not isinstance(raw_path, str):
+            raise _error("resource_measurement_failed")
+        try:
+            path = _absolute_private_path(Path(raw_path))
+        except EnronCapacityError:
+            raise _error("resource_measurement_failed") from None
+        includes_output = filesystem.get("includes_output")
+        if type(includes_output) is not bool:
+            raise _error("resource_measurement_failed")
+        device = _observer_int(filesystem.get("device"), minimum=0)
+        if expected_filesystems.get(device) != (path, includes_output):
+            raise _error("resource_measurement_failed")
+        filesystems.append(
+            _FilesystemPreflight(
+                device=device,
+                probe_path=path,
+                preflight_free_disk_bytes=_observer_int(filesystem.get("preflight_free_disk_bytes"), minimum=0),
+                includes_output=includes_output,
+            )
+        )
+    if sum(item.includes_output for item in filesystems) != 1 or len({item.device for item in filesystems}) != len(
+        filesystems
+    ):
+        raise _error("resource_measurement_failed")
+    preflight = _Preflight(filesystems=tuple(filesystems), **numeric)
+    return preflight, run_started_ns, cast(int, frame["interval_ns"])
+
+
+class _LauncherResourceObserver:
+    """Observe the isolated workload from the already-supervising launcher process."""
+
+    def __init__(
+        self,
+        endpoint: socket.socket,
+        *,
+        worker_pid: int,
+        nonce: str,
+        options: EnronCapacityOptions,
+    ) -> None:
+        self.endpoint = endpoint
+        self.worker_pid = worker_pid
+        self.nonce = nonce
+        self.options = options
+        self.thread = threading.Thread(target=self._run, name="nerb-capacity-launcher-resource-observer", daemon=True)
+        self.supervisor = threading.Thread(
+            target=self._supervise_deadlines,
+            name="nerb-capacity-launcher-resource-supervisor",
+            daemon=True,
+        )
+        self.send_lock = threading.Lock()
+        self.state_condition = threading.Condition()
+        self.supervision_started_ns = time.monotonic_ns()
+        self.acquisition_started_ns: int | None = None
+        self.pending_publication_completed_ns: int | None = None
+        self.last_completed_ns: int | None = None
+        self.started = False
+        self.terminal_sample_sent = False
+        self.stop_acknowledged = False
+        self.failure_code: str | None = None
+        self.failure: BaseException | None = None
+        self.failure_event = threading.Event()
+        self.failure_publication_complete = False
+        self.failure_delivery_succeeded = False
+        self._finished = threading.Event()
+
+    def start(self) -> None:
+        self.supervisor.start()
+        try:
+            self.thread.start()
+        except BaseException:
+            self._finished.set()
+            with self.state_condition:
+                self.state_condition.notify_all()
+            self.supervisor.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+            raise
+
+    def join(self) -> None:
+        if self.thread.ident is not None:
+            self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            if self._reserve_failure("resource_measurement_failed"):
+                self._finish_failure_publication(delivered=False)
+            try:
+                self.endpoint.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.thread.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.thread.is_alive():
+            raise _error("resource_measurement_failed")
+        if self.supervisor.ident is not None:
+            self.supervisor.join(RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        if self.supervisor.is_alive():
+            raise _error("resource_measurement_failed")
+
+    def close(self) -> None:
+        try:
+            self.endpoint.close()
+        except OSError:
+            pass
+
+    def _reserve_failure(self, code: str, exc: BaseException | None = None) -> bool:
+        safe_code = code if code in _ERROR_MESSAGES else "resource_measurement_failed"
+        with self.state_condition:
+            if self.failure_code is not None:
+                return False
+            self.failure_code = safe_code
+            if exc is not None:
+                self.failure = exc
+            self.failure_event.set()
+            self.state_condition.notify_all()
+            return True
+
+    def _finish_failure_publication(self, *, delivered: bool) -> None:
+        with self.state_condition:
+            self.failure_delivery_succeeded = delivered
+            self.failure_publication_complete = True
+            self.state_condition.notify_all()
+
+    def _publish_failure(
+        self,
+        code: str,
+        exc: BaseException | None = None,
+        *,
+        already_delivered: bool = False,
+    ) -> bool:
+        if not self._reserve_failure(code, exc):
+            return False
+        delivered = already_delivered
+        try:
+            if not already_delivered:
+                self._send(
+                    {
+                        "type": "observer_failure",
+                        "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                        "nonce": self.nonce,
+                        "failure_code": self.failure_code,
+                    },
+                )
+                delivered = True
+        except BaseException:
+            delivered = False
+        finally:
+            self._finish_failure_publication(delivered=delivered)
+        return True
+
+    def wait_for_failure_publication(self, timeout_ns: int) -> bool:
+        deadline_ns = time.monotonic_ns() + timeout_ns
+        with self.state_condition:
+            while self.failure_event.is_set() and not self.failure_publication_complete:
+                remaining_ns = deadline_ns - time.monotonic_ns()
+                if remaining_ns <= 0:
+                    break
+                self.state_condition.wait(remaining_ns / 1_000_000_000)
+            return self.failure_publication_complete and self.failure_delivery_succeeded
+
+    def _run(self) -> None:
+        try:
+            self._run_protocol()
+        except _ResourceObserverEOF:
+            if not self.stop_acknowledged:
+                self._publish_failure("resource_measurement_failed")
+        except BaseException as exc:
+            safe_code = (
+                exc.code
+                if isinstance(exc, EnronCapacityError) and exc.code in _ERROR_MESSAGES
+                else "resource_measurement_failed"
+            )
+            self._publish_failure(safe_code, exc)
+        finally:
+            self._finished.set()
+            with self.state_condition:
+                self.acquisition_started_ns = None
+                self.pending_publication_completed_ns = None
+                self.state_condition.notify_all()
+
+    def _send(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+
+    def _supervise_deadlines(self) -> None:
+        while not self._finished.is_set():
+            failure_code: str | None = None
+            with self.state_condition:
+                if self.failure_code is not None:
+                    return
+                if self.terminal_sample_sent:
+                    return
+                now_ns = time.monotonic_ns()
+                if self.acquisition_started_ns is not None:
+                    acquisition_deadline_ns = self.acquisition_started_ns + MAX_RESOURCE_ACQUISITION_DURATION_NS
+                    completion_deadline_ns = (
+                        acquisition_deadline_ns
+                        if self.last_completed_ns is None
+                        else self.last_completed_ns + MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+                    )
+                    deadline_ns = min(acquisition_deadline_ns, completion_deadline_ns)
+                    if now_ns > deadline_ns:
+                        failure_code = (
+                            "resource_acquisition_timeout"
+                            if acquisition_deadline_ns <= completion_deadline_ns
+                            else "resource_measurement_failed"
+                        )
+                elif self.pending_publication_completed_ns is not None:
+                    deadline_ns = self.pending_publication_completed_ns + MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+                    if now_ns > deadline_ns:
+                        failure_code = "resource_measurement_failed"
+                elif self.last_completed_ns is not None:
+                    deadline_ns = self.last_completed_ns + MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+                    if now_ns > deadline_ns:
+                        failure_code = "resource_measurement_failed"
+                else:
+                    deadline_ns = self.supervision_started_ns + RESOURCE_OBSERVER_START_TIMEOUT_NS
+                    if now_ns > deadline_ns:
+                        failure_code = "resource_measurement_failed"
+                if failure_code is None:
+                    remaining_ns = max(1, deadline_ns - now_ns + 1)
+                    self.state_condition.wait(min(remaining_ns, 10_000_000) / 1_000_000_000)
+                    continue
+            self._publish_failure(cast(str, failure_code))
+            return
+
+    def _run_protocol(self) -> None:
+        reader = _ResourceObserverFrames(self.endpoint)
+        init_deadline = time.monotonic_ns() + RESOURCE_OBSERVER_START_TIMEOUT_NS
+        init: dict[str, Any] | None = None
+        while init is None:
+            remaining = init_deadline - time.monotonic_ns()
+            if remaining <= 0:
+                raise _error("resource_measurement_failed")
+            frames = reader.receive(remaining)
+            if len(frames) > 1:
+                raise _error("resource_measurement_failed")
+            if frames:
+                init = frames[0]
+        preflight, run_started_ns, interval_ns = _observer_init_preflight(
+            init,
+            nonce=self.nonce,
+            options=self.options,
+        )
+        self.started = True
+        with self.state_condition:
+            self.state_condition.notify_all()
+        probe = _SystemResourceProbe()
+        event_sequence = 0
+        last_completed_ns: int | None = None
+        next_deadline_ns = time.monotonic_ns()
+        last_request_id = 0
+        worker_peak_rss = preflight.preflight_process_tree_rss_bytes
+        failure_latched = False
+        failure_acknowledged = False
+
+        def observe(*, sample_kind: str, request_id: int, scheduled_ns: int) -> None:
+            nonlocal event_sequence, last_completed_ns, next_deadline_ns, failure_latched
+            event_sequence += 1
+            started_ns = time.monotonic_ns()
+            with self.state_condition:
+                self.acquisition_started_ns = started_ns
+                self.state_condition.notify_all()
+            rss_started_ns = started_ns
+            rss: int | None = None
+            minimum_free: int | None = None
+            output_free: int | None = None
+            rss_retries = 0
+            disk_retries = 0
+            failure_code: str | None = None
+            try:
+                rss, rss_retries = _acquire_runtime_process_tree_rss(probe)
+                launcher_peak_rss = _root_process_peak_rss_bytes()
+                if type(launcher_peak_rss) is not int or launcher_peak_rss <= 0:
+                    raise _error("resource_measurement_failed")
+                combined_peak = worker_peak_rss + launcher_peak_rss
+                if combined_peak > _MAX_RESOURCE_INTEGER:
+                    raise _error("resource_measurement_failed")
+                rss = max(rss, combined_peak)
+            except EnronCapacityError as exc:
+                failure_code = exc.code if exc.code in _ERROR_MESSAGES else "resource_measurement_failed"
+            rss_finished_ns = time.monotonic_ns()
+            if failure_code is None and rss is not None and rss > preflight.maximum_peak_rss_bytes:
+                failure_code = "rss_limit"
+            filesystem_started_ns = rss_finished_ns
+            if failure_code is None:
+                try:
+                    minimum_free, output_disk, disk_retries = _sample_runtime_filesystems(probe, preflight)
+                    output_free = output_disk.free
+                except _RuntimeDiskFloor as exc:
+                    minimum_free = exc.minimum_free
+                    disk_retries = exc.retry_count
+                    failure_code = "runtime_disk_floor"
+                except EnronCapacityError as exc:
+                    failure_code = exc.code if exc.code in _ERROR_MESSAGES else "resource_measurement_failed"
+            if sample_kind == "terminal":
+                descendants = _worker_descendant_pids(self.worker_pid)
+                if descendants is None:
+                    failure_code = failure_code or "resource_measurement_failed"
+                elif descendants:
+                    for descendant_pid in reversed(descendants):
+                        try:
+                            os.kill(descendant_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            continue
+                        except OSError:
+                            failure_code = failure_code or "resource_measurement_failed"
+                    failure_code = failure_code or "worker_process_leak"
+            completed_ns = time.monotonic_ns()
+            valid = rss is not None and minimum_free is not None and output_free is not None
+            gap_ns = 0 if last_completed_ns is None else completed_ns - last_completed_ns
+            if valid and (gap_ns < 0 or completed_ns < started_ns or started_ns < run_started_ns):
+                valid = False
+                failure_code = "clock_invalid"
+            if valid and failure_code is None and completed_ns - started_ns > MAX_RESOURCE_ACQUISITION_DURATION_NS:
+                failure_code = "resource_acquisition_timeout"
+            if valid and failure_code is None and gap_ns > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
+                failure_code = "resource_observation_gap"
+            if valid and failure_code is None and completed_ns - run_started_ns > MAX_TOTAL_RUNTIME_NS:
+                failure_code = "runtime_limit"
+            if not valid and failure_code is None:
+                failure_code = "resource_measurement_failed"
+            frame = {
+                "type": "sample",
+                "protocol": _RESOURCE_OBSERVER_PROTOCOL,
+                "nonce": self.nonce,
+                "event_sequence": event_sequence,
+                "request_id": request_id,
+                "sample_kind": sample_kind,
+                "valid": valid,
+                "started_wall_ns": started_ns,
+                "completed_wall_ns": completed_ns,
+                "resource_observation_wall_gap_ns": gap_ns,
+                "acquisition_duration_ns": completed_ns - started_ns,
+                "rss_duration_ns": rss_finished_ns - rss_started_ns,
+                "filesystem_duration_ns": completed_ns - filesystem_started_ns,
+                "scheduler_lateness_ns": max(0, started_ns - scheduled_ns),
+                "process_tree_rss_bytes": rss,
+                "minimum_free_disk_bytes": minimum_free,
+                "output_free_disk_bytes": output_free,
+                "rss_retry_count": rss_retries,
+                "filesystem_retry_count": disk_retries,
+                "failure_code": failure_code,
+            }
+            if valid:
+                last_completed_ns = completed_ns
+            sample_failure_reserved = failure_code is not None and self._reserve_failure(failure_code)
+            with self.state_condition:
+                if self.failure_code is not None and not sample_failure_reserved:
+                    self.acquisition_started_ns = None
+                    self.state_condition.notify_all()
+                    raise _error(self.failure_code)
+                # Probe acquisition ends at completed_ns.  Publication is a
+                # separately supervised protocol step and must never inflate
+                # the reported or enforced acquisition duration.
+                self.acquisition_started_ns = None
+                self.pending_publication_completed_ns = completed_ns
+                if valid:
+                    self.last_completed_ns = completed_ns
+                self.state_condition.notify_all()
+            try:
+                if sample_kind == "terminal":
+                    self._send_final(frame)
+                else:
+                    self._send(frame)
+            except BaseException:
+                if sample_failure_reserved:
+                    self._finish_failure_publication(delivered=False)
+                with self.state_condition:
+                    self.pending_publication_completed_ns = None
+                    self.state_condition.notify_all()
+                raise
+            if sample_failure_reserved:
+                self._finish_failure_publication(delivered=True)
+                failure_latched = True
+            with self.state_condition:
+                self.pending_publication_completed_ns = None
+                if sample_kind == "terminal":
+                    self.terminal_sample_sent = True
+                externally_failed = self.failure_code is not None and not sample_failure_reserved
+                external_failure_code = self.failure_code or "resource_measurement_failed"
+                self.state_condition.notify_all()
+            if externally_failed:
+                raise _error(external_failure_code)
+            next_deadline_ns = started_ns + interval_ns
+
+        observe(sample_kind="startup", request_id=0, scheduled_ns=next_deadline_ns)
+        while True:
+            now_ns = time.monotonic_ns()
+            wait_until = next_deadline_ns
+            frames = reader.receive(max(0, wait_until - now_ns))
+            for command_index, command in enumerate(frames):
+                command_type = command.get("type")
+                if command_type == "failure_ack":
+                    _observer_closed(command, {"type", "protocol", "nonce"})
+                    if (
+                        command.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+                        or command.get("nonce") != self.nonce
+                        or not failure_latched
+                        or failure_acknowledged
+                    ):
+                        raise _error("resource_measurement_failed")
+                    failure_acknowledged = True
+                    continue
+                _observer_closed(
+                    command,
+                    {"type", "protocol", "nonce", "request_id", "sample_kind", "worker_peak_rss_bytes"},
+                )
+                request_id = _observer_int(command.get("request_id"), minimum=1)
+                reported_worker_peak = _observer_int(command.get("worker_peak_rss_bytes"), minimum=1)
+                sample_kind = command.get("sample_kind")
+                if (
+                    command_type not in {"force", "stop"}
+                    or command.get("protocol") != _RESOURCE_OBSERVER_PROTOCOL
+                    or command.get("nonce") != self.nonce
+                    or request_id <= last_request_id
+                    or sample_kind not in {"boundary", "checkpoint", "heartbeat", "activity", "terminal"}
+                    or (command_type == "stop") != (sample_kind == "terminal")
+                ):
+                    raise _error("resource_measurement_failed")
+                last_request_id = request_id
+                worker_peak_rss = max(worker_peak_rss, reported_worker_peak)
+                observe(sample_kind=cast(str, sample_kind), request_id=request_id, scheduled_ns=time.monotonic_ns())
+                if command_type == "stop":
+                    if command_index != len(frames) - 1 or reader.buffer:
+                        raise _error("resource_measurement_failed")
+                    _require_resource_observer_eof(reader)
+                    with self.state_condition:
+                        self.stop_acknowledged = True
+                        self.state_condition.notify_all()
+                    return
+            now_ns = time.monotonic_ns()
+            if now_ns >= next_deadline_ns:
+                if failure_latched:
+                    next_deadline_ns = now_ns + interval_ns
+                else:
+                    observe(sample_kind="continuous", request_id=0, scheduled_ns=next_deadline_ns)
+
+    def _send_final(self, frame: Mapping[str, Any]) -> None:
+        with self.send_lock:
+            _send_resource_observer_frame(self.endpoint, frame)
+            _shutdown_resource_observer_write(self.endpoint)
+
+
+def _terminate_worker_process_group(process: subprocess.Popen[bytes]) -> bool:
+    """Terminate residual isolated-worker processes and report whether any existed."""
+
+    process_group_id = process.pid
+    if type(process_group_id) is not int or process_group_id <= 1 or process_group_id == os.getpgrp():
+        raise _error("production_worker_failed")
+    group_existed = False
+    if process.poll() is None:
+        group_existed = True
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            group_existed = False
+        except PermissionError:
+            pass
+        except OSError:
+            raise _error("production_worker_failed") from None
+        try:
+            process.wait(timeout=RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS / 1_000_000_000)
+        except (OSError, subprocess.TimeoutExpired):
+            raise _error("production_worker_failed") from None
+    deadline = time.monotonic_ns() + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+    while True:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return group_existed
+        except PermissionError:
+            group_existed = True
+        except OSError:
+            raise _error("production_worker_failed") from None
+        else:
+            group_existed = True
+        if time.monotonic_ns() > deadline:
+            raise _error("production_worker_failed")
+        try:
+            os.killpg(process_group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            return group_existed
+        except PermissionError:
+            pass
+        except OSError:
+            raise _error("production_worker_failed") from None
+        time.sleep(0.01)
+
+
+def _request_worker_cooperative_cleanup(
+    process: subprocess.Popen[bytes],
+    observer: _LauncherResourceObserver,
+    *,
+    deadline_ns: int,
+) -> bool:
+    """Ask the live worker watchdog to unwind while its cleanup authority is retained."""
+
+    if process.poll() is not None or time.monotonic_ns() >= deadline_ns:
+        return False
+    with observer.state_condition:
+        watchdog_available = observer.started and not observer.stop_acknowledged
+    if not watchdog_available or not hasattr(signal, "SIGUSR1"):
+        return False
+    if observer.failure_event.is_set():
+        publication_wait_ns = min(50_000_000, max(0, deadline_ns - time.monotonic_ns()))
+        if publication_wait_ns and observer.wait_for_failure_publication(publication_wait_ns):
+            return True
+        if time.monotonic_ns() >= deadline_ns:
+            return False
+    if not observer.failure_event.is_set() and observer._reserve_failure("production_worker_failed"):
+        observer._finish_failure_publication(delivered=False)
+    try:
+        os.kill(process.pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        raise _error("production_worker_failed") from None
+    return True
+
+
+def _wait_for_worker_cleanup_until(process: subprocess.Popen[bytes], deadline_ns: int) -> bool:
+    """Wait until one absolute deadline for cooperative worker cleanup and root exit."""
+
+    while process.poll() is None:
+        remaining_ns = deadline_ns - time.monotonic_ns()
+        if remaining_ns <= 0:
+            return False
+        time.sleep(min(0.01, remaining_ns / 1_000_000_000))
+    return True
+
+
+def _read_production_worker_response(
+    process: subprocess.Popen[bytes],
+    request: bytes,
+    *,
+    timeout_seconds: int,
+    observer: _LauncherResourceObserver | None = None,
+    cooperative_abort: Callable[[int], bool] | None = None,
+) -> bytes:
+    """Exchange one bounded worker request/response without unbounded buffering."""
+
+    if process.stdin is None or process.stdout is None or not request or len(request) > 64 * 1024:
+        raise _error("production_worker_failed")
+    chunks: list[bytes] = []
+    total_bytes = 0
+    stdin_fd = process.stdin.fileno()
+    stdout_fd = process.stdout.fileno()
+    request_offset = 0
+    stdin_open = True
+    stdout_open = True
+    root_exit_deadline_ns: int | None = None
+    observer_failure_deadline_ns: int | None = None
+    deadline_ns = time.monotonic_ns() + timeout_seconds * 1_000_000_000
+
+    def exchange_failure(*, now_ns: int | None = None) -> _ProductionWorkerExchangeFailure:
+        nonlocal observer_failure_deadline_ns
+        failure_now_ns = time.monotonic_ns() if now_ns is None else now_ns
+        if observer_failure_deadline_ns is None and observer is not None and observer.failure_event.is_set():
+            observer_failure_deadline_ns = failure_now_ns + PRODUCTION_WORKER_CLEANUP_GRACE_NS
+        return _ProductionWorkerExchangeFailure(
+            cleanup_deadline_ns=observer_failure_deadline_ns,
+            cleanup_grace_consumed=(
+                observer_failure_deadline_ns is not None and failure_now_ns >= observer_failure_deadline_ns
+            ),
+        )
+
+    try:
+        os.set_blocking(stdin_fd, False)
+        os.set_blocking(stdout_fd, False)
+        while stdout_open or process.poll() is None:
+            now_ns = time.monotonic_ns()
+            if observer is not None and observer.failure_event.is_set() and observer_failure_deadline_ns is None:
+                observer_failure_deadline_ns = now_ns + PRODUCTION_WORKER_CLEANUP_GRACE_NS
+                publication_wait_ns = min(
+                    50_000_000,
+                    max(0, observer_failure_deadline_ns - time.monotonic_ns()),
+                )
+                try:
+                    delivered = observer.wait_for_failure_publication(publication_wait_ns)
+                    if not delivered and cooperative_abort is not None:
+                        cooperative_abort(observer_failure_deadline_ns)
+                except (KeyboardInterrupt, SystemExit, MemoryError):
+                    raise
+                except BaseException:
+                    raise exchange_failure() from None
+                now_ns = time.monotonic_ns()
+            if process.poll() is not None and stdout_open and root_exit_deadline_ns is None:
+                root_exit_deadline_ns = now_ns + RESOURCE_OBSERVER_COMMAND_TIMEOUT_NS
+            deadlines = [deadline_ns]
+            if root_exit_deadline_ns is not None:
+                deadlines.append(root_exit_deadline_ns)
+            if observer_failure_deadline_ns is not None:
+                deadlines.append(observer_failure_deadline_ns)
+            effective_deadline_ns = min(deadlines)
+            remaining_ns = effective_deadline_ns - now_ns
+            if remaining_ns <= 0:
+                raise exchange_failure(now_ns=now_ns)
+            try:
+                readable, writable, _exceptional = select.select(
+                    [stdout_fd] if stdout_open else [],
+                    [stdin_fd] if stdin_open else [],
+                    [],
+                    min(0.1, remaining_ns / 1_000_000_000),
+                )
+            except (OSError, ValueError):
+                raise exchange_failure() from None
+            if stdin_open and stdin_fd in writable:
+                try:
+                    written = os.write(stdin_fd, request[request_offset:])
+                except OSError as exc:
+                    if exc.errno not in {errno.EPIPE, errno.EBADF}:
+                        raise exchange_failure() from None
+                    written = 0
+                    request_offset = len(request)
+                if written < 0:
+                    raise exchange_failure()
+                request_offset += written
+                if request_offset == len(request):
+                    process.stdin.close()
+                    stdin_open = False
+            if stdout_open and stdout_fd in readable:
+                try:
+                    chunk = os.read(stdout_fd, 64 * 1024)
+                except OSError:
+                    raise exchange_failure() from None
+                if not chunk:
+                    process.stdout.close()
+                    stdout_open = False
+                else:
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_PRODUCTION_WORKER_RESPONSE_BYTES:
+                        raise exchange_failure()
+                    chunks.append(chunk)
+            if process.poll() is not None and stdin_open:
+                process.stdin.close()
+                stdin_open = False
+        return b"".join(chunks)
+    finally:
+        if stdin_open:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if stdout_open:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
 
 
 def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
-    source_root, dependency_roots, _layouts = _validated_capacity_bootstrap()
+    source_root, dependency_roots, _layouts, observer_fd = _validated_capacity_bootstrap()
+    if observer_fd is not None:
+        raise _error("production_identity_invalid")
     nonce = secrets.token_hex(32)
     request = {
         "output_dir": os.fspath(_absolute_private_path(options.output_dir)),
@@ -2590,42 +4233,170 @@ def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
             "RUST_LOG": "off",
         }
     )
+    process: subprocess.Popen[bytes] | None = None
+    observer: _LauncherResourceObserver | None = None
+    completed_stdout = b""
+    residual_worker_group = False
+    quiescence_proven = False
+    cooperative_signal_sent = False
+
+    def request_cooperative_cleanup(cleanup_deadline_ns: int) -> bool:
+        nonlocal cooperative_signal_sent
+        if cooperative_signal_sent:
+            return True
+        if process is None or observer is None:
+            return False
+        requested = _request_worker_cooperative_cleanup(
+            process,
+            observer,
+            deadline_ns=cleanup_deadline_ns,
+        )
+        cooperative_signal_sent = cooperative_signal_sent or requested
+        return requested
+
     try:
         with tempfile.TemporaryDirectory(prefix="nerb-capacity-pycache-") as pycache_directory:
             pycache_root = Path(pycache_directory).resolve(strict=True)
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-I",
-                    "-S",
-                    "-B",
-                    "-X",
-                    f"pycache_prefix={pycache_root}",
-                    "-c",
-                    _PRODUCTION_WORKER_BOOTSTRAP,
-                    os.fspath(source_root),
-                    str(len(dependency_roots)),
-                    *(os.fspath(path) for path in dependency_roots),
-                    _PRODUCTION_WORKER_ARGUMENT,
-                ],
-                input=_canonical_json_bytes(request),
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                env=environment,
-                timeout=MAX_TOTAL_RUNTIME_NS // 1_000_000_000 + 300,
-            )
-    except (OSError, subprocess.SubprocessError):
+            launcher_endpoint, worker_endpoint = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            worker_error: BaseException | None = None
+            try:
+                try:
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-I",
+                            "-S",
+                            "-B",
+                            "-X",
+                            f"pycache_prefix={pycache_root}",
+                            "-c",
+                            _PRODUCTION_WORKER_BOOTSTRAP,
+                            os.fspath(source_root),
+                            str(len(dependency_roots)),
+                            *(os.fspath(path) for path in dependency_roots),
+                            str(worker_endpoint.fileno()),
+                            _PRODUCTION_WORKER_ARGUMENT,
+                        ],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        env=environment,
+                        pass_fds=(worker_endpoint.fileno(),),
+                        start_new_session=True,
+                    )
+                    worker_endpoint.close()
+                    observer = _LauncherResourceObserver(
+                        launcher_endpoint,
+                        worker_pid=process.pid,
+                        nonce=nonce,
+                        options=options,
+                    )
+                    observer.start()
+                    completed_stdout = _read_production_worker_response(
+                        process,
+                        _canonical_json_bytes(request),
+                        timeout_seconds=MAX_TOTAL_RUNTIME_NS // 1_000_000_000 + 300,
+                        observer=observer,
+                        cooperative_abort=request_cooperative_cleanup,
+                    )
+                    observer.join()
+                except BaseException as exc:
+                    worker_error = exc
+            finally:
+                # Prove that the isolated process group is gone before closing
+                # its observer channel or deleting its private bytecode root.
+                # Recovery may inspect and wipe sensitive inflight state only
+                # after this proof succeeds.
+                if process is None:
+                    quiescence_proven = True
+                else:
+                    cleanup_deadline_ns = (
+                        worker_error.cleanup_deadline_ns
+                        if isinstance(worker_error, _ProductionWorkerExchangeFailure)
+                        else None
+                    )
+                    if worker_error is not None and process.poll() is None:
+                        if cleanup_deadline_ns is None:
+                            cleanup_deadline_ns = time.monotonic_ns() + PRODUCTION_WORKER_CLEANUP_GRACE_NS
+                        if time.monotonic_ns() < cleanup_deadline_ns:
+                            cooperative_cleanup_available = False
+                            if observer is not None and observer.failure_event.is_set():
+                                publication_wait_ns = min(
+                                    50_000_000,
+                                    max(0, cleanup_deadline_ns - time.monotonic_ns()),
+                                )
+                                if publication_wait_ns:
+                                    cooperative_cleanup_available = observer.wait_for_failure_publication(
+                                        publication_wait_ns
+                                    )
+                            if not cooperative_cleanup_available and time.monotonic_ns() < cleanup_deadline_ns:
+                                try:
+                                    cooperative_cleanup_available = request_cooperative_cleanup(cleanup_deadline_ns)
+                                except BaseException as exc:
+                                    if (
+                                        isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError))
+                                        or worker_error is None
+                                    ):
+                                        worker_error = exc
+                            if cooperative_cleanup_available and time.monotonic_ns() < cleanup_deadline_ns:
+                                try:
+                                    _wait_for_worker_cleanup_until(process, cleanup_deadline_ns)
+                                except BaseException as exc:
+                                    if (
+                                        isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError))
+                                        or worker_error is None
+                                    ):
+                                        worker_error = exc
+                    try:
+                        residual_worker_group = _terminate_worker_process_group(process)
+                    except EnronCapacityError as exc:
+                        quiescence_proven = False
+                        worker_error = exc
+                    else:
+                        quiescence_proven = True
+                if observer is not None:
+                    try:
+                        observer.join()
+                    except BaseException as exc:
+                        if worker_error is None:
+                            worker_error = exc
+                try:
+                    worker_endpoint.close()
+                except OSError:
+                    pass
+                if observer is not None:
+                    observer.close()
+                else:
+                    try:
+                        launcher_endpoint.close()
+                    except OSError:
+                        pass
+            if not quiescence_proven:
+                raise _error("production_worker_failed")
+            if worker_error is not None:
+                raise worker_error
+    except BaseException as exc:
+        if not quiescence_proven:
+            raise _error("production_worker_failed") from None
         _recover_worker_inflight(options)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, MemoryError)):
+            raise
         raise _error("production_worker_failed") from None
     _recover_worker_inflight(options)
-    if completed.returncode != 0 or len(completed.stdout) > MAX_CAPACITY_REPORT_BYTES + 64 * 1024:
+    if (
+        process is None
+        or process.returncode != 0
+        or residual_worker_group
+        or len(completed_stdout) > MAX_PRODUCTION_WORKER_RESPONSE_BYTES
+    ):
         raise _error("production_worker_failed")
     try:
-        response = json.loads(completed.stdout.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+        response = json.loads(completed_stdout.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeError, ValueError):
         raise _error("production_worker_failed") from None
     if not isinstance(response, Mapping) or set(response) != {"ok", "code", "diagnostic", "report"}:
+        raise _error("production_worker_failed")
+    if observer is None:
         raise _error("production_worker_failed")
     if response.get("ok") is not True:
         code = response.get("code")
@@ -2633,7 +4404,7 @@ def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
         if (
             not isinstance(code, str)
             or code not in _ERROR_MESSAGES
-            or (code == "checkpoint_wall_gap") != (diagnostic is not None)
+            or (code in {"checkpoint_wall_gap", "resource_observation_gap"}) != (diagnostic is not None)
             or (diagnostic is not None and _validated_failure_diagnostic(diagnostic) is None)
         ):
             raise _error("production_worker_failed")
@@ -2641,8 +4412,16 @@ def _spawn_production_worker(options: EnronCapacityOptions) -> dict[str, Any]:
             code,
             diagnostic=cast(Mapping[str, Any] | None, diagnostic),
         )
+    if observer.failure_code is not None:
+        raise _error(observer.failure_code)
     report = response.get("report")
-    if response.get("code") is not None or response.get("diagnostic") is not None or not isinstance(report, Mapping):
+    if (
+        response.get("code") is not None
+        or response.get("diagnostic") is not None
+        or not isinstance(report, Mapping)
+        or not observer.started
+        or not observer.stop_acknowledged
+    ):
         raise _error("production_worker_failed")
     return dict(report)
 
@@ -2668,8 +4447,21 @@ def _recover_worker_inflight(options: EnronCapacityOptions) -> None:
 def _production_worker_main() -> int:
     global _FRESH_PRODUCTION_WORKER
     response: dict[str, Any]
+    observer_endpoint: socket.socket | None = None
     try:
-        _validated_capacity_bootstrap()
+        _source_root, _dependency_roots, _layouts, observer_fd = _validated_capacity_bootstrap()
+        if observer_fd is None:
+            raise _error("production_identity_invalid")
+        observer_endpoint = socket.socket(fileno=observer_fd)
+        observer_endpoint.set_inheritable(False)
+
+        def close_observer_in_fork_child() -> None:
+            try:
+                observer_endpoint.close()
+            except OSError:
+                pass
+
+        os.register_at_fork(after_in_child=close_observer_in_fork_child)
         _set_production_worker_umask()
         payload = sys.stdin.buffer.read(64 * 1024 + 1)
         request = json.loads(payload.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
@@ -2688,6 +4480,7 @@ def _production_worker_main() -> int:
             or os.environ.get(_PRODUCTION_WORKER_ENV) != nonce
         ):
             raise _error("production_identity_invalid")
+        del os.environ[_PRODUCTION_WORKER_ENV]
         workspace = request.get("workspace_root")
         options = EnronCapacityOptions(
             output_dir=Path(cast(str, request["output_dir"])),
@@ -2704,6 +4497,8 @@ def _production_worker_main() -> int:
             production_evidence=True,
             monitor_interval_ns=PRODUCTION_MONITOR_INTERVAL_NS,
             wall_clock=time.monotonic_ns,
+            resource_observer_socket=observer_endpoint,
+            resource_observer_nonce=nonce,
         )
         response = {"ok": True, "code": None, "diagnostic": None, "report": report}
     except BaseException as exc:
@@ -2713,7 +4508,7 @@ def _production_worker_main() -> int:
             else "production_worker_failed"
         )
         diagnostic = exc.diagnostic if isinstance(exc, EnronCapacityError) else None
-        if (code == "checkpoint_wall_gap") != (diagnostic is not None):
+        if (code in {"checkpoint_wall_gap", "resource_observation_gap"}) != (diagnostic is not None):
             code = "production_worker_failed"
             diagnostic = None
         response = {
@@ -2722,6 +4517,11 @@ def _production_worker_main() -> int:
             "diagnostic": diagnostic,
             "report": None,
         }
+    if observer_endpoint is not None:
+        try:
+            observer_endpoint.close()
+        except OSError:
+            response = {"ok": False, "code": "production_worker_failed", "diagnostic": None, "report": None}
     sys.stdout.buffer.write(_canonical_json_bytes(response))
     sys.stdout.buffer.flush()
     return 0
@@ -3469,6 +5269,8 @@ def _run_capacity_entry(
     production_evidence: bool,
     monitor_interval_ns: int,
     wall_clock: Callable[[], int],
+    resource_observer_socket: socket.socket | None = None,
+    resource_observer_nonce: str | None = None,
 ) -> dict[str, Any]:
     _validate_options(options)
     runners = _validated_phase_runners(phase_runners)
@@ -3533,6 +5335,8 @@ def _run_capacity_entry(
                 monitor_interval_ns=monitor_interval_ns,
                 metrics=metrics,
                 wall_clock=wall_clock,
+                resource_observer_socket=resource_observer_socket,
+                resource_observer_nonce=resource_observer_nonce,
             )
             report = completed_run.report
         except BaseException as exc:
@@ -3860,6 +5664,8 @@ def _execute_capacity_transaction(
     monitor_interval_ns: int,
     metrics: _AttemptMetrics,
     wall_clock: Callable[[], int],
+    resource_observer_socket: socket.socket | None,
+    resource_observer_nonce: str | None,
 ) -> _CompletedCapacityRun:
     preflight = _resource_preflight(
         final_dir,
@@ -3912,8 +5718,17 @@ def _execute_capacity_transaction(
                 run_started_ns=run_started_ns,
                 interval_ns=monitor_interval_ns,
                 wall_clock=wall_clock,
+                resource_observer_socket=resource_observer_socket,
+                resource_observer_nonce=resource_observer_nonce,
             )
-            private_run.register_cleanup_barrier(monitor.stop, monitor._shutdown_is_settled)
+            # The fixture monitor scans the private tree from its background
+            # thread and must settle before PrivateRun commits or cleans up.
+            # Production's launcher observer owns no private-tree descriptor;
+            # exact tree scans stay serialized in this workload process.  It
+            # therefore remains live through promotion and is reaped only
+            # after the promoted-tree terminal observation.
+            if monitor._remote is None:
+                private_run.register_cleanup_barrier(monitor.stop, monitor._shutdown_is_settled)
             monitor.start()
             phase_reports: list[dict[str, Any]] = []
             for phase, runner in runners:
@@ -4009,10 +5824,11 @@ def _execute_capacity_transaction(
             if final_staging_owned + len(_COMMIT_PAYLOAD) != report["totals"]["final_owned_disk_bytes"]:
                 raise _error("report_invalid")
             monitor.observe_transaction_boundary(final_staging_owned)
-            monitor.stop()
-            monitor.raise_if_failed()
-            snapshot = monitor.global_snapshot()
-            _merge_monitor_metrics(metrics, snapshot)
+            if monitor._remote is None:
+                monitor.stop()
+                monitor.raise_if_failed()
+                snapshot = monitor.global_snapshot()
+                _merge_monitor_metrics(metrics, snapshot)
 
             _reassert_production_execution_current(execution)
             try:
@@ -4021,6 +5837,7 @@ def _execute_capacity_transaction(
                     before_promotion=lambda identities: _bind_inflight_cleanup_inventory(inflight, identities),
                 )
             except EnronPrivateIOError:
+                _raise_recorded_monitor_failure(monitor)
                 raise _error("private_transaction_failed") from None
             promoted = True
             tree.rebind(final_dir)
@@ -4772,6 +6589,9 @@ def _capacity_report(
             "maximum_resource_observation_wall_gap_ns": int(
                 monitor_snapshot["maximum_resource_observation_wall_gap_ns"]
             ),
+            "maximum_resource_acquisition_duration_ns": int(
+                monitor_snapshot["maximum_resource_acquisition_duration_ns"]
+            ),
             "peak_process_tree_rss_bytes": max(
                 preflight.preflight_process_tree_rss_bytes,
                 int(monitor_snapshot["peak_process_tree_rss_bytes"]),
@@ -4795,6 +6615,7 @@ def _capacity_report(
             "replay_equal": True,
             "continuous_resource_monitoring": True,
             "resource_observation_cadence": True,
+            "resource_acquisition_duration": True,
             "checkpoint_progress": True,
             "checkpoint_wall_cadence": True,
             "watchdog_interruption_supported": True,
@@ -5143,6 +6964,7 @@ def _verify_phase_report(
             "owned_disk_high_water_bytes",
             "minimum_free_disk_bytes",
             "maximum_resource_observation_wall_gap_ns",
+            "maximum_resource_acquisition_duration_ns",
             "maximum_progress_checkpoint_wall_gap_ns",
             "resource_samples",
             "checkpoint_count",
@@ -5183,6 +7005,9 @@ def _verify_phase_report(
     maximum_resource_wall_gap = _bounded_int(
         phase.get("maximum_resource_observation_wall_gap_ns"), "resource wall gap", minimum=0
     )
+    maximum_resource_acquisition_duration = _bounded_int(
+        phase.get("maximum_resource_acquisition_duration_ns"), "resource acquisition duration", minimum=0
+    )
     maximum_progress_wall_gap = _bounded_int(
         phase.get("maximum_progress_checkpoint_wall_gap_ns"), "progress wall gap", minimum=0
     )
@@ -5211,6 +7036,11 @@ def _verify_phase_report(
                 "process_tree_rss_bytes",
                 "owned_disk_bytes",
                 "free_disk_bytes",
+                "resource_acquisition_duration_ns",
+                "rss_acquisition_duration_ns",
+                "filesystem_acquisition_duration_ns",
+                "resource_acquisition_retry_count",
+                "scheduler_lateness_ns",
             },
             "resource sample",
         )
@@ -5235,12 +7065,31 @@ def _verify_phase_report(
         _positive_int(sample.get("process_tree_rss_bytes"), "sample RSS")
         _bounded_int(sample.get("owned_disk_bytes"), "sample owned disk", minimum=0)
         _bounded_int(sample.get("free_disk_bytes"), "sample free disk", minimum=0)
+        acquisition_duration = _bounded_int(
+            sample.get("resource_acquisition_duration_ns"), "sample resource acquisition duration", minimum=0
+        )
+        rss_duration = _bounded_int(
+            sample.get("rss_acquisition_duration_ns"), "sample RSS acquisition duration", minimum=0
+        )
+        filesystem_duration = _bounded_int(
+            sample.get("filesystem_acquisition_duration_ns"), "sample filesystem acquisition duration", minimum=0
+        )
+        sample_retries = _bounded_int(
+            sample.get("resource_acquisition_retry_count"), "sample acquisition retry count", minimum=0
+        )
+        _bounded_int(sample.get("scheduler_lateness_ns"), "sample scheduler lateness", minimum=0)
+        if rss_duration + filesystem_duration != acquisition_duration or sample_retries > 2 * (
+            _RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1
+        ):
+            raise _error("report_invalid")
         samples.append(sample)
     if (
         max(int(item["process_tree_rss_bytes"]) for item in samples) != peak
         or max(int(item["owned_disk_bytes"]) for item in samples) != owned
         or min(int(item["free_disk_bytes"]) for item in samples) != minimum_free
         or max(int(item["resource_observation_wall_gap_ns"]) for item in samples) != maximum_resource_wall_gap
+        or max(int(item["resource_acquisition_duration_ns"]) for item in samples)
+        != maximum_resource_acquisition_duration
     ):
         raise _error("report_invalid")
     retained_sequences = {int(item["sequence"]) for item in samples}
@@ -5349,6 +7198,7 @@ def _verify_phase_report(
         or phase.get("maximum_checkpoint_gap_records") != maximum_gap
         or maximum_gap > MAX_CHECKPOINT_RECORD_GAP
         or maximum_resource_wall_gap > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS
+        or maximum_resource_acquisition_duration > MAX_RESOURCE_ACQUISITION_DURATION_NS
         or maximum_progress_wall_gap != maximum_signal_wall_gap
         or maximum_progress_wall_gap > MAX_PROGRESS_CHECKPOINT_WALL_GAP_NS
     ):
@@ -5368,6 +7218,7 @@ def _verify_totals(
             "resource_observation_count",
             "resource_acquisition_retry_count",
             "maximum_resource_observation_wall_gap_ns",
+            "maximum_resource_acquisition_duration_ns",
             "peak_process_tree_rss_bytes",
             "pre_report_owned_disk_bytes",
             "report_bytes",
@@ -5409,6 +7260,8 @@ def _verify_totals(
         * (_RUNTIME_RESOURCE_ACQUISITION_MAX_ATTEMPTS - 1)
         or totals["maximum_resource_observation_wall_gap_ns"]
         < max(int(phase["maximum_resource_observation_wall_gap_ns"]) for phase in phases)
+        or totals["maximum_resource_acquisition_duration_ns"]
+        < max(int(phase["maximum_resource_acquisition_duration_ns"]) for phase in phases)
         or totals["peak_process_tree_rss_bytes"]
         < max(
             int(environment["preflight_process_tree_rss_bytes"]),
@@ -5452,6 +7305,8 @@ def _expected_gates(
         "continuous_resource_monitoring": all(int(phase["resource_observation_count"]) > 0 for phase in phases),
         "resource_observation_cadence": int(totals["maximum_resource_observation_wall_gap_ns"])
         <= MAX_RESOURCE_OBSERVATION_WALL_GAP_NS,
+        "resource_acquisition_duration": int(totals["maximum_resource_acquisition_duration_ns"])
+        <= MAX_RESOURCE_ACQUISITION_DURATION_NS,
         "checkpoint_progress": all(
             0 < int(phase["maximum_checkpoint_gap_records"]) <= MAX_CHECKPOINT_RECORD_GAP for phase in phases
         ),
@@ -6974,7 +8829,7 @@ def _reader_lock_sha256_at_commit(git_commit: str) -> str:
 
 def _capacity_bootstrap_identity() -> dict[str, Any]:
     try:
-        _source_root, dependencies, layouts = _validated_capacity_bootstrap()
+        _source_root, dependencies, layouts, _observer_fd = _validated_capacity_bootstrap()
         launcher = _git_root() / _CAPACITY_LAUNCHER_PATH
         info = launcher.lstat()
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
@@ -7653,7 +9508,10 @@ def _post_promotion_enforce(
     monitor: _ContinuousResourceMonitor,
 ) -> None:
     monitor.observe_transaction_boundary(final_owned)
-    _merge_monitor_metrics(metrics, monitor.global_snapshot())
+    monitor.stop()
+    monitor.raise_if_failed()
+    terminal_snapshot = monitor.global_snapshot()
+    _merge_monitor_metrics(metrics, terminal_snapshot)
     now = _probe_monotonic_ns(probe)
     if now < run_started_ns:
         raise _error("clock_invalid")
@@ -7665,6 +9523,8 @@ def _post_promotion_enforce(
         raise _error("runtime_disk_floor")
     if (metrics.maximum_resource_observation_wall_gap_ns or 0) > MAX_RESOURCE_OBSERVATION_WALL_GAP_NS:
         raise _error("resource_observation_gap")
+    if int(terminal_snapshot["maximum_resource_acquisition_duration_ns"]) > MAX_RESOURCE_ACQUISITION_DURATION_NS:
+        raise _error("resource_acquisition_timeout")
     if final_owned > MAX_OWNED_DISK_BYTES:
         raise _error("owned_disk_limit")
     if metrics.elapsed_ns > MAX_TOTAL_RUNTIME_NS:
