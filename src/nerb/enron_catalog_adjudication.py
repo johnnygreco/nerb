@@ -12,6 +12,7 @@ import json
 import os
 import re
 import stat
+import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -38,18 +39,35 @@ from .schema import validate_bank_schema
 
 CATALOG_POLICY_SCHEMA_VERSION = "nerb.enron_catalog_qualification_policy"
 CATALOG_BINDING_SCHEMA_VERSION = "nerb.enron_catalog_bindings"
+CATALOG_REVIEW_SCHEMA_VERSION = "nerb.enron_catalog_review"
 CATALOG_PUBLIC_RECEIPT_SCHEMA_VERSION = "nerb.enron_catalog_public_receipt"
 CATALOG_RUN_MANIFEST_SCHEMA_VERSION = "nerb.enron_catalog_qualification_run"
 CATALOG_RUN_RECEIPT_SCHEMA_VERSION = "nerb.enron_catalog_qualification_run_receipt"
 
 _COMMIT_PAYLOAD = b"nerb.enron.private-run.v2\n"
-_RUN_FILES = frozenset({"COMMITTED", "binding.jsonl", "manifest.json", "receipt.json"})
+_RUN_FILES = frozenset({"COMMITTED", "binding.jsonl", "catalog-review.jsonl", "manifest.json", "receipt.json"})
 _BINDING_FIELDS = frozenset({"document_id", "entity_class", "start", "end", "catalog_identity"})
 _CATALOG_IDENTITY_FIELDS = frozenset({"entity_id", "name_id", "pattern_id"})
+_CATALOG_REVIEW_FIELDS = frozenset(
+    {
+        "schema_version",
+        "document_id",
+        "text_sha256",
+        "bank_sha256",
+        "gold_sha256",
+        "reviewer_id",
+        "decisions",
+        "unresolved",
+    }
+)
+_CATALOG_REVIEW_DECISION_FIELDS = frozenset({"entity_class", "start", "end", "catalog_identity"})
+_GOLD_COMMITMENT_FIELDS = frozenset({"gold_sha256", "manifest_sha256", "artifacts_sha256"})
 _MAX_BANK_BYTES = 64 * 1024 * 1024
 _MAX_METADATA_BYTES = 16 * 1024 * 1024
 _MAX_BINDING_LINE_BYTES = 1024 * 1024
 _MAX_BINDINGS = 1_000_000
+_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 _SUPPORTED_GENERIC_EMAIL_REGEX = (
     r"(?i)\b[a-z0-9_][a-z0-9.!#$%&'*+/=?^_`{|}~-]*@"
@@ -70,8 +88,9 @@ CATALOG_QUALIFICATION_POLICY: dict[str, Any] = {
     "schema_version": CATALOG_POLICY_SCHEMA_VERSION,
     "input": "immutable_independent_gold",
     "prediction_visibility": "forbidden",
+    "review": "one_bounded_private_reviewer_exactly_replays_active_bank_qualification",
     "bank_scope": "active_bank_entity_name_pattern_chain",
-    "literal_matching": "rust_equivalent_conservative_ascii_fold_exact_whitespace_and_proved_boundary",
+    "literal_matching": "rust_equivalent_conservative_ascii_fold_exact_whitespace_and_unicode_word_boundary",
     "regex_matching": "closed_ascii_exact_context_subset",
     "winner": "ascending_priority_then_name_id_then_pattern_id",
     "catalog_identity": "entity_name_and_one_qualifying_active_pattern",
@@ -232,9 +251,12 @@ def finalize_enron_catalog_qualification_files(
     sample_run_dir: Path,
     gold_run_dir: Path,
     bank: Mapping[str, Any] | Path,
+    catalog_review_path: Path,
     output_dir: Path,
     *,
     expected_audit_output_binding_sha256: str | None = None,
+    expected_gold_commitment: Mapping[str, str] | None = None,
+    gold_state_dir: Path | None = None,
     allow_unignored_output: bool = False,
 ) -> dict[str, Any]:
     """Commit prediction-blind per-span catalog bindings before scoring."""
@@ -244,20 +266,45 @@ def finalize_enron_catalog_qualification_files(
             Path(gold_run_dir),
             Path(sample_run_dir),
             expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+            expected_gold_commitment=expected_gold_commitment,
+            gold_state_dir=gold_state_dir,
         )
         _validate_upstream_policy_bindings(gold_receipt)
+        trusted_gold_commitment = _trusted_gold_commitment(gold_receipt, expected_gold_commitment)
         canonical_bank, bank_artifact = _load_catalog_bank(bank)
         _validate_planned_bank_binding(gold_receipt, canonical_bank)
         qualification = qualify_enron_gold_catalog(canonical_bank, documents, gold)
+        review_rows, _source_review_descriptor = _load_catalog_review_jsonl(
+            Path(catalog_review_path),
+            require_canonical=False,
+        )
+        canonical_review_rows, reviewer_id, review_counts = _prepare_catalog_reviews(
+            review_rows,
+            documents,
+            qualification,
+        )
+        review_payload = _canonical_jsonl(canonical_review_rows)
+        review_artifact = _artifact_descriptor("catalog-review.jsonl", review_payload, len(canonical_review_rows))
+        review_provenance = _catalog_review_provenance(reviewer_id, review_artifact, review_counts)
         binding_rows = tuple(qualification["bindings"])
         binding_payload = _canonical_jsonl(binding_rows)
         binding_artifact = _artifact_descriptor("binding.jsonl", binding_payload, len(binding_rows))
-        manifest = _catalog_run_manifest(gold_receipt, bank_artifact, binding_artifact, qualification)
+        manifest = _catalog_run_manifest(
+            gold_receipt,
+            trusted_gold_commitment,
+            bank_artifact,
+            binding_artifact,
+            review_artifact,
+            review_provenance,
+            qualification,
+        )
         receipt = _catalog_run_receipt(manifest)
 
         with PrivateRun(Path(output_dir), allow_unignored_output=allow_unignored_output) as run:
             with run.open_binary("binding.jsonl") as file:
                 file.write(binding_payload)
+            with run.open_binary("catalog-review.jsonl") as file:
+                file.write(review_payload)
             with run.open_binary("manifest.json") as file:
                 file.write(_canonical_json_file(manifest))
             with run.open_binary("receipt.json") as file:
@@ -277,6 +324,8 @@ def verify_enron_catalog_qualification(
     bank: Mapping[str, Any] | Path,
     *,
     expected_audit_output_binding_sha256: str | None = None,
+    expected_gold_commitment: Mapping[str, str] | None = None,
+    gold_state_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Replay a committed catalog qualification and return aggregate evidence."""
 
@@ -285,8 +334,11 @@ def verify_enron_catalog_qualification(
             Path(gold_run_dir),
             Path(sample_run_dir),
             expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+            expected_gold_commitment=expected_gold_commitment,
+            gold_state_dir=gold_state_dir,
         )
         _validate_upstream_policy_bindings(gold_receipt)
+        trusted_gold_commitment = _trusted_gold_commitment(gold_receipt, expected_gold_commitment)
         canonical_bank, bank_artifact = _load_catalog_bank(bank)
         _validate_planned_bank_binding(gold_receipt, canonical_bank)
         expected = qualify_enron_gold_catalog(canonical_bank, documents, gold)
@@ -295,12 +347,33 @@ def verify_enron_catalog_qualification(
         bindings, binding_descriptor = _load_binding_jsonl(root / "binding.jsonl")
         if bindings != expected["bindings"]:
             raise EnronCatalogAdjudicationError("Stored catalog bindings differ from direct qualification replay.")
+        stored_review_rows, review_descriptor = _load_catalog_review_jsonl(
+            root / "catalog-review.jsonl",
+            require_canonical=True,
+        )
+        canonical_review_rows, reviewer_id, review_counts = _prepare_catalog_reviews(
+            stored_review_rows,
+            documents,
+            expected,
+        )
+        if stored_review_rows != list(canonical_review_rows):
+            raise EnronCatalogAdjudicationError("Stored catalog review rows are not in canonical order.")
         manifest, manifest_raw = _load_strict_json_object(root / "manifest.json", "Catalog qualification manifest")
         receipt, receipt_raw = _load_strict_json_object(root / "receipt.json", "Catalog qualification receipt")
         if manifest_raw != _canonical_json_file(manifest) or receipt_raw != _canonical_json_file(receipt):
             raise EnronCatalogAdjudicationError("Catalog qualification metadata is not canonically encoded.")
         binding_artifact = {"name": "binding.jsonl", **binding_descriptor}
-        expected_manifest = _catalog_run_manifest(gold_receipt, bank_artifact, binding_artifact, expected)
+        review_artifact = {"name": "catalog-review.jsonl", **review_descriptor}
+        review_provenance = _catalog_review_provenance(reviewer_id, review_artifact, review_counts)
+        expected_manifest = _catalog_run_manifest(
+            gold_receipt,
+            trusted_gold_commitment,
+            bank_artifact,
+            binding_artifact,
+            review_artifact,
+            review_provenance,
+            expected,
+        )
         if manifest != expected_manifest:
             raise EnronCatalogAdjudicationError("Catalog qualification manifest differs from replay.")
         expected_receipt = _catalog_run_receipt(expected_manifest)
@@ -320,7 +393,9 @@ def _load_verified_enron_catalog_qualification_files(
     bank: Mapping[str, Any] | Path,
     *,
     expected_audit_output_binding_sha256: str | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    expected_gold_commitment: Mapping[str, str] | None = None,
+    gold_state_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     """Load private bindings only after full sample, gold, bank, and run replay.
 
     Downstream scorers should call this helper once and consume its returned
@@ -334,12 +409,20 @@ def _load_verified_enron_catalog_qualification_files(
         gold_run_dir,
         bank,
         expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        expected_gold_commitment=expected_gold_commitment,
+        gold_state_dir=gold_state_dir,
     )
     root = _validate_private_run_tree(run_dir)
     rows, descriptor = _load_binding_jsonl(root / "binding.jsonl")
     if descriptor["sha256"] != receipt["binding_artifact_sha256"]:
         raise EnronCatalogAdjudicationError("Verified catalog bindings changed before loading.")
-    return rows, receipt
+    review_rows, review_descriptor = _load_catalog_review_jsonl(root / "catalog-review.jsonl", require_canonical=True)
+    if review_descriptor["sha256"] != receipt["review_artifact_sha256"]:
+        raise EnronCatalogAdjudicationError("Verified catalog review changed before loading.")
+    reviewer_ids = {str(row["reviewer_id"]) for row in review_rows}
+    if len(reviewer_ids) != 1:
+        raise EnronCatalogAdjudicationError("Verified catalog review does not have one reviewer identity.")
+    return rows, reviewer_ids.pop(), receipt
 
 
 def _validate_upstream_policy_bindings(gold_receipt: Mapping[str, Any]) -> None:
@@ -353,6 +436,8 @@ def _validate_upstream_policy_bindings(gold_receipt: Mapping[str, Any]) -> None:
         or not isinstance(gold_receipt.get("sample_artifact_sha256"), str)
         or not isinstance(gold_receipt.get("gold_sha256"), str)
         or not isinstance(gold_receipt.get("planned_bank_sha256"), str)
+        or not isinstance(gold_receipt.get("planned_evaluator_source_sha256"), str)
+        or not isinstance(gold_receipt.get("planned_thresholds_sha256"), str)
     ):
         raise EnronCatalogAdjudicationError(
             "Gold run does not bind the current annotation and catalog qualification policies."
@@ -362,6 +447,33 @@ def _validate_upstream_policy_bindings(gold_receipt: Mapping[str, Any]) -> None:
 def _validate_planned_bank_binding(gold_receipt: Mapping[str, Any], bank: Mapping[str, Any]) -> None:
     if gold_receipt.get("planned_bank_sha256") != hash_bank(bank):
         raise EnronCatalogAdjudicationError("Catalog bank differs from the bank frozen in the audit plan.")
+
+
+def _trusted_gold_commitment(
+    gold_receipt: Mapping[str, Any],
+    expected_gold_commitment: Mapping[str, str] | None,
+) -> dict[str, str]:
+    actual = {key: gold_receipt.get(key) for key in sorted(_GOLD_COMMITMENT_FIELDS)}
+    if any(not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None for value in actual.values()):
+        raise EnronCatalogAdjudicationError("Gold receipt commitments are invalid.")
+    if expected_gold_commitment is None:
+        if gold_receipt.get("fixture_mode") is not True:
+            raise EnronCatalogAdjudicationError(
+                "Production catalog qualification requires an explicit trusted gold commitment."
+            )
+    elif (
+        not isinstance(expected_gold_commitment, Mapping)
+        or set(expected_gold_commitment) != _GOLD_COMMITMENT_FIELDS
+        or any(
+            not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+            for value in expected_gold_commitment.values()
+        )
+        or dict(expected_gold_commitment) != actual
+    ):
+        raise EnronCatalogAdjudicationError(
+            "Trusted gold commitment is invalid or does not match the verified gold run."
+        )
+    return {key: str(actual[key]) for key in sorted(actual)}
 
 
 def _load_catalog_bank(source: Mapping[str, Any] | Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -478,6 +590,210 @@ def _load_binding_jsonl(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any
     return rows, {"sha256": "sha256:" + digest.hexdigest(), "bytes": byte_count, "records": len(rows)}
 
 
+def _load_catalog_review_jsonl(
+    path: Path,
+    *,
+    require_canonical: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    digest = hashlib.sha256()
+    byte_count = 0
+    try:
+        for line_no, raw, row in iter_strict_jsonl(path, _MAX_BINDING_LINE_BYTES):
+            if line_no > _MAX_BINDINGS:
+                raise EnronCatalogAdjudicationError("Catalog review artifact exceeds the row limit.")
+            detached = dict(row)
+            if require_canonical and raw != _canonical_bytes(detached) + b"\n":
+                raise EnronCatalogAdjudicationError(f"Catalog review row {line_no} is not canonical.")
+            rows.append(detached)
+            digest.update(raw)
+            byte_count += len(raw)
+    except EnronPrivateIOError:
+        raise EnronCatalogAdjudicationError("Catalog review artifact is not valid private JSONL.") from None
+    return rows, {"sha256": "sha256:" + digest.hexdigest(), "bytes": byte_count, "records": len(rows)}
+
+
+def _prepare_catalog_reviews(
+    rows: Sequence[Mapping[str, Any]],
+    documents: Sequence[Mapping[str, Any]],
+    qualification: Mapping[str, Any],
+) -> tuple[tuple[dict[str, Any], ...], str, dict[str, int]]:
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
+        raise EnronCatalogAdjudicationError("Catalog review must be a sequence.")
+    document_text = _prepare_documents(documents)
+    bank_sha256 = qualification.get("bank_sha256")
+    gold_sha256 = qualification.get("gold_sha256")
+    expected_bindings = qualification.get("bindings")
+    if (
+        not isinstance(bank_sha256, str)
+        or _SHA256_RE.fullmatch(bank_sha256) is None
+        or not isinstance(gold_sha256, str)
+        or _SHA256_RE.fullmatch(gold_sha256) is None
+        or not isinstance(expected_bindings, list)
+    ):
+        raise EnronCatalogAdjudicationError("Deterministic catalog qualification is invalid.")
+    expected_by_document: dict[str, list[dict[str, Any]]] = {document_id: [] for document_id in document_text}
+    for binding in expected_bindings:
+        if not isinstance(binding, Mapping) or set(binding) != _BINDING_FIELDS:
+            raise EnronCatalogAdjudicationError("Deterministic catalog binding is invalid.")
+        document_id = binding["document_id"]
+        if not isinstance(document_id, str) or document_id not in expected_by_document:
+            raise EnronCatalogAdjudicationError("Deterministic catalog binding document is invalid.")
+        expected_by_document[document_id].append(
+            {
+                "entity_class": binding["entity_class"],
+                "start": binding["start"],
+                "end": binding["end"],
+                "catalog_identity": _normalize_catalog_identity(binding["catalog_identity"]),
+            }
+        )
+    for decisions in expected_by_document.values():
+        decisions.sort(key=_catalog_review_decision_key)
+
+    canonical_rows: list[dict[str, Any]] = []
+    reviewers: set[str] = set()
+    reviewed_documents: set[str] = set()
+    reviewed_occurrences: set[tuple[str, str, int, int]] = set()
+    for index, row in enumerate(rows):
+        if not isinstance(row, Mapping) or set(row) != _CATALOG_REVIEW_FIELDS:
+            raise EnronCatalogAdjudicationError(f"Catalog review row {index} schema is invalid.")
+        if row["schema_version"] != CATALOG_REVIEW_SCHEMA_VERSION:
+            raise EnronCatalogAdjudicationError(f"Catalog review row {index} version is invalid.")
+        document_id = row["document_id"]
+        if not isinstance(document_id, str) or document_id not in document_text:
+            raise EnronCatalogAdjudicationError(f"Catalog review row {index} document is invalid.")
+        if document_id in reviewed_documents:
+            raise EnronCatalogAdjudicationError("Catalog review document rows must be unique.")
+        if (
+            row["text_sha256"] != _hash_bytes(document_text[document_id].encode("utf-8"))
+            or row["bank_sha256"] != bank_sha256
+            or row["gold_sha256"] != gold_sha256
+        ):
+            raise EnronCatalogAdjudicationError("Catalog review does not bind the exact gold and active bank.")
+        reviewer_id = _identifier(row["reviewer_id"], "Catalog reviewer identity")
+        if row["unresolved"] != []:
+            raise EnronCatalogAdjudicationError("Catalog review must have zero unresolved decisions.")
+        decisions = row["decisions"]
+        if not isinstance(decisions, list):
+            raise EnronCatalogAdjudicationError("Catalog review decisions must be a list.")
+        normalized_decisions: list[dict[str, Any]] = []
+        for decision_index, decision in enumerate(decisions):
+            if not isinstance(decision, Mapping) or set(decision) != _CATALOG_REVIEW_DECISION_FIELDS:
+                raise EnronCatalogAdjudicationError(
+                    f"Catalog review row {index} decision {decision_index} schema is invalid."
+                )
+            detached_decision = dict(decision)
+            entity_class = detached_decision["entity_class"]
+            start = detached_decision["start"]
+            end = detached_decision["end"]
+            if (
+                entity_class not in _SUPPORTED_ENTITY_CLASSES
+                or type(start) is not int
+                or type(end) is not int
+                or not 0 <= start < end <= len(document_text[document_id])
+            ):
+                raise EnronCatalogAdjudicationError(
+                    f"Catalog review row {index} decision {decision_index} occurrence is invalid."
+                )
+            occurrence = (document_id, str(entity_class), start, end)
+            if occurrence in reviewed_occurrences:
+                raise EnronCatalogAdjudicationError("Catalog review contains a duplicate gold occurrence decision.")
+            reviewed_occurrences.add(occurrence)
+            normalized_decisions.append(
+                {
+                    "entity_class": str(entity_class),
+                    "start": start,
+                    "end": end,
+                    "catalog_identity": _normalize_catalog_identity(detached_decision["catalog_identity"]),
+                }
+            )
+        normalized_decisions.sort(key=_catalog_review_decision_key)
+        expected_decisions = expected_by_document[document_id]
+        observed_keys = {_catalog_review_decision_occurrence_key(value) for value in normalized_decisions}
+        expected_keys = {_catalog_review_decision_occurrence_key(value) for value in expected_decisions}
+        if observed_keys != expected_keys:
+            raise EnronCatalogAdjudicationError(
+                "Catalog review must cover every exact gold occurrence once, including uncataloged decisions."
+            )
+        if normalized_decisions != expected_decisions:
+            raise EnronCatalogAdjudicationError(
+                "Catalog review decisions differ from deterministic active-bank qualification."
+            )
+        reviewers.add(reviewer_id)
+        reviewed_documents.add(document_id)
+        canonical_rows.append(
+            {
+                "schema_version": CATALOG_REVIEW_SCHEMA_VERSION,
+                "document_id": document_id,
+                "text_sha256": row["text_sha256"],
+                "bank_sha256": bank_sha256,
+                "gold_sha256": gold_sha256,
+                "reviewer_id": reviewer_id,
+                "decisions": normalized_decisions,
+                "unresolved": [],
+            }
+        )
+    if reviewed_documents != set(document_text):
+        raise EnronCatalogAdjudicationError("Catalog review must cover every gold document exactly once.")
+    if len(reviewers) != 1:
+        raise EnronCatalogAdjudicationError("Catalog review must use exactly one bounded reviewer identity.")
+    canonical_rows.sort(key=lambda row: row["document_id"])
+    return (
+        tuple(canonical_rows),
+        reviewers.pop(),
+        {
+            "documents_reviewed": len(canonical_rows),
+            "decisions_reviewed": len(reviewed_occurrences),
+            "reviewers": 1,
+            "unresolved": 0,
+        },
+    )
+
+
+def _normalize_catalog_identity(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != _CATALOG_IDENTITY_FIELDS:
+        raise EnronCatalogAdjudicationError("Catalog review identity is invalid.")
+    return {key: _identifier(value[key], f"Catalog review {key}") for key in ("entity_id", "name_id", "pattern_id")}
+
+
+def _catalog_review_decision_key(value: Mapping[str, Any]) -> tuple[int, int, str]:
+    return int(value["start"]), int(value["end"]), str(value["entity_class"])
+
+
+def _catalog_review_decision_occurrence_key(value: Mapping[str, Any]) -> tuple[str, int, int]:
+    return str(value["entity_class"]), int(value["start"]), int(value["end"])
+
+
+def _identifier(value: Any, description: str) -> str:
+    if not isinstance(value, str) or _ID_RE.fullmatch(value) is None:
+        raise EnronCatalogAdjudicationError(f"{description} is invalid.")
+    return value
+
+
+def _catalog_review_provenance(
+    reviewer_id: str,
+    review_artifact: Mapping[str, Any],
+    counts: Mapping[str, int],
+) -> dict[str, Any]:
+    artifact_sha256 = review_artifact.get("sha256")
+    if not isinstance(artifact_sha256, str) or _SHA256_RE.fullmatch(artifact_sha256) is None:
+        raise EnronCatalogAdjudicationError("Catalog review artifact commitment is invalid.")
+    return {
+        **{key: counts[key] for key in ("documents_reviewed", "decisions_reviewed", "reviewers", "unresolved")},
+        "bank_aware": True,
+        "prediction_blind": True,
+        "reviewer_identity_sha256": _canonical_hash(
+            {
+                "schema_version": "nerb.enron_catalog_reviewer_binding",
+                "review_artifact_sha256": artifact_sha256,
+                "reviewer_id": reviewer_id,
+            }
+        ),
+    }
+
+
 def _load_strict_json_object(path: Path, description: str) -> tuple[dict[str, Any], bytes]:
     try:
         with open_private_binary_input(path) as file:
@@ -539,8 +855,11 @@ def _artifact_descriptor(name: str, payload: bytes, records: int) -> dict[str, A
 
 def _catalog_run_manifest(
     gold_receipt: Mapping[str, Any],
+    trusted_gold_commitment: Mapping[str, str],
     bank_artifact: Mapping[str, Any],
     binding_artifact: Mapping[str, Any],
+    review_artifact: Mapping[str, Any],
+    review_provenance: Mapping[str, Any],
     qualification: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
@@ -554,15 +873,21 @@ def _catalog_run_manifest(
         "sample_artifact_sha256": gold_receipt["sample_artifact_sha256"],
         "sample_receipt_artifact_sha256": gold_receipt["sample_receipt_artifact_sha256"],
         "sample_binding_sha256": gold_receipt["sample_binding_sha256"],
+        "planned_evaluator_source_sha256": gold_receipt["planned_evaluator_source_sha256"],
+        "planned_thresholds_sha256": gold_receipt["planned_thresholds_sha256"],
         "gold_sha256": gold_receipt["gold_sha256"],
         "gold_manifest_sha256": gold_receipt["manifest_sha256"],
         "gold_artifacts_sha256": gold_receipt["artifacts_sha256"],
+        "trusted_gold_commitment": _detached_mapping(trusted_gold_commitment),
+        "trusted_gold_commitment_sha256": _canonical_hash(trusted_gold_commitment),
         "annotation_policy_sha256": gold_receipt["annotation_policy_sha256"],
         "catalog_policy_sha256": qualification["policy_sha256"],
         "planned_bank_sha256": gold_receipt["planned_bank_sha256"],
         "bank_sha256": qualification["bank_sha256"],
         "bank_artifact": _detached_mapping(bank_artifact),
         "binding_artifact": _detached_mapping(binding_artifact),
+        "review_artifact": _detached_mapping(review_artifact),
+        "review_provenance": _detached_mapping(review_provenance),
         "catalog_binding_sha256": qualification["catalog_binding_sha256"],
         "counts": _detached_mapping(qualification["counts"]),
     }
@@ -571,8 +896,21 @@ def _catalog_run_manifest(
 def _catalog_run_receipt(manifest: Mapping[str, Any]) -> dict[str, Any]:
     binding_artifact = manifest["binding_artifact"]
     bank_artifact = manifest["bank_artifact"]
+    review_artifact = manifest["review_artifact"]
+    review_provenance = manifest["review_provenance"]
     counts = manifest["counts"]
-    if not all(isinstance(value, Mapping) for value in (binding_artifact, bank_artifact, counts)):
+    trusted_gold_commitment = manifest["trusted_gold_commitment"]
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            binding_artifact,
+            bank_artifact,
+            review_artifact,
+            review_provenance,
+            counts,
+            trusted_gold_commitment,
+        )
+    ):
         raise EnronCatalogAdjudicationError("Catalog qualification manifest aggregates are invalid.")
     gold_spans = counts.get("gold_spans")
     cataloged = counts.get("cataloged_gold_spans")
@@ -588,16 +926,32 @@ def _catalog_run_receipt(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "audit_execution_policy_sha256": manifest["audit_execution_policy_sha256"],
         "sample_artifact_sha256": manifest["sample_artifact_sha256"],
         "sample_binding_sha256": manifest["sample_binding_sha256"],
+        "planned_evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "planned_thresholds_sha256": manifest["planned_thresholds_sha256"],
         "gold_sha256": manifest["gold_sha256"],
+        "gold_manifest_sha256": manifest["gold_manifest_sha256"],
+        "gold_artifacts_sha256": manifest["gold_artifacts_sha256"],
+        "trusted_gold_commitment": _detached_mapping(trusted_gold_commitment),
+        "trusted_gold_commitment_sha256": manifest["trusted_gold_commitment_sha256"],
         "annotation_policy_sha256": manifest["annotation_policy_sha256"],
         "catalog_policy_sha256": manifest["catalog_policy_sha256"],
         "bank_sha256": manifest["bank_sha256"],
         "bank_artifact_sha256": bank_artifact["sha256"],
         "binding_artifact_sha256": binding_artifact["sha256"],
+        "review_artifact_sha256": review_artifact["sha256"],
+        "review_provenance": _detached_mapping(review_provenance),
         "catalog_binding_sha256": manifest["catalog_binding_sha256"],
         "manifest_sha256": _canonical_hash(manifest),
+        "artifacts_sha256": _canonical_hash(
+            {
+                "bank_artifact": bank_artifact,
+                "binding_artifact": binding_artifact,
+                "review_artifact": review_artifact,
+            }
+        ),
         "counts": _detached_mapping(counts),
         "catalog_coverage": None if gold_spans == 0 else cataloged / gold_spans,
+        "unresolved": review_provenance["unresolved"],
         "privacy": {
             "aggregate_only": True,
             "raw_text_included": False,
@@ -607,6 +961,7 @@ def _catalog_run_receipt(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "catalog_identities_included": False,
             "entity_names_included": False,
             "pattern_ids_included": False,
+            "reviewer_ids_included": False,
             "private_paths_included": False,
         },
     }
@@ -726,7 +1081,7 @@ def _pattern_matches_exact_context(pattern: _Pattern, text: str, start: int, end
         expected = _normalize_rust_whitespace(expected)
     case_insensitive = pattern.case_sensitive is False or bool(pattern.flags & re.IGNORECASE)
     if pattern.flags & ~int(re.IGNORECASE):
-        return False
+        raise EnronCatalogAdjudicationError("Active catalog literal uses unsupported independent semantics.")
     if case_insensitive and surface != expected:
         if not expected.isascii():
             return False
@@ -737,9 +1092,9 @@ def _pattern_matches_exact_context(pattern: _Pattern, text: str, start: int, end
         expected = expected.lower()
     if surface != expected:
         return False
-    if pattern.left_boundary == "word" and not _proved_ascii_word_boundary(text, start):
+    if pattern.left_boundary == "word" and not _rust_word_boundary(text, start):
         return False
-    if pattern.right_boundary == "word" and not _proved_ascii_word_boundary(text, end):
+    if pattern.right_boundary == "word" and not _rust_word_boundary(text, end):
         return False
     return True
 
@@ -792,17 +1147,23 @@ def _rust_ascii_fold(value: str) -> str | None:
     return "".join(folded)
 
 
-def _proved_ascii_word_boundary(text: str, offset: int) -> bool:
-    adjacent = [text[index] for index in (offset - 1, offset) if 0 <= index < len(text)]
-    if any(not character.isascii() for character in adjacent):
-        return False
-    left = offset > 0 and _ascii_word_character(text[offset - 1])
-    right = offset < len(text) and _ascii_word_character(text[offset])
+def _rust_word_boundary(text: str, offset: int) -> bool:
+    left = offset > 0 and _rust_word_character(text[offset - 1])
+    right = offset < len(text) and _rust_word_character(text[offset])
     return left != right
 
 
-def _ascii_word_character(character: str) -> bool:
-    return character.isascii() and (character.isalnum() or character == "_")
+def _rust_word_character(character: str) -> bool:
+    if len(character) != 1:
+        raise EnronCatalogAdjudicationError("Catalog word-boundary input is invalid.")
+    category = unicodedata.category(character)
+    if len(category) != 2:
+        raise EnronCatalogAdjudicationError("Catalog word-boundary Unicode semantics are unsupported.")
+    return (
+        category[0] in {"L", "M"}
+        or category in {"Nl", "Nd", "Pc"}
+        or character in {"\N{ZERO WIDTH NON-JOINER}", "\N{ZERO WIDTH JOINER}"}
+    )
 
 
 def _prepare_documents(values: Sequence[Mapping[str, Any]]) -> dict[str, str]:

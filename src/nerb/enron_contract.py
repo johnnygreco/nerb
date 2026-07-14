@@ -1340,6 +1340,192 @@ _VERIFIER_RESULT = _closed_object(
     },
 )
 
+_NULLABLE_HASH = {"anyOf": [_HASH, {"type": "null"}]}
+_AUDIT_GOLD_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "sample_artifact_sha256",
+        "gold_sha256",
+        "annotation_policy_sha256",
+        "unresolved",
+    ),
+    {
+        "status": {"const": "completed"},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _HASH,
+        "manifest_sha256": _HASH,
+        "artifacts_sha256": _HASH,
+        "sample_artifact_sha256": _HASH,
+        "gold_sha256": _HASH,
+        "annotation_policy_sha256": _HASH,
+        "unresolved": _NONNEGATIVE_INTEGER,
+    },
+)
+_AUDIT_CATALOG_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "sample_artifact_sha256",
+        "gold_sha256",
+        "catalog_binding_sha256",
+        "binding_artifact_sha256",
+        "review_artifact_sha256",
+        "catalog_policy_sha256",
+        "unresolved",
+    ),
+    {
+        "status": {"const": "completed"},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _HASH,
+        "manifest_sha256": _HASH,
+        "artifacts_sha256": _HASH,
+        "sample_artifact_sha256": _HASH,
+        "gold_sha256": _HASH,
+        "catalog_binding_sha256": _HASH,
+        "binding_artifact_sha256": _HASH,
+        "review_artifact_sha256": _HASH,
+        "catalog_policy_sha256": _HASH,
+        "unresolved": _NONNEGATIVE_INTEGER,
+    },
+)
+_AUDIT_SCORE_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "sample_artifact_sha256",
+        "gold_sha256",
+        "catalog_binding_sha256",
+        "prediction_commitment_sha256",
+        "scoring_policy_sha256",
+        "thresholds_sha256",
+        "evaluator_source_sha256",
+        "quality_decision_sha256",
+        "quality_decision_passed",
+        "support_failure_codes",
+    ),
+    {
+        "status": {"type": "string", "enum": ["scored_pending_prediction_audit", "insufficient_support"]},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _HASH,
+        "manifest_sha256": _HASH,
+        "artifacts_sha256": _HASH,
+        "sample_artifact_sha256": _HASH,
+        "gold_sha256": _HASH,
+        "catalog_binding_sha256": _HASH,
+        "prediction_commitment_sha256": _NULLABLE_HASH,
+        "scoring_policy_sha256": _HASH,
+        "thresholds_sha256": _HASH,
+        "evaluator_source_sha256": _HASH,
+        "quality_decision_sha256": _NULLABLE_HASH,
+        "quality_decision_passed": {"type": "boolean"},
+        "support_failure_codes": _STRING_ARRAY,
+    },
+)
+_AUDIT_PREDICTION_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "gold_sha256",
+        "catalog_binding_sha256",
+        "score_manifest_sha256",
+        "prediction_commitment_sha256",
+        "prediction_audit_policy_sha256",
+        "unresolved_cases",
+        "gold_defects",
+        "decision_eligible",
+        "release",
+    ),
+    {
+        "status": {
+            "type": "string",
+            "enum": [
+                "accepted",
+                "quality_gates_failed",
+                "invalidated_gold_defect",
+                "not_run_insufficient_support",
+            ],
+        },
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _NULLABLE_HASH,
+        "manifest_sha256": _NULLABLE_HASH,
+        "artifacts_sha256": _NULLABLE_HASH,
+        "gold_sha256": _HASH,
+        "catalog_binding_sha256": _HASH,
+        "score_manifest_sha256": _HASH,
+        "prediction_commitment_sha256": _NULLABLE_HASH,
+        "prediction_audit_policy_sha256": _HASH,
+        "unresolved_cases": _NONNEGATIVE_INTEGER,
+        "gold_defects": _NONNEGATIVE_INTEGER,
+        "decision_eligible": {"type": "boolean"},
+        "release": {"type": "string", "enum": ["quality_eligible", "do_not_ship"]},
+    },
+)
+_AUDIT_CHAIN_PRIVACY = _closed_object(
+    (
+        "aggregate_only",
+        "raw_text_included",
+        "document_ids_included",
+        "reviewer_ids_included",
+        "span_coordinates_included",
+        "span_surfaces_included",
+        "private_paths_included",
+    ),
+    {
+        "aggregate_only": {"const": True},
+        "raw_text_included": {"const": False},
+        "document_ids_included": {"const": False},
+        "reviewer_ids_included": {"const": False},
+        "span_coordinates_included": {"const": False},
+        "span_surfaces_included": {"const": False},
+        "private_paths_included": {"const": False},
+    },
+)
+_AUDIT_CHAIN = _closed_object(
+    (
+        "schema_version",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "gold",
+        "catalog",
+        "score",
+        "prediction_audit",
+        "privacy",
+        "chain_sha256",
+    ),
+    {
+        "schema_version": {"const": "nerb.enron_audit_chain.v1"},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "gold": _AUDIT_GOLD_STAGE,
+        "catalog": _AUDIT_CATALOG_STAGE,
+        "score": _AUDIT_SCORE_STAGE,
+        "prediction_audit": _AUDIT_PREDICTION_STAGE,
+        "privacy": _AUDIT_CHAIN_PRIVACY,
+        "chain_sha256": _HASH,
+    },
+)
+
 ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://nerb.dev/schemas/enron-evidence.v2.schema.json",
@@ -1367,6 +1553,7 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "performance",
             "performance_manifest_sha256",
             "thresholds_sha256",
+            "audit_chain",
             "promotion",
             "verifier",
         ),
@@ -1400,6 +1587,7 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "performance": _PERFORMANCE_OUTPUT,
             "performance_manifest_sha256": _HASH,
             "thresholds_sha256": _HASH,
+            "audit_chain": _AUDIT_CHAIN,
             "promotion": _closed_object(
                 ("passed", "checks", "claims"),
                 {
@@ -2006,6 +2194,14 @@ def hash_enron_thresholds(checks: Sequence[Mapping[str, Any]]) -> str:
     return _canonical_hash(configuration)
 
 
+def hash_enron_audit_chain(audit_chain: Mapping[str, Any]) -> str:
+    """Hash a closed public audit chain without its self-authenticating field."""
+
+    if not isinstance(audit_chain, Mapping) or "chain_sha256" not in audit_chain:
+        raise ValueError("Enron audit chain must contain its canonical hash field.")
+    return _canonical_hash({key: value for key, value in audit_chain.items() if key != "chain_sha256"})
+
+
 def hash_enron_test_lineage_entry(entry: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in entry.items() if key != "entry_sha256"})
 
@@ -2130,6 +2326,7 @@ def validate_enron_evidence(
             promotion_passed=promotion["passed"] or evidence["verifier"]["passed"],
         )
     )
+    diagnostics.extend(_audit_chain_diagnostics(evidence))
     diagnostics.extend(_gate_diagnostics(evidence, recomputed_performance_stats))
     diagnostics.extend(_promotion_diagnostics(evidence, recomputed_performance_stats))
     if promotion["passed"] or evidence["verifier"]["passed"]:
@@ -5457,6 +5654,111 @@ def _gate_diagnostics(
     return diagnostics
 
 
+def _audit_chain_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
+    chain = evidence["audit_chain"]
+    gold = chain["gold"]
+    catalog = chain["catalog"]
+    score = chain["score"]
+    prediction = chain["prediction_audit"]
+    diagnostics: list[Diagnostic] = []
+
+    def mismatch(path: str, message: str) -> None:
+        diagnostics.append(_error("contract.audit_chain_mismatch", path, message))
+
+    if chain["chain_sha256"] != hash_enron_audit_chain(chain):
+        mismatch("/audit_chain/chain_sha256", "Audit-chain hash does not match the canonical stage commitments.")
+    if chain["audit_plan_sha256"] != evidence["audit_plan_sha256"]:
+        mismatch("/audit_chain/audit_plan_sha256", "Audit chain differs from the preregistered audit plan.")
+    for stage_name, stage in (("gold", gold), ("catalog", catalog), ("score", score), ("prediction_audit", prediction)):
+        if stage["audit_plan_sha256"] != chain["audit_plan_sha256"]:
+            mismatch(
+                f"/audit_chain/{stage_name}/audit_plan_sha256",
+                "Audit stage differs from the shared preregistered plan.",
+            )
+        if stage["audit_output_binding_sha256"] != chain["audit_output_binding_sha256"]:
+            mismatch(
+                f"/audit_chain/{stage_name}/audit_output_binding_sha256",
+                "Audit stage differs from the shared sealed sample output.",
+            )
+    if score["thresholds_sha256"] != evidence["thresholds_sha256"]:
+        mismatch("/audit_chain/score/thresholds_sha256", "Scored thresholds differ from the frozen evidence checks.")
+    if score["evaluator_source_sha256"] != evidence["evaluator"]["source_sha256"]:
+        mismatch("/audit_chain/score/evaluator_source_sha256", "Scored evaluator differs from evidence provenance.")
+
+    shared_sample = gold["sample_artifact_sha256"]
+    if catalog["sample_artifact_sha256"] != shared_sample or score["sample_artifact_sha256"] != shared_sample:
+        mismatch("/audit_chain", "Gold, catalog, and score stages do not bind one sampled artifact.")
+    if catalog["gold_sha256"] != gold["gold_sha256"] or score["gold_sha256"] != gold["gold_sha256"]:
+        mismatch("/audit_chain", "Catalog or score stage does not bind the committed gold output.")
+    if prediction["gold_sha256"] != gold["gold_sha256"]:
+        mismatch("/audit_chain/prediction_audit/gold_sha256", "Prediction audit does not bind the committed gold.")
+    if score["catalog_binding_sha256"] != catalog["catalog_binding_sha256"]:
+        mismatch("/audit_chain/score/catalog_binding_sha256", "Score does not bind the catalog qualification.")
+    if prediction["catalog_binding_sha256"] != catalog["catalog_binding_sha256"]:
+        mismatch(
+            "/audit_chain/prediction_audit/catalog_binding_sha256",
+            "Prediction audit does not bind the catalog qualification.",
+        )
+    if prediction["score_manifest_sha256"] != score["manifest_sha256"]:
+        mismatch("/audit_chain/prediction_audit/score_manifest_sha256", "Prediction audit does not bind the score.")
+    if gold["unresolved"] != 0 or catalog["unresolved"] != 0 or prediction["unresolved_cases"] != 0:
+        mismatch("/audit_chain", "Every audit stage must commit zero unresolved decisions.")
+
+    score_status = score["status"]
+    prediction_status = prediction["status"]
+    prediction_hashes = (
+        prediction["receipt_sha256"],
+        prediction["manifest_sha256"],
+        prediction["artifacts_sha256"],
+        prediction["prediction_commitment_sha256"],
+    )
+    if score_status == "insufficient_support":
+        valid_terminal = (
+            bool(score["support_failure_codes"])
+            and score["prediction_commitment_sha256"] is None
+            and score["quality_decision_sha256"] is None
+            and score["quality_decision_passed"] is False
+            and prediction_status == "not_run_insufficient_support"
+            and all(value is None for value in prediction_hashes)
+            and prediction["gold_defects"] == 0
+            and prediction["decision_eligible"] is False
+            and prediction["release"] == "do_not_ship"
+        )
+    else:
+        hashes_complete = (
+            score["prediction_commitment_sha256"] is not None
+            and score["quality_decision_sha256"] is not None
+            and all(value is not None for value in prediction_hashes)
+            and prediction["prediction_commitment_sha256"] == score["prediction_commitment_sha256"]
+        )
+        if prediction_status == "accepted":
+            terminal_consistent = (
+                score["quality_decision_passed"] is True
+                and prediction["gold_defects"] == 0
+                and prediction["decision_eligible"] is True
+                and prediction["release"] == "quality_eligible"
+            )
+        elif prediction_status == "quality_gates_failed":
+            terminal_consistent = (
+                score["quality_decision_passed"] is False
+                and prediction["gold_defects"] == 0
+                and prediction["decision_eligible"] is False
+                and prediction["release"] == "do_not_ship"
+            )
+        elif prediction_status == "invalidated_gold_defect":
+            terminal_consistent = (
+                prediction["gold_defects"] > 0
+                and prediction["decision_eligible"] is False
+                and prediction["release"] == "do_not_ship"
+            )
+        else:
+            terminal_consistent = False
+        valid_terminal = not score["support_failure_codes"] and hashes_complete and terminal_consistent
+    if not valid_terminal:
+        mismatch("/audit_chain", "Audit stages do not form a valid accepted or terminal do-not-ship chain.")
+    return diagnostics
+
+
 def _supported_performance_gate_target(target: str) -> bool:
     parts = target.split("/")
     if len(parts) == 5 and parts[1:3] == ["performance", "workloads"]:
@@ -5573,6 +5875,8 @@ def _recomputed_performance_gate_value(
 
 def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any] | None) -> list[Diagnostic]:
     promotion = evidence["promotion"]
+    audit_chain = evidence["audit_chain"]
+    prediction_audit = audit_chain["prediction_audit"]
     diagnostics: list[Diagnostic] = []
     current_version = evidence["test_access"]["benchmark_version"]
     lineage = evidence["test_access"]["lineage"]
@@ -5597,6 +5901,17 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
         "clean git state": evidence["software"]["git_dirty"] is False,
         "one-shot final test": evidence["test_access"]["current_version_access_count"] == 1,
         "matching passed current lineage": current_lineage_passed,
+        "accepted audit chain": (
+            audit_chain["gold"]["status"] == "completed"
+            and audit_chain["catalog"]["status"] == "completed"
+            and audit_chain["score"]["status"] == "scored_pending_prediction_audit"
+            and audit_chain["score"]["quality_decision_passed"] is True
+            and prediction_audit["status"] == "accepted"
+            and prediction_audit["unresolved_cases"] == 0
+            and prediction_audit["gold_defects"] == 0
+            and prediction_audit["decision_eligible"] is True
+            and prediction_audit["release"] == "quality_eligible"
+        ),
         "real benchmark artifact": evidence["artifact_kind"] == "real_benchmark",
         "exact valid manifest binding": manifest_bound,
     }
@@ -7293,6 +7608,7 @@ __all__ = [
     "calculate_enron_breakeven",
     "calculate_enron_performance_comparison",
     "calculate_enron_performance_statistics",
+    "hash_enron_audit_chain",
     "hash_enron_environment",
     "hash_enron_breakeven_plan",
     "hash_enron_manifest",

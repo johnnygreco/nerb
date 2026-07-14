@@ -27,12 +27,15 @@ from .bank import hash_bank
 from .enron_contract import (
     CHARACTER_POSITION_SEMANTICS,
     MATCHING_SEMANTICS,
+    MAX_QUALITY_THRESHOLDS,
     MIN_DECISION_GRADE_DOCUMENTS,
     MIN_DECISION_GRADE_GOLD_SPANS,
     MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS,
     MIN_DECISION_GRADE_SENSITIVE_CHARACTERS,
+    MIN_QUALITY_THRESHOLDS,
     PERSON_CONTACT_ENTITY_CLASSES,
     PERSON_CONTACT_SCOPE_ID,
+    hash_enron_thresholds,
     validate_enron_quality_output,
 )
 from .enron_private_io import (
@@ -61,15 +64,18 @@ __all__ = [
 
 SCORE_MANIFEST_SCHEMA_VERSION = "nerb.enron_gold_audit_score_run"
 SCORE_RECEIPT_SCHEMA_VERSION = "nerb.enron_gold_audit_score_receipt"
+INSUFFICIENT_SUPPORT_MANIFEST_SCHEMA_VERSION = "nerb.enron_gold_audit_insufficient_support_run"
+INSUFFICIENT_SUPPORT_RECEIPT_SCHEMA_VERSION = "nerb.enron_gold_audit_insufficient_support_receipt"
 CASE_SCHEMA_VERSION = "nerb.enron_prediction_audit_case"
 PREDICTION_AUDIT_REVIEW_SCHEMA_VERSION = "nerb.enron_prediction_audit_review"
 PREDICTION_AUDIT_MANIFEST_SCHEMA_VERSION = "nerb.enron_prediction_audit_run"
 PREDICTION_AUDIT_RECEIPT_SCHEMA_VERSION = "nerb.enron_prediction_audit_receipt"
 
 _COMMIT_PAYLOAD = b"nerb.enron.private-run.v2\n"
-_SCORE_RUN_FILES = frozenset(
+_SUCCESSFUL_SCORE_RUN_FILES = frozenset(
     {"COMMITTED", "predictions.jsonl", "cases.jsonl", "quality.json", "manifest.json", "receipt.json"}
 )
+_INSUFFICIENT_SCORE_RUN_FILES = frozenset({"COMMITTED", "manifest.json", "receipt.json"})
 _AUDIT_RUN_FILES = frozenset({"COMMITTED", "reviews.jsonl", "manifest.json", "receipt.json"})
 _PREDICTION_FIELDS = frozenset({"document_id", "entity_class", "start", "end", "entity_id", "name_id", "pattern_id"})
 _CATALOG_IDENTITY_FIELDS = frozenset({"entity_id", "name_id", "pattern_id"})
@@ -99,6 +105,8 @@ _TEXT_VIEW_DESCRIPTOR_FIELDS = frozenset(
         "answer_bearing_fields_included",
     }
 )
+_PROMOTION_CHECK_CONFIGURATION_FIELDS = frozenset({"id", "category", "target", "operator", "threshold"})
+_PROMOTION_CHECK_FIELDS = _PROMOTION_CHECK_CONFIGURATION_FIELDS | {"actual", "passed"}
 _QUALITY_RESULT_FIELDS = frozenset(
     {
         "schema_version",
@@ -141,24 +149,90 @@ _GOLD_DEFECT_REASON_CODES = frozenset(
         "other_gold_defect",
     }
 )
+_SUPPORT_FAILURE_ORDER = (
+    "production_document_count_mismatch",
+    "documents_below_minimum",
+    "gold_spans_below_minimum",
+    "negative_documents_below_minimum",
+    "sensitive_characters_below_minimum",
+    "contact_gold_support_missing",
+    "person_gold_support_missing",
+)
+_SCORE_CLAIM_SCHEMA_VERSION = "nerb.enron_gold_audit_score_claim.v1"
+_SCORE_OUTCOME_SCHEMA_VERSION = "nerb.enron_gold_audit_score_outcome.v1"
 
 QUALITY_DECISION_POLICY: dict[str, Any] = {
     "schema_version": "nerb.enron_gold_audit_quality_decision_policy",
     "slice_id": "person_contact_all_test",
     "scope": PERSON_CONTACT_SCOPE_ID,
+    "contract_gate": {"id": "contract_valid", "operator": "eq", "threshold": True},
     "requirements": [
-        {"id": "contract_valid", "operator": "equal", "threshold": True},
-        {"id": "cataloged_false_negative", "operator": "maximum", "threshold": 0},
-        {"id": "cataloged_wrong_canonical", "operator": "maximum", "threshold": 0},
-        {"id": "documents_with_any_cataloged_miss", "operator": "maximum", "threshold": 0},
-        {"id": "open_world_recall", "operator": "minimum", "threshold": 0.95},
-        {"id": "catalog_coverage", "operator": "minimum", "threshold": 0.80},
-        {"id": "cataloged_recall", "operator": "minimum", "threshold": 1.0},
-        {"id": "sensitive_character_recall", "operator": "minimum", "threshold": 0.98},
-        {"id": "document_leak_rate", "operator": "maximum", "threshold": 0.05},
-        {"id": "sensitive_character_leak_rate", "operator": "maximum", "threshold": 0.02},
-        {"id": "negative_document_false_alarm_rate", "operator": "maximum", "threshold": 0.50},
-        {"id": "over_redaction_rate", "operator": "maximum", "threshold": 0.05},
+        {
+            "id": "cataloged_false_negative",
+            "target": "/quality/slices/0/cataloged_false_negative",
+            "operator": "eq",
+            "policy_threshold": 0,
+        },
+        {
+            "id": "cataloged_wrong_canonical",
+            "target": "/quality/slices/0/cataloged_wrong_canonical",
+            "operator": "eq",
+            "policy_threshold": 0,
+        },
+        {
+            "id": "documents_with_any_cataloged_miss",
+            "target": "/quality/slices/0/documents_with_any_cataloged_miss",
+            "operator": "eq",
+            "policy_threshold": 0,
+        },
+        {
+            "id": "open_world_recall",
+            "target": "/quality/slices/0/metrics/open_world_recall",
+            "operator": "gte",
+            "policy_threshold": MIN_QUALITY_THRESHOLDS["open_world_recall"],
+        },
+        {
+            "id": "catalog_coverage",
+            "target": "/quality/slices/0/metrics/catalog_coverage",
+            "operator": "gte",
+            "policy_threshold": MIN_QUALITY_THRESHOLDS["catalog_coverage"],
+        },
+        {
+            "id": "cataloged_recall",
+            "target": "/quality/slices/0/metrics/cataloged_recall",
+            "operator": "gte",
+            "policy_threshold": MIN_QUALITY_THRESHOLDS["cataloged_recall"],
+        },
+        {
+            "id": "sensitive_character_recall",
+            "target": "/quality/slices/0/metrics/sensitive_character_recall",
+            "operator": "gte",
+            "policy_threshold": MIN_QUALITY_THRESHOLDS["sensitive_character_recall"],
+        },
+        {
+            "id": "document_leak_rate",
+            "target": "/quality/slices/0/metrics/document_leak_rate",
+            "operator": "lte",
+            "policy_threshold": MAX_QUALITY_THRESHOLDS["document_leak_rate"],
+        },
+        {
+            "id": "sensitive_character_leak_rate",
+            "target": "/quality/slices/0/metrics/sensitive_character_leak_rate",
+            "operator": "lte",
+            "policy_threshold": MAX_QUALITY_THRESHOLDS["sensitive_character_leak_rate"],
+        },
+        {
+            "id": "negative_document_false_alarm_rate",
+            "target": "/quality/slices/0/metrics/negative_document_false_alarm_rate",
+            "operator": "lte",
+            "policy_threshold": MAX_QUALITY_THRESHOLDS["negative_document_false_alarm_rate"],
+        },
+        {
+            "id": "over_redaction_rate",
+            "target": "/quality/slices/0/metrics/over_redaction_rate",
+            "operator": "lte",
+            "policy_threshold": MAX_QUALITY_THRESHOLDS["over_redaction_rate"],
+        },
     ],
 }
 QUALITY_DECISION_POLICY_SHA256 = (
@@ -215,7 +289,7 @@ AUDIT_SCORING_POLICY_SHA256 = (
 PREDICTION_AUDIT_POLICY: dict[str, Any] = {
     "schema_version": "nerb.enron_prediction_audit_policy",
     "coverage": "every_committed_case_exactly_once",
-    "reviewer": "one_identity_distinct_from_all_gold_roles",
+    "reviewer": "one_identity_distinct_from_all_gold_roles_and_catalog_reviewer",
     "findings": sorted(_FINDINGS),
     "confirmed_reason_codes": sorted(_CONFIRMED_REASON_CODES),
     "gold_defect_reason_codes": sorted(_GOLD_DEFECT_REASON_CODES),
@@ -253,22 +327,45 @@ def score_enron_gold_audit_files(
     bank: Mapping[str, Any] | Path,
     output_dir: Path,
     *,
+    promotion_checks: Sequence[Mapping[str, Any]] | Mapping[str, Any] | Path,
+    score_state_dir: Path,
+    gold_state_dir: Path,
+    expected_gold_commitment: Mapping[str, str],
     text_view_descriptor: Mapping[str, Any],
     expected_audit_output_binding_sha256: str | None = None,
     allow_unignored_output: bool = False,
 ) -> dict[str, Any]:
     """Score one immutable gold panel with one bank compilation and scan per document."""
 
+    claim: dict[str, Any] | None = None
+    terminalized = False
     try:
         prepared = _load_prepared_inputs(
             Path(sample_run_dir),
             Path(gold_run_dir),
             Path(catalog_run_dir),
             bank,
+            gold_state_dir=Path(gold_state_dir),
+            expected_gold_commitment=expected_gold_commitment,
             expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
         )
         descriptor = _validate_text_view_descriptor(text_view_descriptor)
-        _validate_support(prepared)
+        frozen = _prepare_frozen_decision_inputs(prepared, promotion_checks)
+        claim = _acquire_score_claim(Path(score_state_dir), prepared, Path(output_dir))
+        support = _support_assessment(prepared)
+        if support["failure_codes"]:
+            manifest = _insufficient_support_manifest(prepared, descriptor, frozen, claim, support)
+            receipt = _insufficient_support_receipt(manifest)
+            with PrivateRun(Path(output_dir), allow_unignored_output=allow_unignored_output) as run:
+                with run.open_binary("manifest.json") as file:
+                    file.write(_canonical_json_file(manifest))
+                with run.open_binary("receipt.json") as file:
+                    file.write(_canonical_json_file(receipt))
+                run.commit()
+            _terminalize_score_claim(Path(score_state_dir), claim, receipt)
+            terminalized = True
+            return _detached(receipt)
+
         slice_specs = _slice_specs(descriptor, str(prepared["gold_receipt"]["annotation_policy_sha256"]))
         predictions: list[dict[str, Any]] = []
         session = _quality.prepare_enron_quality(prepared["bank"], slice_specs=slice_specs, max_diagnostics=0)
@@ -294,7 +391,7 @@ def score_enron_gold_audit_files(
             raise EnronAuditScoringError("Quality output does not commit the exact persisted prediction stream.")
         _validate_prediction_order_and_bounds(predictions, prepared["documents"])
         cases = _build_cases(prepared, predictions, prediction_commitment)
-        _verify_quality_result(prepared, descriptor, slice_specs, predictions, quality_result)
+        _verify_quality_result(prepared, descriptor, slice_specs, predictions, quality_result, frozen)
 
         prediction_payload = _canonical_jsonl(predictions)
         case_payload = _canonical_jsonl(cases)
@@ -304,7 +401,7 @@ def score_enron_gold_audit_files(
             "cases": _artifact_descriptor("cases.jsonl", case_payload, len(cases)),
             "quality": _artifact_descriptor("quality.json", quality_payload, 1),
         }
-        manifest = _score_manifest(prepared, descriptor, slice_specs, quality_result, artifacts, cases)
+        manifest = _score_manifest(prepared, descriptor, slice_specs, quality_result, artifacts, cases, frozen, claim)
         receipt = _score_receipt(manifest, quality_result)
         with PrivateRun(Path(output_dir), allow_unignored_output=allow_unignored_output) as run:
             with run.open_binary("predictions.jsonl") as file:
@@ -318,6 +415,58 @@ def score_enron_gold_audit_files(
             with run.open_binary("receipt.json") as file:
                 file.write(_canonical_json_file(receipt))
             run.commit()
+        _terminalize_score_claim(Path(score_state_dir), claim, receipt)
+        terminalized = True
+        return _detached(receipt)
+    except BaseException as exc:
+        if claim is not None and not terminalized:
+            _terminalize_failed_score_claim(Path(score_state_dir), claim)
+        if isinstance(exc, (KeyboardInterrupt, SystemExit, EnronAuditScoringError)):
+            raise
+        if isinstance(
+            exc,
+            (
+                _catalog.EnronCatalogAdjudicationError,
+                _gold.EnronGoldAnnotationError,
+                _quality.EnronQualityError,
+                EnronPrivateIOError,
+                OSError,
+                TypeError,
+                ValueError,
+            ),
+        ):
+            raise EnronAuditScoringError("Enron gold audit scoring could not be completed safely.") from None
+        raise
+
+
+def verify_enron_gold_audit_score(
+    run_dir: Path,
+    sample_run_dir: Path,
+    gold_run_dir: Path,
+    catalog_run_dir: Path,
+    bank: Mapping[str, Any] | Path,
+    *,
+    promotion_checks: Sequence[Mapping[str, Any]] | Mapping[str, Any] | Path,
+    score_state_dir: Path,
+    gold_state_dir: Path,
+    expected_gold_commitment: Mapping[str, str],
+    expected_audit_output_binding_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Replay a committed score without compiling or scanning a bank."""
+
+    try:
+        receipt, _stored = _verify_enron_gold_audit_score(
+            Path(run_dir),
+            Path(sample_run_dir),
+            Path(gold_run_dir),
+            Path(catalog_run_dir),
+            bank,
+            promotion_checks=promotion_checks,
+            score_state_dir=Path(score_state_dir),
+            gold_state_dir=Path(gold_state_dir),
+            expected_gold_commitment=expected_gold_commitment,
+            expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        )
         return _detached(receipt)
     except EnronAuditScoringError:
         raise
@@ -330,30 +479,50 @@ def score_enron_gold_audit_files(
         TypeError,
         ValueError,
     ):
-        raise EnronAuditScoringError("Enron gold audit scoring could not be completed safely.") from None
+        raise EnronAuditScoringError("Enron gold audit score could not be verified safely.") from None
 
 
-def verify_enron_gold_audit_score(
+def _verify_enron_gold_audit_score(
     run_dir: Path,
     sample_run_dir: Path,
     gold_run_dir: Path,
     catalog_run_dir: Path,
     bank: Mapping[str, Any] | Path,
     *,
-    expected_audit_output_binding_sha256: str | None = None,
-) -> dict[str, Any]:
-    """Replay a committed score without compiling or scanning a bank."""
-
+    promotion_checks: Sequence[Mapping[str, Any]] | Mapping[str, Any] | Path,
+    score_state_dir: Path,
+    gold_state_dir: Path,
+    expected_gold_commitment: Mapping[str, str],
+    expected_audit_output_binding_sha256: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         prepared = _load_prepared_inputs(
-            Path(sample_run_dir),
-            Path(gold_run_dir),
-            Path(catalog_run_dir),
+            sample_run_dir,
+            gold_run_dir,
+            catalog_run_dir,
             bank,
+            gold_state_dir=gold_state_dir,
+            expected_gold_commitment=expected_gold_commitment,
             expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
         )
-        _validate_support(prepared)
-        stored = _load_score_run(Path(run_dir))
+        frozen = _prepare_frozen_decision_inputs(prepared, promotion_checks)
+        support = _support_assessment(prepared)
+        if support["failure_codes"]:
+            stored = _load_insufficient_score_run(run_dir)
+            descriptor = _validate_text_view_descriptor(stored["manifest"].get("text_view_descriptor"))
+            claim = _expected_score_claim(prepared, run_dir)
+            expected_manifest = _insufficient_support_manifest(prepared, descriptor, frozen, claim, support)
+            if stored["manifest"] != expected_manifest:
+                raise EnronAuditScoringError("Insufficient-support score manifest differs from deterministic replay.")
+            expected_receipt = _insufficient_support_receipt(expected_manifest)
+            if stored["receipt"] != expected_receipt:
+                raise EnronAuditScoringError("Insufficient-support score receipt differs from deterministic replay.")
+            _verify_score_claim(score_state_dir, prepared, run_dir, expected_receipt)
+            stored["status"] = "insufficient_support"
+            stored["catalog_reviewer_id"] = prepared["catalog_reviewer_id"]
+            return _detached(expected_receipt), stored
+
+        stored = _load_score_run(run_dir, frozen)
         descriptor = _validate_text_view_descriptor(stored["manifest"].get("text_view_descriptor"))
         slice_specs = _slice_specs(descriptor, str(prepared["gold_receipt"]["annotation_policy_sha256"]))
         predictions = stored["predictions"]
@@ -364,7 +533,8 @@ def verify_enron_gold_audit_score(
         expected_cases = _build_cases(prepared, predictions, commitment)
         if stored["cases"] != expected_cases:
             raise EnronAuditScoringError("Stored prediction-audit cases differ from deterministic replay.")
-        _verify_quality_result(prepared, descriptor, slice_specs, predictions, stored["quality"])
+        _verify_quality_result(prepared, descriptor, slice_specs, predictions, stored["quality"], frozen)
+        claim = _expected_score_claim(prepared, run_dir)
         expected_manifest = _score_manifest(
             prepared,
             descriptor,
@@ -372,13 +542,18 @@ def verify_enron_gold_audit_score(
             stored["quality"],
             stored["artifacts"],
             expected_cases,
+            frozen,
+            claim,
         )
         if stored["manifest"] != expected_manifest:
             raise EnronAuditScoringError("Score manifest differs from deterministic replay.")
         expected_receipt = _score_receipt(expected_manifest, stored["quality"])
         if stored["receipt"] != expected_receipt:
             raise EnronAuditScoringError("Score receipt differs from deterministic replay.")
-        return _detached(expected_receipt)
+        _verify_score_claim(score_state_dir, prepared, run_dir, expected_receipt)
+        stored["status"] = "scored_pending_prediction_audit"
+        stored["catalog_reviewer_id"] = prepared["catalog_reviewer_id"]
+        return _detached(expected_receipt), stored
     except EnronAuditScoringError:
         raise
     except (
@@ -399,13 +574,37 @@ def finalize_enron_prediction_audit_files(
     reviews_path: Path,
     output_dir: Path,
     *,
+    sample_run_dir: Path,
+    catalog_run_dir: Path,
+    bank: Mapping[str, Any] | Path,
+    promotion_checks: Sequence[Mapping[str, Any]] | Mapping[str, Any] | Path,
+    score_state_dir: Path,
+    gold_state_dir: Path,
+    expected_gold_commitment: Mapping[str, str],
+    expected_score_receipt: Mapping[str, Any],
+    expected_audit_output_binding_sha256: str | None = None,
     allow_unignored_output: bool = False,
 ) -> dict[str, Any]:
     """Commit complete distinct-reviewer findings for every frozen score case."""
 
     try:
-        score = _load_score_run(Path(score_run_dir))
+        verified_receipt, score = _verify_enron_gold_audit_score(
+            Path(score_run_dir),
+            Path(sample_run_dir),
+            Path(gold_run_dir),
+            Path(catalog_run_dir),
+            bank,
+            promotion_checks=promotion_checks,
+            score_state_dir=Path(score_state_dir),
+            gold_state_dir=Path(gold_state_dir),
+            expected_gold_commitment=expected_gold_commitment,
+            expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        )
+        _require_trusted_score_receipt(expected_score_receipt, verified_receipt, score)
+        if score.get("status") != "scored_pending_prediction_audit":
+            raise EnronAuditScoringError("Prediction audit requires a successfully completed score run.")
         reviewer_identities = _load_bound_gold_reviewer_identities(Path(gold_run_dir), score["receipt"])
+        reviewer_identities.add(_identifier(score["catalog_reviewer_id"], "catalog_reviewer_id"))
         reviews, _source_descriptor = _load_prediction_audit_reviews(Path(reviews_path), score["cases"])
         _validate_prediction_audit_reviews(reviews, score["cases"], reviewer_identities)
         review_payload = _canonical_jsonl(reviews)
@@ -427,12 +626,41 @@ def finalize_enron_prediction_audit_files(
         raise EnronAuditScoringError("Prediction audit could not be finalized safely.") from None
 
 
-def verify_enron_prediction_audit(run_dir: Path, score_run_dir: Path, gold_run_dir: Path) -> dict[str, Any]:
+def verify_enron_prediction_audit(
+    run_dir: Path,
+    score_run_dir: Path,
+    gold_run_dir: Path,
+    *,
+    sample_run_dir: Path,
+    catalog_run_dir: Path,
+    bank: Mapping[str, Any] | Path,
+    promotion_checks: Sequence[Mapping[str, Any]] | Mapping[str, Any] | Path,
+    score_state_dir: Path,
+    gold_state_dir: Path,
+    expected_gold_commitment: Mapping[str, str],
+    expected_score_receipt: Mapping[str, Any],
+    expected_audit_output_binding_sha256: str | None = None,
+) -> dict[str, Any]:
     """Replay prediction-audit coverage and immutable score/gold bindings."""
 
     try:
-        score = _load_score_run(Path(score_run_dir))
+        verified_receipt, score = _verify_enron_gold_audit_score(
+            Path(score_run_dir),
+            Path(sample_run_dir),
+            Path(gold_run_dir),
+            Path(catalog_run_dir),
+            bank,
+            promotion_checks=promotion_checks,
+            score_state_dir=Path(score_state_dir),
+            gold_state_dir=Path(gold_state_dir),
+            expected_gold_commitment=expected_gold_commitment,
+            expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        )
+        _require_trusted_score_receipt(expected_score_receipt, verified_receipt, score)
+        if score.get("status") != "scored_pending_prediction_audit":
+            raise EnronAuditScoringError("Prediction audit requires a successfully completed score run.")
         reviewer_identities = _load_bound_gold_reviewer_identities(Path(gold_run_dir), score["receipt"])
+        reviewer_identities.add(_identifier(score["catalog_reviewer_id"], "catalog_reviewer_id"))
         root = _validate_private_run_tree(Path(run_dir), _AUDIT_RUN_FILES, "Prediction audit")
         reviews, review_descriptor = _load_jsonl(
             root / "reviews.jsonl",
@@ -467,19 +695,34 @@ def _load_prepared_inputs(
     catalog_run_dir: Path,
     bank: Mapping[str, Any] | Path,
     *,
+    gold_state_dir: Path,
+    expected_gold_commitment: Mapping[str, str],
     expected_audit_output_binding_sha256: str | None,
 ) -> dict[str, Any]:
-    bindings, catalog_receipt = _catalog._load_verified_enron_catalog_qualification_files(
+    if (
+        not isinstance(expected_gold_commitment, Mapping)
+        or set(expected_gold_commitment) != {"gold_sha256", "manifest_sha256", "artifacts_sha256"}
+        or any(not _is_sha256(value) for value in expected_gold_commitment.values())
+    ):
+        raise EnronAuditScoringError("Trusted expected gold commitment is invalid.")
+    trusted_gold_commitment = dict(expected_gold_commitment)
+    documents, gold, gold_receipt = _gold._load_verified_enron_gold_annotations_files(
+        gold_run_dir,
+        sample_run_dir,
+        expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        expected_gold_commitment=trusted_gold_commitment,
+        gold_state_dir=gold_state_dir,
+    )
+    if any(gold_receipt.get(field) != value for field, value in trusted_gold_commitment.items()):
+        raise EnronAuditScoringError("Verified gold run differs from the trusted expected commitment.")
+    bindings, catalog_reviewer_id, catalog_receipt = _catalog._load_verified_enron_catalog_qualification_files(
         catalog_run_dir,
         sample_run_dir,
         gold_run_dir,
         bank,
         expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
-    )
-    documents, gold, gold_receipt = _gold._load_verified_enron_gold_annotations_files(
-        gold_run_dir,
-        sample_run_dir,
-        expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        expected_gold_commitment=trusted_gold_commitment,
+        gold_state_dir=gold_state_dir,
     )
     canonical_bank, _bank_artifact = _catalog._load_catalog_bank(bank)
     cross_fields = (
@@ -493,6 +736,8 @@ def _load_prepared_inputs(
         "gold_sha256",
         "annotation_policy_sha256",
         "catalog_policy_sha256",
+        "planned_evaluator_source_sha256",
+        "planned_thresholds_sha256",
     )
     if any(catalog_receipt.get(field) != gold_receipt.get(field) for field in cross_fields):
         raise EnronAuditScoringError("Gold and catalog runs do not share one immutable upstream binding.")
@@ -500,6 +745,11 @@ def _load_prepared_inputs(
         "planned_bank_sha256"
     ) != catalog_receipt.get("bank_sha256"):
         raise EnronAuditScoringError("Scoring bank differs from the frozen catalog and audit bank.")
+    if catalog_receipt.get("trusted_gold_commitment") != trusted_gold_commitment or catalog_receipt.get(
+        "trusted_gold_commitment_sha256"
+    ) != _canonical_hash(trusted_gold_commitment):
+        raise EnronAuditScoringError("Catalog qualification does not preserve the trusted gold commitment.")
+    catalog_reviewer_id = _identifier(catalog_reviewer_id, "catalog_reviewer_id")
 
     document_map: dict[str, dict[str, Any]] = {}
     for index, value in enumerate(documents):
@@ -619,18 +869,17 @@ def _load_prepared_inputs(
         "gold": gold,
         "gold_receipt": gold_receipt,
         "catalog_receipt": catalog_receipt,
+        "catalog_reviewer_id": catalog_reviewer_id,
     }
 
 
-def _validate_support(prepared: Mapping[str, Any]) -> None:
+def _support_assessment(prepared: Mapping[str, Any]) -> dict[str, Any]:
     document_ids = prepared["document_ids"]
     gold_by_document = prepared["gold_by_document"]
     gold_receipt = prepared["gold_receipt"]
     if not isinstance(document_ids, tuple) or not isinstance(gold_by_document, Mapping):
         raise EnronAuditScoringError("Prepared audit support is invalid.")
     documents = len(document_ids)
-    if gold_receipt.get("promotable") is True and documents != MIN_DECISION_GRADE_DOCUMENTS:
-        raise EnronAuditScoringError("Production audit support must contain exactly 100 documents.")
     gold_spans = 0
     sensitive_characters = 0
     negative_documents = 0
@@ -643,14 +892,6 @@ def _validate_support(prepared: Mapping[str, Any]) -> None:
         intervals = _merge_intervals([(int(span["start"]), int(span["end"])) for span in spans])
         sensitive_characters += sum(end - start for start, end in intervals)
         by_class.update(str(span["entity_class"]) for span in spans)
-    if (
-        documents < MIN_DECISION_GRADE_DOCUMENTS
-        or gold_spans < MIN_DECISION_GRADE_GOLD_SPANS
-        or negative_documents < MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS
-        or sensitive_characters < MIN_DECISION_GRADE_SENSITIVE_CHARACTERS
-        or any(by_class[entity_class] == 0 for entity_class in PERSON_CONTACT_ENTITY_CLASSES)
-    ):
-        raise EnronAuditScoringError("Audit support is insufficient for a decision-grade score.")
     receipt_counts = gold_receipt.get("counts")
     if not isinstance(receipt_counts, Mapping) or (
         receipt_counts.get("documents") != documents
@@ -659,6 +900,188 @@ def _validate_support(prepared: Mapping[str, Any]) -> None:
         or receipt_counts.get("sensitive_gold_characters") != sensitive_characters
     ):
         raise EnronAuditScoringError("Gold receipt support counts differ from private replay.")
+    failures: list[str] = []
+    if gold_receipt.get("promotable") is True and documents != MIN_DECISION_GRADE_DOCUMENTS:
+        failures.append("production_document_count_mismatch")
+    if documents < MIN_DECISION_GRADE_DOCUMENTS:
+        failures.append("documents_below_minimum")
+    if gold_spans < MIN_DECISION_GRADE_GOLD_SPANS:
+        failures.append("gold_spans_below_minimum")
+    if negative_documents < MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS:
+        failures.append("negative_documents_below_minimum")
+    if sensitive_characters < MIN_DECISION_GRADE_SENSITIVE_CHARACTERS:
+        failures.append("sensitive_characters_below_minimum")
+    for entity_class in PERSON_CONTACT_ENTITY_CLASSES:
+        if by_class[entity_class] == 0:
+            failures.append(f"{entity_class}_gold_support_missing")
+    failures.sort(key=_SUPPORT_FAILURE_ORDER.index)
+    counts = {
+        "documents": documents,
+        "gold_spans": gold_spans,
+        "negative_documents": negative_documents,
+        "sensitive_gold_characters": sensitive_characters,
+        "gold_spans_by_class": {entity_class: by_class[entity_class] for entity_class in PERSON_CONTACT_ENTITY_CLASSES},
+    }
+    requirements = {
+        "production_documents_exact": MIN_DECISION_GRADE_DOCUMENTS,
+        "minimum_documents": MIN_DECISION_GRADE_DOCUMENTS,
+        "minimum_gold_spans": MIN_DECISION_GRADE_GOLD_SPANS,
+        "minimum_negative_documents": MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS,
+        "minimum_sensitive_gold_characters": MIN_DECISION_GRADE_SENSITIVE_CHARACTERS,
+        "nonzero_classes": list(PERSON_CONTACT_ENTITY_CLASSES),
+    }
+    core = {"counts": counts, "requirements": requirements, "failure_codes": failures}
+    return {**core, "support_assessment_sha256": _canonical_hash(core)}
+
+
+def _prepare_frozen_decision_inputs(
+    prepared: Mapping[str, Any],
+    source: Sequence[Mapping[str, Any]] | Mapping[str, Any] | Path,
+) -> dict[str, Any]:
+    gold_receipt = prepared["gold_receipt"]
+    catalog_receipt = prepared["catalog_receipt"]
+    planned_evaluator = gold_receipt.get("planned_evaluator_source_sha256")
+    planned_thresholds = gold_receipt.get("planned_thresholds_sha256")
+    if (
+        not _is_sha256(planned_evaluator)
+        or catalog_receipt.get("planned_evaluator_source_sha256") != planned_evaluator
+        or not _is_sha256(planned_thresholds)
+        or catalog_receipt.get("planned_thresholds_sha256") != planned_thresholds
+    ):
+        raise EnronAuditScoringError("Upstream runs do not propagate the frozen evaluator and threshold commitments.")
+    evaluator = _quality.enron_quality_evaluator_identity()
+    if evaluator.get("source_sha256") != planned_evaluator:
+        raise EnronAuditScoringError("Installed quality evaluator differs from the source frozen in the audit plan.")
+    checks = _load_promotion_checks(source)
+    try:
+        thresholds_sha256 = hash_enron_thresholds(checks)
+    except (KeyError, TypeError, ValueError):
+        raise EnronAuditScoringError("Frozen promotion checks cannot be hashed as threshold configuration.") from None
+    if thresholds_sha256 != planned_thresholds:
+        raise EnronAuditScoringError(
+            "Promotion checks differ from the threshold configuration frozen in the audit plan."
+        )
+    gate_configurations = _select_quality_gate_configurations(checks)
+    return {
+        "evaluator": _detached(evaluator),
+        "planned_evaluator_source_sha256": planned_evaluator,
+        "thresholds_sha256": thresholds_sha256,
+        "quality_gate_configurations": gate_configurations,
+        "quality_gate_configuration_sha256": _canonical_hash(gate_configurations),
+    }
+
+
+def _load_promotion_checks(
+    source: Sequence[Mapping[str, Any]] | Mapping[str, Any] | Path,
+) -> list[dict[str, Any]]:
+    value: Any = source
+    if isinstance(source, Path):
+        raw = _read_regular_file(source, _MAX_JSON_BYTES, "Frozen promotion-check artifact")
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=_reject_duplicate_pairs,
+                parse_constant=_reject_json_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError):
+            raise EnronAuditScoringError("Frozen promotion-check artifact is not strict JSON.") from None
+    if isinstance(value, Mapping):
+        if isinstance(value.get("checks"), list):
+            value = value["checks"]
+        elif isinstance(value.get("promotion"), Mapping) and isinstance(value["promotion"].get("checks"), list):
+            value = value["promotion"]["checks"]
+        else:
+            raise EnronAuditScoringError("Frozen promotion-check mapping does not contain a checks sequence.")
+    if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
+        raise EnronAuditScoringError("Frozen promotion checks must be a sequence, mapping, or JSON file.")
+    checks: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_targets: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping) or set(item) not in {
+            _PROMOTION_CHECK_CONFIGURATION_FIELDS,
+            _PROMOTION_CHECK_FIELDS,
+        }:
+            raise EnronAuditScoringError(f"Promotion check {index} schema is invalid.")
+        check = dict(item)
+        check_id = _identifier(check.get("id"), "promotion check id")
+        target = check.get("target")
+        threshold = check.get("threshold")
+        if (
+            check_id in seen_ids
+            or not isinstance(target, str)
+            or not target.startswith("/")
+            or target in seen_targets
+            or check.get("category") not in {"quality", "catalog_conformance", "performance", "privacy", "provenance"}
+            or check.get("operator") not in {"gte", "lte", "eq"}
+            or not _is_json_gate_scalar(threshold)
+            or ("actual" in check and not _is_json_gate_scalar(check["actual"]))
+            or ("passed" in check and not isinstance(check["passed"], bool))
+        ):
+            raise EnronAuditScoringError(f"Promotion check {index} identity or values are invalid.")
+        seen_ids.add(check_id)
+        seen_targets.add(target)
+        checks.append(check)
+    if not checks:
+        raise EnronAuditScoringError("Frozen promotion-check artifact is empty.")
+    return checks
+
+
+def _select_quality_gate_configurations(checks: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    by_target = {str(check["target"]): check for check in checks}
+    configurations: list[dict[str, Any]] = []
+    for requirement in QUALITY_DECISION_POLICY["requirements"]:
+        target = str(requirement["target"])
+        check = by_target.get(target)
+        if check is None:
+            raise EnronAuditScoringError(f"Frozen promotion checks omit required quality gate {requirement['id']}.")
+        threshold = check["threshold"]
+        operator = requirement["operator"]
+        policy_threshold = requirement["policy_threshold"]
+        if (
+            check.get("id") != requirement["id"]
+            or check.get("category") != "quality"
+            or check.get("operator") != operator
+        ):
+            raise EnronAuditScoringError(f"Frozen quality gate {requirement['id']} has mismatched semantics.")
+        if operator == "eq":
+            strong_enough = type(threshold) is int and threshold == policy_threshold
+        elif operator == "gte":
+            strong_enough = (
+                type(threshold) in {int, float}
+                and 0 < float(threshold) <= 1
+                and float(threshold) >= float(policy_threshold)
+            )
+        else:
+            strong_enough = (
+                type(threshold) in {int, float}
+                and 0 <= float(threshold) < 1
+                and float(threshold) <= float(policy_threshold)
+            )
+        if not strong_enough:
+            raise EnronAuditScoringError(f"Frozen quality gate {requirement['id']} is weaker than policy.")
+        configurations.append(
+            {
+                "id": check["id"],
+                "category": check["category"],
+                "target": check["target"],
+                "operator": check["operator"],
+                "threshold": threshold,
+            }
+        )
+    return configurations
+
+
+def _is_json_gate_scalar(value: Any) -> bool:
+    if value is None or isinstance(value, (str, bool)):
+        return True
+    if type(value) not in {int, float}:
+        return False
+    try:
+        _canonical_bytes(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _validate_text_view_descriptor(value: Any) -> dict[str, Any]:
@@ -777,10 +1200,15 @@ def _verify_quality_result(
     slice_specs: Sequence[Mapping[str, Any]],
     predictions: Sequence[Mapping[str, Any]],
     result: Mapping[str, Any],
+    frozen: Mapping[str, Any],
 ) -> None:
     if not isinstance(result, Mapping) or set(result) != _QUALITY_RESULT_FIELDS:
         raise EnronAuditScoringError("Quality result schema is invalid.")
     evaluator = _quality.enron_quality_evaluator_identity()
+    if evaluator != frozen.get("evaluator") or evaluator.get("source_sha256") != frozen.get(
+        "planned_evaluator_source_sha256"
+    ):
+        raise EnronAuditScoringError("Quality evaluator no longer matches the frozen source commitment.")
     policy_sha256 = _quality_policy_sha256()
     specs = _quality._prepare_slices(slice_specs)
     normalized_descriptor = dict(text_view_descriptor)
@@ -1254,6 +1682,103 @@ def _validate_case_span(value: Mapping[str, Any], index: int, *, catalog: bool) 
         raise EnronAuditScoringError(f"Prediction-audit case {index} prediction identity is invalid.")
 
 
+def _insufficient_support_manifest(
+    prepared: Mapping[str, Any],
+    text_view_descriptor: Mapping[str, Any],
+    frozen: Mapping[str, Any],
+    claim: Mapping[str, Any],
+    support: Mapping[str, Any],
+) -> dict[str, Any]:
+    gold_receipt = prepared["gold_receipt"]
+    catalog_receipt = prepared["catalog_receipt"]
+    return {
+        "schema_version": INSUFFICIENT_SUPPORT_MANIFEST_SCHEMA_VERSION,
+        "status": "insufficient_support",
+        "decision_eligible": False,
+        "release": "do_not_ship",
+        "scoring_policy_sha256": AUDIT_SCORING_POLICY_SHA256,
+        "prediction_audit_policy_sha256": PREDICTION_AUDIT_POLICY_SHA256,
+        "fixture_mode": gold_receipt["fixture_mode"],
+        "promotable": gold_receipt["promotable"],
+        "audit_plan_sha256": gold_receipt["audit_plan_sha256"],
+        "audit_output_binding_sha256": gold_receipt["audit_output_binding_sha256"],
+        "audit_execution_policy_sha256": gold_receipt["audit_execution_policy_sha256"],
+        "sample_artifact_sha256": gold_receipt["sample_artifact_sha256"],
+        "sample_binding_sha256": gold_receipt["sample_binding_sha256"],
+        "annotation_policy_sha256": gold_receipt["annotation_policy_sha256"],
+        "catalog_policy_sha256": catalog_receipt["catalog_policy_sha256"],
+        "gold_sha256": gold_receipt["gold_sha256"],
+        "gold_manifest_sha256": gold_receipt["manifest_sha256"],
+        "gold_artifacts_sha256": gold_receipt["artifacts_sha256"],
+        "bank_sha256": catalog_receipt["bank_sha256"],
+        "catalog_binding_sha256": catalog_receipt["catalog_binding_sha256"],
+        "catalog_binding_artifact_sha256": catalog_receipt["binding_artifact_sha256"],
+        "trusted_gold_commitment_sha256": catalog_receipt["trusted_gold_commitment_sha256"],
+        "text_view_descriptor": _detached(text_view_descriptor),
+        "planned_evaluator_source_sha256": frozen["planned_evaluator_source_sha256"],
+        "thresholds_sha256": frozen["thresholds_sha256"],
+        "quality_gate_configuration_sha256": frozen["quality_gate_configuration_sha256"],
+        "score_attempt_binding_sha256": claim["score_attempt_binding_sha256"],
+        "score_claim_sha256": claim["score_claim_sha256"],
+        "support": _detached(support),
+        "artifacts": {},
+    }
+
+
+def _insufficient_support_receipt(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    support = manifest["support"]
+    if not isinstance(support, Mapping):
+        raise EnronAuditScoringError("Insufficient-support manifest aggregates are invalid.")
+    return {
+        "schema_version": INSUFFICIENT_SUPPORT_RECEIPT_SCHEMA_VERSION,
+        "valid": True,
+        "status": "insufficient_support",
+        "decision_eligible": False,
+        "release": "do_not_ship",
+        "fixture_mode": manifest["fixture_mode"],
+        "promotable": manifest["promotable"],
+        "audit_plan_sha256": manifest["audit_plan_sha256"],
+        "audit_output_binding_sha256": manifest["audit_output_binding_sha256"],
+        "audit_execution_policy_sha256": manifest["audit_execution_policy_sha256"],
+        "scoring_policy_sha256": manifest["scoring_policy_sha256"],
+        "prediction_audit_policy_sha256": manifest["prediction_audit_policy_sha256"],
+        "sample_artifact_sha256": manifest["sample_artifact_sha256"],
+        "sample_binding_sha256": manifest["sample_binding_sha256"],
+        "gold_sha256": manifest["gold_sha256"],
+        "gold_manifest_sha256": manifest["gold_manifest_sha256"],
+        "gold_artifacts_sha256": manifest["gold_artifacts_sha256"],
+        "bank_sha256": manifest["bank_sha256"],
+        "catalog_binding_sha256": manifest["catalog_binding_sha256"],
+        "catalog_binding_artifact_sha256": manifest["catalog_binding_artifact_sha256"],
+        "trusted_gold_commitment_sha256": manifest["trusted_gold_commitment_sha256"],
+        "planned_evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "thresholds_sha256": manifest["thresholds_sha256"],
+        "quality_gate_configuration_sha256": manifest["quality_gate_configuration_sha256"],
+        "score_attempt_binding_sha256": manifest["score_attempt_binding_sha256"],
+        "score_claim_sha256": manifest["score_claim_sha256"],
+        "prediction_commitment": None,
+        "prediction_commitment_sha256": None,
+        "quality_decision": None,
+        "quality_decision_sha256": None,
+        "quality_decision_passed": False,
+        "support_failure_codes": list(support["failure_codes"]),
+        "manifest_sha256": _canonical_hash(manifest),
+        "artifacts_sha256": _canonical_hash({}),
+        "counts": _detached(support["counts"]),
+        "privacy": {
+            "aggregate_only": True,
+            "raw_text_included": False,
+            "document_ids_included": False,
+            "reviewer_ids_included": False,
+            "span_coordinates_included": False,
+            "span_surfaces_included": False,
+            "catalog_identities_included": False,
+            "private_paths_included": False,
+        },
+    }
+
+
 def _score_manifest(
     prepared: Mapping[str, Any],
     text_view_descriptor: Mapping[str, Any],
@@ -1261,11 +1786,17 @@ def _score_manifest(
     quality_result: Mapping[str, Any],
     artifacts: Mapping[str, Mapping[str, Any]],
     cases: Sequence[Mapping[str, Any]],
+    frozen: Mapping[str, Any],
+    claim: Mapping[str, Any],
 ) -> dict[str, Any]:
     gold_receipt = prepared["gold_receipt"]
     catalog_receipt = prepared["catalog_receipt"]
     case_counts = {reason: sum(reason in case["reasons"] for case in cases) for reason in _CASE_REASON_ORDER}
-    quality_decision = _quality_decision(quality_result)
+    quality_decision = _quality_decision(
+        quality_result,
+        frozen["quality_gate_configurations"],
+        str(frozen["thresholds_sha256"]),
+    )
     return {
         "schema_version": SCORE_MANIFEST_SCHEMA_VERSION,
         "scoring_policy_sha256": AUDIT_SCORING_POLICY_SHA256,
@@ -1285,8 +1816,12 @@ def _score_manifest(
         "bank_sha256": catalog_receipt["bank_sha256"],
         "catalog_binding_sha256": catalog_receipt["catalog_binding_sha256"],
         "catalog_binding_artifact_sha256": catalog_receipt["binding_artifact_sha256"],
+        "trusted_gold_commitment_sha256": catalog_receipt["trusted_gold_commitment_sha256"],
         "text_view_descriptor": _detached(text_view_descriptor),
         "slice_specs_sha256": _canonical_hash(list(slice_specs)),
+        "planned_evaluator_source_sha256": frozen["planned_evaluator_source_sha256"],
+        "thresholds_sha256": frozen["thresholds_sha256"],
+        "quality_gate_configuration_sha256": frozen["quality_gate_configuration_sha256"],
         "quality_evaluator_sha256": quality_result["evaluator_sha256"],
         "quality_policy_sha256": quality_result["policy_sha256"],
         "quality_protocol_sha256": quality_result["protocol_sha256"],
@@ -1294,6 +1829,8 @@ def _score_manifest(
         "prediction_commitment": _detached(quality_result["prediction_commitment"]),
         "quality_run_sha256": quality_result["run_sha256"],
         "quality_decision": quality_decision,
+        "score_attempt_binding_sha256": claim["score_attempt_binding_sha256"],
+        "score_claim_sha256": claim["score_claim_sha256"],
         "support": _detached(gold_receipt["counts"]),
         "case_counts": case_counts,
         "artifacts": {key: _detached(artifacts[key]) for key in sorted(artifacts)},
@@ -1325,9 +1862,20 @@ def _score_receipt(manifest: Mapping[str, Any], quality_result: Mapping[str, Any
         "bank_sha256": manifest["bank_sha256"],
         "catalog_binding_sha256": manifest["catalog_binding_sha256"],
         "catalog_binding_artifact_sha256": manifest["catalog_binding_artifact_sha256"],
+        "trusted_gold_commitment_sha256": manifest["trusted_gold_commitment_sha256"],
+        "planned_evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "thresholds_sha256": manifest["thresholds_sha256"],
+        "quality_gate_configuration_sha256": manifest["quality_gate_configuration_sha256"],
         "prediction_commitment": _detached(manifest["prediction_commitment"]),
+        "prediction_commitment_sha256": manifest["prediction_commitment"]["sha256"],
         "quality_run_sha256": manifest["quality_run_sha256"],
         "quality_decision": _detached(manifest["quality_decision"]),
+        "quality_decision_sha256": manifest["quality_decision"]["quality_decision_sha256"],
+        "quality_decision_passed": manifest["quality_decision"]["passed"],
+        "support_failure_codes": [],
+        "score_attempt_binding_sha256": manifest["score_attempt_binding_sha256"],
+        "score_claim_sha256": manifest["score_claim_sha256"],
         "manifest_sha256": _canonical_hash(manifest),
         "artifacts_sha256": _canonical_hash(artifacts),
         "prediction_artifact_sha256": artifacts["predictions"]["sha256"],
@@ -1355,7 +1903,11 @@ def _score_receipt(manifest: Mapping[str, Any], quality_result: Mapping[str, Any
     }
 
 
-def _quality_decision(quality_result: Mapping[str, Any]) -> dict[str, Any]:
+def _quality_decision(
+    quality_result: Mapping[str, Any],
+    gate_configurations: Sequence[Mapping[str, Any]],
+    thresholds_sha256: str,
+) -> dict[str, Any]:
     quality = quality_result.get("quality")
     contract_validation = quality_result.get("contract_validation")
     slices = quality.get("slices") if isinstance(quality, Mapping) else None
@@ -1387,21 +1939,49 @@ def _quality_decision(quality_result: Mapping[str, Any]) -> dict[str, Any]:
         "negative_document_false_alarm_rate": metrics.get("negative_document_false_alarm_rate"),
         "over_redaction_rate": metrics.get("over_redaction_rate"),
     }
-    gates: list[dict[str, Any]] = []
-    for requirement in QUALITY_DECISION_POLICY["requirements"]:
+    contract_gate = QUALITY_DECISION_POLICY["contract_gate"]
+    gates: list[dict[str, Any]] = [
+        {
+            "id": contract_gate["id"],
+            "operator": contract_gate["operator"],
+            "threshold": contract_gate["threshold"],
+            "actual": actuals["contract_valid"],
+            "passed": actuals["contract_valid"] is True,
+        }
+    ]
+    if len(gate_configurations) != len(QUALITY_DECISION_POLICY["requirements"]):
+        raise EnronAuditScoringError("Frozen quality gate configuration is incomplete.")
+    for requirement, configuration in zip(QUALITY_DECISION_POLICY["requirements"], gate_configurations, strict=True):
         gate_id = requirement["id"]
-        operator = requirement["operator"]
-        threshold = requirement["threshold"]
+        if (
+            configuration.get("id") != gate_id
+            or configuration.get("target") != requirement["target"]
+            or configuration.get("operator") != requirement["operator"]
+        ):
+            raise EnronAuditScoringError("Frozen quality gate configuration differs from the scoring policy.")
+        operator = configuration["operator"]
+        threshold = configuration["threshold"]
         actual = actuals[gate_id]
-        if operator == "equal":
-            passed = actual is threshold
-        elif operator == "minimum":
+        if operator == "eq":
+            passed = type(actual) is type(threshold) and actual == threshold
+        elif operator == "gte":
             passed = type(actual) in {int, float} and actual >= threshold
         else:
             passed = type(actual) in {int, float} and actual <= threshold
-        gates.append({"id": gate_id, "operator": operator, "threshold": threshold, "actual": actual, "passed": passed})
+        gates.append(
+            {
+                "id": gate_id,
+                "target": configuration["target"],
+                "operator": operator,
+                "threshold": threshold,
+                "actual": actual,
+                "passed": passed,
+            }
+        )
     core = {
         "policy_sha256": QUALITY_DECISION_POLICY_SHA256,
+        "thresholds_sha256": thresholds_sha256,
+        "gate_configuration_sha256": _canonical_hash(list(gate_configurations)),
         "slice_id": "person_contact_all_test",
         "gates": gates,
         "passed": all(gate["passed"] for gate in gates),
@@ -1409,8 +1989,8 @@ def _quality_decision(quality_result: Mapping[str, Any]) -> dict[str, Any]:
     return {**core, "quality_decision_sha256": _canonical_hash(core)}
 
 
-def _load_score_run(path: Path) -> dict[str, Any]:
-    root = _validate_private_run_tree(path, _SCORE_RUN_FILES, "Gold audit score")
+def _load_score_run(path: Path, frozen: Mapping[str, Any]) -> dict[str, Any]:
+    root = _validate_private_run_tree(path, _SUCCESSFUL_SCORE_RUN_FILES, "Gold audit score")
     predictions, prediction_descriptor = _load_jsonl(
         root / "predictions.jsonl",
         description="Gold audit predictions",
@@ -1443,7 +2023,12 @@ def _load_score_run(path: Path) -> dict[str, Any]:
         manifest.get("schema_version") != SCORE_MANIFEST_SCHEMA_VERSION
         or manifest.get("scoring_policy_sha256") != AUDIT_SCORING_POLICY_SHA256
         or manifest.get("prediction_audit_policy_sha256") != PREDICTION_AUDIT_POLICY_SHA256
-        or manifest.get("quality_decision") != _quality_decision(quality)
+        or manifest.get("quality_decision")
+        != _quality_decision(
+            quality,
+            frozen["quality_gate_configurations"],
+            str(frozen["thresholds_sha256"]),
+        )
     ):
         raise EnronAuditScoringError("Gold audit score manifest schema is invalid.")
     if receipt != _score_receipt(manifest, quality):
@@ -1456,6 +2041,31 @@ def _load_score_run(path: Path) -> dict[str, Any]:
         "manifest": manifest,
         "receipt": receipt,
         "artifacts": artifacts,
+        "metadata_artifacts": {
+            "manifest": _artifact_descriptor("manifest.json", manifest_raw, 1),
+            "receipt": _artifact_descriptor("receipt.json", receipt_raw, 1),
+        },
+    }
+
+
+def _load_insufficient_score_run(path: Path) -> dict[str, Any]:
+    root = _validate_private_run_tree(path, _INSUFFICIENT_SCORE_RUN_FILES, "Insufficient-support score")
+    manifest, manifest_raw = _load_json_object(root / "manifest.json", "Insufficient-support score manifest")
+    receipt, receipt_raw = _load_json_object(root / "receipt.json", "Insufficient-support score receipt")
+    if manifest_raw != _canonical_json_file(manifest) or receipt_raw != _canonical_json_file(receipt):
+        raise EnronAuditScoringError("Insufficient-support score metadata is not canonically encoded.")
+    if (
+        manifest.get("schema_version") != INSUFFICIENT_SUPPORT_MANIFEST_SCHEMA_VERSION
+        or manifest.get("status") != "insufficient_support"
+        or receipt.get("schema_version") != INSUFFICIENT_SUPPORT_RECEIPT_SCHEMA_VERSION
+        or receipt.get("status") != "insufficient_support"
+        or receipt != _insufficient_support_receipt(manifest)
+    ):
+        raise EnronAuditScoringError("Insufficient-support score metadata is invalid.")
+    return {
+        "root": root,
+        "manifest": manifest,
+        "receipt": receipt,
         "metadata_artifacts": {
             "manifest": _artifact_descriptor("manifest.json", manifest_raw, 1),
             "receipt": _artifact_descriptor("receipt.json", receipt_raw, 1),
@@ -1509,6 +2119,27 @@ def _load_bound_gold_reviewer_identities(gold_run_dir: Path, score_receipt: Mapp
     if not identities:
         raise EnronAuditScoringError("Gold annotation reviewer identities are missing.")
     return identities
+
+
+def _require_trusted_score_receipt(
+    expected: Mapping[str, Any], verified: Mapping[str, Any], score: Mapping[str, Any]
+) -> None:
+    if not isinstance(expected, Mapping):
+        raise EnronAuditScoringError("Prediction audit requires a trusted expected score receipt.")
+    expected_detached = _detached(expected)
+    metadata = score.get("metadata_artifacts")
+    receipt_artifact = metadata.get("receipt") if isinstance(metadata, Mapping) else None
+    if (
+        expected_detached != verified
+        or expected_detached.get("manifest_sha256") != score["receipt"].get("manifest_sha256")
+        or expected_detached.get("prediction_commitment") != score["receipt"].get("prediction_commitment")
+        or expected_detached.get("prediction_commitment_sha256") != score["receipt"].get("prediction_commitment_sha256")
+        or not isinstance(receipt_artifact, Mapping)
+        or receipt_artifact.get("sha256") != _hash_bytes(_canonical_json_file(expected_detached))
+    ):
+        raise EnronAuditScoringError(
+            "Verified score receipt, manifest, or prediction commitment differs from the trusted expectation."
+        )
 
 
 def _load_prediction_audit_reviews(
@@ -1599,9 +2230,16 @@ def _prediction_audit_manifest(
         "quality_decision_sha256": score["receipt"]["quality_decision"]["quality_decision_sha256"],
         "quality_gates_passed": quality_passed,
         "score_case_artifact_sha256": score["receipt"]["case_artifact_sha256"],
+        "prediction_commitment_sha256": score["receipt"]["prediction_commitment_sha256"],
+        "catalog_binding_sha256": score["receipt"]["catalog_binding_sha256"],
         "gold_sha256": score["receipt"]["gold_sha256"],
         "gold_manifest_sha256": score["receipt"]["gold_manifest_sha256"],
         "gold_artifacts_sha256": score["receipt"]["gold_artifacts_sha256"],
+        "planned_evaluator_source_sha256": score["receipt"]["planned_evaluator_source_sha256"],
+        "thresholds_sha256": score["receipt"]["thresholds_sha256"],
+        "quality_gate_configuration_sha256": score["receipt"]["quality_gate_configuration_sha256"],
+        "score_attempt_binding_sha256": score["receipt"]["score_attempt_binding_sha256"],
+        "score_claim_sha256": score["receipt"]["score_claim_sha256"],
         "review_artifact": _detached(review_artifact),
         "counts": {
             "cases": len(score["cases"]),
@@ -1633,11 +2271,21 @@ def _prediction_audit_receipt(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "quality_decision_sha256": manifest["quality_decision_sha256"],
         "quality_gates_passed": manifest["quality_gates_passed"],
         "score_case_artifact_sha256": manifest["score_case_artifact_sha256"],
+        "prediction_commitment_sha256": manifest["prediction_commitment_sha256"],
+        "catalog_binding_sha256": manifest["catalog_binding_sha256"],
         "gold_sha256": manifest["gold_sha256"],
         "gold_manifest_sha256": manifest["gold_manifest_sha256"],
         "gold_artifacts_sha256": manifest["gold_artifacts_sha256"],
+        "planned_evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "thresholds_sha256": manifest["thresholds_sha256"],
+        "quality_gate_configuration_sha256": manifest["quality_gate_configuration_sha256"],
+        "score_attempt_binding_sha256": manifest["score_attempt_binding_sha256"],
+        "score_claim_sha256": manifest["score_claim_sha256"],
         "review_artifact_sha256": review_artifact["sha256"],
         "manifest_sha256": _canonical_hash(manifest),
+        "artifacts_sha256": _canonical_hash({"review": review_artifact}),
+        "unresolved_cases": manifest["counts"]["unresolved"],
         "counts": _detached(manifest["counts"]),
         "privacy": {
             "aggregate_only": True,
@@ -1650,6 +2298,208 @@ def _prediction_audit_receipt(manifest: Mapping[str, Any]) -> dict[str, Any]:
             "private_paths_included": False,
         },
     }
+
+
+def _score_attempt_binding_sha256(prepared: Mapping[str, Any]) -> str:
+    return _canonical_hash(
+        {
+            "domain": "nerb/enron/gold-audit/sole-score-attempt/v1",
+            "audit_plan_sha256": prepared["gold_receipt"]["audit_plan_sha256"],
+            "audit_output_binding_sha256": prepared["gold_receipt"]["audit_output_binding_sha256"],
+        }
+    )
+
+
+def _expected_score_claim(prepared: Mapping[str, Any], output_dir: Path) -> dict[str, Any]:
+    core = {
+        "schema_version": _SCORE_CLAIM_SCHEMA_VERSION,
+        "audit_plan_sha256": prepared["gold_receipt"]["audit_plan_sha256"],
+        "audit_output_binding_sha256": prepared["gold_receipt"]["audit_output_binding_sha256"],
+        "score_attempt_binding_sha256": _score_attempt_binding_sha256(prepared),
+        "score_output_directory_sha256": _canonical_hash(
+            {"absolute_output_directory": os.fspath(_absolute_path(output_dir))}
+        ),
+    }
+    return {**core, "score_claim_sha256": _canonical_hash(core)}
+
+
+def _score_state_filenames(claim: Mapping[str, Any]) -> tuple[str, str]:
+    binding = claim.get("score_attempt_binding_sha256")
+    if not _is_sha256(binding):
+        raise EnronAuditScoringError("Score claim binding is invalid.")
+    suffix = str(binding).removeprefix("sha256:")
+    return f"claim-{suffix}.json", f"outcome-{suffix}.json"
+
+
+def _acquire_score_claim(score_state_dir: Path, prepared: Mapping[str, Any], output_dir: Path) -> dict[str, Any]:
+    claim = _expected_score_claim(prepared, output_dir)
+    claim_name, _outcome_name = _score_state_filenames(claim)
+    directory_fd = _open_score_state_directory(score_state_dir)
+    try:
+        _write_exclusive_state_record(directory_fd, claim_name, claim)
+    except FileExistsError:
+        raise EnronAuditScoringError(
+            "This audit plan and sealed output binding already consumed their sole score attempt."
+        ) from None
+    except (EnronPrivateIOError, OSError, TypeError, ValueError):
+        raise EnronAuditScoringError("Sole-score claim could not be acquired durably.") from None
+    finally:
+        os.close(directory_fd)
+    return claim
+
+
+def _terminalize_score_claim(
+    score_state_dir: Path, claim: Mapping[str, Any], score_receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    core = {
+        "schema_version": _SCORE_OUTCOME_SCHEMA_VERSION,
+        "audit_plan_sha256": claim["audit_plan_sha256"],
+        "audit_output_binding_sha256": claim["audit_output_binding_sha256"],
+        "score_attempt_binding_sha256": claim["score_attempt_binding_sha256"],
+        "score_claim_sha256": claim["score_claim_sha256"],
+        "status": score_receipt["status"],
+        "decision_eligible": score_receipt["decision_eligible"],
+        "release": score_receipt["release"],
+        "score_receipt_sha256": _canonical_hash(score_receipt),
+        "failure_codes": list(score_receipt.get("support_failure_codes", [])),
+    }
+    outcome = {**core, "score_outcome_sha256": _canonical_hash(core)}
+    _write_score_outcome(score_state_dir, claim, outcome)
+    return outcome
+
+
+def _terminalize_failed_score_claim(score_state_dir: Path, claim: Mapping[str, Any]) -> None:
+    core = {
+        "schema_version": _SCORE_OUTCOME_SCHEMA_VERSION,
+        "audit_plan_sha256": claim["audit_plan_sha256"],
+        "audit_output_binding_sha256": claim["audit_output_binding_sha256"],
+        "score_attempt_binding_sha256": claim["score_attempt_binding_sha256"],
+        "score_claim_sha256": claim["score_claim_sha256"],
+        "status": "score_failed",
+        "decision_eligible": False,
+        "release": "do_not_ship",
+        "score_receipt_sha256": None,
+        "failure_codes": ["score_execution_failed"],
+    }
+    outcome = {**core, "score_outcome_sha256": _canonical_hash(core)}
+    try:
+        _write_score_outcome(score_state_dir, claim, outcome)
+    except (EnronAuditScoringError, EnronPrivateIOError, OSError, TypeError, ValueError):
+        # The exclusive claim itself is terminal and continues to forbid resampling.
+        pass
+
+
+def _write_score_outcome(score_state_dir: Path, claim: Mapping[str, Any], outcome: Mapping[str, Any]) -> None:
+    _claim_name, outcome_name = _score_state_filenames(claim)
+    directory_fd = _open_score_state_directory(score_state_dir)
+    try:
+        _write_exclusive_state_record(directory_fd, outcome_name, outcome)
+    except FileExistsError:
+        raise EnronAuditScoringError("Sole-score claim already has a terminal outcome.") from None
+    except (EnronPrivateIOError, OSError, TypeError, ValueError):
+        raise EnronAuditScoringError("Sole-score outcome could not be committed durably.") from None
+    finally:
+        os.close(directory_fd)
+
+
+def _verify_score_claim(
+    score_state_dir: Path,
+    prepared: Mapping[str, Any],
+    output_dir: Path,
+    score_receipt: Mapping[str, Any],
+) -> None:
+    expected_claim = _expected_score_claim(prepared, output_dir)
+    claim_name, outcome_name = _score_state_filenames(expected_claim)
+    directory_fd = _open_score_state_directory(score_state_dir)
+    try:
+        claim = _load_score_state_record(directory_fd, claim_name, "Sole-score claim")
+        outcome = _load_score_state_record(directory_fd, outcome_name, "Sole-score outcome")
+    finally:
+        os.close(directory_fd)
+    if claim != expected_claim or score_receipt.get("score_claim_sha256") != expected_claim["score_claim_sha256"]:
+        raise EnronAuditScoringError("Sole-score claim differs from the score-bound audit attempt.")
+    core = {
+        "schema_version": _SCORE_OUTCOME_SCHEMA_VERSION,
+        "audit_plan_sha256": claim["audit_plan_sha256"],
+        "audit_output_binding_sha256": claim["audit_output_binding_sha256"],
+        "score_attempt_binding_sha256": claim["score_attempt_binding_sha256"],
+        "score_claim_sha256": claim["score_claim_sha256"],
+        "status": score_receipt["status"],
+        "decision_eligible": score_receipt["decision_eligible"],
+        "release": score_receipt["release"],
+        "score_receipt_sha256": _canonical_hash(score_receipt),
+        "failure_codes": list(score_receipt.get("support_failure_codes", [])),
+    }
+    expected_outcome = {**core, "score_outcome_sha256": _canonical_hash(core)}
+    if outcome != expected_outcome:
+        raise EnronAuditScoringError("Sole-score terminal outcome differs from the verified score receipt.")
+
+
+def _open_score_state_directory(path: Path) -> int:
+    root = _absolute_path(path)
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            os.close(descriptor)
+            raise EnronAuditScoringError("Score-state directory must be owner-only mode 0700.")
+        return descriptor
+    except EnronAuditScoringError:
+        raise
+    except OSError:
+        raise EnronAuditScoringError("Score-state directory could not be opened safely.") from None
+
+
+def _write_exclusive_state_record(directory_fd: int, name: str, value: Mapping[str, Any]) -> None:
+    payload = _canonical_json_file(value)
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def _load_score_state_record(directory_fd: int, name: str, description: str) -> dict[str, Any]:
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise EnronAuditScoringError(f"{description} identity is invalid.")
+        with open_private_binary_input_at(directory_fd, name) as file:
+            raw = file.read(_MAX_JSON_BYTES + 1)
+    except EnronAuditScoringError:
+        raise
+    except (EnronPrivateIOError, OSError):
+        raise EnronAuditScoringError(f"{description} could not be opened safely.") from None
+    if len(raw) > _MAX_JSON_BYTES:
+        raise EnronAuditScoringError(f"{description} exceeds the byte limit.")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        raise EnronAuditScoringError(f"{description} is not strict JSON.") from None
+    if not isinstance(value, dict) or raw != _canonical_json_file(value):
+        raise EnronAuditScoringError(f"{description} is not one canonical object.")
+    return value
 
 
 def _validate_private_run_tree(path: Path, expected_files: frozenset[str], description: str) -> Path:
@@ -1732,6 +2582,38 @@ def _load_json_object(path: Path, description: str) -> tuple[dict[str, Any], byt
     if not isinstance(value, dict):
         raise EnronAuditScoringError(f"{description} must contain one JSON object.")
     return value, raw
+
+
+def _read_regular_file(path: Path, maximum_bytes: int, description: str) -> bytes:
+    candidate = _absolute_path(path)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            candidate,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise EnronAuditScoringError(f"{description} must be a single-link regular file.")
+        payload = bytearray()
+        while len(payload) <= maximum_bytes:
+            chunk = os.read(descriptor, min(1024 * 1024, maximum_bytes + 1 - len(payload)))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > maximum_bytes:
+            raise EnronAuditScoringError(f"{description} exceeds the byte limit.")
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino, after.st_size) != (info.st_dev, info.st_ino, info.st_size):
+            raise EnronAuditScoringError(f"{description} changed while it was read.")
+        return bytes(payload)
+    except EnronAuditScoringError:
+        raise
+    except OSError:
+        raise EnronAuditScoringError(f"{description} could not be opened safely.") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _reject_duplicate_pairs(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:

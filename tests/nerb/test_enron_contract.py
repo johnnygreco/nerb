@@ -20,6 +20,7 @@ from nerb.enron_contract import (
     calculate_enron_breakeven,
     calculate_enron_performance_comparison,
     calculate_enron_performance_statistics,
+    hash_enron_audit_chain,
     hash_enron_breakeven_plan,
     hash_enron_environment,
     hash_enron_manifest,
@@ -322,6 +323,13 @@ def _normalize_lineage(evidence: JsonObject) -> None:
 def _refresh_frozen_contract(evidence: JsonObject) -> None:
     evidence["performance_manifest_sha256"] = hash_enron_performance_manifest(evidence["performance"])
     evidence["thresholds_sha256"] = hash_enron_thresholds(evidence["promotion"]["checks"])
+    audit_chain = evidence["audit_chain"]
+    audit_chain["audit_plan_sha256"] = evidence["audit_plan_sha256"]
+    for stage in ("gold", "catalog", "score", "prediction_audit"):
+        audit_chain[stage]["audit_plan_sha256"] = audit_chain["audit_plan_sha256"]
+        audit_chain[stage]["audit_output_binding_sha256"] = audit_chain["audit_output_binding_sha256"]
+    audit_chain["score"]["thresholds_sha256"] = evidence["thresholds_sha256"]
+    audit_chain["score"]["evaluator_source_sha256"] = evidence["evaluator"]["source_sha256"]
     access = evidence["test_access"]
     frozen = access["frozen_target"]
     frozen_at = frozen["frozen_at"]
@@ -343,6 +351,36 @@ def _refresh_frozen_contract(evidence: JsonObject) -> None:
         if entry["benchmark_version"] == access["benchmark_version"]:
             entry["frozen_target"] = copy.deepcopy(frozen)
     _normalize_lineage(evidence)
+    audit_chain["chain_sha256"] = hash_enron_audit_chain(audit_chain)
+
+
+def _accept_audit_chain(evidence: JsonObject) -> None:
+    chain = evidence["audit_chain"]
+    score = chain["score"]
+    prediction = chain["prediction_audit"]
+    prediction_commitment = "sha256:" + "2" * 64
+    score.update(
+        {
+            "status": "scored_pending_prediction_audit",
+            "prediction_commitment_sha256": prediction_commitment,
+            "quality_decision_sha256": "sha256:" + "3" * 64,
+            "quality_decision_passed": True,
+            "support_failure_codes": [],
+        }
+    )
+    prediction.update(
+        {
+            "status": "accepted",
+            "receipt_sha256": "sha256:" + "4" * 64,
+            "manifest_sha256": "sha256:" + "5" * 64,
+            "artifacts_sha256": "sha256:" + "6" * 64,
+            "prediction_commitment_sha256": prediction_commitment,
+            "unresolved_cases": 0,
+            "gold_defects": 0,
+            "decision_eligible": True,
+            "release": "quality_eligible",
+        }
+    )
 
 
 def _sync_bound_manifest(manifest: JsonObject, evidence: JsonObject) -> None:
@@ -1485,6 +1523,7 @@ def _promotable(
     ]
     value["promotion"]["passed"] = True
     value["verifier"]["passed"] = True
+    _accept_audit_chain(value)
     _refresh_frozen_contract(value)
     _sync_bound_manifest(bound_manifest, value)
     result = (bound_manifest, value, inventories)
@@ -1651,6 +1690,7 @@ def test_contract_rejects_non_json_or_out_of_range_numeric_values(
     "field",
     [
         "audit_plan_sha256",
+        "audit_chain",
         "artifact_kind",
         "evaluator",
         "source",
@@ -1685,8 +1725,62 @@ def test_synthetic_fixtures_are_valid_exactly_bound_and_nonclaimable(
     assert evidence["manifest_sha256"] == hash_enron_manifest(manifest)
     assert evidence["promotion"]["passed"] is False
     assert evidence["verifier"]["passed"] is False
+    assert evidence["audit_chain"]["score"]["status"] == "insufficient_support"
+    assert evidence["audit_chain"]["prediction_audit"]["release"] == "do_not_ship"
     assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
     assert validate_enron_evidence(evidence, manifest=manifest) == {"valid": True, "diagnostics": []}
+
+
+def test_audit_chain_hash_detects_stage_tampering(evidence: JsonObject) -> None:
+    evidence["audit_chain"]["gold"]["gold_sha256"] = "sha256:" + "f" * 64
+
+    _assert_code(validate_enron_evidence(evidence), "contract.audit_chain_mismatch")
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("catalog", "gold_sha256"), "sha256:" + "a" * 64),
+        (("score", "catalog_binding_sha256"), "sha256:" + "b" * 64),
+        (("prediction_audit", "score_manifest_sha256"), "sha256:" + "c" * 64),
+        (("catalog", "audit_output_binding_sha256"), "sha256:" + "d" * 64),
+        (("gold", "unresolved"), 1),
+    ],
+)
+def test_audit_chain_rejects_swapped_or_unresolved_stage(
+    evidence: JsonObject, path: tuple[str, str], replacement: Any
+) -> None:
+    stage, field = path
+    evidence["audit_chain"][stage][field] = replacement
+    evidence["audit_chain"]["chain_sha256"] = hash_enron_audit_chain(evidence["audit_chain"])
+
+    _assert_code(validate_enron_evidence(evidence), "contract.audit_chain_mismatch")
+
+
+def test_audit_chain_requires_every_closed_stage(evidence: JsonObject) -> None:
+    del evidence["audit_chain"]["catalog"]
+
+    _assert_code(validate_enron_evidence(evidence), "contract.schema.required")
+
+
+@pytest.mark.parametrize("terminal_status", ["quality_gates_failed", "invalidated_gold_defect"])
+def test_terminal_do_not_ship_audit_cannot_be_promoted(
+    manifest: JsonObject, evidence: JsonObject, terminal_status: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    prediction = promoted["audit_chain"]["prediction_audit"]
+    prediction["status"] = terminal_status
+    prediction["decision_eligible"] = False
+    prediction["release"] = "do_not_ship"
+    prediction["gold_defects"] = 1 if terminal_status == "invalidated_gold_defect" else 0
+    if terminal_status == "quality_gates_failed":
+        promoted["audit_chain"]["score"]["quality_decision_passed"] = False
+    promoted["audit_chain"]["chain_sha256"] = hash_enron_audit_chain(promoted["audit_chain"])
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.decision_grade_prerequisite",
+    )
 
 
 def test_synthetic_fixture_cannot_self_promote_or_claim_verifier_success(

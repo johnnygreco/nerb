@@ -12,6 +12,7 @@ import pytest
 from nerb.bank import hash_bank
 from nerb.engine import Bank
 from nerb.enron_catalog_adjudication import (
+    CATALOG_REVIEW_SCHEMA_VERSION,
     EnronCatalogAdjudicationError,
     _load_verified_enron_catalog_qualification_files,
     enron_catalog_qualification_policy_sha256,
@@ -27,6 +28,7 @@ from nerb.enron_gold_annotations import (
     build_enron_gold,
     enron_gold_annotation_policy_sha256,
     finalize_enron_gold_annotations_files,
+    hash_enron_gold_adjudication,
 )
 from nerb.enron_private_io import PrivateRun
 from nerb.enron_sealed_audit import make_enron_sealed_audit_plan, select_enron_sealed_audit_sample
@@ -151,6 +153,7 @@ def _gold_for(text: str, spans: list[dict[str, Any]]) -> tuple[list[dict[str, An
         "document_id": "doc_1",
         "text_sha256": document["text_sha256"],
         "reviewer_id": "reviewer",
+        "adjudication_sha256": hash_enron_gold_adjudication(adjudication),
         "disagreements_reviewed": True,
         "agreement_audit": True,
         "status": "accepted",
@@ -182,13 +185,42 @@ def _write_private_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
     return path
 
 
+def _catalog_reviews(
+    documents: list[dict[str, Any]],
+    gold: dict[str, Any],
+    bank: dict[str, Any],
+    *,
+    reviewer_id: str = "catalog_reviewer",
+) -> list[dict[str, Any]]:
+    qualification = qualify_enron_gold_catalog(bank, documents, gold)
+    decisions_by_document = {str(document["document_id"]): [] for document in documents}
+    for binding in qualification["bindings"]:
+        decisions_by_document[str(binding["document_id"])].append(
+            {key: copy.deepcopy(binding[key]) for key in ("entity_class", "start", "end", "catalog_identity")}
+        )
+    return [
+        {
+            "schema_version": CATALOG_REVIEW_SCHEMA_VERSION,
+            "document_id": document["document_id"],
+            "text_sha256": document["text_sha256"],
+            "bank_sha256": qualification["bank_sha256"],
+            "gold_sha256": qualification["gold_sha256"],
+            "reviewer_id": reviewer_id,
+            "decisions": decisions_by_document[str(document["document_id"])],
+            "unresolved": [],
+        }
+        for document in documents
+    ]
+
+
 def _qualification_runs(
     tmp_path: Path,
     *,
     catalog_policy_sha256: str | None = None,
-) -> tuple[Path, Path, dict[str, Any], list[dict[str, Any]]]:
+    fixture_mode: bool = True,
+) -> tuple[Path, Path, dict[str, Any], list[dict[str, Any]], Path, dict[str, str], str]:
     bank = _bank()
-    text = "Alice <bob@example.com>"
+    text = "Alice <bob@example.com> Unknown"
     document_id = "doc_" + "1" * 64
     record = {"document_id": document_id, "views": {"subject_current_body": text}}
     membership = {
@@ -222,7 +254,7 @@ def _qualification_runs(
         performance_manifest_sha256=sha,
         annotation_policy_sha256=enron_gold_annotation_policy_sha256(),
         catalog_policy_sha256=(catalog_policy_sha256 or enron_catalog_qualification_policy_sha256()),
-        fixture_mode=True,
+        fixture_mode=fixture_mode,
     )
     documents, sample_receipt = select_enron_sealed_audit_sample([(record, membership)], plan)
     sample_run = tmp_path / "sample-run"
@@ -238,6 +270,7 @@ def _qualification_runs(
     spans = [
         {"entity_class": "person", "start": 0, "end": 5},
         {"entity_class": "contact", "start": 7, "end": 22},
+        {"entity_class": "person", "start": 24, "end": 31},
     ]
     pass_a = [
         {
@@ -268,6 +301,7 @@ def _qualification_runs(
             "document_id": document_id,
             "text_sha256": documents[0]["text_sha256"],
             "reviewer_id": "reviewer",
+            "adjudication_sha256": hash_enron_gold_adjudication(adjudication[0]),
             "disagreements_reviewed": True,
             "agreement_audit": True,
             "status": "accepted",
@@ -275,16 +309,34 @@ def _qualification_runs(
         }
     ]
     gold_run = tmp_path / "gold-run"
-    finalize_enron_gold_annotations_files(
+    gold_receipt = finalize_enron_gold_annotations_files(
         sample_run,
         _write_private_jsonl(tmp_path / "pass-a.jsonl", pass_a),
         _write_private_jsonl(tmp_path / "pass-b.jsonl", pass_b),
         _write_private_jsonl(tmp_path / "adjudication.jsonl", adjudication),
         _write_private_jsonl(tmp_path / "review.jsonl", review),
         gold_run,
+        expected_audit_output_binding_sha256=(
+            None if fixture_mode else str(sample_receipt["audit_output_binding_sha256"])
+        ),
         allow_unignored_output=True,
     )
-    return sample_run, gold_run, bank, [dict(row) for row in documents]
+    private_documents = [dict(row) for row in documents]
+    gold = build_enron_gold(private_documents, pass_a, pass_b, adjudication, review)
+    catalog_review_path = _write_private_jsonl(
+        tmp_path / "catalog-review.jsonl",
+        _catalog_reviews(private_documents, gold, bank),
+    )
+    gold_commitment = {key: str(gold_receipt[key]) for key in ("gold_sha256", "manifest_sha256", "artifacts_sha256")}
+    return (
+        sample_run,
+        gold_run,
+        bank,
+        private_documents,
+        catalog_review_path,
+        gold_commitment,
+        str(sample_receipt["audit_output_binding_sha256"]),
+    )
 
 
 def test_catalog_qualification_uses_active_definitions_without_predictions() -> None:
@@ -396,6 +448,37 @@ def test_conservative_literal_qualification_matches_rust_subset(
     assert qualified is _rust_exact_match(bank, surface, "person", start, end)
 
 
+@pytest.mark.parametrize(
+    ("text", "start", "end", "expected"),
+    [
+        ("—Alice", 1, 6, True),
+        ("-Alice", 1, 6, True),
+        ("xAlice", 1, 6, False),
+        ("éAlice", 1, 6, False),
+        ("\N{COMBINING ACUTE ACCENT}Alice", 1, 6, False),
+        ("\N{ARABIC-INDIC DIGIT ONE}Alice", 1, 6, False),
+        ("\N{UNDERTIE}Alice", 1, 6, False),
+        ("\N{ZERO WIDTH NON-JOINER}Alice", 1, 6, False),
+        ("\N{ZERO WIDTH JOINER}Alice", 1, 6, False),
+        ("Alice—", 0, 5, True),
+    ],
+)
+def test_unicode_word_boundaries_match_rust_regex_syntax(
+    text: str,
+    start: int,
+    end: int,
+    expected: bool,
+) -> None:
+    bank = _bank()
+    bank["entities"]["person"]["names"] = {"candidate": _name("Candidate", {"primary": _literal("Alice", 1)})}
+    documents, gold = _gold_for(text, [{"entity_class": "person", "start": start, "end": end}])
+
+    qualified = qualify_enron_gold_catalog(bank, documents, gold)["bindings"][0]["catalog_identity"] is not None
+
+    assert qualified is expected
+    assert qualified is _rust_exact_match(bank, text, "person", start, end)
+
+
 def test_production_email_regex_qualification_matches_rust() -> None:
     text = "<unknown@example.net>"
     start = 1
@@ -419,30 +502,63 @@ def test_catalog_qualification_rejects_ambiguous_priority_ties() -> None:
 
 
 def test_catalog_file_finalizer_commits_and_replays_mapping_or_path(tmp_path: Path) -> None:
-    sample_run, gold_run, bank, _documents_value = _qualification_runs(tmp_path)
+    sample_run, gold_run, bank, _documents_value, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
     output = tmp_path / "catalog-run"
     result = finalize_enron_catalog_qualification_files(
         sample_run,
         gold_run,
         bank,
+        catalog_review,
         output,
+        expected_gold_commitment=gold_commitment,
         allow_unignored_output=True,
     )
     bank_path = tmp_path / "bank.json"
     bank_path.write_bytes(_canonical(bank))
 
-    verified = verify_enron_catalog_qualification(output, sample_run, gold_run, bank_path)
-    bindings, loaded_receipt = _load_verified_enron_catalog_qualification_files(output, sample_run, gold_run, bank_path)
+    verified = verify_enron_catalog_qualification(
+        output,
+        sample_run,
+        gold_run,
+        bank_path,
+        expected_gold_commitment=gold_commitment,
+    )
+    bindings, catalog_reviewer_id, loaded_receipt = _load_verified_enron_catalog_qualification_files(
+        output,
+        sample_run,
+        gold_run,
+        bank_path,
+        expected_gold_commitment=gold_commitment,
+    )
 
     assert result == verified
     assert loaded_receipt == verified
-    assert len(bindings) == 2
-    assert result["counts"]["gold_spans"] == 2
+    assert catalog_reviewer_id == "catalog_reviewer"
+    assert len(bindings) == 3
+    assert result["counts"]["gold_spans"] == 3
     assert result["counts"]["cataloged_gold_spans"] == 2
-    assert result["catalog_coverage"] == 1.0
+    assert result["catalog_coverage"] == 2 / 3
+    assert result["review_provenance"]["decisions_reviewed"] == 3
+    assert result["review_provenance"]["reviewers"] == 1
+    assert result["unresolved"] == 0
+    assert result["trusted_gold_commitment"] == gold_commitment
+    assert result["planned_evaluator_source_sha256"] == "sha256:" + "3" * 64
+    assert result["planned_thresholds_sha256"] == "sha256:" + "3" * 64
+    assert all(
+        isinstance(result[field], str) and result[field].startswith("sha256:")
+        for field in (
+            "manifest_sha256",
+            "artifacts_sha256",
+            "binding_artifact_sha256",
+            "review_artifact_sha256",
+        )
+    )
     assert set(path.name for path in output.iterdir()) == {
         "COMMITTED",
         "binding.jsonl",
+        "catalog-review.jsonl",
         "manifest.json",
         "receipt.json",
     }
@@ -451,24 +567,135 @@ def test_catalog_file_finalizer_commits_and_replays_mapping_or_path(tmp_path: Pa
 
 
 def test_catalog_file_verifier_rejects_tampering(tmp_path: Path) -> None:
-    sample_run, gold_run, bank, _documents_value = _qualification_runs(tmp_path)
+    sample_run, gold_run, bank, _documents_value, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
     output = tmp_path / "catalog-run"
     finalize_enron_catalog_qualification_files(
         sample_run,
         gold_run,
         bank,
+        catalog_review,
         output,
+        expected_gold_commitment=gold_commitment,
         allow_unignored_output=True,
     )
     binding = output / "binding.jsonl"
     binding.write_bytes(binding.read_bytes().replace(b'"pattern_id":"primary"', b'"pattern_id":"forged"', 1))
 
     with pytest.raises(EnronCatalogAdjudicationError):
-        verify_enron_catalog_qualification(output, sample_run, gold_run, bank)
+        verify_enron_catalog_qualification(
+            output,
+            sample_run,
+            gold_run,
+            bank,
+            expected_gold_commitment=gold_commitment,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "cover every exact gold occurrence"),
+        ("duplicate", "duplicate gold occurrence"),
+        ("mismatch", "differ from deterministic"),
+        ("unresolved", "zero unresolved"),
+        ("unbounded_reviewer", "reviewer identity is invalid"),
+    ],
+)
+def test_catalog_file_finalizer_requires_complete_exact_private_review(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    sample_run, gold_run, bank, _documents, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
+    rows = [json.loads(line) for line in catalog_review.read_text().splitlines()]
+    if mutation == "missing":
+        rows[0]["decisions"].pop()
+    elif mutation == "duplicate":
+        rows[0]["decisions"].append(copy.deepcopy(rows[0]["decisions"][0]))
+    elif mutation == "mismatch":
+        rows[0]["decisions"][-1]["catalog_identity"] = {
+            "entity_id": "person",
+            "name_id": "alice",
+            "pattern_id": "primary",
+        }
+    elif mutation == "unresolved":
+        rows[0]["unresolved"] = ["pending"]
+    else:
+        rows[0]["reviewer_id"] = "x" * 129
+    _write_private_jsonl(catalog_review, rows)
+    output = tmp_path / "catalog-run"
+
+    with pytest.raises(EnronCatalogAdjudicationError, match=message):
+        finalize_enron_catalog_qualification_files(
+            sample_run,
+            gold_run,
+            bank,
+            catalog_review,
+            output,
+            expected_gold_commitment=gold_commitment,
+            allow_unignored_output=True,
+        )
+
+    assert not output.exists()
+
+
+def test_catalog_file_verifier_rejects_tampered_captured_review(tmp_path: Path) -> None:
+    sample_run, gold_run, bank, _documents, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
+    output = tmp_path / "catalog-run"
+    finalize_enron_catalog_qualification_files(
+        sample_run,
+        gold_run,
+        bank,
+        catalog_review,
+        output,
+        expected_gold_commitment=gold_commitment,
+        allow_unignored_output=True,
+    )
+    captured_review = output / "catalog-review.jsonl"
+    captured_review.write_bytes(
+        captured_review.read_bytes().replace(b'"reviewer_id":"catalog_reviewer"', b'"reviewer_id":"catalog_intruder"')
+    )
+
+    with pytest.raises(EnronCatalogAdjudicationError):
+        verify_enron_catalog_qualification(
+            output,
+            sample_run,
+            gold_run,
+            bank,
+            expected_gold_commitment=gold_commitment,
+        )
+
+
+def test_catalog_file_finalizer_rejects_a_different_trusted_gold_commitment(tmp_path: Path) -> None:
+    sample_run, gold_run, bank, _documents, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
+    wrong = dict(gold_commitment)
+    wrong["gold_sha256"] = "sha256:" + "f" * 64
+    output = tmp_path / "catalog-run"
+
+    with pytest.raises(EnronCatalogAdjudicationError):
+        finalize_enron_catalog_qualification_files(
+            sample_run,
+            gold_run,
+            bank,
+            catalog_review,
+            output,
+            expected_gold_commitment=wrong,
+            allow_unignored_output=True,
+        )
+
+    assert not output.exists()
 
 
 def test_catalog_file_finalizer_rejects_wrong_plan_policy_atomically(tmp_path: Path) -> None:
-    sample_run, gold_run, bank, _documents_value = _qualification_runs(
+    sample_run, gold_run, bank, _documents_value, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
         tmp_path,
         catalog_policy_sha256="sha256:" + "9" * 64,
     )
@@ -479,7 +706,9 @@ def test_catalog_file_finalizer_rejects_wrong_plan_policy_atomically(tmp_path: P
             sample_run,
             gold_run,
             bank,
+            catalog_review,
             output,
+            expected_gold_commitment=gold_commitment,
             allow_unignored_output=True,
         )
 
@@ -488,7 +717,9 @@ def test_catalog_file_finalizer_rejects_wrong_plan_policy_atomically(tmp_path: P
 
 
 def test_catalog_file_finalizer_rejects_bank_not_frozen_in_plan(tmp_path: Path) -> None:
-    sample_run, gold_run, bank, _documents_value = _qualification_runs(tmp_path)
+    sample_run, gold_run, bank, _documents_value, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
     changed_bank = copy.deepcopy(bank)
     changed_bank["description"] = "A different canonical bank."
     output = tmp_path / "catalog-run"
@@ -498,7 +729,9 @@ def test_catalog_file_finalizer_rejects_bank_not_frozen_in_plan(tmp_path: Path) 
             sample_run,
             gold_run,
             changed_bank,
+            catalog_review,
             output,
+            expected_gold_commitment=gold_commitment,
             allow_unignored_output=True,
         )
 
@@ -506,13 +739,17 @@ def test_catalog_file_finalizer_rejects_bank_not_frozen_in_plan(tmp_path: Path) 
 
 
 def test_catalog_file_receipt_contains_no_private_binding_data(tmp_path: Path) -> None:
-    sample_run, gold_run, bank, documents = _qualification_runs(tmp_path)
+    sample_run, gold_run, bank, documents, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
     output = tmp_path / "private-catalog-name"
     receipt = finalize_enron_catalog_qualification_files(
         sample_run,
         gold_run,
         bank,
+        catalog_review,
         output,
+        expected_gold_commitment=gold_commitment,
         allow_unignored_output=True,
     )
     encoded = json.dumps(receipt, sort_keys=True)
@@ -532,5 +769,6 @@ def test_catalog_file_receipt_contains_no_private_binding_data(tmp_path: Path) -
         "catalog_identities_included": False,
         "entity_names_included": False,
         "pattern_ids_included": False,
+        "reviewer_ids_included": False,
         "private_paths_included": False,
     }

@@ -17,6 +17,7 @@ from nerb.enron_gold_annotations import (
     build_enron_gold,
     enron_gold_annotation_policy_sha256,
     finalize_enron_gold_annotations_files,
+    hash_enron_gold_adjudication,
     public_enron_gold_receipt,
     verify_enron_gold_annotations,
 )
@@ -118,9 +119,14 @@ def _agreement_audit_ids(
 def _reviews(
     documents: list[dict[str, object]],
     *,
+    adjudications: list[dict[str, object]] | None = None,
     agreement_audit: bool = True,
     agreement_document_ids: set[str] | None = None,
 ) -> list[dict[str, object]]:
+    adjudication_by_document = {
+        str(row["document_id"]): row
+        for row in (adjudications if adjudications is not None else _adjudications(documents))
+    }
     audited = _agreement_audit_ids(documents, agreement_document_ids) if agreement_audit else set()
     return [
         {
@@ -128,6 +134,7 @@ def _reviews(
             "document_id": document["document_id"],
             "text_sha256": document["text_sha256"],
             "reviewer_id": "independent_reviewer",
+            "adjudication_sha256": hash_enron_gold_adjudication(adjudication_by_document[str(document["document_id"])]),
             "disagreements_reviewed": True,
             "agreement_audit": document["document_id"] in audited,
             "status": "accepted",
@@ -139,12 +146,13 @@ def _reviews(
 
 def _valid_inputs():
     documents = _documents()
+    adjudications = _adjudications(documents)
     return (
         documents,
         _passes(documents, "pass_a"),
         _passes(documents, "pass_b"),
-        _adjudications(documents),
-        _reviews(documents),
+        adjudications,
+        _reviews(documents, adjudications=adjudications),
     )
 
 
@@ -175,7 +183,12 @@ def _sample_pair(index: int) -> tuple[dict[str, Any], dict[str, Any]]:
     )
 
 
-def _sample_run(tmp_path: Path, count: int = 5) -> tuple[Path, list[dict[str, Any]]]:
+def _sample_run(
+    tmp_path: Path,
+    count: int = 5,
+    *,
+    fixture_mode: bool = True,
+) -> tuple[Path, list[dict[str, Any]]]:
     sha = "sha256:" + "a" * 64
     plan = make_enron_sealed_audit_plan(
         sample_size=count,
@@ -192,7 +205,7 @@ def _sample_run(tmp_path: Path, count: int = 5) -> tuple[Path, list[dict[str, An
         performance_manifest_sha256=sha,
         annotation_policy_sha256=enron_gold_annotation_policy_sha256(),
         catalog_policy_sha256=sha,
-        fixture_mode=True,
+        fixture_mode=fixture_mode,
     )
     selected, receipt = select_enron_sealed_audit_sample([_sample_pair(index) for index in range(count)], plan)
     sample_dir = tmp_path / "sample-run"
@@ -216,12 +229,13 @@ def _write_private_jsonl(path: Path, rows: list[dict[str, Any]]) -> Path:
 
 def _file_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, list[dict[str, Any]]]:
     sample_dir, documents = _sample_run(tmp_path)
+    adjudications = _adjudications(documents)
     return (
         sample_dir,
         _write_private_jsonl(tmp_path / "pass-a.jsonl", _passes(documents, "pass_a")),
         _write_private_jsonl(tmp_path / "pass-b.jsonl", _passes(documents, "pass_b")),
-        _write_private_jsonl(tmp_path / "adjudications.jsonl", _adjudications(documents)),
-        _write_private_jsonl(tmp_path / "reviews.jsonl", _reviews(documents)),
+        _write_private_jsonl(tmp_path / "adjudications.jsonl", adjudications),
+        _write_private_jsonl(tmp_path / "reviews.jsonl", _reviews(documents, adjudications=adjudications)),
         documents,
     )
 
@@ -307,7 +321,7 @@ def test_build_enron_gold_requires_each_disagreement_to_be_explained_and_reviewe
         }
     ]
     agreement_ids = {str(document["document_id"]) for document in documents[1:]}
-    reviews = _reviews(documents, agreement_document_ids=agreement_ids)
+    reviews = _reviews(documents, adjudications=adjudications, agreement_document_ids=agreement_ids)
     reviews[0]["disagreements_reviewed"] = False
     with pytest.raises(EnronGoldAnnotationError, match="disagreement"):
         build_enron_gold(documents, first, second, adjudications, reviews)
@@ -325,6 +339,52 @@ def test_build_enron_gold_requires_deterministic_twenty_percent_agreement_audit(
 
     with pytest.raises(EnronGoldAnnotationError, match="20% agreement audit"):
         build_enron_gold(documents, first, second, adjudications, reviews)
+
+
+def test_build_enron_gold_rejects_a_stale_review_for_the_opposite_adjudication() -> None:
+    documents, first, second, adjudications, _reviews_value = _valid_inputs()
+    second[0]["spans"] = [second[0]["spans"][1]]
+    adjudications[0]["decisions"] = [
+        {
+            "entity_class": "person",
+            "start": 0,
+            "end": 5,
+            "resolution": "include",
+            "reason_code": "confirmed_person",
+        }
+    ]
+    agreement_ids = {str(document["document_id"]) for document in documents[1:]}
+    stale_reviews = _reviews(
+        documents,
+        adjudications=adjudications,
+        agreement_document_ids=agreement_ids,
+    )
+    opposite = copy.deepcopy(adjudications)
+    opposite[0]["spans"] = [opposite[0]["spans"][1]]
+    opposite[0]["decisions"][0]["resolution"] = "exclude"
+
+    build_enron_gold(documents, first, second, adjudications, stale_reviews)
+    with pytest.raises(EnronGoldAnnotationError, match="normalized adjudication"):
+        build_enron_gold(documents, first, second, opposite, stale_reviews)
+
+
+def test_adjudication_commitment_normalizes_order_and_excludes_adjudicator_identity() -> None:
+    adjudication = _adjudications(_documents(1))[0]
+    reordered = copy.deepcopy(adjudication)
+    reordered_spans = reordered["spans"]
+    assert isinstance(reordered_spans, list)
+    reordered_spans.reverse()
+    reordered["adjudicator_id"] = "different_adjudicator"
+
+    assert hash_enron_gold_adjudication(reordered) == hash_enron_gold_adjudication(adjudication)
+
+
+def test_adjudication_commitment_rejects_unresolved_items() -> None:
+    adjudication = _adjudications(_documents(1))[0]
+    adjudication["unresolved"] = ["pending"]
+
+    with pytest.raises(EnronGoldAnnotationError, match="zero unresolved"):
+        hash_enron_gold_adjudication(adjudication)
 
 
 @pytest.mark.parametrize("forbidden", ["predictions", "matches", "gold_spans", "labels"])
@@ -384,6 +444,8 @@ def test_file_finalizer_commits_canonical_private_bundle_and_deep_verifies(tmp_p
     assert result["valid"] is True
     assert result["fixture_mode"] is True
     assert result["promotable"] is False
+    assert result["planned_evaluator_source_sha256"] == "sha256:" + "a" * 64
+    assert result["planned_thresholds_sha256"] == "sha256:" + "a" * 64
     assert result["counts"]["documents"] == 5
     assert set(path.name for path in output.iterdir()) == {
         "COMMITTED",
@@ -468,3 +530,54 @@ def test_file_workflow_returns_only_aggregate_commitments(tmp_path: Path) -> Non
         "span_surfaces_included": False,
         "private_paths_included": False,
     }
+
+
+def test_production_gold_state_registers_only_the_first_commitment_for_a_sealed_binding(tmp_path: Path) -> None:
+    sample_dir, first_path, second_path, adjudication_path, review_path, _documents = _file_inputs(tmp_path)
+    state_dir = tmp_path / "gold-state"
+    state_dir.mkdir(mode=0o700)
+    first_output = tmp_path / "first-gold"
+    first_receipt = finalize_enron_gold_annotations_files(
+        sample_dir,
+        first_path,
+        second_path,
+        adjudication_path,
+        review_path,
+        first_output,
+        gold_state_dir=state_dir,
+        allow_unignored_output=True,
+    )
+    trusted = {key: str(first_receipt[key]) for key in ("gold_sha256", "manifest_sha256", "artifacts_sha256")}
+
+    assert (
+        verify_enron_gold_annotations(
+            first_output,
+            sample_dir,
+            expected_gold_commitment=trusted,
+            gold_state_dir=state_dir,
+        )
+        == first_receipt
+    )
+    registered = tuple(state_dir.iterdir())
+    assert len(registered) == 1
+    assert os.stat(registered[0]).st_mode & 0o777 == 0o600
+
+    first = [json.loads(line) for line in first_path.read_text().splitlines()]
+    second = [json.loads(line) for line in second_path.read_text().splitlines()]
+    adjudications = [json.loads(line) for line in adjudication_path.read_text().splitlines()]
+    reviews = [json.loads(line) for line in review_path.read_text().splitlines()]
+    first[0]["spans"] = [first[0]["spans"][1]]
+    second[0]["spans"] = [second[0]["spans"][1]]
+    adjudications[0]["spans"] = [adjudications[0]["spans"][1]]
+    reviews[0]["adjudication_sha256"] = hash_enron_gold_adjudication(adjudications[0])
+    with pytest.raises(EnronGoldAnnotationError, match="first committed gold commitment"):
+        finalize_enron_gold_annotations_files(
+            sample_dir,
+            _write_private_jsonl(tmp_path / "second-pass-a.jsonl", first),
+            _write_private_jsonl(tmp_path / "second-pass-b.jsonl", second),
+            _write_private_jsonl(tmp_path / "second-adjudication.jsonl", adjudications),
+            _write_private_jsonl(tmp_path / "second-review.jsonl", reviews),
+            tmp_path / "second-gold",
+            gold_state_dir=state_dir,
+            allow_unignored_output=True,
+        )

@@ -9,6 +9,7 @@ import pytest
 
 import nerb.enron_audit_scoring as scoring
 from nerb.bank import hash_bank
+from nerb.enron_contract import hash_enron_thresholds
 from nerb.enron_gold_annotations import enron_gold_annotation_policy_sha256
 from nerb.enron_private_io import PrivateRun
 from nerb.enron_sealed_audit import AUDIT_EXECUTION_POLICY_SHA256
@@ -104,8 +105,49 @@ def _text_view_descriptor() -> dict[str, Any]:
     }
 
 
+def _promotion_checks() -> list[dict[str, Any]]:
+    checks = [
+        {
+            "id": requirement["id"],
+            "category": "quality",
+            "target": requirement["target"],
+            "operator": requirement["operator"],
+            "threshold": requirement["policy_threshold"],
+            "actual": None,
+            "passed": False,
+        }
+        for requirement in scoring.QUALITY_DECISION_POLICY["requirements"]
+    ]
+    checks.extend(
+        [
+            {
+                "id": "catalog_conformance",
+                "category": "catalog_conformance",
+                "target": "/catalog_conformance/passed",
+                "operator": "eq",
+                "threshold": True,
+                "actual": None,
+                "passed": False,
+            },
+            {
+                "id": "clean_git",
+                "category": "provenance",
+                "target": "/software/git_dirty",
+                "operator": "eq",
+                "threshold": False,
+                "actual": None,
+                "passed": False,
+            },
+        ]
+    )
+    return checks
+
+
 def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
     bank = _bank()
+    promotion_checks = _promotion_checks()
+    evaluator_source_sha256 = scoring._quality.enron_quality_evaluator_identity()["source_sha256"]
+    thresholds_sha256 = hash_enron_thresholds(promotion_checks)
     documents: list[dict[str, Any]] = []
     gold_documents: list[dict[str, Any]] = []
     bindings: list[dict[str, Any]] = []
@@ -224,6 +266,8 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
         "annotation_policy_sha256": enron_gold_annotation_policy_sha256(),
         "catalog_policy_sha256": catalog_policy_sha256,
         "bank_sha256": hash_bank(bank),
+        "evaluator_source_sha256": evaluator_source_sha256,
+        "thresholds_sha256": thresholds_sha256,
         "plan_artifact": {"sha256": "sha256:" + "4" * 64, "bytes": 1},
         "sample_artifact": {"sha256": "sha256:" + "5" * 64, "bytes": 1, "records": 100},
         "receipt_artifact": {"sha256": "sha256:" + "6" * 64, "bytes": 1, "records": 1},
@@ -271,6 +315,7 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
                 "document_id": "doc_000",
                 "text_sha256": documents[0]["text_sha256"],
                 "reviewer_id": "gold_reviewer",
+                "adjudication_sha256": "sha256:" + "a" * 64,
                 "disagreements_reviewed": True,
                 "agreement_audit": True,
                 "status": "accepted",
@@ -288,6 +333,11 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
         artifacts[key] = scoring._artifact_descriptor(filename, payload, len(rows))
     manifest = scoring._gold._gold_run_manifest(sample_binding, artifacts, gold)
     receipt = scoring._gold._gold_run_receipt(manifest)
+    expected_gold_commitment = {
+        "gold_sha256": receipt["gold_sha256"],
+        "manifest_sha256": receipt["manifest_sha256"],
+        "artifacts_sha256": receipt["artifacts_sha256"],
+    }
     gold_run = tmp_path / "gold-run"
     with PrivateRun(gold_run, allow_unignored_output=True) as run:
         for filename, payload in artifact_payloads.items():
@@ -318,7 +368,13 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
         "audit_execution_policy_sha256": AUDIT_EXECUTION_POLICY_SHA256,
         "sample_artifact_sha256": receipt["sample_artifact_sha256"],
         "sample_binding_sha256": receipt["sample_binding_sha256"],
+        "planned_evaluator_source_sha256": evaluator_source_sha256,
+        "planned_thresholds_sha256": thresholds_sha256,
         "gold_sha256": receipt["gold_sha256"],
+        "gold_manifest_sha256": receipt["manifest_sha256"],
+        "gold_artifacts_sha256": receipt["artifacts_sha256"],
+        "trusted_gold_commitment": expected_gold_commitment,
+        "trusted_gold_commitment_sha256": scoring._canonical_hash(expected_gold_commitment),
         "annotation_policy_sha256": receipt["annotation_policy_sha256"],
         "catalog_policy_sha256": catalog_policy_sha256,
         "bank_sha256": hash_bank(bank),
@@ -326,6 +382,17 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
         "binding_artifact_sha256": "sha256:" + "8" * 64,
         "catalog_binding_sha256": "sha256:" + "9" * 64,
         "manifest_sha256": "sha256:" + "c" * 64,
+        "artifacts_sha256": "sha256:" + "d" * 64,
+        "review_artifact_sha256": "sha256:" + "e" * 64,
+        "review_provenance": {
+            "documents_reviewed": 100,
+            "decisions_reviewed": 160,
+            "reviewers": 1,
+            "unresolved": 0,
+            "bank_aware": True,
+            "prediction_blind": True,
+            "reviewer_identity_sha256": "sha256:" + "f" * 64,
+        },
         "counts": catalog_counts,
         "catalog_coverage": 159 / 160,
         "privacy": {
@@ -340,6 +407,12 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
             "private_paths_included": False,
         },
     }
+    score_state = tmp_path / "score-state"
+    score_state.mkdir(mode=0o700)
+    score_state.chmod(0o700)
+    gold_state = tmp_path / "gold-state"
+    gold_state.mkdir(mode=0o700)
+    gold_state.chmod(0o700)
     return {
         "bank": bank,
         "documents": documents,
@@ -349,6 +422,11 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
             bindings, key=lambda row: (row["document_id"], row["start"], row["end"], row["entity_class"])
         ),
         "catalog_receipt": catalog_receipt,
+        "catalog_reviewer_id": "catalog_reviewer",
+        "promotion_checks": promotion_checks,
+        "expected_gold_commitment": expected_gold_commitment,
+        "score_state": score_state,
+        "gold_state": gold_state,
         "gold_run": gold_run,
         "sample_run": tmp_path / "sample-run-placeholder",
         "catalog_run": tmp_path / "catalog-run-placeholder",
@@ -357,8 +435,12 @@ def _build_private_inputs(tmp_path: Path) -> dict[str, Any]:
 
 
 def _install_upstream(monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]) -> None:
-    def load_catalog(*_args: Any, **_kwargs: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        return copy.deepcopy(data["bindings"]), copy.deepcopy(data["catalog_receipt"])
+    def load_catalog(*_args: Any, **_kwargs: Any) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+        return (
+            copy.deepcopy(data["bindings"]),
+            data["catalog_reviewer_id"],
+            copy.deepcopy(data["catalog_receipt"]),
+        )
 
     def load_gold(*_args: Any, **_kwargs: Any) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
         return (
@@ -369,6 +451,69 @@ def _install_upstream(monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]) -> 
 
     monkeypatch.setattr(scoring._catalog, "_load_verified_enron_catalog_qualification_files", load_catalog)
     monkeypatch.setattr(scoring._gold, "_load_verified_enron_gold_annotations_files", load_gold)
+
+
+def _apply_support_failure(data: dict[str, Any], failure_code: str) -> None:
+    if failure_code == "documents_below_minimum":
+        data["documents"].pop(79)
+        data["gold"]["documents"].pop(79)
+        data["bindings"] = [row for row in data["bindings"] if row["document_id"] != "doc_079"]
+        counts = (99, 158, 20, 1738)
+    elif failure_code == "gold_spans_below_minimum":
+        for document in data["gold"]["documents"][40:80]:
+            document["spans"] = []
+        data["bindings"] = [row for row in data["bindings"] if int(row["document_id"].removeprefix("doc_")) < 40]
+        counts = (100, 80, 60, 880)
+    elif failure_code == "negative_documents_below_minimum":
+        data["gold"]["documents"][80]["spans"] = [{"entity_class": "person", "start": 0, "end": 1}]
+        data["bindings"].append(
+            {
+                "document_id": "doc_080",
+                "entity_class": "person",
+                "start": 0,
+                "end": 1,
+                "catalog_identity": None,
+            }
+        )
+        counts = (100, 161, 19, 1761)
+    elif failure_code == "sensitive_characters_below_minimum":
+        for document in data["gold"]["documents"][:80]:
+            document["spans"] = [
+                {"entity_class": "person", "start": 0, "end": 1},
+                {"entity_class": "contact", "start": 6, "end": 7},
+            ]
+        for row in data["bindings"]:
+            row["end"] = row["start"] + 1
+        counts = (100, 160, 20, 160)
+    else:
+        missing_class = failure_code.removesuffix("_gold_support_missing")
+        retained_class = "person" if missing_class == "contact" else "contact"
+        base_start, base_end = (0, 5) if retained_class == "person" else (6, 23)
+        data["bindings"] = [row for row in data["bindings"] if row["entity_class"] == retained_class]
+        for index, document in enumerate(data["gold"]["documents"][:80]):
+            document["spans"] = [{"entity_class": retained_class, "start": base_start, "end": base_end}]
+            if index < 60:
+                for start in (0, 1) if retained_class == "contact" else (5, 6):
+                    document["spans"].append({"entity_class": retained_class, "start": start, "end": start + 1})
+                    data["bindings"].append(
+                        {
+                            "document_id": document["document_id"],
+                            "entity_class": retained_class,
+                            "start": start,
+                            "end": start + 1,
+                            "catalog_identity": None,
+                        }
+                    )
+        sensitive = 1480 if retained_class == "contact" else 520
+        counts = (100, 200, 20, sensitive)
+    data["bindings"].sort(key=lambda row: (row["document_id"], row["start"], row["end"], row["entity_class"]))
+    receipt_counts = data["gold_receipt"]["counts"]
+    (
+        receipt_counts["documents"],
+        receipt_counts["gold_spans"],
+        receipt_counts["negative_documents"],
+        receipt_counts["sensitive_gold_characters"],
+    ) = counts
 
 
 def _score(
@@ -392,6 +537,10 @@ def _score(
         data["catalog_run"],
         data["bank"],
         score_run,
+        promotion_checks=data["promotion_checks"],
+        score_state_dir=data["score_state"],
+        gold_state_dir=data["gold_state"],
+        expected_gold_commitment=data["expected_gold_commitment"],
         text_view_descriptor=_text_view_descriptor(),
         allow_unignored_output=True,
     )
@@ -411,6 +560,40 @@ def _reviews_for(score_run: Path, *, reviewer: str = "prediction_reviewer") -> l
         }
         for case in cases
     ]
+
+
+def _verify_score(data: dict[str, Any], score_run: Path) -> dict[str, Any]:
+    return scoring.verify_enron_gold_audit_score(
+        score_run,
+        data["sample_run"],
+        data["gold_run"],
+        data["catalog_run"],
+        data["bank"],
+        promotion_checks=data["promotion_checks"],
+        score_state_dir=data["score_state"],
+        gold_state_dir=data["gold_state"],
+        expected_gold_commitment=data["expected_gold_commitment"],
+    )
+
+
+def _finalize_prediction_audit(
+    data: dict[str, Any], score_receipt: dict[str, Any], score_run: Path, reviews: Path, output: Path
+) -> dict[str, Any]:
+    return scoring.finalize_enron_prediction_audit_files(
+        score_run,
+        data["gold_run"],
+        reviews,
+        output,
+        sample_run_dir=data["sample_run"],
+        catalog_run_dir=data["catalog_run"],
+        bank=data["bank"],
+        promotion_checks=data["promotion_checks"],
+        score_state_dir=data["score_state"],
+        gold_state_dir=data["gold_state"],
+        expected_gold_commitment=data["expected_gold_commitment"],
+        expected_score_receipt=score_receipt,
+        allow_unignored_output=True,
+    )
 
 
 def test_score_scans_once_commits_predictions_and_replays_without_engine(
@@ -439,6 +622,10 @@ def test_score_scans_once_commits_predictions_and_replays_without_engine(
         data["catalog_run"],
         data["bank"],
         score_run,
+        promotion_checks=data["promotion_checks"],
+        score_state_dir=data["score_state"],
+        gold_state_dir=data["gold_state"],
+        expected_gold_commitment=data["expected_gold_commitment"],
         text_view_descriptor=_text_view_descriptor(),
         allow_unignored_output=True,
     )
@@ -453,20 +640,13 @@ def test_score_scans_once_commits_predictions_and_replays_without_engine(
         "true_positive_sample": 20,
         "wrong_canonical": 1,
     }
-    assert (
-        scoring.verify_enron_gold_audit_score(
-            score_run, data["sample_run"], data["gold_run"], data["catalog_run"], data["bank"]
-        )
-        == receipt
-    )
+    assert _verify_score(data, score_run) == receipt
     assert calls == {"compile": 1, "scan": 100}
 
 
-def test_support_failure_precedes_compile_and_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_support_failure_commits_terminal_run_before_compile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data = _build_private_inputs(tmp_path)
-    data["documents"] = data["documents"][:-1]
-    data["gold"]["documents"] = data["gold"]["documents"][:-1]
-    data["gold_receipt"]["counts"]["documents"] = 99
+    _apply_support_failure(data, "documents_below_minimum")
     _install_upstream(monkeypatch, data)
     compiled = False
 
@@ -477,18 +657,70 @@ def test_support_failure_precedes_compile_and_output(tmp_path: Path, monkeypatch
 
     monkeypatch.setattr(scoring._quality, "prepare_enron_quality", forbidden)
     output = tmp_path / "score-run"
-    with pytest.raises(scoring.EnronAuditScoringError, match="support"):
-        scoring.score_enron_gold_audit_files(
-            data["sample_run"],
-            data["gold_run"],
-            data["catalog_run"],
-            data["bank"],
-            output,
-            text_view_descriptor=_text_view_descriptor(),
-            allow_unignored_output=True,
-        )
+    receipt = scoring.score_enron_gold_audit_files(
+        data["sample_run"],
+        data["gold_run"],
+        data["catalog_run"],
+        data["bank"],
+        output,
+        promotion_checks=data["promotion_checks"],
+        score_state_dir=data["score_state"],
+        gold_state_dir=data["gold_state"],
+        expected_gold_commitment=data["expected_gold_commitment"],
+        text_view_descriptor=_text_view_descriptor(),
+        allow_unignored_output=True,
+    )
     assert compiled is False
-    assert not output.exists()
+    assert receipt["status"] == "insufficient_support"
+    assert receipt["release"] == "do_not_ship"
+    assert receipt["support_failure_codes"] == ["documents_below_minimum"]
+    assert _verify_score(data, output) == receipt
+
+
+@pytest.mark.parametrize(
+    "failure_code",
+    [
+        "documents_below_minimum",
+        "gold_spans_below_minimum",
+        "negative_documents_below_minimum",
+        "sensitive_characters_below_minimum",
+        "contact_gold_support_missing",
+        "person_gold_support_missing",
+    ],
+)
+def test_each_support_floor_is_scan_free_terminal_and_tamper_evident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_code: str
+) -> None:
+    data = _build_private_inputs(tmp_path)
+    _apply_support_failure(data, failure_code)
+    _install_upstream(monkeypatch, data)
+    monkeypatch.setattr(
+        scoring._quality,
+        "prepare_enron_quality",
+        lambda *_args, **_kwargs: pytest.fail("insufficient support must not compile"),
+    )
+    output = tmp_path / "score-run"
+    receipt = scoring.score_enron_gold_audit_files(
+        data["sample_run"],
+        data["gold_run"],
+        data["catalog_run"],
+        data["bank"],
+        output,
+        promotion_checks=data["promotion_checks"],
+        score_state_dir=data["score_state"],
+        gold_state_dir=data["gold_state"],
+        expected_gold_commitment=data["expected_gold_commitment"],
+        text_view_descriptor=_text_view_descriptor(),
+        allow_unignored_output=True,
+    )
+    assert receipt["support_failure_codes"] == [failure_code]
+    assert _verify_score(data, output) == receipt
+    receipt_path = output / "receipt.json"
+    tampered = json.loads(receipt_path.read_text())
+    tampered["support_failure_codes"] = []
+    receipt_path.write_bytes(_canonical(tampered))
+    with pytest.raises(scoring.EnronAuditScoringError):
+        _verify_score(data, output)
 
 
 @pytest.mark.parametrize("artifact", ["predictions.jsonl", "cases.jsonl", "quality.json", "manifest.json"])
@@ -500,9 +732,7 @@ def test_score_verifier_rejects_tampered_artifacts(
     raw = path.read_bytes()
     path.write_bytes(raw + (b"{}\n" if artifact.endswith(".jsonl") else b" "))
     with pytest.raises(scoring.EnronAuditScoringError):
-        scoring.verify_enron_gold_audit_score(
-            score_run, data["sample_run"], data["gold_run"], data["catalog_run"], data["bank"]
-        )
+        _verify_score(data, score_run)
 
 
 def test_score_verifier_rejects_reordered_predictions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -512,9 +742,7 @@ def test_score_verifier_rejects_reordered_predictions(tmp_path: Path, monkeypatc
     lines[0], lines[1] = lines[1], lines[0]
     path.write_bytes(b"".join(lines))
     with pytest.raises(scoring.EnronAuditScoringError):
-        scoring.verify_enron_gold_audit_score(
-            score_run, data["sample_run"], data["gold_run"], data["catalog_run"], data["bank"]
-        )
+        _verify_score(data, score_run)
 
 
 def test_score_rejects_upstream_binding_drift(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -528,6 +756,134 @@ def test_score_rejects_upstream_binding_drift(tmp_path: Path, monkeypatch: pytes
             data["catalog_run"],
             data["bank"],
             tmp_path / "score-run",
+            promotion_checks=data["promotion_checks"],
+            score_state_dir=data["score_state"],
+            gold_state_dir=data["gold_state"],
+            expected_gold_commitment=data["expected_gold_commitment"],
+            text_view_descriptor=_text_view_descriptor(),
+            allow_unignored_output=True,
+        )
+
+
+def test_score_rejects_frozen_evaluator_drift_before_claim_or_compile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = _build_private_inputs(tmp_path)
+    drifted = "sha256:" + "0" * 64
+    data["gold_receipt"]["planned_evaluator_source_sha256"] = drifted
+    data["catalog_receipt"]["planned_evaluator_source_sha256"] = drifted
+    _install_upstream(monkeypatch, data)
+    monkeypatch.setattr(
+        scoring._quality,
+        "prepare_enron_quality",
+        lambda *_args, **_kwargs: pytest.fail("compile must not run"),
+    )
+    with pytest.raises(scoring.EnronAuditScoringError, match="evaluator"):
+        scoring.score_enron_gold_audit_files(
+            data["sample_run"],
+            data["gold_run"],
+            data["catalog_run"],
+            data["bank"],
+            tmp_path / "score-run",
+            promotion_checks=data["promotion_checks"],
+            score_state_dir=data["score_state"],
+            gold_state_dir=data["gold_state"],
+            expected_gold_commitment=data["expected_gold_commitment"],
+            text_view_descriptor=_text_view_descriptor(),
+            allow_unignored_output=True,
+        )
+    assert not list(data["score_state"].iterdir())
+
+
+def test_score_requires_externally_trusted_gold_commitment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data = _build_private_inputs(tmp_path)
+    _install_upstream(monkeypatch, data)
+    expected = copy.deepcopy(data["expected_gold_commitment"])
+    expected["gold_sha256"] = "sha256:" + "0" * 64
+    with pytest.raises(scoring.EnronAuditScoringError, match="trusted expected commitment"):
+        scoring.score_enron_gold_audit_files(
+            data["sample_run"],
+            data["gold_run"],
+            data["catalog_run"],
+            data["bank"],
+            tmp_path / "score-run",
+            promotion_checks=data["promotion_checks"],
+            score_state_dir=data["score_state"],
+            gold_state_dir=data["gold_state"],
+            expected_gold_commitment=expected,
+            text_view_descriptor=_text_view_descriptor(),
+            allow_unignored_output=True,
+        )
+    assert not list(data["score_state"].iterdir())
+
+
+@pytest.mark.parametrize("mutation", ["changed", "missing", "duplicate", "weak", "mismatched"])
+def test_score_rejects_invalid_frozen_thresholds_before_claim_or_compile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    data = _build_private_inputs(tmp_path)
+    checks = copy.deepcopy(data["promotion_checks"])
+    if mutation == "changed":
+        checks[0]["threshold"] = 1
+    elif mutation == "missing":
+        checks.pop(0)
+    elif mutation == "duplicate":
+        duplicate = copy.deepcopy(checks[0])
+        duplicate["threshold"] = 1
+        checks.append(duplicate)
+    elif mutation == "weak":
+        target = next(item for item in checks if item["id"] == "open_world_recall")
+        target["threshold"] = 0.90
+    else:
+        target = next(item for item in checks if item["id"] == "open_world_recall")
+        target["operator"] = "lte"
+    if mutation in {"weak", "mismatched"}:
+        threshold_hash = hash_enron_thresholds(checks)
+        data["gold_receipt"]["planned_thresholds_sha256"] = threshold_hash
+        data["catalog_receipt"]["planned_thresholds_sha256"] = threshold_hash
+    _install_upstream(monkeypatch, data)
+    monkeypatch.setattr(
+        scoring._quality,
+        "prepare_enron_quality",
+        lambda *_args, **_kwargs: pytest.fail("compile must not run"),
+    )
+    with pytest.raises(scoring.EnronAuditScoringError):
+        scoring.score_enron_gold_audit_files(
+            data["sample_run"],
+            data["gold_run"],
+            data["catalog_run"],
+            data["bank"],
+            tmp_path / "score-run",
+            promotion_checks=checks,
+            score_state_dir=data["score_state"],
+            gold_state_dir=data["gold_state"],
+            expected_gold_commitment=data["expected_gold_commitment"],
+            text_view_descriptor=_text_view_descriptor(),
+            allow_unignored_output=True,
+        )
+    assert not list(data["score_state"].iterdir())
+
+
+def test_score_claim_allows_exactly_one_attempt_across_output_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data, _receipt, _score_run = _score(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        scoring._quality,
+        "prepare_enron_quality",
+        lambda *_args, **_kwargs: pytest.fail("second attempt must not compile"),
+    )
+    with pytest.raises(scoring.EnronAuditScoringError, match="sole score attempt"):
+        scoring.score_enron_gold_audit_files(
+            data["sample_run"],
+            data["gold_run"],
+            data["catalog_run"],
+            data["bank"],
+            tmp_path / "different-score-run",
+            promotion_checks=data["promotion_checks"],
+            score_state_dir=data["score_state"],
+            gold_state_dir=data["gold_state"],
+            expected_gold_commitment=data["expected_gold_commitment"],
             text_view_descriptor=_text_view_descriptor(),
             allow_unignored_output=True,
         )
@@ -539,27 +895,72 @@ def test_prediction_audit_accepts_complete_distinct_review_and_is_private(
     data, score_receipt, score_run = _score(tmp_path, monkeypatch, quality_pass=True)
     reviews = _write_private_jsonl(tmp_path / "reviews.jsonl", _reviews_for(score_run))
     audit_run = tmp_path / "audit-run"
-    receipt = scoring.finalize_enron_prediction_audit_files(
-        score_run, data["gold_run"], reviews, audit_run, allow_unignored_output=True
-    )
+    receipt = _finalize_prediction_audit(data, score_receipt, score_run, reviews, audit_run)
     assert receipt["status"] == "accepted"
     assert receipt["decision_eligible"] is True
     assert receipt["release"] == "quality_eligible"
     assert receipt["counts"]["cases"] == score_receipt["counts"]["cases"]
-    assert scoring.verify_enron_prediction_audit(audit_run, score_run, data["gold_run"]) == receipt
+    assert (
+        scoring.verify_enron_prediction_audit(
+            audit_run,
+            score_run,
+            data["gold_run"],
+            sample_run_dir=data["sample_run"],
+            catalog_run_dir=data["catalog_run"],
+            bank=data["bank"],
+            promotion_checks=data["promotion_checks"],
+            score_state_dir=data["score_state"],
+            gold_state_dir=data["gold_state"],
+            expected_gold_commitment=data["expected_gold_commitment"],
+            expected_score_receipt=score_receipt,
+        )
+        == receipt
+    )
     encoded = json.dumps(receipt, sort_keys=True)
     assert "doc_000" not in encoded
     assert "prediction_reviewer" not in encoded
     assert '"start"' not in encoded
 
 
+def test_prediction_audit_rejects_catalog_reviewer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    data, score_receipt, score_run = _score(tmp_path, monkeypatch)
+    reviews = _write_private_jsonl(
+        tmp_path / "reviews.jsonl",
+        _reviews_for(score_run, reviewer=data["catalog_reviewer_id"]),
+    )
+    with pytest.raises(scoring.EnronAuditScoringError, match="distinct"):
+        _finalize_prediction_audit(data, score_receipt, score_run, reviews, tmp_path / "audit-run")
+
+
+def test_prediction_audit_rejects_appended_prediction_before_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data, score_receipt, score_run = _score(tmp_path, monkeypatch)
+    reviews = _write_private_jsonl(tmp_path / "reviews.jsonl", _reviews_for(score_run))
+    prediction_path = score_run / "predictions.jsonl"
+    prediction_payload = prediction_path.read_bytes()
+    prediction_payload += prediction_payload.splitlines(keepends=True)[-1]
+    prediction_path.write_bytes(prediction_payload)
+    manifest_path = score_run / "manifest.json"
+    receipt_path = score_run / "receipt.json"
+    quality = json.loads((score_run / "quality.json").read_text())
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifacts"]["predictions"] = scoring._artifact_descriptor(
+        "predictions.jsonl",
+        prediction_payload,
+        manifest["artifacts"]["predictions"]["records"] + 1,
+    )
+    manifest_path.write_bytes(_canonical(manifest))
+    receipt_path.write_bytes(_canonical(scoring._score_receipt(manifest, quality)))
+    with pytest.raises(scoring.EnronAuditScoringError):
+        _finalize_prediction_audit(data, score_receipt, score_run, reviews, tmp_path / "audit-run")
+
+
 def test_prediction_audit_quality_gate_failure_is_do_not_ship(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     data, score_receipt, score_run = _score(tmp_path, monkeypatch)
     assert score_receipt["quality_decision"]["passed"] is False
     source = _write_private_jsonl(tmp_path / "reviews.jsonl", _reviews_for(score_run))
-    receipt = scoring.finalize_enron_prediction_audit_files(
-        score_run, data["gold_run"], source, tmp_path / "audit-run", allow_unignored_output=True
-    )
+    receipt = _finalize_prediction_audit(data, score_receipt, score_run, source, tmp_path / "audit-run")
     assert receipt["status"] == "quality_gates_failed"
     assert receipt["decision_eligible"] is False
     assert receipt["release"] == "do_not_ship"
@@ -568,15 +969,13 @@ def test_prediction_audit_quality_gate_failure_is_do_not_ship(tmp_path: Path, mo
 def test_prediction_audit_gold_defect_invalidates_without_mutating_score(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    data, _score_receipt, score_run = _score(tmp_path, monkeypatch)
+    data, score_receipt, score_run = _score(tmp_path, monkeypatch)
     score_before = {path.name: path.read_bytes() for path in score_run.iterdir()}
     reviews = _reviews_for(score_run)
     reviews[0]["finding"] = "gold_defect"
     reviews[0]["reason_codes"] = ["incorrect_gold_span"]
     source = _write_private_jsonl(tmp_path / "reviews.jsonl", reviews)
-    receipt = scoring.finalize_enron_prediction_audit_files(
-        score_run, data["gold_run"], source, tmp_path / "audit-run", allow_unignored_output=True
-    )
+    receipt = _finalize_prediction_audit(data, score_receipt, score_run, source, tmp_path / "audit-run")
     assert receipt["status"] == "invalidated_gold_defect"
     assert receipt["decision_eligible"] is False
     assert receipt["release"] == "do_not_ship"
@@ -587,7 +986,7 @@ def test_prediction_audit_gold_defect_invalidates_without_mutating_score(
 def test_prediction_audit_rejects_incomplete_or_nonindependent_reviews_atomically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
-    data, _score_receipt, score_run = _score(tmp_path, monkeypatch)
+    data, score_receipt, score_run = _score(tmp_path, monkeypatch)
     reviews = _reviews_for(score_run)
     if mutation == "missing":
         reviews.pop()
@@ -603,7 +1002,5 @@ def test_prediction_audit_rejects_incomplete_or_nonindependent_reviews_atomicall
     source = _write_private_jsonl(tmp_path / "reviews.jsonl", reviews)
     output = tmp_path / "audit-run"
     with pytest.raises(scoring.EnronAuditScoringError):
-        scoring.finalize_enron_prediction_audit_files(
-            score_run, data["gold_run"], source, output, allow_unignored_output=True
-        )
+        _finalize_prediction_audit(data, score_receipt, score_run, source, output)
     assert not output.exists()

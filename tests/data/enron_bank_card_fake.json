@@ -190,7 +190,7 @@
     "label_strength": "structured_weak",
     "protocol_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000001",
     "quality_run_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000002",
-    "evaluator_sha256": "sha256:f7c4e3f0fd8429f64b12e3efeaf573b1f3fa6cf4522259fc3014ea7064f1a405",
+    "evaluator_sha256": "sha256:f7fc193bc98f17712110dbb4110ee2d7afb37b0bdc4d49534515283e445f5a08",
     "contact": {
       "documents": 2,
       "documents_with_sensitive_gold": 2,
@@ -268,9 +268,9 @@
     "direct_identifiers_included": false,
     "private_paths_included": false,
     "scanner": "nerb.enron_bank_workflow.public_card_scan.v2",
-    "scanner_source_sha256": "sha256:7c737c55d1bcb1f53f55477a8054fd1cff02e3ef694d015c7239f3d5074622b6",
+    "scanner_source_sha256": "sha256:c096e0bb6150e4b071b371c61f038d2ae93777407d61c5c48e70be5c3b20cd34",
     "violation_count": 0,
-    "report_sha256": "sha256:bdae0fbca63740557065f3a56bddfb7f9414e49684002d538f9f58c9700cc163"
+    "report_sha256": "sha256:34bc8fa91ba342d7e52366f17ba002aa7494a85684bfc0d995ee733230ebb58c"
   },
-  "run_sha256": "sha256:1dabd7f1d25582fa1dfd941efeca03a363cefddeac1dbd889ffce86aa04f792a"
+  "run_sha256": "sha256:ac19f2a79c36dcd6f211a6a1af1339a3cbb3d1f3687b334db495581b55cc5a08"
 }

@@ -43,6 +43,7 @@ ANNOTATION_REVIEW_SCHEMA_VERSION = "nerb.enron_gold_annotation_review"
 GOLD_SCHEMA_VERSION = "nerb.enron_gold"
 GOLD_RUN_MANIFEST_SCHEMA_VERSION = "nerb.enron_gold_annotation_run"
 GOLD_RUN_RECEIPT_SCHEMA_VERSION = "nerb.enron_gold_annotation_run_receipt"
+_GOLD_STATE_SCHEMA_VERSION = "nerb.enron_gold_commitment_state.v1"
 
 _COMMIT_PAYLOAD = b"nerb.enron.private-run.v2\n"
 _SAMPLE_RUN_FILES = frozenset({"COMMITTED", "plan.json", "documents.jsonl", "receipt.json"})
@@ -103,6 +104,7 @@ _SAMPLE_ARTIFACT_FIELDS = frozenset({"sha256", "bytes", "records"})
 _MAX_JSON_FILE_BYTES = 16 * 1024 * 1024
 _MAX_JSONL_LINE_BYTES = 16 * 1024 * 1024
 _MAX_ANNOTATION_ROWS = 10_000
+_GOLD_COMMITMENT_FIELDS = frozenset({"gold_sha256", "manifest_sha256", "artifacts_sha256"})
 
 ENTITY_CLASSES = ("contact", "person")
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -135,6 +137,7 @@ _REVIEW_FIELDS = frozenset(
         "document_id",
         "text_sha256",
         "reviewer_id",
+        "adjudication_sha256",
         "disagreements_reviewed",
         "agreement_audit",
         "status",
@@ -195,6 +198,78 @@ def enron_gold_annotation_policy_sha256() -> str:
     return _canonical_hash(ANNOTATION_POLICY)
 
 
+def hash_enron_gold_adjudication(adjudication: Mapping[str, Any]) -> str:
+    """Commit one normalized adjudication decision for independent review."""
+
+    if not isinstance(adjudication, Mapping) or set(adjudication) != _ADJUDICATION_FIELDS:
+        raise EnronGoldAnnotationError("Adjudication commitment schema is invalid.")
+    if adjudication.get("schema_version") != ADJUDICATION_SCHEMA_VERSION:
+        raise EnronGoldAnnotationError("Adjudication commitment version is invalid.")
+    document_id = _identifier(adjudication.get("document_id"), "document_id")
+    text_sha256 = adjudication.get("text_sha256")
+    if not isinstance(text_sha256, str) or _SHA256_RE.fullmatch(text_sha256) is None:
+        raise EnronGoldAnnotationError("Adjudication commitment text binding is invalid.")
+    spans = adjudication.get("spans")
+    decisions = adjudication.get("decisions")
+    unresolved = adjudication.get("unresolved")
+    if not isinstance(spans, list) or not isinstance(decisions, list):
+        raise EnronGoldAnnotationError("Adjudication commitment spans and decisions must be lists.")
+    if not isinstance(unresolved, list) or unresolved:
+        raise EnronGoldAnnotationError("Adjudication commitment must have zero unresolved items.")
+    normalized_spans: list[dict[str, Any]] = []
+    for value in spans:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != _SPAN_FIELDS
+            or not isinstance(value["entity_class"], str)
+            or type(value["start"]) is not int
+            or type(value["end"]) is not int
+        ):
+            raise EnronGoldAnnotationError("Adjudication commitment span is invalid.")
+        normalized_spans.append({"entity_class": value["entity_class"], "start": value["start"], "end": value["end"]})
+    normalized_spans.sort(key=lambda value: (value["start"], value["end"], value["entity_class"]))
+    normalized_decisions: list[dict[str, Any]] = []
+    for value in decisions:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != _DECISION_FIELDS
+            or not isinstance(value["entity_class"], str)
+            or type(value["start"]) is not int
+            or type(value["end"]) is not int
+            or not isinstance(value["resolution"], str)
+            or not isinstance(value["reason_code"], str)
+        ):
+            raise EnronGoldAnnotationError("Adjudication commitment decision is invalid.")
+        normalized_decisions.append(
+            {
+                "entity_class": value["entity_class"],
+                "start": value["start"],
+                "end": value["end"],
+                "resolution": value["resolution"],
+                "reason_code": value["reason_code"],
+            }
+        )
+    normalized_decisions.sort(
+        key=lambda value: (
+            value["start"],
+            value["end"],
+            value["entity_class"],
+            value["resolution"],
+            value["reason_code"],
+        )
+    )
+    return _canonical_hash(
+        {
+            "schema_version": ADJUDICATION_SCHEMA_VERSION,
+            "document_id": document_id,
+            "text_sha256": text_sha256,
+            "spans": normalized_spans,
+            "decisions": normalized_decisions,
+            "unresolved": list(unresolved),
+        }
+    )
+
+
 def build_enron_gold(
     documents: Sequence[Mapping[str, Any]],
     pass_a: Sequence[Mapping[str, Any]],
@@ -215,11 +290,13 @@ def build_enron_gold(
     second, second_reviewers = _prepare_pass("B", pass_b, normalized_documents)
     if first_reviewers & second_reviewers:
         raise EnronGoldAnnotationError("Blind annotation passes must use distinct reviewer identities.")
-    final, adjudicators, required_reviews, disagreement_count, decision_count = _prepare_adjudications(
-        adjudications,
-        normalized_documents,
-        first,
-        second,
+    final, adjudicators, adjudication_commitments, required_reviews, disagreement_count, decision_count = (
+        _prepare_adjudications(
+            adjudications,
+            normalized_documents,
+            first,
+            second,
+        )
     )
     if (first_reviewers | second_reviewers) & adjudicators:
         raise EnronGoldAnnotationError("Adjudicators must be distinct from both blind annotation passes.")
@@ -244,6 +321,7 @@ def build_enron_gold(
         required_reviews,
         agreement_documents,
         sample_binding_sha256,
+        adjudication_commitments,
     )
     if (first_reviewers | second_reviewers | adjudicators) & reviewed_by:
         raise EnronGoldAnnotationError(
@@ -362,6 +440,7 @@ def finalize_enron_gold_annotations_files(
     output_dir: Path,
     *,
     expected_audit_output_binding_sha256: str | None = None,
+    gold_state_dir: Path | None = None,
     allow_unignored_output: bool = False,
 ) -> dict[str, Any]:
     """Validate and transactionally capture one prediction-blind gold bundle.
@@ -375,6 +454,11 @@ def finalize_enron_gold_annotations_files(
             Path(sample_run_dir),
             expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
         )
+        if not sample_binding["fixture_mode"] and gold_state_dir is None:
+            raise EnronGoldAnnotationError("Production gold finalization requires an explicit gold-state directory.")
+        if gold_state_dir is not None:
+            state_directory_fd = _open_gold_state_directory(Path(gold_state_dir))
+            os.close(state_directory_fd)
         source_rows = {
             "pass_a": _load_annotation_rows(Path(pass_a_path), "Annotation pass A"),
             "pass_b": _load_annotation_rows(Path(pass_b_path), "Annotation pass B"),
@@ -415,6 +499,8 @@ def finalize_enron_gold_annotations_files(
             with run.open_binary("receipt.json") as file:
                 file.write(_canonical_json_file(receipt))
             run.commit()
+        if gold_state_dir is not None:
+            _register_gold_commitment(Path(gold_state_dir), receipt)
         return _detached_mapping(receipt)
     except EnronGoldAnnotationError:
         raise
@@ -427,6 +513,8 @@ def verify_enron_gold_annotations(
     sample_run_dir: Path,
     *,
     expected_audit_output_binding_sha256: str | None = None,
+    expected_gold_commitment: Mapping[str, str] | None = None,
+    gold_state_dir: Path | None = None,
 ) -> dict[str, Any]:
     """Deep-verify one committed gold bundle and return aggregate-only evidence."""
 
@@ -473,6 +561,8 @@ def verify_enron_gold_annotations(
         expected_receipt = _gold_run_receipt(expected_manifest)
         if receipt != expected_receipt:
             raise EnronGoldAnnotationError("Gold annotation receipt differs from deterministic replay.")
+        _validate_expected_gold_commitment(expected_receipt, expected_gold_commitment)
+        _verify_registered_gold_commitment(gold_state_dir, expected_receipt)
         return _detached_mapping(expected_receipt)
     except EnronGoldAnnotationError:
         raise
@@ -534,6 +624,8 @@ def _load_sample_run(
         "annotation_policy_sha256": validated_plan["annotation_policy_sha256"],
         "catalog_policy_sha256": validated_plan["catalog_policy_sha256"],
         "bank_sha256": validated_plan["bank_sha256"],
+        "evaluator_source_sha256": validated_plan["evaluator_source_sha256"],
+        "thresholds_sha256": validated_plan["thresholds_sha256"],
         "plan_artifact": dict(receipt["plan_artifact"]),
         "sample_artifact": dict(receipt["sample_artifact"]),
         "receipt_artifact": _artifact_descriptor_without_name(receipt_raw, 1),
@@ -756,6 +848,8 @@ def _gold_run_manifest(
         "schema_version": GOLD_RUN_MANIFEST_SCHEMA_VERSION,
         "sample_binding": _detached_mapping(sample_binding),
         "annotation_policy_sha256": gold["annotation_policy_sha256"],
+        "planned_evaluator_source_sha256": sample_binding["evaluator_source_sha256"],
+        "planned_thresholds_sha256": sample_binding["thresholds_sha256"],
         "gold_schema_version": gold["schema_version"],
         "sample_binding_sha256": gold["sample_binding_sha256"],
         "gold_sha256": gold["gold_sha256"],
@@ -784,6 +878,8 @@ def _gold_run_receipt(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "audit_execution_policy_sha256": sample_binding["audit_execution_policy_sha256"],
         "catalog_policy_sha256": sample_binding["catalog_policy_sha256"],
         "planned_bank_sha256": sample_binding["bank_sha256"],
+        "planned_evaluator_source_sha256": manifest["planned_evaluator_source_sha256"],
+        "planned_thresholds_sha256": manifest["planned_thresholds_sha256"],
         "sample_plan_artifact_sha256": plan_artifact["sha256"],
         "sample_artifact_sha256": sample_artifact["sha256"],
         "sample_receipt_artifact_sha256": receipt_artifact["sha256"],
@@ -813,11 +909,162 @@ def _detached_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     return detached
 
 
+def _validate_expected_gold_commitment(
+    receipt: Mapping[str, Any],
+    expected_gold_commitment: Mapping[str, str] | None,
+) -> None:
+    actual = {key: receipt.get(key) for key in sorted(_GOLD_COMMITMENT_FIELDS)}
+    if any(not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None for value in actual.values()):
+        raise EnronGoldAnnotationError("Gold receipt commitments are invalid.")
+    if expected_gold_commitment is None:
+        if receipt.get("fixture_mode") is not True:
+            raise EnronGoldAnnotationError("Production gold verification requires an explicit trusted gold commitment.")
+        return
+    if (
+        not isinstance(expected_gold_commitment, Mapping)
+        or set(expected_gold_commitment) != _GOLD_COMMITMENT_FIELDS
+        or any(
+            not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None
+            for value in expected_gold_commitment.values()
+        )
+        or dict(expected_gold_commitment) != actual
+    ):
+        raise EnronGoldAnnotationError("Trusted gold commitment is invalid or does not match deterministic replay.")
+
+
+def _gold_commitment(receipt: Mapping[str, Any]) -> dict[str, str]:
+    commitment = {key: receipt.get(key) for key in sorted(_GOLD_COMMITMENT_FIELDS)}
+    if any(not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None for value in commitment.values()):
+        raise EnronGoldAnnotationError("Gold receipt commitments are invalid.")
+    return {key: str(commitment[key]) for key in sorted(commitment)}
+
+
+def _expected_gold_state(receipt: Mapping[str, Any]) -> dict[str, Any]:
+    audit_plan_sha256 = receipt.get("audit_plan_sha256")
+    audit_output_binding_sha256 = receipt.get("audit_output_binding_sha256")
+    if (
+        not isinstance(audit_plan_sha256, str)
+        or _SHA256_RE.fullmatch(audit_plan_sha256) is None
+        or not isinstance(audit_output_binding_sha256, str)
+        or _SHA256_RE.fullmatch(audit_output_binding_sha256) is None
+    ):
+        raise EnronGoldAnnotationError("Gold state audit binding is invalid.")
+    commitment = _gold_commitment(receipt)
+    core = {
+        "schema_version": _GOLD_STATE_SCHEMA_VERSION,
+        "audit_plan_sha256": audit_plan_sha256,
+        "audit_output_binding_sha256": audit_output_binding_sha256,
+        "gold_commitment": commitment,
+        "gold_commitment_sha256": _canonical_hash(commitment),
+    }
+    return {**core, "gold_state_sha256": _canonical_hash(core)}
+
+
+def _gold_state_filename(receipt: Mapping[str, Any]) -> str:
+    binding = _canonical_hash(
+        {
+            "schema_version": "nerb.enron_gold_commitment_state_key.v1",
+            "audit_plan_sha256": receipt.get("audit_plan_sha256"),
+            "audit_output_binding_sha256": receipt.get("audit_output_binding_sha256"),
+        }
+    )
+    return f"gold-{binding.removeprefix('sha256:')}.json"
+
+
+def _open_gold_state_directory(path: Path) -> int:
+    root = _absolute_path(path)
+    try:
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            os.close(descriptor)
+            raise EnronGoldAnnotationError("Gold-state directory must be owner-only mode 0700.")
+        return descriptor
+    except EnronGoldAnnotationError:
+        raise
+    except OSError:
+        raise EnronGoldAnnotationError("Gold-state directory could not be opened safely.") from None
+
+
+def _register_gold_commitment(gold_state_dir: Path, receipt: Mapping[str, Any]) -> None:
+    value = _expected_gold_state(receipt)
+    name = _gold_state_filename(receipt)
+    directory_fd = _open_gold_state_directory(gold_state_dir)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        payload = _canonical_json_file(value)
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+        os.fsync(directory_fd)
+    except FileExistsError:
+        raise EnronGoldAnnotationError(
+            "This sealed audit binding already has a first committed gold commitment."
+        ) from None
+    except (OSError, TypeError, ValueError):
+        raise EnronGoldAnnotationError("Gold commitment could not be registered durably.") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
+
+
+def _verify_registered_gold_commitment(gold_state_dir: Path | None, receipt: Mapping[str, Any]) -> None:
+    if gold_state_dir is None:
+        if receipt.get("fixture_mode") is not True:
+            raise EnronGoldAnnotationError("Production gold verification requires an explicit gold-state directory.")
+        return
+    expected = _expected_gold_state(receipt)
+    name = _gold_state_filename(receipt)
+    directory_fd = _open_gold_state_directory(Path(gold_state_dir))
+    try:
+        info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise EnronGoldAnnotationError("Registered gold commitment identity is invalid.")
+        with open_private_binary_input_at(directory_fd, name) as file:
+            raw = file.read(_MAX_JSON_FILE_BYTES + 1)
+    except EnronGoldAnnotationError:
+        raise
+    except (EnronPrivateIOError, OSError):
+        raise EnronGoldAnnotationError("Registered gold commitment could not be loaded safely.") from None
+    finally:
+        os.close(directory_fd)
+    if len(raw) > _MAX_JSON_FILE_BYTES:
+        raise EnronGoldAnnotationError("Registered gold commitment exceeds the byte limit.")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        raise EnronGoldAnnotationError("Registered gold commitment is not strict JSON.") from None
+    if not isinstance(value, dict) or raw != _canonical_json_file(value) or value != expected:
+        raise EnronGoldAnnotationError("Registered gold commitment differs from deterministic replay.")
+
+
 def _load_verified_enron_gold_annotations_files(
     run_dir: Path,
     sample_run_dir: Path,
     *,
     expected_audit_output_binding_sha256: str | None = None,
+    expected_gold_commitment: Mapping[str, str] | None = None,
+    gold_state_dir: Path | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Return private documents and gold only after full committed-run replay."""
 
@@ -825,18 +1072,31 @@ def _load_verified_enron_gold_annotations_files(
         run_dir,
         sample_run_dir,
         expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        expected_gold_commitment=expected_gold_commitment,
+        gold_state_dir=gold_state_dir,
     )
     documents, _sample_binding = _load_sample_run(
         sample_run_dir,
         expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
     )
     root = _validate_private_run_tree(run_dir, _GOLD_RUN_FILES, "Gold annotation run")
-    manifest, _manifest_raw = _load_strict_json_object(root / "manifest.json", "Gold annotation manifest")
-    gold_rows, _gold_descriptor = _load_jsonl(
+    manifest, manifest_raw = _load_strict_json_object(root / "manifest.json", "Gold annotation manifest")
+    if (
+        manifest_raw != _canonical_json_file(manifest)
+        or _canonical_hash(manifest) != verified_receipt["manifest_sha256"]
+    ):
+        raise EnronGoldAnnotationError("Reloaded gold manifest differs from the verified commitment.")
+    gold_rows, gold_descriptor = _load_jsonl(
         root / _ARTIFACT_FILENAMES["gold"],
         description="Gold annotation gold",
         require_canonical=True,
     )
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping) or artifacts.get("gold") != {
+        "name": _ARTIFACT_FILENAMES["gold"],
+        **gold_descriptor,
+    }:
+        raise EnronGoldAnnotationError("Reloaded gold artifact differs from the verified manifest.")
     gold = {
         "schema_version": manifest["gold_schema_version"],
         "annotation_policy_sha256": manifest["annotation_policy_sha256"],
@@ -928,6 +1188,7 @@ def _prepare_adjudications(
 ) -> tuple[
     dict[str, tuple[tuple[str, int, int], ...]],
     set[str],
+    dict[str, str],
     set[str],
     int,
     int,
@@ -935,6 +1196,7 @@ def _prepare_adjudications(
     _require_sequence(rows, "Adjudications")
     result: dict[str, tuple[tuple[str, int, int], ...]] = {}
     adjudicators: set[str] = set()
+    adjudication_commitments: dict[str, str] = {}
     required_reviews: set[str] = set()
     disagreement_count = 0
     decision_count = 0
@@ -966,9 +1228,10 @@ def _prepare_adjudications(
         disagreement_count += len(symmetric_difference)
         decision_count += len(decisions)
         result[document_id] = final
+        adjudication_commitments[document_id] = hash_enron_gold_adjudication(row)
     if set(result) != set(documents):
         raise EnronGoldAnnotationError("Adjudication must cover every sampled document exactly once.")
-    return result, adjudicators, required_reviews, disagreement_count, decision_count
+    return result, adjudicators, adjudication_commitments, required_reviews, disagreement_count, decision_count
 
 
 def _prepare_reviews(
@@ -977,6 +1240,7 @@ def _prepare_reviews(
     required_disagreement_reviews: set[str],
     agreement_documents: set[str],
     sample_binding_sha256: str,
+    adjudication_commitments: Mapping[str, str],
 ) -> tuple[set[str], int]:
     _require_sequence(rows, "Annotation reviews")
     result: dict[str, Mapping[str, Any]] = {}
@@ -989,6 +1253,8 @@ def _prepare_reviews(
         document_id = _bound_document(row, documents, f"Annotation review row {index}")
         if document_id in result:
             raise EnronGoldAnnotationError("Annotation review document IDs must be unique.")
+        if row["adjudication_sha256"] != adjudication_commitments[document_id]:
+            raise EnronGoldAnnotationError("Annotation review does not bind the normalized adjudication decision.")
         if (
             type(row["disagreements_reviewed"]) is not bool
             or type(row["agreement_audit"]) is not bool
@@ -1145,6 +1411,7 @@ __all__ = [
     "build_enron_gold",
     "enron_gold_annotation_policy_sha256",
     "finalize_enron_gold_annotations_files",
+    "hash_enron_gold_adjudication",
     "public_enron_gold_receipt",
     "verify_enron_gold_annotations",
 ]
