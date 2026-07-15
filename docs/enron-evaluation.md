@@ -1,14 +1,19 @@
-# Enron Privacy Evaluation
+# Enron Contract, Coverage, and Privacy Evaluation
 
-The evaluator keeps three questions separate:
+The evaluator keeps four questions separate:
 
-1. **Catalog coverage:** how much independently labeled sensitive text the frozen bank knew.
-2. **Catalog conformance:** whether every approved active pattern is detected and mapped exactly as declared.
-3. **Open-world privacy recall:** how much sensitive text is detected whether or not it was already cataloged.
+1. **Catalog conformance:** whether every approved active pattern is detected and mapped exactly as declared. This is the
+   direct evidence for NERB's known-bank contract.
+2. **Natural-text cataloged exact-span recall:** whether realistic catalog-qualified occurrences agree under the stricter
+   exact span, class, and canonical-identity evaluator.
+3. **Catalog coverage:** how much independently labeled sensitive text the frozen bank knew before scanning.
+4. **Open-world privacy recall:** how much sensitive text a proposed standalone redaction bank detects, including values
+   absent from the bank.
 
-This distinction is operationally important. A matcher can conform perfectly to its catalog while still missing an
-unknown person. NERB therefore reports missed spans, documents with any miss, and leaked sensitive characters before
-secondary summaries such as F1.
+This distinction is operationally important. A matcher can conform perfectly to its catalog while a bank covers only a
+small fraction of a population. Unknown entities are bank-construction or discovery-layer gaps, not matcher failures.
+When a bank is proposed for comprehensive redaction, NERB still reports missed spans, documents with any miss, and
+leaked sensitive characters before secondary summaries such as F1.
 
 ## Independent person-name source
 
@@ -256,6 +261,7 @@ person identity. The archive does not provide labels for the full NERB taxonomy,
 a content-level adjudication protocol or redistribution license. Keep it research/aggregate-only, keep its test role
 frozen from tuning, and never use it to claim guaranteed detection of unknown PII.
 
-The one deterministic guarantee remains narrower and testable: NERB must detect and correctly map every approved active
-catalog pattern under its declared normalization, boundary, and overlap semantics. Open-world privacy recall measures
-what lies beyond that guarantee.
+The deterministic guarantee is narrow and testable: NERB must detect and correctly map every approved active catalog
+pattern under its declared normalization, boundary, priority, and overlap semantics. Natural exact-span evaluation is a
+stricter occurrence diagnostic. Open-world privacy recall measures bank/application coverage beyond the guarantee and
+never determines whether the NERB package may be released.

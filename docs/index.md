@@ -39,21 +39,21 @@ nerb extract-text \
 ### Compile knowledge once, scan many times
 
 An entity bank is a reviewable cache of approved names, aliases, and structured patterns. NERB deterministically finds
-qualifying cataloged occurrences under the bank's declared matching semantics. Unknown PII remains a coverage problem,
-so privacy evidence must report open-world recall and misses separately from catalog conformance.
+qualifying cataloged occurrences under the bank's declared matching semantics. Entities absent from the bank are outside
+that guarantee; applications that need open-ended discovery must measure bank coverage or add a separately evaluated
+discovery layer.
 
 [Read the guarantee boundary](enron-benchmark.md#guarantee-boundary)
 
 </div>
 </section>
 
-!!! danger "Enron benchmark decision: do not ship the evaluated bank"
+!!! info "Enron evidence: known-bank contract passed"
 
-    The frozen full-source workflow, capacity proof, decision-grade performance run, and one-shot independently
-    annotated audit are complete. Performance passed, but the 100-document panel measured 10.19% open-world recall,
-    21.34% sensitive-character recall, and 89.86% document leakage. The aggregate bundle verifies cleanly because it is
-    authentic terminal evidence; the explicit quality-eligibility check fails. Read the
-    [evidence and decision](enron-evidence.md) before using this bank as a privacy control.
+    NERB detected and correctly mapped 39,604/39,604 approved positive cases across all 13,201 active patterns, with
+    1,210/1,210 required negative cases clean. A separate natural-text diagnostic found 142/146 cataloged exact matches.
+    The constructed bank knew only 146/1,393 labeled spans, so it is not suitable by itself as a comprehensive PII
+    redactor. Read the [evidence interpretation](enron-evidence.md) for the guarantee, coverage, and scale results.
 
 ## Why Teams Use NERB
 

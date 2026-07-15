@@ -996,8 +996,8 @@ def test_enron_evidence_commands_are_thin_and_use_only_explicit_paths(monkeypatc
         captured["export"] = (output_dir, kwargs)
         return {"valid": True}
 
-    def fake_verify(bundle_dir, *, require_quality_eligible=False):
-        captured["verify"] = (bundle_dir, require_quality_eligible)
+    def fake_verify(bundle_dir, *, require_standalone_redaction_eligible=False):
+        captured["verify"] = (bundle_dir, require_standalone_redaction_eligible)
         return {"valid": True}
 
     def fake_render(bundle_dir, output_dir):
@@ -1035,7 +1035,7 @@ def test_enron_evidence_commands_are_thin_and_use_only_explicit_paths(monkeypatc
             str(bank_card),
             "--inventory-dir",
             str(inventories),
-            "--require-quality-eligible",
+            "--require-standalone-redaction-eligible",
         ],
     )
     assert export.exit_code == 0, export.output
@@ -1048,13 +1048,13 @@ def test_enron_evidence_commands_are_thin_and_use_only_explicit_paths(monkeypatc
             "capacity_decision_path": capacity,
             "bank_card_path": bank_card,
             "inventory_dir": inventories,
-            "require_quality_eligible": True,
+            "require_standalone_redaction_eligible": True,
         },
     )
 
     verify = runner.invoke(
         app,
-        ["verify-enron-evidence", "--bundle", str(bundle), "--require-quality-eligible"],
+        ["verify-enron-evidence", "--bundle", str(bundle), "--require-standalone-redaction-eligible"],
     )
     assert verify.exit_code == 0, verify.output
     assert captured["verify"] == (bundle, True)

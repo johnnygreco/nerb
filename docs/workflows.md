@@ -104,7 +104,7 @@ artifact. Outputs remain private and ignored; only privacy-scanned aggregate evi
 suitable for a later reviewed handoff. The smoke profile is non-promotable. See [Performance](performance.md#enron-intelligence-cache-workflow)
 for the decision command, measurement boundaries, scale semantics, and sample policy.
 
-### Verify the published Enron decision
+### Verify the published Enron evidence
 
 The committed publication needs no private `.nerb` artifacts:
 
@@ -115,5 +115,7 @@ nerb render-enron-evidence \
   --output-dir /tmp/nerb-enron-render
 ```
 
-The normal verifier succeeds for an authentic terminal failure. Release automation must add
-`--require-quality-eligible`; that check fails for the committed bank because its recall and leakage gates failed.
+The normal verifier authenticates the known-bank, natural-text, coverage, standalone-redaction, and performance results.
+A workflow that specifically requires a comprehensive standalone redaction bank can add
+`--require-standalone-redaction-eligible`; that application check fails for the committed bank. It does not gate NERB
+package releases.

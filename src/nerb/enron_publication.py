@@ -24,6 +24,7 @@ from typing import Any, NoReturn
 from .enron_contract import (
     hash_enron_manifest,
     hash_enron_performance_manifest,
+    recompute_enron_quality_gate_decision,
     validate_enron_evidence,
     validate_enron_manifest,
 )
@@ -53,11 +54,21 @@ _ROOT_ARTIFACTS = (
     "summary.md",
 )
 _FIGURE_ARTIFACTS = (
-    "figures/leakage.svg",
+    "figures/bank-coverage.svg",
+    "figures/known-bank-contract.svg",
     "figures/performance-scale.svg",
-    "figures/quality-recall.svg",
+    "figures/standalone-redaction.svg",
 )
 _CARD_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
+_SVG_BACKGROUND = "#0b1020"
+_SVG_TEXT = "#e8eefc"
+_SVG_VALUE_BACKGROUND = "#0b1020"
+_SCALE_WORKLOAD_SPECS = (
+    ("1,000 patterns", "scale_1000_direct"),
+    ("10,000 patterns", "scale_10000_direct"),
+    ("25,000 patterns", "scale_25000_direct"),
+    ("100,000 patterns", "scale_100000_direct"),
+)
 
 _COUNT_TRIPLE = {"entities": "count", "names": "count", "patterns": "count"}
 _PUBLIC_BANK_CARD_SHAPE: dict[str, Any] = {
@@ -857,24 +868,52 @@ def _decision_summary(
     evidence: Mapping[str, Any], performance: Mapping[str, Any], capacity: Mapping[str, Any]
 ) -> dict[str, Any]:
     prediction = evidence["audit_chain"]["prediction_audit"]
-    score = evidence["audit_chain"]["score"]
+    quality_gates_passed = evidence["audit_chain"]["score"][
+        "status"
+    ] != "insufficient_support" and recompute_enron_quality_gate_decision(evidence)
     terminal_quality_eligible = (
         prediction["status"] == "accepted"
         and prediction["release"] == "quality_eligible"
         and prediction["decision_eligible"] is True
-        and score["quality_decision_passed"] is True
+        and quality_gates_passed
     )
     performance_passed = performance["decision_grade"]["passed"] is True
     capacity_passed = capacity["report"]["gates"]["passed"] is True
+    conformance_passed = evidence["catalog_conformance"]["passed"] is True
     return {
-        "audit_status": prediction["status"],
-        "release": prediction["release"],
-        "quality_gates_passed": score["quality_decision_passed"],
-        "bank_release_eligible": terminal_quality_eligible,
-        "performance_decision_grade": performance_passed,
+        "standalone_privacy_audit_status": prediction["status"],
+        "standalone_privacy_audit_outcome": prediction["release"],
+        "catalog_conformance_passed": conformance_passed,
         "capacity_gates_passed": capacity_passed,
-        "package_release_allowed": terminal_quality_eligible and performance_passed and capacity_passed,
+        "performance_gates_passed": performance_passed,
+        "standalone_privacy_redaction_allowed": (
+            terminal_quality_eligible and conformance_passed and performance_passed and capacity_passed
+        ),
+        "standalone_privacy_redaction_quality_passed": quality_gates_passed,
     }
+
+
+def _contract_status(conformance: Mapping[str, Any]) -> str:
+    if conformance["evaluated"] is not True:
+        return "UNAVAILABLE"
+    return "PASS" if conformance["passed"] is True else "FAIL"
+
+
+def _contract_lead(conformance: Mapping[str, Any]) -> str:
+    status = _contract_status(conformance)
+    if conformance["evaluated"] is not True:
+        return (
+            f"**Known-bank contract evidence: {status}.** Catalog conformance was not evaluated, so this bundle "
+            "makes no measured known-bank detection claim."
+        )
+    return (
+        f"**Known-bank contract evidence: {status}.** NERB detected and correctly mapped "
+        f"{conformance['correctly_mapped']:,} of {conformance['approved_positive_cases']:,} approved cases across "
+        f"{conformance['patterns_with_positive_cases']:,} of {conformance['active_patterns']:,} active patterns. "
+        f"It produced {conformance['wrong_canonical']:,} wrong canonical mappings and "
+        f"{conformance['unexpected_negative_matches']:,} unexpected matches on "
+        f"{conformance['negative_cases']:,} required negative and adversarial cases."
+    )
 
 
 def _fmt_percent(value: Any) -> str:
@@ -914,6 +953,14 @@ def _render_insufficient_support_summary(
 ) -> bytes:
     direct = _find_by_id(performance_report["performance"]["workloads"], "real_direct_throughput", "direct workload")
     latency = _find_by_id(performance_report["performance"]["workloads"], "real_direct_latency", "latency workload")
+    scale_workloads = [
+        (
+            label,
+            _find_by_id(performance_report["performance"]["workloads"], identifier, f"{label} workload"),
+        )
+        for label, identifier in _SCALE_WORKLOAD_SPECS
+    ]
+    conformance = evidence["catalog_conformance"]
     decision = _decision_summary(evidence, performance_report, capacity)
     planned_documents = _planned_audit_documents(manifest)
     panel_description = (
@@ -924,27 +971,31 @@ def _render_insufficient_support_summary(
     failure_codes = evidence["audit_chain"]["score"]["support_failure_codes"]
     rendered_codes = ", ".join(f"`{item}`" for item in failure_codes) or "`unspecified_support_failure`"
     capacity_status = "passed" if decision["capacity_gates_passed"] else "failed"
-    performance_status = "passed" if decision["performance_decision_grade"] else "failed"
+    performance_status = "passed" if decision["performance_gates_passed"] else "failed"
     lines = [
-        "# Enron benchmark decision",
+        "# NERB Enron evidence",
         "",
-        "**Release decision: DO NOT SHIP.** The terminal audit had insufficient independent support to calculate "
-        "quality, recall, or leakage metrics. No quality claim is available and infrastructure results do not make "
-        "the bank release-eligible.",
+        _contract_lead(conformance),
         "",
-        "The source corpus is public. This committed bundle nevertheless contains aggregate evidence only—no source "
-        "text, entity-bank values, document IDs, span surfaces, or private paths.",
+        "This is the contract NERB is built to make: given the same validated bank, engine, scan options, and input "
+        "bytes, qualifying occurrences are detected and mapped under the bank's declared normalization, boundary, "
+        "priority, and overlap semantics. It is not a guarantee to discover entities absent from the bank.",
         "",
-        "## Quality decision",
+        "## Known-bank contract",
+        "",
+        "![Known-bank contract evidence](figures/known-bank-contract.svg)",
+        "",
+        "## Bank coverage and standalone redaction",
         "",
         f"{panel_description}, selected from the {manifest['splits']['roles']['test']['records']:,}-document sealed "
-        f"frame. Scoring ended with insufficient support ({rendered_codes}), so rates and miss counts are "
-        "intentionally "
-        "shown as unavailable rather than inferred or replaced with zeros.",
+        f"frame. Scoring ended with insufficient independent support ({rendered_codes}), so bank-coverage, open-world, "
+        "and "
+        "standalone-redaction rates and miss counts are intentionally unavailable rather than inferred or replaced "
+        "with zeros.",
         "",
-        "![Quality unavailable](figures/quality-recall.svg)",
+        "![Bank coverage unavailable](figures/bank-coverage.svg)",
         "",
-        "![Leakage unavailable](figures/leakage.svg)",
+        "![Standalone redaction unavailable](figures/standalone-redaction.svg)",
         "",
         "## Scale and reuse",
         "",
@@ -952,6 +1003,13 @@ def _render_insufficient_support_summary(
         f"in a median {_fmt_number(direct['stats']['median_seconds'] * 1_000, 3)} ms "
         f"({_fmt_number(direct['stats']['documents_per_second'], 1)} documents/s). Per-document direct-scan latency "
         f"was {_fmt_number(latency['stats']['median_seconds'] * 1_000_000, 3)} µs median.",
+        "",
+        "| Bank size | Direct-scan throughput |",
+        "|---:|---:|",
+        *[
+            f"| {label} | {_fmt_number(workload['stats']['documents_per_second'], 1)} documents/s |"
+            for label, workload in scale_workloads
+        ],
         "",
         "![Scale throughput](figures/performance-scale.svg)",
         "",
@@ -976,7 +1034,8 @@ def _render_insufficient_support_summary(
         "uv run nerb render-enron-evidence --bundle evidence/enron --output-dir /tmp/nerb-enron-render",
         "```",
         "",
-        "Use `--require-quality-eligible` when a workflow must reject this structurally valid do-not-ship result.",
+        "Use `--require-standalone-redaction-eligible` only when a workflow requires this particular bank to qualify "
+        "as a comprehensive standalone privacy redactor.",
         "",
     ]
     return "\n".join(lines).encode("utf-8")
@@ -999,60 +1058,151 @@ def _render_summary(
     compile_workload = _find_by_id(
         performance_report["performance"]["workloads"], "real_cold_compile", "compile workload"
     )
-    scale = _find_by_id(performance_report["performance"]["workloads"], "scale_100000_direct", "scale workload")
+    scale_workloads = [
+        (
+            label,
+            _find_by_id(performance_report["performance"]["workloads"], identifier, f"{label} workload"),
+        )
+        for label, identifier in _SCALE_WORKLOAD_SPECS
+    ]
+    scale = scale_workloads[-1][1]
+    conformance = evidence["catalog_conformance"]
     decision = _decision_summary(evidence, performance_report, capacity)
-    release = "DO NOT SHIP" if not decision["package_release_allowed"] else "ELIGIBLE"
+    redaction_status = "ELIGIBLE" if decision["standalone_privacy_redaction_allowed"] else "NOT ELIGIBLE"
     metrics = combined["metrics"]
     contact_metrics = contact["metrics"]
     person_metrics = person["metrics"]
 
-    def score_row(label: str, field: str, requirement: str) -> str:
+    def application_row(label: str, field: str, requirement: str) -> str:
         return (
             f"| {label} | {_fmt_percent(metrics[field])} | {_fmt_percent(contact_metrics[field])} | "
             f"{_fmt_percent(person_metrics[field])} | {requirement} |"
         )
 
     capacity_status = "passed" if decision["capacity_gates_passed"] else "failed"
-    performance_status = "passed" if decision["performance_decision_grade"] else "failed"
+    performance_status = "passed" if decision["performance_gates_passed"] else "failed"
     measurement_commit = evidence["software"]["git_commit"]
     bank_hash = evidence["bank"]["canonical_hash"]
+    if conformance["evaluated"]:
+        contract_table = [
+            "| Contract evidence | Result |",
+            "|---|---:|",
+            f"| Active patterns exercised | {conformance['patterns_with_positive_cases']:,} / "
+            f"{conformance['active_patterns']:,} |",
+            f"| Approved positives detected and mapped | {conformance['correctly_mapped']:,} / "
+            f"{conformance['approved_positive_cases']:,} |",
+            f"| Required negative/adversarial cases without unexpected matches | "
+            f"{conformance['negative_cases'] - conformance['unexpected_negative_matches']:,} / "
+            f"{conformance['negative_cases']:,} |",
+            f"| Wrong canonical mappings | {conformance['wrong_canonical']:,} |",
+        ]
+    else:
+        contract_table = [
+            "| Contract evidence | Result |",
+            "|---|---:|",
+            "| Evaluation status | Not evaluated |",
+        ]
+    documents_without_exact_span_miss = combined["documents_with_sensitive_gold"] - combined["documents_with_any_miss"]
+    scale_table = [
+        "| Bank size | Direct-scan throughput |",
+        "|---:|---:|",
+        *[
+            f"| {label} | {_fmt_number(workload['stats']['documents_per_second'], 1)} documents/s |"
+            for label, workload in scale_workloads
+        ],
+    ]
     lines = [
-        "# Enron benchmark decision",
+        "# NERB Enron evidence",
         "",
-        f"**Release decision: {release}.** The evaluated bank is not safe for privacy redaction: its independent "
-        f"100-document audit found {combined['false_negative']:,} missed sensitive spans in "
-        f"{combined['documents_with_any_miss']} "
-        "documents. Passing performance and capacity checks does not override failed quality gates.",
+        _contract_lead(conformance),
         "",
-        "The source corpus is public. This committed bundle nevertheless contains aggregate evidence only—"
-        "no source text, "
-        "entity-bank values, document IDs, span surfaces, or private paths.",
+        "This is the contract NERB is built to make: given the same validated bank, engine, scan options, and input "
+        "bytes, qualifying occurrences are detected and mapped under the bank's declared normalization, boundary, "
+        "priority, and overlap semantics. It is not a guarantee to discover entities absent from the bank.",
         "",
-        "## Practical quality scorecard",
+        f"**Separate application result: {redaction_status} for standalone PII redaction.** The frozen audit found "
+        f"that this constructed bank cataloged only {combined['cataloged_gold_spans']:,} of "
+        f"{combined['gold_spans']:,} independently labeled spans. That result limits this bank's use as a "
+        "comprehensive redactor; it does not control whether the NERB package can be released.",
         "",
-        "| Metric | Combined | Contact | Person | Required |",
+        "The source corpus is public. This bundle remains aggregate-only so the same publication boundary works for "
+        "private organizational sources: it contains no source text, bank values, document IDs, span surfaces, or "
+        "private paths.",
+        "",
+        "## 1. Known-bank contract",
+        "",
+        *contract_table,
+        "",
+        "The independent natural-text panel adds a stricter exact-span, class, and canonical-mapping diagnostic. It "
+        f"found {combined['cataloged_true_positive']:,} of {combined['cataloged_gold_spans']:,} catalog-qualified "
+        f"occurrences exactly and with the expected canonical mapping ({_fmt_percent(metrics['cataloged_recall'])}).",
+        "",
+        "| Class | Catalog-qualified | Correct exact + mapping | Exact-span miss | Wrong mapping |",
         "|---|---:|---:|---:|---:|",
-        score_row("Open-world recall", "open_world_recall", "≥95%"),
-        score_row("Catalog coverage", "catalog_coverage", "≥80%"),
-        score_row("Cataloged recall", "cataloged_recall", "100%"),
-        score_row("Sensitive-character recall", "sensitive_character_recall", "≥98%"),
-        score_row("Document leakage", "document_leak_rate", "≤5%"),
-        score_row("Sensitive-character leakage", "sensitive_character_leak_rate", "≤2%"),
-        score_row("Precision", "precision", "diagnostic"),
-        score_row("Over-redaction", "over_redaction_rate", "≤5%"),
+        f"| Combined | {combined['cataloged_gold_spans']:,} | {combined['cataloged_true_positive']:,} | "
+        f"{combined['cataloged_false_negative']:,} | {combined['cataloged_wrong_canonical']:,} |",
+        f"| Contact | {contact['cataloged_gold_spans']:,} | {contact['cataloged_true_positive']:,} | "
+        f"{contact['cataloged_false_negative']:,} | {contact['cataloged_wrong_canonical']:,} |",
+        f"| Person | {person['cataloged_gold_spans']:,} | {person['cataloged_true_positive']:,} | "
+        f"{person['cataloged_false_negative']:,} | {person['cataloged_wrong_canonical']:,} |",
         "",
-        f"Exact catalog conformance passed all {evidence['catalog_conformance']['active_patterns']:,} active "
-        "patterns on "
-        f"{evidence['catalog_conformance']['approved_positive_cases']:,} approved positive cases, but the independent "
-        f"audit still found {combined['cataloged_false_negative']} cataloged misses. Conformance proves pattern "
-        "mechanics; "
-        "it does not prove open-world coverage or occurrence-level recall.",
+        "![Known-bank contract evidence](figures/known-bank-contract.svg)",
         "",
-        "![Recall and coverage](figures/quality-recall.svg)",
+        "## 2. Bank coverage, outside the guarantee",
         "",
-        "![Leakage](figures/leakage.svg)",
+        "Catalog coverage asks how much of the independently labeled population the constructed bank knew before "
+        "scanning. Open-world recall counts every labeled span, including entities absent from the bank. Neither is "
+        "matcher recall.",
         "",
-        "## Scale and reuse",
+        "| Class | All gold | Cataloged | Outside bank | Catalog coverage |",
+        "|---|---:|---:|---:|---:|",
+        f"| Combined | {combined['gold_spans']:,} | {combined['cataloged_gold_spans']:,} | "
+        f"{combined['gold_spans'] - combined['cataloged_gold_spans']:,} | "
+        f"{_fmt_percent(metrics['catalog_coverage'])} |",
+        f"| Contact | {contact['gold_spans']:,} | {contact['cataloged_gold_spans']:,} | "
+        f"{contact['gold_spans'] - contact['cataloged_gold_spans']:,} | "
+        f"{_fmt_percent(contact_metrics['catalog_coverage'])} |",
+        f"| Person | {person['gold_spans']:,} | {person['cataloged_gold_spans']:,} | "
+        f"{person['gold_spans'] - person['cataloged_gold_spans']:,} | "
+        f"{_fmt_percent(person_metrics['catalog_coverage'])} |",
+        "",
+        f"The combined panel contained {combined['gold_spans'] - combined['cataloged_gold_spans']:,} spans outside "
+        f"the bank, {combined['cataloged_false_negative']:,} catalog-qualified exact-span misses, and "
+        f"{combined['cataloged_wrong_canonical']:,} catalog-qualified wrong canonical mappings.",
+        "",
+        "![Coverage decomposition](figures/bank-coverage.svg)",
+        "",
+        "## 3. Standalone privacy-redaction assessment",
+        "",
+        "The preregistered application gate deliberately asked a broader question: could this bank, by itself, "
+        "redact all in-scope person and contact PII? It could not. These frozen results remain important when someone "
+        "wants that application, but they are not part of NERB's known-bank guarantee.",
+        "",
+        "| Application metric | Combined | Contact | Person | Frozen requirement |",
+        "|---|---:|---:|---:|---:|",
+        application_row("Open-world recall", "open_world_recall", "≥95%"),
+        application_row("Catalog coverage", "catalog_coverage", "≥80%"),
+        application_row("Cataloged exact-span recall", "cataloged_recall", "100%"),
+        application_row("Sensitive-character recall", "sensitive_character_recall", "≥98%"),
+        application_row("Document leakage", "document_leak_rate", "≤5%"),
+        application_row("Sensitive-character leakage", "sensitive_character_leak_rate", "≤2%"),
+        application_row("Precision", "precision", "diagnostic"),
+        application_row("Over-redaction", "over_redaction_rate", "≤5%"),
+        "",
+        "The combined application rates above come from these raw counts:",
+        "",
+        "| Combined application count | Result |",
+        "|---|---:|",
+        f"| Labeled spans detected exactly | {combined['true_positive']:,} / {combined['gold_spans']:,} |",
+        f"| Sensitive characters covered | {combined['covered_sensitive_characters']:,} / "
+        f"{combined['sensitive_gold_characters']:,} |",
+        f"| Documents without an exact-span miss | {documents_without_exact_span_miss:,} / "
+        f"{combined['documents_with_sensitive_gold']:,} |",
+        f"| Predicted spans that were exact | {combined['true_positive']:,} / {combined['predicted_spans']:,} |",
+        "",
+        "![Standalone privacy-redaction assessment](figures/standalone-redaction.svg)",
+        "",
+        "## 4. Scale and reuse",
         "",
         f"The evaluated {evidence['bank']['active_patterns']:,}-pattern bank scanned the 100-document throughput "
         "input in a "
@@ -1064,14 +1214,15 @@ def _render_summary(
         f"{_fmt_number(compile_workload['stats']['median_seconds'], 3)} s. At 100,000 patterns, throughput remained "
         f"{_fmt_number(scale['stats']['documents_per_second'], 1)} documents/s on the recorded Apple M4 environment.",
         "",
+        *scale_table,
+        "",
         "![Scale throughput](figures/performance-scale.svg)",
         "",
         "The value mechanism is compile once, scan many: curated aliases map detected text to canonical entity "
-        "metadata, while the compiled bank is reused across messages. This is useful only when the curated bank "
-        "covers the sensitive "
-        "population; this bank did not.",
+        "metadata, while the compiled bank is reused across messages. Applications decide which entities must be in "
+        "the bank; comprehensive redaction additionally requires independently validated population coverage.",
         "",
-        "## Scope and provenance",
+        "## 5. Scope and provenance",
         "",
         f"- Public source rows: {manifest['source']['input_records']:,}; prepared records: "
         f"{manifest['preparation']['output_records']:,}.",
@@ -1096,9 +1247,9 @@ def _render_summary(
         "uv run nerb render-enron-evidence --bundle evidence/enron --output-dir /tmp/nerb-enron-render",
         "```",
         "",
-        "Use `--require-quality-eligible` when a workflow must fail unless the bank is releasable. This bundle "
-        "verifies "
-        "successfully as authentic terminal evidence, but that stricter check fails by design.",
+        "Use `--require-standalone-redaction-eligible` only when a workflow requires this particular bank to qualify "
+        "as a comprehensive standalone privacy redactor. This bundle verifies as authentic evidence, while that "
+        "application-specific check fails by design.",
         "",
     ]
     return "\n".join(lines).encode("utf-8")
@@ -1107,45 +1258,149 @@ def _render_summary(
 def _svg_chart(
     title: str,
     subtitle: str,
-    rows: Sequence[tuple[str, float, float | None, bool]],
-    *,
-    value_formatter: str = "percent",
+    rows: Sequence[tuple[str, float, str, float | None, str, str]],
 ) -> bytes:
     width = 960
     left = 260
-    chart_width = 620
+    chart_width = 500
+    value_left = 778
+    value_width = 150
     row_height = 62
     height = 120 + row_height * len(rows)
+    row_descriptions = []
+    for label, _value, _display, threshold, tone, accessible_value in rows:
+        threshold_description = (
+            f"minimum threshold {_fmt_percent(threshold)}; result {tone}"
+            if threshold is not None
+            else "no threshold; diagnostic result"
+        )
+        row_descriptions.append(f"{label}: {accessible_value}; {threshold_description}.")
+    description = f"{subtitle} {' '.join(row_descriptions)}"
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
         'role="img" aria-labelledby="title desc">',
         f'<title id="title">{html.escape(title)}</title>',
-        f'<desc id="desc">{html.escape(subtitle)}</desc>',
-        '<rect width="100%" height="100%" fill="#0b1020"/>',
-        "<style>text{font-family:ui-sans-serif,system-ui,sans-serif;fill:#e8eefc}.title{font-size:25px;font-weight:700}.sub{font-size:14px;fill:#aebbd4}.label{font-size:15px}.value{font-size:14px;font-weight:700}.axis{stroke:#53617d;stroke-width:1}.threshold{stroke:#f7c948;stroke-width:3}</style>",
+        f'<desc id="desc">{html.escape(description)}</desc>',
+        f'<rect width="100%" height="100%" fill="{_SVG_BACKGROUND}"/>',
+        f"<style>text{{font-family:ui-sans-serif,system-ui,sans-serif;fill:{_SVG_TEXT}}}.title{{font-size:25px;"
+        "font-weight:700}.sub{font-size:14px;fill:#aebbd4}.label{font-size:15px}.value{font-size:14px;"
+        "font-weight:700}.value-bg{fill:"
+        f"{_SVG_VALUE_BACKGROUND};stroke:#53617d;stroke-width:1}}.axis{{stroke:#53617d;stroke-width:1}}"
+        ".threshold{stroke:#f7c948;stroke-width:3}</style>",
         f'<text class="title" x="34" y="38">{html.escape(title)}</text>',
         f'<text class="sub" x="34" y="64">{html.escape(subtitle)}</text>',
         f'<line class="axis" x1="{left}" y1="88" x2="{left + chart_width}" y2="88"/>',
     ]
-    for index, (label, value, threshold, passed) in enumerate(rows):
+    fills = {"pass": "#29c7a9", "fail": "#f05b67", "neutral": "#65a9ff"}
+    for index, (label, value, display, threshold, tone, _accessible_value) in enumerate(rows):
         if not 0 <= value <= 1 or (threshold is not None and not 0 <= threshold <= 1):
             _fail("Chart values must be bounded ratios.")
+        if tone not in fills:
+            _fail("Chart row has an invalid tone.")
         y = 108 + index * row_height
         bar_width = max(1, round(value * chart_width))
-        fill = "#29c7a9" if passed else "#f05b67"
-        display = f"{value:.2%}" if value_formatter == "percent" else f"{value:.3f}"
         parts.extend(
             (
                 f'<text class="label" x="34" y="{y + 22}">{html.escape(label)}</text>',
                 f'<rect x="{left}" y="{y}" width="{chart_width}" height="28" rx="5" fill="#202a42"/>',
-                f'<rect x="{left}" y="{y}" width="{bar_width}" height="28" rx="5" fill="{fill}"/>',
-                f'<text class="value" x="{left + chart_width - 6}" y="{y + 20}" text-anchor="end">{display}</text>',
+                f'<rect x="{left}" y="{y}" width="{bar_width}" height="28" rx="5" fill="{fills[tone]}"/>',
+                f'<rect class="value-bg" x="{value_left}" y="{y}" width="{value_width}" height="28" rx="5"/>',
+                f'<text class="value" x="{value_left + value_width - 7}" y="{y + 20}" '
+                f'text-anchor="end">{html.escape(display)}</text>',
             )
         )
         if threshold is not None:
             threshold_x = left + round(threshold * chart_width)
             parts.append(f'<line class="threshold" x1="{threshold_x}" y1="{y - 4}" x2="{threshold_x}" y2="{y + 32}"/>')
     parts.append("</svg>\n")
+    return "".join(parts).encode("utf-8")
+
+
+def _svg_coverage_decomposition(slices: Sequence[Mapping[str, Any]]) -> bytes:
+    width = 960
+    left = 260
+    chart_width = 620
+    row_height = 74
+    height = 154 + row_height * len(slices)
+    decompositions: list[tuple[str, int, int, int, int, int]] = []
+    for item in slices:
+        label = str(item["entity_class"]).replace("person_contact", "combined").title()
+        total = int(item["gold_spans"])
+        exact = int(item["cataloged_true_positive"])
+        catalog_miss = int(item["cataloged_false_negative"])
+        wrong_mapping = int(item["cataloged_wrong_canonical"])
+        outside = total - int(item["cataloged_gold_spans"])
+        if (
+            min(total, exact, catalog_miss, wrong_mapping, outside) < 0
+            or exact + catalog_miss + wrong_mapping + outside != total
+            or total == 0
+        ):
+            _fail("Coverage decomposition counts are invalid.")
+        decompositions.append((label, total, exact, catalog_miss, wrong_mapping, outside))
+    row_descriptions = " ".join(
+        f"{label}: {exact:,} cataloged exact and correctly mapped, {catalog_miss:,} cataloged exact-span misses, "
+        f"{wrong_mapping:,} cataloged wrong mappings, and {outside:,} outside the bank, from {total:,} gold spans."
+        for label, total, exact, catalog_miss, wrong_mapping, outside in decompositions
+    )
+    description = (
+        "Gold spans are split into cataloged exact matches, cataloged exact-span misses, cataloged wrong mappings, "
+        "and entities outside the bank. Outside-bank spans measure bank construction coverage, not NERB matcher "
+        f"recall. {row_descriptions}"
+    )
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+        'role="img" aria-labelledby="title desc">',
+        '<title id="title">Bank coverage decomposition</title>',
+        f'<desc id="desc">{html.escape(description)}</desc>',
+        f'<rect width="100%" height="100%" fill="{_SVG_BACKGROUND}"/>',
+        "<style>text{font-family:ui-sans-serif,system-ui,sans-serif;fill:#e8eefc}.title{font-size:25px;"
+        "font-weight:700}.sub{font-size:14px;fill:#aebbd4}.label{font-size:15px;font-weight:700}.value{font-size:13px;"
+        "fill:#cbd6eb}.legend{font-size:13px;fill:#cbd6eb}</style>",
+        '<text class="title" x="34" y="38">Bank coverage decomposition</text>',
+        '<text class="sub" x="34" y="64">Outside-bank spans are a catalog-construction result, '
+        "not matcher misses.</text>",
+    ]
+    for index, (label, total, exact, catalog_miss, wrong_mapping, outside) in enumerate(decompositions):
+        y = 92 + index * row_height
+        summary = (
+            f"{exact:,} exact · {catalog_miss:,} span miss · {wrong_mapping:,} wrong mapping · {outside:,} outside"
+        )
+        parts.extend(
+            (
+                f'<text class="label" x="34" y="{y + 18}">{html.escape(label)}</text>',
+                f'<text class="value" x="{left}" y="{y + 18}">{html.escape(summary)}</text>',
+                f'<rect x="{left}" y="{y + 28}" width="{chart_width}" height="24" rx="4" fill="#202a42"/>',
+            )
+        )
+        cumulative = 0
+        for count, fill in (
+            (exact, "#29c7a9"),
+            (catalog_miss, "#f7c948"),
+            (wrong_mapping, "#f05b67"),
+            (outside, "#71819f"),
+        ):
+            segment_start = left + round(cumulative / total * chart_width)
+            cumulative += count
+            segment_end = left + round(cumulative / total * chart_width)
+            if segment_end > segment_start:
+                parts.append(
+                    f'<rect x="{segment_start}" y="{y + 28}" width="{segment_end - segment_start}" '
+                    f'height="24" fill="{fill}"/>'
+                )
+    legend_y = 110 + row_height * len(slices)
+    parts.extend(
+        (
+            f'<rect x="225" y="{legend_y}" width="14" height="14" fill="#29c7a9"/>',
+            f'<text class="legend" x="247" y="{legend_y + 12}">cataloged exact</text>',
+            f'<rect x="390" y="{legend_y}" width="14" height="14" fill="#f7c948"/>',
+            f'<text class="legend" x="412" y="{legend_y + 12}">exact-span miss</text>',
+            f'<rect x="555" y="{legend_y}" width="14" height="14" fill="#f05b67"/>',
+            f'<text class="legend" x="577" y="{legend_y + 12}">wrong mapping</text>',
+            f'<rect x="705" y="{legend_y}" width="14" height="14" fill="#71819f"/>',
+            f'<text class="legend" x="727" y="{legend_y + 12}">outside bank</text>',
+            "</svg>\n",
+        )
+    )
     return "".join(parts).encode("utf-8")
 
 
@@ -1167,77 +1422,158 @@ def _svg_unavailable(title: str, message: str) -> bytes:
 
 def _render_figures(evidence: Mapping[str, Any], performance_report: Mapping[str, Any]) -> dict[str, bytes]:
     combined = _combined_quality_slice(evidence)
+    conformance = evidence["catalog_conformance"]
     workloads = performance_report["performance"]["workloads"]
-    scale_specs = (
-        ("1,000 patterns", "scale_1000_direct"),
-        ("10,000 patterns", "scale_10000_direct"),
-        ("25,000 patterns", "scale_25000_direct"),
-        ("100,000 patterns", "scale_100000_direct"),
-    )
     scale_values = [
         float(_find_by_id(workloads, identifier, f"{label} workload")["stats"]["documents_per_second"])
-        for label, identifier in scale_specs
+        for label, identifier in _SCALE_WORKLOAD_SPECS
     ]
     maximum = max(scale_values)
+
+    def ratio(numerator: int, denominator: int) -> float:
+        return numerator / denominator if denominator else 0.0
+
     scale_rows = tuple(
-        (f"{label} · {value:,.0f} docs/s", value / maximum, None, True)
-        for (label, _identifier), value in zip(scale_specs, scale_values, strict=True)
+        (
+            label,
+            value / maximum,
+            f"{value:,.0f} docs/s",
+            None,
+            "pass",
+            f"{value:,.0f} documents per second, {_fmt_percent(value / maximum)} of the fastest measured cell",
+        )
+        for (label, _identifier), value in zip(_SCALE_WORKLOAD_SPECS, scale_values, strict=True)
+    )
+    contract_rows = (
+        (
+            "Active patterns exercised",
+            ratio(conformance["patterns_with_positive_cases"], conformance["active_patterns"]),
+            f"{conformance['patterns_with_positive_cases']:,} / {conformance['active_patterns']:,}",
+            1.0,
+            "pass" if conformance["patterns_with_positive_cases"] == conformance["active_patterns"] else "fail",
+            f"{conformance['patterns_with_positive_cases']:,} of {conformance['active_patterns']:,} active patterns "
+            "exercised",
+        ),
+        (
+            "Approved cases mapped",
+            ratio(conformance["correctly_mapped"], conformance["approved_positive_cases"]),
+            f"{conformance['correctly_mapped']:,} / {conformance['approved_positive_cases']:,}",
+            1.0,
+            "pass" if conformance["correctly_mapped"] == conformance["approved_positive_cases"] else "fail",
+            f"{conformance['correctly_mapped']:,} of {conformance['approved_positive_cases']:,} approved cases "
+            "detected and correctly mapped",
+        ),
+        (
+            "Negative cases clean",
+            ratio(
+                conformance["negative_cases"] - conformance["unexpected_negative_matches"],
+                conformance["negative_cases"],
+            ),
+            f"{conformance['negative_cases'] - conformance['unexpected_negative_matches']:,} / "
+            f"{conformance['negative_cases']:,}",
+            1.0,
+            "pass" if conformance["unexpected_negative_matches"] == 0 else "fail",
+            f"{conformance['negative_cases'] - conformance['unexpected_negative_matches']:,} of "
+            f"{conformance['negative_cases']:,} required negative and adversarial cases without unexpected matches",
+        ),
     )
     if combined is None:
         quality_figures = {
-            "figures/quality-recall.svg": _svg_unavailable(
-                "Independent audit: recall unavailable",
-                "The terminal audit had insufficient support to calculate quality rates.",
+            "figures/known-bank-contract.svg": (
+                _svg_chart(
+                    "Known-bank contract evidence",
+                    "The exhaustive suite exercises every approved pattern and required conformance case.",
+                    contract_rows,
+                )
+                if conformance["evaluated"]
+                else _svg_unavailable(
+                    "Known-bank contract evidence unavailable",
+                    "Catalog conformance was not evaluated; no zero-value substitute is reported.",
+                )
             ),
-            "figures/leakage.svg": _svg_unavailable(
-                "Independent audit: leakage unavailable",
-                "The terminal audit had insufficient support to calculate leakage rates.",
+            "figures/bank-coverage.svg": _svg_unavailable(
+                "Bank coverage unavailable",
+                "The terminal audit had insufficient support to calculate population coverage.",
+            ),
+            "figures/standalone-redaction.svg": _svg_unavailable(
+                "Standalone redaction unavailable",
+                "The terminal audit had insufficient support to calculate application-level quality.",
             ),
         }
     else:
         metrics = combined["metrics"]
-        recall_rows = (
-            ("Open-world recall", float(metrics["open_world_recall"]), 0.95, metrics["open_world_recall"] >= 0.95),
-            ("Catalog coverage", float(metrics["catalog_coverage"]), 0.80, metrics["catalog_coverage"] >= 0.80),
-            ("Cataloged recall", float(metrics["cataloged_recall"]), 1.0, metrics["cataloged_recall"] >= 1.0),
-            (
-                "Sensitive-character recall",
-                float(metrics["sensitive_character_recall"]),
-                0.98,
-                metrics["sensitive_character_recall"] >= 0.98,
-            ),
+        natural_contract_row = (
+            "Natural exact matches",
+            float(metrics["cataloged_recall"]),
+            f"{combined['cataloged_true_positive']:,} / {combined['cataloged_gold_spans']:,}",
+            1.0,
+            "pass" if metrics["cataloged_recall"] >= 1.0 else "fail",
+            f"{combined['cataloged_true_positive']:,} of {combined['cataloged_gold_spans']:,} catalog-qualified "
+            "spans detected exactly and correctly mapped",
         )
-        leakage_rows = (
+        documents_without_exact_span_miss = (
+            combined["documents_with_sensitive_gold"] - combined["documents_with_any_miss"]
+        )
+        standalone_rows = (
             (
-                "Document leakage",
-                float(metrics["document_leak_rate"]),
-                0.05,
-                metrics["document_leak_rate"] <= 0.05,
+                "Open-world exact-span recall",
+                float(metrics["open_world_recall"]),
+                _fmt_percent(metrics["open_world_recall"]),
+                0.95,
+                "pass" if metrics["open_world_recall"] >= 0.95 else "fail",
+                f"{combined['true_positive']:,} of {combined['gold_spans']:,} labeled spans detected exactly",
             ),
             (
-                "Sensitive-character leakage",
-                float(metrics["sensitive_character_leak_rate"]),
-                0.02,
-                metrics["sensitive_character_leak_rate"] <= 0.02,
+                "Sensitive-character coverage",
+                float(metrics["sensitive_character_recall"]),
+                _fmt_percent(metrics["sensitive_character_recall"]),
+                0.98,
+                "pass" if metrics["sensitive_character_recall"] >= 0.98 else "fail",
+                f"{combined['covered_sensitive_characters']:,} of {combined['sensitive_gold_characters']:,} "
+                "sensitive characters covered",
             ),
             (
-                "Negative false alarms",
-                float(metrics["negative_document_false_alarm_rate"]),
-                0.50,
-                metrics["negative_document_false_alarm_rate"] <= 0.50,
+                "Docs without exact-span miss",
+                1.0 - float(metrics["document_leak_rate"]),
+                f"{documents_without_exact_span_miss:,} / {combined['documents_with_sensitive_gold']:,}",
+                0.95,
+                "pass" if metrics["document_leak_rate"] <= 0.05 else "fail",
+                f"{documents_without_exact_span_miss:,} of {combined['documents_with_sensitive_gold']:,} documents "
+                "without an exact-span miss",
             ),
-            ("Over-redaction", float(metrics["over_redaction_rate"]), 0.05, metrics["over_redaction_rate"] <= 0.05),
+            (
+                "Precision (diagnostic)",
+                float(metrics["precision"]),
+                _fmt_percent(metrics["precision"]),
+                None,
+                "neutral",
+                f"{combined['true_positive']:,} of {combined['predicted_spans']:,} predicted spans exact",
+            ),
         )
         quality_figures = {
-            "figures/quality-recall.svg": _svg_chart(
-                "Independent audit: recall and coverage",
-                "Red bars failed their preregistered minimum; gold lines mark thresholds.",
-                recall_rows,
+            "figures/known-bank-contract.svg": (
+                _svg_chart(
+                    "Known-bank contract and natural diagnostic",
+                    "The first three rows are exhaustive conformance; the last is a stricter natural exact-span check.",
+                    (*contract_rows, natural_contract_row),
+                )
+                if conformance["evaluated"]
+                else _svg_unavailable(
+                    "Known-bank contract evidence unavailable",
+                    "Catalog conformance was not evaluated; natural diagnostics do not replace contract evidence.",
+                )
             ),
-            "figures/leakage.svg": _svg_chart(
-                "Independent audit: leakage and over-redaction",
-                "Lower is better; gold lines mark maximum allowed rates.",
-                leakage_rows,
+            "figures/bank-coverage.svg": _svg_coverage_decomposition(
+                (
+                    combined,
+                    _find_by_id(evidence["quality"]["slices"], "contact_all_test", "contact quality slice"),
+                    _find_by_id(evidence["quality"]["slices"], "person_all_test", "person quality slice"),
+                )
+            ),
+            "figures/standalone-redaction.svg": _svg_chart(
+                "Standalone privacy-redaction assessment",
+                "This application-level gate includes unknown entities and sits outside NERB's known-bank guarantee.",
+                standalone_rows,
             ),
         }
     return {
@@ -1383,7 +1719,7 @@ def _verify_bundle_core(
     bundle_dir: Path,
     *,
     check_generated: bool,
-    require_quality_eligible: bool,
+    require_standalone_redaction_eligible: bool,
 ) -> tuple[dict[str, Any], dict[str, bytes]]:
     _require_directory(bundle_dir)
     manifest, evidence, performance_report, bank_card, capacity, inventories = _validate_components(bundle_dir)
@@ -1424,10 +1760,10 @@ def _verify_bundle_core(
         capacity=capacity,
     )
     decision = publication["decision"]
-    if require_quality_eligible and decision["package_release_allowed"] is not True:
+    if require_standalone_redaction_eligible and decision["standalone_privacy_redaction_allowed"] is not True:
         _fail(
-            "The verified evidence is terminal but the evaluated bank is not quality-eligible.",
-            code="enron_quality_ineligible",
+            "The verified evidence is valid, but the evaluated bank is not eligible for standalone privacy redaction.",
+            code="enron_standalone_redaction_ineligible",
         )
     result = {
         "valid": True,
@@ -1441,13 +1777,15 @@ def _verify_bundle_core(
     return result, _rendered_artifacts(manifest, evidence, performance_report, bank_card, capacity)
 
 
-def verify_enron_publication(bundle_dir: Path, *, require_quality_eligible: bool = False) -> dict[str, Any]:
+def verify_enron_publication(
+    bundle_dir: Path, *, require_standalone_redaction_eligible: bool = False
+) -> dict[str, Any]:
     """Verify a clean-clone publication, including hashes, arithmetic, privacy, and terminal decision."""
 
     result, _generated = _verify_bundle_core(
         Path(bundle_dir),
         check_generated=True,
-        require_quality_eligible=require_quality_eligible,
+        require_standalone_redaction_eligible=require_standalone_redaction_eligible,
     )
     return result
 
@@ -1458,7 +1796,7 @@ def render_enron_publication(bundle_dir: Path, output_dir: Path) -> dict[str, An
     result, generated = _verify_bundle_core(
         Path(bundle_dir),
         check_generated=True,
-        require_quality_eligible=False,
+        require_standalone_redaction_eligible=False,
     )
     output = Path(output_dir)
     if output.exists() or output.is_symlink():
@@ -1487,7 +1825,7 @@ def export_enron_publication(
     capacity_decision_path: Path,
     bank_card_path: Path,
     inventory_dir: Path,
-    require_quality_eligible: bool = False,
+    require_standalone_redaction_eligible: bool = False,
 ) -> dict[str, Any]:
     """Create one immutable aggregate publication without reading private per-record artifacts."""
 
@@ -1553,7 +1891,10 @@ def export_enron_publication(
             verified_capacity,
         )
         _write_new(stage / "publication.json", _pretty_json_bytes(publication))
-        result = verify_enron_publication(stage, require_quality_eligible=require_quality_eligible)
+        result = verify_enron_publication(
+            stage,
+            require_standalone_redaction_eligible=require_standalone_redaction_eligible,
+        )
         os.replace(stage, output)
         return result
     except BaseException:

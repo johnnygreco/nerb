@@ -13,13 +13,18 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 
 ## Operating Stance
 
-- Build for the charter's measured utility. For privacy detection, missed sensitive spans, documents, and characters are
-  the primary harms, so maximize measured recall within explicit runtime, memory, and over-redaction constraints.
+- Start from the charter's actual contract. NERB guarantees qualifying matches against a supplied known bank, so catalog
+  conformance and correct canonical mapping are primary engine evidence. Catalog coverage is a separate bank-construction
+  question.
+- When a bank is proposed for open-ended privacy discovery or comprehensive redaction, missed sensitive spans,
+  documents, and characters become primary application harms. Measure that open-world use explicitly without relabeling
+  uncataloged entities as matcher failures.
 - Treat the corpus as evidence, not as the taxonomy owner. User goals decide which entity classes matter.
 - Keep raw or sensitive corpora out of git. Commit scripts, schemas, tiny fixtures, aggregate metrics, and redacted examples.
-- Freeze data prep and held-out evals before claiming benchmark or quality improvements. Report the metrics the charter
-  needs: privacy work starts with open-world span, document, and sensitive-character recall plus leak rates; precision,
-  false alarms, over-redaction, and F1 are secondary constraints only when labels support them.
+- Freeze data prep and held-out evals before claiming benchmark or quality improvements. Always report exact catalog
+  conformance first. Add natural-text catalog diagnostics and population coverage; add open-world span, document, and
+  character leakage only when the charter claims comprehensive discovery or redaction. Precision, false alarms,
+  over-redaction, and F1 remain secondary constraints only when labels support them.
 - Separate evaluator changes from bank or engine changes. If both must change, say so explicitly in the PR/tracker.
 
 ## Workflow
@@ -38,8 +43,9 @@ For detailed checklists, read `references/build-checklist.md` only when planning
 3. Create reproducible private artifacts.
    - Clean obvious transport noise, quoted/replied boilerplate, control characters, empty fields, and pathological records.
    - Create deterministic train/test or train/validation/test splits before candidate tuning.
-   - Preserve or derive independent, exhaustive-within-scope gold labels needed for open-world recall and leakage
-     metrics. Add precision, false-alarm, over-redaction, and F1 evidence only where the annotation scope supports them.
+   - Preserve or derive independent, exhaustive-within-scope gold labels when the charter needs population coverage,
+     open-world recall, or leakage metrics. Add precision, false-alarm, over-redaction, and F1 evidence only where the
+     annotation scope supports them.
    - Store large or sensitive generated corpora under ignored paths such as `.nerb/`.
 
 4. Seed the bank conservatively.
@@ -122,14 +128,15 @@ For detailed checklists, read `references/build-checklist.md` only when planning
      uv run nerb verify-enron-evidence --bundle evidence/enron
      uv run nerb verify-enron-evidence \
        --bundle evidence/enron \
-       --require-quality-eligible
+       --require-standalone-redaction-eligible
      uv run nerb render-enron-evidence \
        --bundle evidence/enron \
        --output-dir /tmp/nerb-enron-render
      ```
 
-     The first command proves authenticity and arithmetic even for a terminal no-ship result. The second must fail for
-     such a result; performance or capacity success never overrides failed recall or leakage gates.
+     The first command proves authenticity and arithmetic. The second applies only when a workflow requires this bank to
+     stand alone as a comprehensive privacy redactor; it must fail for an ineligible bank. That application result never
+     controls release of NERB for its known-bank contract.
 
 8. Leave a handoff another agent can use.
    - Summarize entity classes, split policy, artifact locations, eval coverage, known false positives, and next candidate

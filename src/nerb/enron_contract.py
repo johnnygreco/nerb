@@ -2212,6 +2212,22 @@ def hash_enron_audit_chain(audit_chain: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in audit_chain.items() if key != "chain_sha256"})
 
 
+def recompute_enron_quality_gate_decision(evidence: Mapping[str, Any]) -> bool:
+    """Recompute the aggregate quality decision from its declared gates and source values."""
+
+    checks = [check for check in evidence["promotion"]["checks"] if check["category"] == "quality"]
+    if not checks:
+        return False
+    for check in checks:
+        try:
+            actual = _resolve_pointer(evidence, check["target"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return False
+        if _compare_gate(actual, check["operator"], check["threshold"]) is not True:
+            return False
+    return True
+
+
 def hash_enron_test_lineage_entry(entry: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in entry.items() if key != "entry_sha256"})
 
@@ -5777,6 +5793,12 @@ def _audit_chain_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
 
     score_status = score["status"]
     prediction_status = prediction["status"]
+    recomputed_quality_passed = recompute_enron_quality_gate_decision(evidence)
+    if score_status != "insufficient_support" and score["quality_decision_passed"] is not recomputed_quality_passed:
+        mismatch(
+            "/audit_chain/score/quality_decision_passed",
+            "Scored quality decision differs from the recomputed frozen quality gates.",
+        )
     if score_status == "insufficient_support":
         valid_terminal = _is_insufficient_support_terminal(chain)
     else:
@@ -7670,6 +7692,7 @@ __all__ = [
     "calculate_enron_performance_comparison",
     "calculate_enron_performance_statistics",
     "hash_enron_audit_chain",
+    "recompute_enron_quality_gate_decision",
     "hash_enron_environment",
     "hash_enron_breakeven_plan",
     "hash_enron_manifest",
