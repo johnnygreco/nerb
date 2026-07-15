@@ -530,6 +530,36 @@ def test_source_profile_accepts_owner_read_only_frozen_file(tmp_path: Path) -> N
     assert result["record_count"] == 1
 
 
+@pytest.mark.parametrize(
+    "byte_count",
+    [2 * 1024 * 1024 * 1024 + 1, worker_module.DEFAULT_MAX_SOURCE_BYTES],
+)
+def test_source_profile_reference_accepts_the_frozen_source_budget_without_reading(byte_count: int) -> None:
+    value: dict[str, Any] = {
+        "path": str((Path.cwd() / "private-source.jsonl").resolve()),
+        "sha256": "sha256:" + "1" * 64,
+        "bytes": byte_count,
+        "identity": {
+            "kind": "file",
+            "device": 1,
+            "inode": 2,
+            "mode": 0o600,
+            "link_count": 1,
+            "size": byte_count,
+            "modified_ns": 3,
+            "changed_ns": 4,
+        },
+    }
+
+    assert worker_module._artifact_ref(value).bytes == byte_count
+
+    value["bytes"] = worker_module.DEFAULT_MAX_SOURCE_BYTES + 1
+    value["identity"]["size"] = worker_module.DEFAULT_MAX_SOURCE_BYTES + 1
+    with pytest.raises(worker_module._WorkerError) as error:
+        worker_module._artifact_ref(value)
+    assert error.value.code == "request_shape"
+
+
 def test_source_build_is_explicitly_unsupported_in_narrow_worker() -> None:
     request = _request("source_build", artifacts={}, parameters={}, workload="source-build")
 

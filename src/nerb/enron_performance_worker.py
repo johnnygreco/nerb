@@ -52,7 +52,7 @@ DEFAULT_MAX_RESULT_BYTES = 4 * 1024
 DEFAULT_MAX_BANK_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_INPUT_BYTES = 64 * 1024 * 1024
 DEFAULT_MAX_INVENTORY_BYTES = 16 * 1024 * 1024
-DEFAULT_MAX_PROFILE_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_SOURCE_BYTES = 16 * 1024 * 1024 * 1024
 DEFAULT_MAX_DOCUMENTS = 10_000
 DEFAULT_MAX_TOTAL_RECORDS = 5_000_000
 DEFAULT_MAX_RECORDS_PER_DOCUMENT = 999_999
@@ -122,6 +122,7 @@ ErrorCode = Literal[
 __all__ = [
     "DEFAULT_MAX_REQUEST_BYTES",
     "DEFAULT_MAX_RESULT_BYTES",
+    "DEFAULT_MAX_SOURCE_BYTES",
     "REQUEST_SCHEMA_VERSION",
     "RESULT_SCHEMA_VERSION",
     "EnronPerformanceWorker",
@@ -401,7 +402,7 @@ def _prepare_source_profile(request: _Request) -> _Operation:
     source = request.artifacts["source"]
     max_line_bytes = cast(int, request.parameters["max_line_bytes"])
     max_records = cast(int, request.parameters["max_records"])
-    if source.bytes > DEFAULT_MAX_PROFILE_BYTES:
+    if source.bytes > DEFAULT_MAX_SOURCE_BYTES:
         raise _WorkerError("artifact_too_large")
 
     def observe() -> _Observation:
@@ -1234,7 +1235,7 @@ def _artifact_ref(value: Any) -> _ArtifactRef:
         or _SHA256_RE.fullmatch(raw_sha256) is None
     ):
         raise _WorkerError("request_shape")
-    byte_count = _bounded_int(value.get("bytes"), minimum=0, maximum=DEFAULT_MAX_PROFILE_BYTES)
+    byte_count = _bounded_int(value.get("bytes"), minimum=0, maximum=DEFAULT_MAX_SOURCE_BYTES)
     raw_identity = value.get("identity")
     identity_keys = {
         "kind",
