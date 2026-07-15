@@ -104,6 +104,18 @@ heterogeneous per-document timings is never compared with a whole-input average.
 shared declared scenario—not a measured model invocation, token, hosted-service, or dollar cost—and cannot manufacture
 the crossing.
 
+### Frozen production result
+
+The frozen decision-profile run passed all 19 decision cells and its aggregate privacy scan on an Apple M4 with 10 CPU
+cores and 16 GiB memory. The evaluated bank had 13,201 active patterns. Its 100-document direct throughput cell measured
+0.699 ms median (143,057 documents/s); direct per-document latency measured 9.021 µs median and 55.250 µs p95. Cold
+compilation measured 7.792 s median, full train-source bank construction measured 334.988 s median, and the controlled
+100,000-pattern cell measured 6,811 documents/s. The separate full-source capacity evidence also passed.
+
+These are runtime results, not a release endorsement. The independently annotated quality audit failed recall and
+leakage gates, so the evaluated bank is do-not-ship for privacy redaction. See the
+[aggregate evidence and decision](enron-evidence.md).
+
 ## Decision-Grade Performance Benchmark Standard
 
 A *decision-grade performance benchmark* is evidence strong enough to support a specific runtime-architecture decision,
@@ -128,9 +140,9 @@ final evidence contract uses `decision_grade` for the broader *release decision*
 quality, privacy, capacity, lineage, and performance requirements all pass. Smoke runs are useful for correctness and
 harness checks, but their small sample counts are not decision-grade performance evidence.
 
-The repository currently publishes the workflow and frozen gates, not a current production-capacity result. A fresh run
-must regenerate and deep-verify all aggregate commitments after any bank policy, evaluator, or workload change before a
-measured value is cited.
+The repository publishes the frozen aggregate performance and capacity result with a clean-clone verifier. Any bank,
+evaluator, workload, implementation, or threshold change creates a different candidate and requires new preregistered
+evidence; the sealed panel reported here must not be reused for tuning or rescoring.
 
 ### Frozen promotion gates
 

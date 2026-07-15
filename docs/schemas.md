@@ -516,6 +516,19 @@ decision status, sample policy, the exact-block assignment, balanced ABBA/BAAB a
 fresh/reused process isolation, disjoint twin PIDs, cross-path correctness, and audit bindings
 without accepting or opening a preparation-source or sealed-test input.
 
+### Aggregate publication bundle
+
+`nerb.enron_publication` is the closed clean-clone bundle manifest in `evidence/enron/publication.json`. It binds the
+benchmark manifest/evidence, portable capacity decision, aggregate performance report and content-addressed inventories,
+sanitized bank card, generated Markdown/SVGs, terminal decision, audit chain, bank, measurement commit, and a fixed file
+inventory. It deliberately has no compatibility branch or alternate historical behavior.
+
+`nerb verify-enron-evidence --bundle evidence/enron` validates authentic terminal evidence whether the quality decision
+passes or fails. `--require-quality-eligible` adds the release policy and fails for the committed do-not-ship result.
+`nerb render-enron-evidence` regenerates only `summary.md` and the three SVG figures from committed aggregates. The
+verifier rejects extra files, missing inventories, symlinks, stale renders, hash drift, non-finite arithmetic, private
+paths, raw text, direct identifiers, bank values, document IDs, and span surfaces.
+
 ## Enron bank-build artifacts
 
 The [Enron bank construction workflow](enron-bank-building.md) emits a strict, manifest-bound private run. These

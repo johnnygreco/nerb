@@ -30,6 +30,7 @@ nerb extract-text \
 [Build an Enron bank](enron-bank-building.md){ .md-button }
 [Evaluate Enron](enron-evaluation.md){ .md-button }
 [Measure Enron performance](performance.md#enron-intelligence-cache-workflow){ .md-button }
+[Enron evidence and decision](enron-evidence.md){ .md-button }
 </p>
 
 </div>
@@ -46,15 +47,13 @@ so privacy evidence must report open-world recall and misses separately from cat
 </div>
 </section>
 
-!!! warning "Enron evidence is not yet promotable"
+!!! danger "Enron benchmark decision: do not ship the evaluated bank"
 
-    The privacy-first Enron contract, private preparation, immutable splits, independent quality executor, train-only
-    [bank construction](enron-bank-building.md), catalog-conformance gate, and deep-verified performance evidence
-    workflow are implemented. The [decision-grade performance benchmark standard](performance.md#decision-grade-performance-benchmark-standard)
-    requires a fresh production-capacity result. The bank card remains non-promotable until the mandatory full-source
-    streaming/resource proof, frozen one-shot sealed evaluation, privacy verification, and final lineage gates are
-    complete. See the [charter](enron-benchmark.md),
-    [preparation guide](enron-preparation.md), [split guide](enron-splits.md), and [evaluation guide](enron-evaluation.md).
+    The frozen full-source workflow, capacity proof, decision-grade performance run, and one-shot independently
+    annotated audit are complete. Performance passed, but the 100-document panel measured 10.19% open-world recall,
+    21.34% sensitive-character recall, and 89.86% document leakage. The aggregate bundle verifies cleanly because it is
+    authentic terminal evidence; the explicit quality-eligibility check fails. Read the
+    [evidence and decision](enron-evidence.md) before using this bank as a privacy control.
 
 ## Why Teams Use NERB
 

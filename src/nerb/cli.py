@@ -120,6 +120,12 @@ from .enron_preparation import (
     DEFAULT_OUTPUT_DIR as DEFAULT_ENRON_OUTPUT_DIR,
 )
 from .enron_preparation import EnronPreparationOptions, load_enron_preparation_run, prepare_enron_source
+from .enron_publication import (
+    EnronPublicationError,
+    export_enron_publication,
+    render_enron_publication,
+    verify_enron_publication,
+)
 from .enron_quality import (
     EnronQualityError,
     evaluate_cmu_enron_training_quality_files,
@@ -2872,6 +2878,75 @@ def _load_enron_capacity_api() -> Any:
     from . import enron_capacity
 
     return enron_capacity
+
+
+@app.command("export-enron-evidence")
+def export_enron_evidence_command(
+    output_dir: Path = typer.Option(..., "--output-dir", help="New aggregate publication directory."),
+    manifest_path: Path = typer.Option(..., "--manifest", help="Closed aggregate benchmark manifest JSON."),
+    evidence_path: Path = typer.Option(..., "--evidence", help="Closed aggregate benchmark evidence JSON."),
+    performance_report_path: Path = typer.Option(
+        ..., "--performance-report", help="Verified aggregate performance report JSON."
+    ),
+    capacity_decision_path: Path = typer.Option(
+        ..., "--capacity-decision", help="Verified portable capacity decision JSON."
+    ),
+    bank_card_path: Path = typer.Option(..., "--bank-card", help="Verified aggregate bank card JSON."),
+    inventory_dir: Path = typer.Option(..., "--inventory-dir", help="Aggregate performance inventory directory."),
+    require_quality_eligible: bool = typer.Option(
+        False,
+        "--require-quality-eligible",
+        help="Fail unless the terminal quality decision permits release.",
+    ),
+) -> None:
+    """Publish a path-free bundle from already committed aggregate evidence."""
+
+    try:
+        payload = export_enron_publication(
+            output_dir,
+            benchmark_manifest_path=manifest_path,
+            benchmark_evidence_path=evidence_path,
+            performance_report_path=performance_report_path,
+            capacity_decision_path=capacity_decision_path,
+            bank_card_path=bank_card_path,
+            inventory_dir=inventory_dir,
+            require_quality_eligible=require_quality_eligible,
+        )
+    except EnronPublicationError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("verify-enron-evidence")
+def verify_enron_evidence_command(
+    bundle_dir: Path = typer.Option(..., "--bundle", help="Committed aggregate Enron evidence directory."),
+    require_quality_eligible: bool = typer.Option(
+        False,
+        "--require-quality-eligible",
+        help="Fail unless the terminal quality decision permits release.",
+    ),
+) -> None:
+    """Verify hashes, arithmetic, privacy, generated artifacts, and the terminal decision."""
+
+    try:
+        payload = verify_enron_publication(bundle_dir, require_quality_eligible=require_quality_eligible)
+    except EnronPublicationError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
+
+
+@app.command("render-enron-evidence")
+def render_enron_evidence_command(
+    bundle_dir: Path = typer.Option(..., "--bundle", help="Committed aggregate Enron evidence directory."),
+    output_dir: Path = typer.Option(..., "--output-dir", help="New directory for regenerated summary and figures."),
+) -> None:
+    """Regenerate the public summary and figures without private artifacts."""
+
+    try:
+        payload = render_enron_publication(bundle_dir, output_dir)
+    except EnronPublicationError as exc:
+        _exit_error(str(exc))
+    _echo_json(payload)
 
 
 @app.command("prepare-enron-performance")

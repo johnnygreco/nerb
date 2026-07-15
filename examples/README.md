@@ -38,3 +38,23 @@ The scale figures are generated from deterministic synthetic JSON banks rather t
 how compile time, warm extraction, and process-local bank caching behave on a mostly-literal synthetic workload as an
 agent cache grows from 1,000 to 10,000 active patterns. The numbers are local illustrative measurements for comparing
 runs on the same machine rather than portable package-wide performance claims.
+
+## Executable intelligence-cache workflow
+
+`intelligence_cache/` uses only fictitious identities and demonstrates the complete value path:
+
+1. `source.txt` is an authorized source note.
+2. `candidate-review.json` records reviewed candidate aliases and application metadata.
+3. `bank.json` is the curated cache. Multiple surfaces map back to canonical identities and routing metadata.
+4. `run.py` compiles the bank once, scans a new message through the retained `Bank`, and applies deterministic redaction.
+
+Run it from the repository root:
+
+```shell
+uv run nerb validate-bank --bank examples/intelligence_cache/bank.json
+uv run python examples/intelligence_cache/run.py
+```
+
+The new message contains a reviewed nickname, contact address, organization, and an unknown person. The reviewed values
+are detected and redacted; the unknown person remains. That deliberate miss illustrates the guarantee boundary: a fast,
+deterministic intelligence cache recognizes approved knowledge, but it does not provide open-world coverage by itself.

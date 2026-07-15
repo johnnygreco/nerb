@@ -45,6 +45,7 @@ _SOURCE_MODULES = frozenset(
         "enron_performance_worker",
         "enron_preparation",
         "enron_private_io",
+        "enron_publication",
         "enron_quality",
         "enron_sealed_audit",
         "enron_splitting",

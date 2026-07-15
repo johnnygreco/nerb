@@ -1,0 +1,134 @@
+{
+  "artifact_kind": "aggregate_benchmark_publication",
+  "artifacts": [
+    {
+      "bytes": 10530,
+      "path": "bank-card.json",
+      "sha256": "sha256:d3f23569eb060289a67b8eb902c75f9f75e74f01918abd2531c76566f9041aa2"
+    },
+    {
+      "bytes": 1358509,
+      "path": "benchmark-evidence.json",
+      "sha256": "sha256:c3634d83a3b57910d4860a852511451755c03e0734e5b391b5bdf7638a434e4f"
+    },
+    {
+      "bytes": 14871,
+      "path": "benchmark-manifest.json",
+      "sha256": "sha256:d0706d2a6d7198645b21d49bfa111dd547f392218e2f6078cefeab4e00b6f1d6"
+    },
+    {
+      "bytes": 1938167,
+      "path": "capacity-decision.json",
+      "sha256": "sha256:441d90fc64d45d6febdd2a8ee13d9db25c712d195f4414ca6acb9bf1268ddca2"
+    },
+    {
+      "bytes": 2133,
+      "path": "figures/leakage.svg",
+      "sha256": "sha256:f899f8fa42e4e5c6da5d406a143c4cb9482ec07156cf60f4863f57efb25e24fb"
+    },
+    {
+      "bytes": 1971,
+      "path": "figures/performance-scale.svg",
+      "sha256": "sha256:957e3e755025b9f213cb705ea6da50f45a1e5c16d68a176dd153b6c2b33c773c"
+    },
+    {
+      "bytes": 2154,
+      "path": "figures/quality-recall.svg",
+      "sha256": "sha256:045efe559fc12e4f8fa20c3e48161989642f0238cc0130195e4322a235c014d9"
+    },
+    {
+      "bytes": 2801,
+      "path": "inventories/controlled_dense_medium_inventory.json",
+      "sha256": "sha256:877e6afd195300f2154250fceb471d90901c84f5d73c2543805a830ee00c9d9f"
+    },
+    {
+      "bytes": 2901,
+      "path": "inventories/controlled_negative_huge_inventory.json",
+      "sha256": "sha256:aaabd7497f69ca1f4069d321adcf8da54293f629e2f410717a89022210b45d49"
+    },
+    {
+      "bytes": 2801,
+      "path": "inventories/controlled_negative_large_inventory.json",
+      "sha256": "sha256:d7cdc7ca54d7b56503607ad0a26299e351430d2156821e5b065b918f9bc2a8c8"
+    },
+    {
+      "bytes": 2801,
+      "path": "inventories/controlled_negative_medium_inventory.json",
+      "sha256": "sha256:471cd812803b9aabf09a7d7b9c665fd6dec939873a80eed3d44d58ab503520c8"
+    },
+    {
+      "bytes": 2601,
+      "path": "inventories/controlled_negative_small_inventory.json",
+      "sha256": "sha256:6e35842bb2432f7fc0624a0caf0b0e8c82f0f078a123505a94bcdea92a1dea94"
+    },
+    {
+      "bytes": 2801,
+      "path": "inventories/controlled_normal_medium_inventory.json",
+      "sha256": "sha256:84e0ac3be64ad7854aeacdb5032b29a56af3708fc3e57934ea0ba4a70fd7f61c"
+    },
+    {
+      "bytes": 2801,
+      "path": "inventories/controlled_sparse_medium_inventory.json",
+      "sha256": "sha256:10a510d0e9199713f0a685374f830ca35983e93b507c5ff29cb05f6bf4134a8d"
+    },
+    {
+      "bytes": 2569,
+      "path": "inventories/real_validation_inventory.json",
+      "sha256": "sha256:8c679dfb2f9fb7b51d53473b8f9fb1ffd024280b3ca0d9f553acfd5e651a3456"
+    },
+    {
+      "bytes": 1303812,
+      "path": "performance-report.json",
+      "sha256": "sha256:cf8bc7308772800d0b89dfa29fca9313b044a2527d3f66c11f0c927c201d772c"
+    },
+    {
+      "bytes": 3235,
+      "path": "summary.md",
+      "sha256": "sha256:66e1c920887d6a0fd4723f73c4f085c6c371d0ad91ac09654fabe062f8c578aa"
+    }
+  ],
+  "bindings": {
+    "audit_chain_sha256": "sha256:beebdf6016bdb1e6aa49e1593d624d3c352c665ee2e8b30318119bbe8681234a",
+    "bank_sha256": "sha256:9e67747f90873fb6f2cd1bb52afa1cb9e882d6004708d7c22fa4ca08551af84d",
+    "benchmark_manifest_sha256": "sha256:e202869158486b5ff7d9d061ee0b537d0634a00716a046a1878388e931a50bc3",
+    "capacity_decision_sha256": "sha256:6f49646db68c767471ddc0d58bc429febba75085460c06c98f7c2a7626447919",
+    "catalog_binding_sha256": "sha256:2db01b89b47dbb875c0ab0b35b93be950f421e9a8199847d19fefe2d06363f43",
+    "evidence_manifest_sha256": "sha256:e202869158486b5ff7d9d061ee0b537d0634a00716a046a1878388e931a50bc3",
+    "gold_sha256": "sha256:7f8ea3f90433b80947150bd7b4e8b4ebce0698d5cefbab28c9fef8501f7f3c08",
+    "measurement_git_commit": "f574b79caaf194f17ba8b8113939bd22c9380bc3",
+    "performance_manifest_sha256": "sha256:e3e22da2c34e3ab1768904b8e1e434c71d58208b902a57a52655a7ce03ba8f1c",
+    "performance_run_sha256": "sha256:864304877433988de9704677d3d21dc14fe381548857cca2a839c7025ba69808",
+    "prediction_audit_manifest_sha256": "sha256:bbc79c627b58d8845bab379bee15f088ec0372b47bd81b4c7f8993e4035315b1",
+    "score_manifest_sha256": "sha256:293912e59beeab3dd189cdc2ccbd69e09bdec4ac612979c83a34aaf0bc10bf7e"
+  },
+  "decision": {
+    "audit_status": "quality_gates_failed",
+    "bank_release_eligible": false,
+    "capacity_gates_passed": true,
+    "package_release_allowed": false,
+    "performance_decision_grade": true,
+    "quality_gates_passed": false,
+    "release": "do_not_ship"
+  },
+  "privacy": {
+    "aggregate_only": true,
+    "bank_values_included": false,
+    "direct_identifiers_included": false,
+    "document_ids_included": false,
+    "private_paths_included": false,
+    "raw_text_included": false,
+    "span_surfaces_included": false,
+    "violation_count": 0
+  },
+  "publication_sha256": "sha256:6c58e6869285611724e627193ce54d88ac9483b241b66ca9a51accd696d8204f",
+  "schema_version": "nerb.enron_publication",
+  "scope": {
+    "active_patterns": 13201,
+    "candidate_count": 82173,
+    "gold_sample_documents": 100,
+    "gold_spans": 1393,
+    "prepared_records": 517179,
+    "sealed_test_frame_documents": 51704,
+    "source_input_rows": 517401
+  }
+}

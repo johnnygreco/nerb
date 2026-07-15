@@ -75,7 +75,7 @@ For large corpora, treat bank construction as an evidence pipeline:
 - benchmark compile and scan behavior at the expected scale;
 - keep handoff artifacts reproducible and privacy-safe.
 
-The [Enron Benchmark](enron-benchmark.md), [private preparation workflow](enron-preparation.md),
+The [Enron Benchmark](enron-benchmark.md), [verified decision](enron-evidence.md), [private preparation workflow](enron-preparation.md),
 [train-only bank construction guide](enron-bank-building.md), [evaluation guide](enron-evaluation.md), and
 [large-source bank skill](https://github.com/johnnygreco/nerb/tree/main/.agents/skills/nerb-large-source-bank-building)
 document that deeper workflow.
@@ -103,3 +103,17 @@ The commands expose neither a preparation-source nor sealed-test path; profiling
 artifact. Outputs remain private and ignored; only privacy-scanned aggregate evidence is
 suitable for a later reviewed handoff. The smoke profile is non-promotable. See [Performance](performance.md#enron-intelligence-cache-workflow)
 for the decision command, measurement boundaries, scale semantics, and sample policy.
+
+### Verify the published Enron decision
+
+The committed publication needs no private `.nerb` artifacts:
+
+```shell
+nerb verify-enron-evidence --bundle evidence/enron
+nerb render-enron-evidence \
+  --bundle evidence/enron \
+  --output-dir /tmp/nerb-enron-render
+```
+
+The normal verifier succeeds for an authentic terminal failure. Release automation must add
+`--require-quality-eligible`; that check fails for the committed bank because its recall and leakage gates failed.

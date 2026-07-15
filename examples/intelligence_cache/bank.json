@@ -1,0 +1,123 @@
+{
+  "schema_version": "nerb.bank.v1",
+  "id": "fictitious_directory_cache",
+  "name": "Fictitious Directory Cache",
+  "description": "Reviewed entities mined from an entirely fictitious directory note.",
+  "version": "2026.07.15",
+  "status": "active",
+  "created_at": "2026-07-15T00:00:00Z",
+  "updated_at": "2026-07-15T00:00:00Z",
+  "unicode_normalization": "none",
+  "default_regex_flags": [],
+  "entities": {
+    "person": {
+      "description": "Reviewed people in the fictitious directory.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "avery_stone": {
+          "canonical": "Avery Stone",
+          "description": "Fictitious employee identity.",
+          "status": "active",
+          "patterns": {
+            "full_name": {
+              "kind": "literal",
+              "value": "Avery Stone",
+              "description": "Reviewed full name.",
+              "status": "active",
+              "priority": 10,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {}
+            },
+            "nickname": {
+              "kind": "literal",
+              "value": "Ave Stone",
+              "description": "Reviewed nickname and surname.",
+              "status": "active",
+              "priority": 20,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {}
+            }
+          },
+          "metadata": {
+            "directory_id": "employee-1042",
+            "routing_team": "aurora"
+          }
+        }
+      },
+      "metadata": {}
+    },
+    "contact": {
+      "description": "Reviewed contact channels.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "avery_stone_work_email": {
+          "canonical": "Avery Stone work email",
+          "description": "Fictitious approved work address.",
+          "status": "active",
+          "patterns": {
+            "literal": {
+              "kind": "literal",
+              "value": "avery.stone@northstar.invalid",
+              "description": "Reviewed exact address.",
+              "status": "active",
+              "priority": 10,
+              "case_sensitive": false,
+              "normalize_whitespace": false,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {}
+            }
+          },
+          "metadata": {
+            "directory_id": "employee-1042",
+            "channel": "email"
+          }
+        }
+      },
+      "metadata": {}
+    },
+    "organization": {
+      "description": "Reviewed customer organizations.",
+      "status": "active",
+      "regex_flags": [],
+      "names": {
+        "northstar_logistics": {
+          "canonical": "Northstar Logistics",
+          "description": "Fictitious customer account.",
+          "status": "active",
+          "patterns": {
+            "full_name": {
+              "kind": "literal",
+              "value": "Northstar Logistics",
+              "description": "Reviewed organization name.",
+              "status": "active",
+              "priority": 10,
+              "case_sensitive": false,
+              "normalize_whitespace": true,
+              "left_boundary": "word",
+              "right_boundary": "word",
+              "metadata": {}
+            }
+          },
+          "metadata": {
+            "account_id": "account-0088",
+            "routing_queue": "customer-northstar"
+          }
+        }
+      },
+      "metadata": {}
+    }
+  },
+  "metadata": {
+    "example": "fictitious",
+    "source_review": "candidate-review.json"
+  }
+}

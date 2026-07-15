@@ -10,9 +10,10 @@ It mines candidates from **train only**, evaluates three frozen construction pol
 email-recall policy, and generates catalog-conformance evidence for every active pattern. It never accepts a sealed-test
 path or role.
 
-The resulting bank build is development evidence, not a promoted benchmark result. The public bank card is marked
-`promotable: false` because the sealed final test remains unopened and the main validation corpus does not have
-independent exhaustive labels for open-world PII or utility metrics.
+The resulting bank build is development evidence, not a benchmark decision. Its card is deliberately not release
+eligible because structured-header validation does not provide independent exhaustive open-world labels. The later
+one-shot audit supplied those labels and produced a terminal do-not-ship result for this bank; see the
+[aggregate evidence](enron-evidence.md).
 
 ## Build and verify
 
@@ -195,13 +196,13 @@ Do not publish an artifact merely because its filename sounds aggregate. The can
 conformance witnesses, SQLite spool, manifest, and auxiliary bindings are private. Raw text, surfaces, document IDs,
 private paths, and direct identifiers must never be copied into Git, an issue, a PR description, or public evidence.
 
-`bank-card.json` is the only artifact designed as a possible public handoff after successful deep verification and an
-independent publication review. It contains aggregate source commitments, bank statistics, the aggregate candidate
-funnel, iteration decisions, supported validation summaries, explicit `null` metrics, conformance totals, optional
-auxiliary totals, and privacy declarations. Before committing the private run, the builder rejects a card containing an
-email shape or `@`, a phone shape, a document ID, or a private path. The card remains non-promotable until the separate
-freeze, one-shot sealed-test, privacy-verification, performance, and lineage requirements in the
-[charter](enron-benchmark.md) are satisfied.
+`bank-card.json` is the only builder artifact designed for a possible aggregate handoff after successful deep
+verification and independent publication review. It contains aggregate source commitments, bank statistics, the
+candidate funnel, iteration decisions, supported validation summaries, explicit `null` metrics, conformance totals,
+optional auxiliary totals, and privacy declarations. Before committing the private run, the builder rejects a card
+containing an email shape or `@`, a phone shape, a document ID, or a private path. The final public bundle further
+projects this card to counts, commitments, and hashes only and binds it to the terminal quality, performance, capacity,
+and lineage evidence.
 
 ## Scale and fail-closed caps
 

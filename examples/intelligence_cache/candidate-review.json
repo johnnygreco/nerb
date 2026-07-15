@@ -1,0 +1,42 @@
+{
+  "source": "source.txt",
+  "candidates": [
+    {
+      "entity": "person",
+      "canonical": "Avery Stone",
+      "aliases": [
+        "Avery Stone",
+        "Ave Stone"
+      ],
+      "decision": "accept",
+      "metadata": {
+        "directory_id": "employee-1042",
+        "routing_team": "aurora"
+      }
+    },
+    {
+      "entity": "contact",
+      "canonical": "Avery Stone work email",
+      "aliases": [
+        "avery.stone@northstar.invalid"
+      ],
+      "decision": "accept",
+      "metadata": {
+        "directory_id": "employee-1042",
+        "channel": "email"
+      }
+    },
+    {
+      "entity": "organization",
+      "canonical": "Northstar Logistics",
+      "aliases": [
+        "Northstar Logistics"
+      ],
+      "decision": "accept",
+      "metadata": {
+        "account_id": "account-0088",
+        "routing_queue": "customer-northstar"
+      }
+    }
+  ]
+}
