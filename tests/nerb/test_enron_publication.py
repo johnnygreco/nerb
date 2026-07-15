@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import nerb.enron_publication as publication
+from nerb.enron_contract import hash_enron_audit_chain, validate_enron_evidence
 from nerb.enron_publication import (
     EnronPublicationError,
     export_enron_publication,
@@ -22,6 +25,70 @@ def _copy_bundle(tmp_path: Path) -> Path:
     target = tmp_path / "bundle"
     shutil.copytree(COMMITTED_BUNDLE, target)
     return target
+
+
+def _rewrite_publication_artifact(
+    bundle: Path,
+    relative_path: str,
+    payload: bytes,
+    *,
+    binding_updates: dict[str, object] | None = None,
+) -> None:
+    (bundle / relative_path).write_bytes(payload)
+    publication_path = bundle / "publication.json"
+    publication_manifest = json.loads(publication_path.read_text(encoding="utf-8"))
+    descriptor = next(item for item in publication_manifest["artifacts"] if item["path"] == relative_path)
+    descriptor["bytes"] = len(payload)
+    descriptor["sha256"] = publication._sha256_bytes(payload)
+    if binding_updates is not None:
+        publication_manifest["bindings"].update(binding_updates)
+    publication_manifest["publication_sha256"] = publication._canonical_hash(
+        publication._without(publication_manifest, "publication_sha256")
+    )
+    publication_path.write_bytes(publication._pretty_json_bytes(publication_manifest))
+
+
+def _insufficient_support_evidence() -> dict[str, Any]:
+    evidence = copy.deepcopy(json.loads((COMMITTED_BUNDLE / "benchmark-evidence.json").read_text(encoding="utf-8")))
+    evidence["quality"] = {
+        "evaluated": False,
+        "matching_semantics": evidence["quality"]["matching_semantics"],
+        "character_position_semantics": evidence["quality"]["character_position_semantics"],
+        "slices": [],
+    }
+    evidence["promotion"]["passed"] = False
+    evidence["promotion"]["claims"] = []
+    evidence["verifier"]["passed"] = False
+    for check in evidence["promotion"]["checks"]:
+        if check["category"] == "quality":
+            check["actual"] = None
+            check["passed"] = False
+    score = evidence["audit_chain"]["score"]
+    score.update(
+        {
+            "status": "insufficient_support",
+            "support_failure_codes": ["gold_spans_below_minimum"],
+            "artifacts_sha256": publication._canonical_hash({}),
+            "prediction_commitment_sha256": None,
+            "quality_decision_sha256": None,
+            "quality_decision_passed": False,
+        }
+    )
+    prediction = evidence["audit_chain"]["prediction_audit"]
+    prediction.update(
+        {
+            "status": "not_run_insufficient_support",
+            "receipt_sha256": None,
+            "manifest_sha256": None,
+            "artifacts_sha256": None,
+            "prediction_commitment_sha256": None,
+            "gold_defects": 0,
+            "decision_eligible": False,
+            "release": "do_not_ship",
+        }
+    )
+    evidence["audit_chain"]["chain_sha256"] = hash_enron_audit_chain(evidence["audit_chain"])
+    return evidence
 
 
 @pytest.fixture
@@ -117,6 +184,35 @@ def test_publication_rejects_rehashed_release_overstatement(tmp_path: Path, fast
         verify_enron_publication(bundle)
 
 
+def test_publication_rejects_rehashed_performance_decision_corruption(tmp_path: Path, fast_capacity) -> None:
+    bundle = _copy_bundle(tmp_path)
+    report = json.loads((bundle / "performance-report.json").read_text(encoding="utf-8"))
+    report["decision_grade"]["failure_codes"] = ["missing_required_workload"]
+    report["run_sha256"] = publication._canonical_hash(publication._without(report, "run_sha256"))
+    payload = publication._pretty_json_bytes(report)
+    _rewrite_publication_artifact(
+        bundle,
+        "performance-report.json",
+        payload,
+        binding_updates={"performance_run_sha256": report["run_sha256"]},
+    )
+
+    with pytest.raises(EnronPublicationError, match="differs from the frozen aggregate decision"):
+        verify_enron_publication(bundle)
+
+
+def test_publication_rejects_rehashed_bank_card_document_and_entity_fields(tmp_path: Path, fast_capacity) -> None:
+    bundle = _copy_bundle(tmp_path)
+    card = json.loads((bundle / "bank-card.json").read_text(encoding="utf-8"))
+    card["development_validation"]["unreviewed_document_id"] = "message-000001"
+    card["development_validation"]["unreviewed_entity_value"] = "Alice Example"
+    card["card_sha256"] = publication._canonical_hash(publication._without(card, "card_sha256"))
+    _rewrite_publication_artifact(bundle, "bank-card.json", publication._pretty_json_bytes(card))
+
+    with pytest.raises(EnronPublicationError, match="recursively closed shape"):
+        verify_enron_publication(bundle)
+
+
 def test_render_is_deterministic_and_aggregate_only(tmp_path: Path, fast_capacity) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -125,6 +221,8 @@ def test_render_is_deterministic_and_aggregate_only(tmp_path: Path, fast_capacit
     second_result = render_enron_publication(COMMITTED_BUNDLE, second)
 
     assert first_result == second_result
+    committed_publication = json.loads((COMMITTED_BUNDLE / "publication.json").read_text(encoding="utf-8"))
+    assert first_result["source_publication_sha256"] == committed_publication["publication_sha256"]
     assert sorted(path.relative_to(first).as_posix() for path in first.rglob("*") if path.is_file()) == [
         "figures/leakage.svg",
         "figures/performance-scale.svg",
@@ -136,6 +234,49 @@ def test_render_is_deterministic_and_aggregate_only(tmp_path: Path, fast_capacit
             counterpart = second / path.relative_to(first)
             assert path.read_bytes() == counterpart.read_bytes()
             assert path.read_bytes() == (COMMITTED_BUNDLE / path.relative_to(first)).read_bytes()
+
+
+def test_insufficient_support_terminal_exports_and_renders_without_quality_rates(tmp_path: Path, fast_capacity) -> None:
+    evidence = _insufficient_support_evidence()
+    manifest = json.loads((COMMITTED_BUNDLE / "benchmark-manifest.json").read_text(encoding="utf-8"))
+    inventories = {
+        path.stem: json.loads(path.read_text(encoding="utf-8"))
+        for path in (COMMITTED_BUNDLE / "inventories").glob("*.json")
+    }
+    assert validate_enron_evidence(
+        evidence,
+        manifest=manifest,
+        referenced_input_inventories=inventories,
+    ) == {"valid": True, "diagnostics": []}
+    evidence_path = tmp_path / "insufficient-support.json"
+    evidence_path.write_bytes(publication._pretty_json_bytes(evidence))
+    output = tmp_path / "publication"
+
+    result = export_enron_publication(
+        output,
+        benchmark_manifest_path=COMMITTED_BUNDLE / "benchmark-manifest.json",
+        benchmark_evidence_path=evidence_path,
+        performance_report_path=COMMITTED_BUNDLE / "performance-report.json",
+        capacity_decision_path=COMMITTED_BUNDLE / "capacity-decision.json",
+        bank_card_path=COMMITTED_BUNDLE / "bank-card.json",
+        inventory_dir=COMMITTED_BUNDLE / "inventories",
+    )
+
+    assert result["valid"] is True
+    assert result["decision"]["release"] == "do_not_ship"
+    assert result["decision"]["package_release_allowed"] is False
+    publication_manifest = json.loads((output / "publication.json").read_text(encoding="utf-8"))
+    assert publication_manifest["scope"]["gold_sample_documents"] is None
+    assert publication_manifest["scope"]["gold_spans"] is None
+    summary = (output / "summary.md").read_text(encoding="utf-8")
+    assert "insufficient independent support" in summary
+    assert "rates and miss counts are intentionally shown as unavailable" in summary
+    rendered = tmp_path / "rendered"
+    render_result = render_enron_publication(output, rendered)
+    assert render_result["source_publication_sha256"] == publication_manifest["publication_sha256"]
+    assert (rendered / "figures" / "quality-recall.svg").read_bytes() == (
+        output / "figures" / "quality-recall.svg"
+    ).read_bytes()
 
 
 def test_export_round_trip_is_byte_deterministic(tmp_path: Path, fast_capacity) -> None:

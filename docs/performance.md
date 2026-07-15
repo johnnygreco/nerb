@@ -136,9 +136,9 @@ changes.
 
 That standard can justify a runtime architecture choice. It cannot establish PII recall, low leakage, or release
 readiness: quality evaluation, full-source capacity, and the one-shot sealed evaluation remain independent gates. The
-final evidence contract uses `decision_grade` for the broader *release decision*, which passes only when those independent
-quality, privacy, capacity, lineage, and performance requirements all pass. Smoke runs are useful for correctness and
-harness checks, but their small sample counts are not decision-grade performance evidence.
+publication decision combines those quality, privacy, capacity, lineage, and performance gates without conflating the
+performance decision with package-release eligibility. Smoke runs are useful for correctness and harness checks, but
+their small sample counts are not decision-grade performance evidence.
 
 The repository publishes the frozen aggregate performance and capacity result with a clean-clone verifier. Any bank,
 evaluator, workload, implementation, or threshold change creates a different candidate and requires new preregistered

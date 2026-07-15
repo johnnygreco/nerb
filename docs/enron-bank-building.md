@@ -567,8 +567,8 @@ uv run nerb verify-portable-enron-capacity \
 ```
 
 The artifact's status is `pre_terminal_non_decision`: it proves realistic construction and validation capacity, not
-sealed-test quality or a final ship/no-ship decision. See `evidence/enron/README.md` for exact phase measurements,
-identity commitments, privacy properties, and verifier limitations.
+sealed-test quality or a final ship/no-ship decision. See the [terminal evidence decision](enron-evidence.md) for how
+that capacity receipt is bound to the quality and performance result.
 
 ## Regenerating bank evidence
 

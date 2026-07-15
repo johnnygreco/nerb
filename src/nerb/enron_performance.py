@@ -171,6 +171,7 @@ __all__ = [
     "EnronPerformanceError",
     "EnronPerformancePrepareOptions",
     "EnronPerformanceRunOptions",
+    "evaluate_enron_performance_decision",
     "prepare_enron_performance_manifest",
     "run_enron_performance",
     "verify_enron_performance_run",
@@ -3423,6 +3424,38 @@ def _decision_grade_summary(
     return {"passed": not failures, "failure_codes": sorted(set(failures))}
 
 
+def evaluate_enron_performance_decision(
+    performance: Mapping[str, Any],
+    environment: Mapping[str, Any],
+    software: Mapping[str, Any],
+    *,
+    profile: PerformanceProfile | str = "decision",
+) -> dict[str, Any]:
+    """Recompute the frozen aggregate performance decision without private run material."""
+
+    validated_profile = _validate_profile(str(profile))
+    if (
+        not isinstance(performance, Mapping)
+        or not isinstance(environment, Mapping)
+        or not isinstance(software, Mapping)
+    ):
+        raise EnronPerformanceError("Performance decision inputs are invalid.")
+    if type(software.get("git_dirty")) is not bool:
+        raise EnronPerformanceError("Performance decision dirty-state binding is invalid.")
+    if validated_profile == "smoke":
+        return {"passed": False, "failure_codes": ["smoke_profile_nonpromotable"]}
+    try:
+        decision = _decision_grade_summary(performance, PERFORMANCE_DECISION_THRESHOLDS, environment)
+    except (IndexError, KeyError, TypeError, ValueError):
+        raise EnronPerformanceError("Performance decision aggregates are invalid.") from None
+    if software["git_dirty"] is True:
+        decision = {
+            "passed": False,
+            "failure_codes": sorted({*decision["failure_codes"], "dirty_git_worktree"}),
+        }
+    return decision
+
+
 def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str, Any]:
     """Execute a frozen plan and commit aggregate timing/resource evidence."""
 
@@ -3569,11 +3602,6 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
     manifest_hash = hash_enron_performance_manifest(performance)
     if manifest_hash != profile_plan["performance_manifest_sha256"]:
         raise EnronPerformanceError("Materialized performance output changed its frozen plan hash.")
-    decision_summary: dict[str, Any] = (
-        _decision_grade_summary(performance, prepared.plan["decision_thresholds"], environment)
-        if profile == "decision"
-        else {"passed": False, "failure_codes": ["smoke_profile_nonpromotable"]}
-    )
     _assert_performance_private_tree_current(
         prepared.root,
         prepared.tree,
@@ -3583,14 +3611,7 @@ def _run_enron_performance_impl(options: EnronPerformanceRunOptions) -> dict[str
     software = _software()
     if ending_source_sha256 != current_source_sha256 or software != starting_software:
         raise EnronPerformanceError("Performance implementation changed during the measurement run.")
-    if profile == "decision" and software["git_dirty"] is True:
-        failure_codes = decision_summary.get("failure_codes")
-        if not isinstance(failure_codes, list) or any(not isinstance(item, str) for item in failure_codes):
-            raise EnronPerformanceError("Decision-grade summary failure codes are invalid.")
-        decision_summary = {
-            "passed": False,
-            "failure_codes": sorted({*failure_codes, "dirty_git_worktree"}),
-        }
+    decision_summary = evaluate_enron_performance_decision(performance, environment, software, profile=profile)
     audit_rows = [
         {
             "workload_id": identifier,
@@ -4542,19 +4563,12 @@ def _verify_enron_performance_run_impl(run_dir: Path) -> dict[str, Any]:
         )
         if workload["stats"]["sample_count"] != expected_samples:
             raise EnronPerformanceError("Performance report does not match the frozen profile sample policy.")
-    expected_decision = (
-        {"passed": False, "failure_codes": ["smoke_profile_nonpromotable"]}
-        if profile == "smoke"
-        else _decision_grade_summary(report_performance, plan["decision_thresholds"], report["environment"])
+    expected_decision = evaluate_enron_performance_decision(
+        report_performance,
+        report["environment"],
+        report["software"],
+        profile=profile,
     )
-    if profile == "decision" and report["software"]["git_dirty"] is True:
-        failure_codes = expected_decision["failure_codes"]
-        if not isinstance(failure_codes, list) or any(not isinstance(item, str) for item in failure_codes):
-            raise EnronPerformanceError("Performance report decision failure codes are invalid.")
-        expected_decision = {
-            "passed": False,
-            "failure_codes": sorted({*failure_codes, "dirty_git_worktree"}),
-        }
     if report["decision_grade"] != expected_decision:
         raise EnronPerformanceError("Performance report decision-grade summary is invalid.")
     if (

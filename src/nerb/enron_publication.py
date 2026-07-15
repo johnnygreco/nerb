@@ -27,6 +27,7 @@ from .enron_contract import (
     validate_enron_evidence,
     validate_enron_manifest,
 )
+from .enron_performance import EnronPerformanceError, evaluate_enron_performance_decision
 
 PUBLICATION_SCHEMA = "nerb.enron_publication"
 PUBLIC_BANK_CARD_SCHEMA = "nerb.enron_public_bank_card"
@@ -56,6 +57,167 @@ _FIGURE_ARTIFACTS = (
     "figures/performance-scale.svg",
     "figures/quality-recall.svg",
 )
+_CARD_REASON_RE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
+
+_COUNT_TRIPLE = {"entities": "count", "names": "count", "patterns": "count"}
+_PUBLIC_BANK_CARD_SHAPE: dict[str, Any] = {
+    "schema_version": ("const", PUBLIC_BANK_CARD_SCHEMA),
+    "benchmark_version": "text",
+    "source": {
+        "dataset_id": "text",
+        "dataset_revision": "text",
+        "dataset_split": "text",
+        "development_manifest_sha256": "hash",
+        "full_split_manifest_sha256": "hash",
+        "preparation_manifest_sha256": "hash",
+        "split_policy_sha256": "hash",
+        "train_artifact_sha256": "hash",
+        "train_groups": "count",
+        "train_records": "count",
+        "validation_artifact_sha256": "hash",
+        "validation_groups": "count",
+        "validation_records": "count",
+    },
+    "builder": {
+        "policy_sha256": "hash",
+        "source_sha256": "hash",
+        "candidate_source_sha256": "hash",
+        "candidate_ledger_sha256": "hash",
+        "train_records": "count",
+        "observations": "count",
+        "iteration_count": "positive_count",
+        "selected_iteration_id": "category",
+    },
+    "bank": {
+        "id": "text",
+        "version": "text",
+        "canonical_sha256": "hash",
+        "artifact_sha256": "hash",
+        "canonical_json_bytes": "positive_count",
+        "stats": {
+            "active_totals": _COUNT_TRIPLE,
+            "by_kind": {"literal": "count", "regex": "count"},
+            "by_status": {
+                "active": _COUNT_TRIPLE,
+                "deprecated": _COUNT_TRIPLE,
+                "draft": _COUNT_TRIPLE,
+                "inactive": _COUNT_TRIPLE,
+            },
+            "totals": _COUNT_TRIPLE,
+        },
+    },
+    "candidate_funnel": {
+        "schema_version": ("const", "nerb.enron_candidate_funnel.v2"),
+        "total_candidates": "positive_count",
+        "by_decision": {"active": "count", "draft": "count", "rejected": "count"},
+        "by_type": (
+            "fixed_map",
+            {"contact", "contact_fallback", "organization_domain", "person_alias", "phone_fallback"},
+            {"active": "count", "draft": "count", "rejected": "count", "total": "count"},
+        ),
+        "by_primary_reason": ("count_map",),
+    },
+    "iterations": (
+        "list",
+        {
+            "id": "category",
+            "parent_id": "category_or_none",
+            "policy_sha256": "hash",
+            "bank_sha256": "hash",
+            "validation_protocol_sha256": "hash",
+            "quality_run_sha256": "hash",
+            "contact_labeled_spans": "positive_count",
+            "contact_labeled_true_positive": "count",
+            "contact_labeled_false_negative": "count",
+            "contact_labeled_recall": "ratio",
+            "contact_cataloged_false_negative": "count",
+            "contact_cataloged_wrong_canonical": "count",
+            "person_labeled_spans": "count_or_none",
+            "person_cataloged_false_negative": "count_or_none",
+            "person_cataloged_wrong_canonical": "count_or_none",
+            "open_world_metrics_supported": "bool",
+            "utility_metrics_supported": "bool",
+            "active_patterns": "positive_count",
+            "canonical_json_bytes": "positive_count",
+            "decision": ("enum", {"keep", "discard"}),
+            "decision_reason_code": "category",
+            "selected": "bool",
+        },
+    ),
+    "development_validation": {
+        "contact": {
+            "catalog_coverage": "ratio_or_none",
+            "cataloged_false_negative": "count",
+            "cataloged_gold_spans": "count",
+            "cataloged_recall": "ratio_or_none",
+            "cataloged_true_positive": "count",
+            "cataloged_wrong_canonical": "count",
+            "documents": "count",
+            "documents_with_sensitive_gold": "count",
+            "false_negative": "count",
+            "gold_spans": "count",
+            "labeled_span_recall": "ratio_or_none",
+            "negative_document_false_alarm_rate": "ratio_or_none",
+            "open_world_recall": "ratio_or_none",
+            "over_redaction_rate": "ratio_or_none",
+            "precision": "ratio_or_none",
+            "true_positive": "count",
+        },
+        "evaluator_sha256": "hash",
+        "label_strength": "category",
+        "open_world_metrics_supported": "bool",
+        "person": {
+            "catalog_coverage": "ratio_or_none",
+            "cataloged_false_negative": "count",
+            "cataloged_gold_spans": "count",
+            "cataloged_recall": "ratio_or_none",
+            "cataloged_true_positive": "count",
+            "cataloged_wrong_canonical": "count",
+            "documents": "count",
+            "documents_with_sensitive_gold": "count",
+            "evaluated": "bool",
+            "false_negative": "count",
+            "gold_spans": "count",
+            "labeled_span_recall": "ratio_or_none",
+            "negative_document_false_alarm_rate": "ratio_or_none",
+            "open_world_recall": "ratio_or_none",
+            "over_redaction_rate": "ratio_or_none",
+            "precision": "ratio_or_none",
+            "reason_code": "category",
+            "true_positive": "count",
+        },
+        "protocol_sha256": "hash",
+        "quality_run_sha256": "hash",
+        "unsupported_reason_code": "category",
+        "utility_metrics_supported": "bool",
+    },
+    "catalog_conformance": {
+        "evaluated": "bool",
+        "label_artifact_id": "category_or_none",
+        "active_patterns": "count",
+        "patterns_with_positive_cases": "count",
+        "approved_positive_cases": "count",
+        "correctly_mapped": "count",
+        "missed": "count",
+        "wrong_canonical": "count",
+        "negative_cases": "count",
+        "unexpected_negative_matches": "count",
+        "positive_cases_artifact": "artifact_or_none",
+        "negative_cases_artifact": "artifact_or_none",
+        "policy_sha256": "hash_or_none",
+        "recall": "ratio_or_none",
+        "passed": "bool",
+    },
+    "privacy": {
+        "aggregate_only": "bool",
+        "raw_text_included": "bool",
+        "direct_identifiers_included": "bool",
+        "bank_values_included": "bool",
+        "private_paths_included": "bool",
+        "violation_count": "count",
+    },
+    "card_sha256": "hash",
+}
 
 
 class EnronPublicationError(ValueError):
@@ -238,11 +400,113 @@ def _privacy_scan(files: Mapping[str, bytes]) -> None:
             _fail(f"Aggregate privacy scan failed for {relative_path}.")
 
 
+def _valid_public_count(value: Any, *, positive: bool = False) -> bool:
+    return type(value) is int and (value > 0 if positive else value >= 0) and value <= 2**63 - 1
+
+
+def _valid_public_text(value: Any) -> bool:
+    return (
+        type(value) is str
+        and 1 <= len(value) <= 256
+        and all(character >= " " and character != "\x7f" for character in value)
+    )
+
+
+def _validate_closed_public_value(value: Any, shape: Any) -> None:
+    if isinstance(shape, dict):
+        if type(value) is not dict or set(value) != set(shape):
+            _fail("Public bank card has an invalid recursively closed shape.")
+        for field, child_shape in shape.items():
+            _validate_closed_public_value(value[field], child_shape)
+        return
+    if isinstance(shape, tuple):
+        kind = shape[0]
+        if kind == "const":
+            valid = value == shape[1]
+        elif kind == "enum":
+            valid = type(value) is str and value in shape[1]
+        elif kind == "list":
+            valid = type(value) is list and 1 <= len(value) <= 16
+            if valid:
+                for item in value:
+                    _validate_closed_public_value(item, shape[1])
+        elif kind == "fixed_map":
+            valid = type(value) is dict and set(value) == shape[1]
+            if valid:
+                for item in value.values():
+                    _validate_closed_public_value(item, shape[2])
+        elif kind == "count_map":
+            valid = (
+                type(value) is dict
+                and 1 <= len(value) <= 64
+                and all(type(key) is str and _CARD_REASON_RE.fullmatch(key) for key in value)
+                and all(_valid_public_count(item) for item in value.values())
+            )
+        else:  # pragma: no cover - developer-authored shape is static.
+            raise AssertionError(f"Unsupported public-card shape marker: {kind}")
+        if not valid:
+            _fail("Public bank card contains an invalid aggregate category.")
+        return
+    if shape == "bool":
+        valid = type(value) is bool
+    elif shape == "count":
+        valid = _valid_public_count(value)
+    elif shape == "positive_count":
+        valid = _valid_public_count(value, positive=True)
+    elif shape == "count_or_none":
+        valid = value is None or _valid_public_count(value)
+    elif shape == "hash":
+        valid = type(value) is str and _HASH_RE.fullmatch(value) is not None
+    elif shape == "hash_or_none":
+        valid = value is None or (type(value) is str and _HASH_RE.fullmatch(value) is not None)
+    elif shape == "text":
+        valid = _valid_public_text(value)
+    elif shape == "text_or_none":
+        valid = value is None or _valid_public_text(value)
+    elif shape == "category":
+        valid = type(value) is str and _CARD_REASON_RE.fullmatch(value) is not None
+    elif shape == "category_or_none":
+        valid = value is None or (type(value) is str and _CARD_REASON_RE.fullmatch(value) is not None)
+    elif shape == "ratio":
+        valid = (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and 0 <= float(value) <= 1
+        )
+    elif shape == "ratio_or_none":
+        valid = value is None or (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+            and 0 <= float(value) <= 1
+        )
+    elif shape == "artifact_or_none":
+        if value is None:
+            return
+        _validate_closed_public_value(value, {"id": "text", "sha256": "hash", "bytes": "positive_count"})
+        return
+    else:  # pragma: no cover - developer-authored shape is static.
+        raise AssertionError(f"Unsupported public-card scalar marker: {shape}")
+    if not valid:
+        _fail("Public bank card contains an invalid aggregate scalar.")
+
+
+def _validate_source_bank_card(value: Mapping[str, Any]) -> None:
+    try:
+        from .enron_bank_workflow import EnronBankBuildError, _validate_public_card
+
+        _validate_public_card(value)
+    except (EnronBankBuildError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        _fail("Source bank card failed its closed aggregate validation.")
+
+
 def _sanitize_bank_card(value: Mapping[str, Any]) -> dict[str, Any]:
     if value.get("schema_version") == PUBLIC_BANK_CARD_SCHEMA:
         existing_card = copy.deepcopy(dict(value))
         _verify_bank_card(existing_card)
         return existing_card
+    _validate_source_bank_card(value)
     required = {
         "schema_version",
         "artifact_kind",
@@ -363,6 +627,7 @@ def _sanitize_bank_card(value: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _verify_bank_card(card: Mapping[str, Any]) -> None:
+    _validate_closed_public_value(card, _PUBLIC_BANK_CARD_SHAPE)
     expected = {
         "schema_version",
         "benchmark_version",
@@ -415,8 +680,19 @@ def _verify_bank_card(card: Mapping[str, Any]) -> None:
         if item["active"] + item["draft"] + item["rejected"] != item["total"]:
             _fail("Public candidate-funnel type conservation is invalid.")
         type_total += item["total"]
-    if type_total != total or by_decision.get("active") != bank.get("stats", {}).get("active_totals", {}).get(
-        "patterns"
+    by_reason = funnel["by_primary_reason"]
+    stats = bank["stats"]
+    status_totals = stats["by_status"]
+    if (
+        type_total != total
+        or sum(by_reason.values()) != total
+        or by_decision.get("active") != stats["active_totals"]["patterns"]
+        or stats["active_totals"] != status_totals["active"]
+        or any(
+            stats["totals"][field] != sum(status_totals[status][field] for status in status_totals)
+            for field in ("entities", "names", "patterns")
+        )
+        or stats["by_kind"]["literal"] + stats["by_kind"]["regex"] != stats["totals"]["patterns"]
     ):
         _fail("Public candidate funnel does not bind the selected bank.")
     selected = [item for item in iterations if isinstance(item, Mapping) and item.get("selected") is True]
@@ -531,6 +807,17 @@ def _validate_components(
         or not isinstance(decision_grade.get("failure_codes"), list)
     ):
         _fail("Published performance decision is invalid.")
+    try:
+        expected_decision_grade = evaluate_enron_performance_decision(
+            performance_report["performance"],
+            performance_report["environment"],
+            performance_report["software"],
+            profile=str(performance_report["profile"]),
+        )
+    except EnronPerformanceError:
+        _fail("Published performance decision could not be recomputed.")
+    if decision_grade != expected_decision_grade:
+        _fail("Published performance decision differs from the frozen aggregate decision.")
     _verify_bank_card(bank_card)
     if (
         bank_card.get("benchmark_version") != manifest.get("benchmark_version")
@@ -602,6 +889,99 @@ def _fmt_number(value: Any, digits: int = 3) -> str:
     return f"{float(value):,.{digits}f}"
 
 
+def _combined_quality_slice(evidence: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    quality = evidence["quality"]
+    if quality["evaluated"] is False and quality["slices"] == []:
+        return None
+    return _find_by_id(quality["slices"], "person_contact_all_test", "combined quality slice")
+
+
+def _planned_audit_documents(manifest: Mapping[str, Any]) -> int | None:
+    planned = {
+        item["sample_documents"]
+        for item in manifest["quality_plan"]
+        if item.get("promotion_gate") is True and type(item.get("sample_documents")) is int
+    }
+    return next(iter(planned)) if len(planned) == 1 else None
+
+
+def _render_insufficient_support_summary(
+    manifest: Mapping[str, Any],
+    evidence: Mapping[str, Any],
+    performance_report: Mapping[str, Any],
+    bank_card: Mapping[str, Any],
+    capacity: Mapping[str, Any],
+) -> bytes:
+    direct = _find_by_id(performance_report["performance"]["workloads"], "real_direct_throughput", "direct workload")
+    latency = _find_by_id(performance_report["performance"]["workloads"], "real_direct_latency", "latency workload")
+    decision = _decision_summary(evidence, performance_report, capacity)
+    planned_documents = _planned_audit_documents(manifest)
+    panel_description = (
+        f"The preregistered panel called for {planned_documents:,} documents"
+        if planned_documents is not None
+        else "The preregistered audit panel"
+    )
+    failure_codes = evidence["audit_chain"]["score"]["support_failure_codes"]
+    rendered_codes = ", ".join(f"`{item}`" for item in failure_codes) or "`unspecified_support_failure`"
+    capacity_status = "passed" if decision["capacity_gates_passed"] else "failed"
+    performance_status = "passed" if decision["performance_decision_grade"] else "failed"
+    lines = [
+        "# Enron benchmark decision",
+        "",
+        "**Release decision: DO NOT SHIP.** The terminal audit had insufficient independent support to calculate "
+        "quality, recall, or leakage metrics. No quality claim is available and infrastructure results do not make "
+        "the bank release-eligible.",
+        "",
+        "The source corpus is public. This committed bundle nevertheless contains aggregate evidence only—no source "
+        "text, entity-bank values, document IDs, span surfaces, or private paths.",
+        "",
+        "## Quality decision",
+        "",
+        f"{panel_description}, selected from the {manifest['splits']['roles']['test']['records']:,}-document sealed "
+        f"frame. Scoring ended with insufficient support ({rendered_codes}), so rates and miss counts are "
+        "intentionally "
+        "shown as unavailable rather than inferred or replaced with zeros.",
+        "",
+        "![Quality unavailable](figures/quality-recall.svg)",
+        "",
+        "![Leakage unavailable](figures/leakage.svg)",
+        "",
+        "## Scale and reuse",
+        "",
+        f"The evaluated {evidence['bank']['active_patterns']:,}-pattern bank scanned the 100-document throughput input "
+        f"in a median {_fmt_number(direct['stats']['median_seconds'] * 1_000, 3)} ms "
+        f"({_fmt_number(direct['stats']['documents_per_second'], 1)} documents/s). Per-document direct-scan latency "
+        f"was {_fmt_number(latency['stats']['median_seconds'] * 1_000_000, 3)} µs median.",
+        "",
+        "![Scale throughput](figures/performance-scale.svg)",
+        "",
+        "## Scope and provenance",
+        "",
+        f"- Public source rows: {manifest['source']['input_records']:,}; prepared records: "
+        f"{manifest['preparation']['output_records']:,}.",
+        f"- Sealed test frame: {manifest['splits']['roles']['test']['records']:,} documents; independently scored "
+        "quality panel: unavailable because support was insufficient.",
+        f"- Candidate funnel: {bank_card['candidate_funnel']['total_candidates']:,} candidates to "
+        f"{evidence['bank']['active_patterns']:,} active patterns.",
+        f"- Full-source capacity gates: {capacity_status}; performance decision-grade gates: {performance_status}.",
+        f"- Frozen measurement commit: `{evidence['software']['git_commit']}`; bank: "
+        f"`{evidence['bank']['canonical_hash']}`.",
+        "",
+        "No tuning, resampling, re-annotation, or rescoring is implied by this terminal result.",
+        "",
+        "## Reproduce",
+        "",
+        "```console",
+        "uv run nerb verify-enron-evidence --bundle evidence/enron",
+        "uv run nerb render-enron-evidence --bundle evidence/enron --output-dir /tmp/nerb-enron-render",
+        "```",
+        "",
+        "Use `--require-quality-eligible` when a workflow must reject this structurally valid do-not-ship result.",
+        "",
+    ]
+    return "\n".join(lines).encode("utf-8")
+
+
 def _render_summary(
     manifest: Mapping[str, Any],
     evidence: Mapping[str, Any],
@@ -609,7 +989,9 @@ def _render_summary(
     bank_card: Mapping[str, Any],
     capacity: Mapping[str, Any],
 ) -> bytes:
-    combined = _find_by_id(evidence["quality"]["slices"], "person_contact_all_test", "combined quality slice")
+    combined = _combined_quality_slice(evidence)
+    if combined is None:
+        return _render_insufficient_support_summary(manifest, evidence, performance_report, bank_card, capacity)
     contact = _find_by_id(evidence["quality"]["slices"], "contact_all_test", "contact quality slice")
     person = _find_by_id(evidence["quality"]["slices"], "person_all_test", "person quality slice")
     direct = _find_by_id(performance_report["performance"]["workloads"], "real_direct_throughput", "direct workload")
@@ -767,36 +1149,24 @@ def _svg_chart(
     return "".join(parts).encode("utf-8")
 
 
+def _svg_unavailable(title: str, message: str) -> bytes:
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 240" role="img" '
+        'aria-labelledby="title desc">'
+        f'<title id="title">{html.escape(title)}</title>'
+        f'<desc id="desc">{html.escape(message)}</desc>'
+        '<rect width="100%" height="100%" fill="#0b1020"/>'
+        "<style>text{font-family:ui-sans-serif,system-ui,sans-serif;fill:#e8eefc}.title{font-size:25px;"
+        "font-weight:700}.message{font-size:17px;fill:#aebbd4}</style>"
+        f'<text class="title" x="34" y="52">{html.escape(title)}</text>'
+        f'<text class="message" x="34" y="112">{html.escape(message)}</text>'
+        '<text class="message" x="34" y="150">No rate or zero-value substitute is reported.</text>'
+        "</svg>\n"
+    ).encode()
+
+
 def _render_figures(evidence: Mapping[str, Any], performance_report: Mapping[str, Any]) -> dict[str, bytes]:
-    combined = _find_by_id(evidence["quality"]["slices"], "person_contact_all_test", "combined quality slice")
-    metrics = combined["metrics"]
-    recall_rows = (
-        ("Open-world recall", float(metrics["open_world_recall"]), 0.95, metrics["open_world_recall"] >= 0.95),
-        ("Catalog coverage", float(metrics["catalog_coverage"]), 0.80, metrics["catalog_coverage"] >= 0.80),
-        ("Cataloged recall", float(metrics["cataloged_recall"]), 1.0, metrics["cataloged_recall"] >= 1.0),
-        (
-            "Sensitive-character recall",
-            float(metrics["sensitive_character_recall"]),
-            0.98,
-            metrics["sensitive_character_recall"] >= 0.98,
-        ),
-    )
-    leakage_rows = (
-        ("Document leakage", float(metrics["document_leak_rate"]), 0.05, metrics["document_leak_rate"] <= 0.05),
-        (
-            "Sensitive-character leakage",
-            float(metrics["sensitive_character_leak_rate"]),
-            0.02,
-            metrics["sensitive_character_leak_rate"] <= 0.02,
-        ),
-        (
-            "Negative false alarms",
-            float(metrics["negative_document_false_alarm_rate"]),
-            0.50,
-            metrics["negative_document_false_alarm_rate"] <= 0.50,
-        ),
-        ("Over-redaction", float(metrics["over_redaction_rate"]), 0.05, metrics["over_redaction_rate"] <= 0.05),
-    )
+    combined = _combined_quality_slice(evidence)
     workloads = performance_report["performance"]["workloads"]
     scale_specs = (
         ("1,000 patterns", "scale_1000_direct"),
@@ -813,17 +1183,65 @@ def _render_figures(evidence: Mapping[str, Any], performance_report: Mapping[str
         (f"{label} · {value:,.0f} docs/s", value / maximum, None, True)
         for (label, _identifier), value in zip(scale_specs, scale_values, strict=True)
     )
+    if combined is None:
+        quality_figures = {
+            "figures/quality-recall.svg": _svg_unavailable(
+                "Independent audit: recall unavailable",
+                "The terminal audit had insufficient support to calculate quality rates.",
+            ),
+            "figures/leakage.svg": _svg_unavailable(
+                "Independent audit: leakage unavailable",
+                "The terminal audit had insufficient support to calculate leakage rates.",
+            ),
+        }
+    else:
+        metrics = combined["metrics"]
+        recall_rows = (
+            ("Open-world recall", float(metrics["open_world_recall"]), 0.95, metrics["open_world_recall"] >= 0.95),
+            ("Catalog coverage", float(metrics["catalog_coverage"]), 0.80, metrics["catalog_coverage"] >= 0.80),
+            ("Cataloged recall", float(metrics["cataloged_recall"]), 1.0, metrics["cataloged_recall"] >= 1.0),
+            (
+                "Sensitive-character recall",
+                float(metrics["sensitive_character_recall"]),
+                0.98,
+                metrics["sensitive_character_recall"] >= 0.98,
+            ),
+        )
+        leakage_rows = (
+            (
+                "Document leakage",
+                float(metrics["document_leak_rate"]),
+                0.05,
+                metrics["document_leak_rate"] <= 0.05,
+            ),
+            (
+                "Sensitive-character leakage",
+                float(metrics["sensitive_character_leak_rate"]),
+                0.02,
+                metrics["sensitive_character_leak_rate"] <= 0.02,
+            ),
+            (
+                "Negative false alarms",
+                float(metrics["negative_document_false_alarm_rate"]),
+                0.50,
+                metrics["negative_document_false_alarm_rate"] <= 0.50,
+            ),
+            ("Over-redaction", float(metrics["over_redaction_rate"]), 0.05, metrics["over_redaction_rate"] <= 0.05),
+        )
+        quality_figures = {
+            "figures/quality-recall.svg": _svg_chart(
+                "Independent audit: recall and coverage",
+                "Red bars failed their preregistered minimum; gold lines mark thresholds.",
+                recall_rows,
+            ),
+            "figures/leakage.svg": _svg_chart(
+                "Independent audit: leakage and over-redaction",
+                "Lower is better; gold lines mark maximum allowed rates.",
+                leakage_rows,
+            ),
+        }
     return {
-        "figures/quality-recall.svg": _svg_chart(
-            "Independent audit: recall and coverage",
-            "Red bars failed their preregistered minimum; gold lines mark thresholds.",
-            recall_rows,
-        ),
-        "figures/leakage.svg": _svg_chart(
-            "Independent audit: leakage and over-redaction",
-            "Lower is better; gold lines mark maximum allowed rates.",
-            leakage_rows,
-        ),
+        **quality_figures,
         "figures/performance-scale.svg": _svg_chart(
             "Direct scan throughput by bank size",
             "Apple M4, 100-document controlled input; bars are normalized to the fastest cell.",
@@ -858,6 +1276,7 @@ def _publication_manifest(
     capacity: Mapping[str, Any],
 ) -> dict[str, Any]:
     decision = _decision_summary(evidence, performance_report, capacity)
+    combined_quality = _combined_quality_slice(evidence)
     publication: dict[str, Any] = {
         "schema_version": PUBLICATION_SCHEMA,
         "artifact_kind": "aggregate_benchmark_publication",
@@ -866,8 +1285,8 @@ def _publication_manifest(
             "source_input_rows": manifest["source"]["input_records"],
             "prepared_records": manifest["preparation"]["output_records"],
             "sealed_test_frame_documents": manifest["splits"]["roles"]["test"]["records"],
-            "gold_sample_documents": evidence["quality"]["slices"][0]["documents"],
-            "gold_spans": evidence["quality"]["slices"][0]["gold_spans"],
+            "gold_sample_documents": None if combined_quality is None else combined_quality["documents"],
+            "gold_spans": None if combined_quality is None else combined_quality["gold_spans"],
             "active_patterns": evidence["bank"]["active_patterns"],
             "candidate_count": bank_card["candidate_funnel"]["total_candidates"],
         },
@@ -1013,6 +1432,7 @@ def _verify_bundle_core(
     result = {
         "valid": True,
         "schema_version": publication["schema_version"],
+        "publication_sha256": publication["publication_sha256"],
         "decision": copy.deepcopy(decision),
         "bindings": copy.deepcopy(publication["bindings"]),
         "artifacts_verified": len(files),
@@ -1053,7 +1473,7 @@ def render_enron_publication(bundle_dir: Path, output_dir: Path) -> dict[str, An
         raise
     return {
         "valid": True,
-        "source_publication_sha256": result["bindings"]["audit_chain_sha256"],
+        "source_publication_sha256": result["publication_sha256"],
         "artifacts": [_artifact_descriptor(path, generated[path]) for path in sorted(generated)],
     }
 
