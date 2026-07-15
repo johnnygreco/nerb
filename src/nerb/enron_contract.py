@@ -68,6 +68,16 @@ MAX_QUALITY_THRESHOLDS = {
     "negative_document_false_alarm_rate": 0.50,
     "over_redaction_rate": 0.05,
 }
+AUDIT_SUPPORT_FAILURE_ORDER = (
+    "production_document_count_mismatch",
+    "documents_below_minimum",
+    "gold_spans_below_minimum",
+    "negative_documents_below_minimum",
+    "sensitive_characters_below_minimum",
+    "contact_gold_support_missing",
+    "person_gold_support_missing",
+)
+EMPTY_AUDIT_ARTIFACTS_SHA256 = "sha256:" + sha256(b"{}").hexdigest()
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 ZERO_SHA256 = "sha256:" + "0" * 64
@@ -5569,6 +5579,8 @@ def _performance_promotion_diagnostics(
 def _is_insufficient_support_terminal(chain: Mapping[str, Any]) -> bool:
     score = chain["score"]
     prediction = chain["prediction_audit"]
+    support_failure_codes = score["support_failure_codes"]
+    canonical_support_failure_codes = [code for code in AUDIT_SUPPORT_FAILURE_ORDER if code in support_failure_codes]
     prediction_hashes = (
         prediction["receipt_sha256"],
         prediction["manifest_sha256"],
@@ -5577,7 +5589,9 @@ def _is_insufficient_support_terminal(chain: Mapping[str, Any]) -> bool:
     )
     return (
         score["status"] == "insufficient_support"
-        and bool(score["support_failure_codes"])
+        and bool(support_failure_codes)
+        and support_failure_codes == canonical_support_failure_codes
+        and score["artifacts_sha256"] == EMPTY_AUDIT_ARTIFACTS_SHA256
         and score["prediction_commitment_sha256"] is None
         and score["quality_decision_sha256"] is None
         and score["quality_decision_passed"] is False

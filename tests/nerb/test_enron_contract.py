@@ -1775,6 +1775,8 @@ def test_truthful_insufficient_support_preserves_frozen_quality_checks_without_s
         ("claims", "contract.gate_target"),
         ("promotion_passed", "contract.gate_target"),
         ("verifier_passed", "contract.gate_target"),
+        ("support_failure_code", "contract.gate_target"),
+        ("score_artifacts", "contract.gate_target"),
         ("non_quality_target", "contract.gate_target"),
     ],
 )
@@ -1801,6 +1803,10 @@ def test_insufficient_support_quality_gate_exception_rejects_near_misses(
         value["promotion"]["passed"] = True
     elif mutation == "verifier_passed":
         value["verifier"]["passed"] = True
+    elif mutation == "support_failure_code":
+        value["audit_chain"]["score"]["support_failure_codes"] = ["not_a_support_floor"]
+    elif mutation == "score_artifacts":
+        value["audit_chain"]["score"]["artifacts_sha256"] = "sha256:" + "f" * 64
     else:
         non_quality_check = next(check for check in value["promotion"]["checks"] if check["category"] == "privacy")
         non_quality_check.update({"target": "/privacy/missing", "actual": None, "passed": False})
