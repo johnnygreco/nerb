@@ -203,6 +203,9 @@ def test_help_shows_command_structure():
         "verify-enron-capacity",
         "export-enron-capacity",
         "verify-portable-enron-capacity",
+        "export-enron-evidence",
+        "verify-enron-evidence",
+        "render-enron-evidence",
         "prepare-enron-performance",
         "run-enron-performance",
         "verify-enron-performance",
@@ -982,6 +985,86 @@ def test_enron_capacity_commands_are_thin_and_use_only_explicit_paths(monkeypatc
     )
     assert portable_verify.exit_code == 0, portable_verify.output
     assert captured["portable"] == portable
+
+
+def test_enron_evidence_commands_are_thin_and_use_only_explicit_paths(monkeypatch, tmp_path):
+    import nerb.cli as cli
+
+    captured = {}
+
+    def fake_export(output_dir, **kwargs):
+        captured["export"] = (output_dir, kwargs)
+        return {"valid": True}
+
+    def fake_verify(bundle_dir, *, require_quality_eligible=False):
+        captured["verify"] = (bundle_dir, require_quality_eligible)
+        return {"valid": True}
+
+    def fake_render(bundle_dir, output_dir):
+        captured["render"] = (bundle_dir, output_dir)
+        return {"valid": True}
+
+    monkeypatch.setattr(cli, "export_enron_publication", fake_export)
+    monkeypatch.setattr(cli, "verify_enron_publication", fake_verify)
+    monkeypatch.setattr(cli, "render_enron_publication", fake_render)
+    output = tmp_path / "publication"
+    bundle = tmp_path / "bundle"
+    rendered = tmp_path / "rendered"
+    manifest = tmp_path / "manifest.json"
+    evidence = tmp_path / "evidence.json"
+    performance = tmp_path / "performance.json"
+    capacity = tmp_path / "capacity.json"
+    bank_card = tmp_path / "bank-card.json"
+    inventories = tmp_path / "inventories"
+
+    export = runner.invoke(
+        app,
+        [
+            "export-enron-evidence",
+            "--output-dir",
+            str(output),
+            "--manifest",
+            str(manifest),
+            "--evidence",
+            str(evidence),
+            "--performance-report",
+            str(performance),
+            "--capacity-decision",
+            str(capacity),
+            "--bank-card",
+            str(bank_card),
+            "--inventory-dir",
+            str(inventories),
+            "--require-quality-eligible",
+        ],
+    )
+    assert export.exit_code == 0, export.output
+    assert captured["export"] == (
+        output,
+        {
+            "benchmark_manifest_path": manifest,
+            "benchmark_evidence_path": evidence,
+            "performance_report_path": performance,
+            "capacity_decision_path": capacity,
+            "bank_card_path": bank_card,
+            "inventory_dir": inventories,
+            "require_quality_eligible": True,
+        },
+    )
+
+    verify = runner.invoke(
+        app,
+        ["verify-enron-evidence", "--bundle", str(bundle), "--require-quality-eligible"],
+    )
+    assert verify.exit_code == 0, verify.output
+    assert captured["verify"] == (bundle, True)
+
+    render = runner.invoke(
+        app,
+        ["render-enron-evidence", "--bundle", str(bundle), "--output-dir", str(rendered)],
+    )
+    assert render.exit_code == 0, render.output
+    assert captured["render"] == (bundle, rendered)
 
 
 def test_enron_capacity_cli_emits_only_the_closed_wall_gap_diagnostic(monkeypatch, tmp_path):

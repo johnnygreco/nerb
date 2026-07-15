@@ -1,18 +1,15 @@
 # Enron Benchmark Charter
 
-> **Status: contract, private preparation, immutable splitting, train-only bank construction, independent quality
-> execution, catalog conformance, and the decision-grade performance workflow implemented.**
-> The manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
-> [group-aware split and sealing workflow](enron-splits.md), and [privacy evaluation workflow](enron-evaluation.md) are
-> implemented alongside the [train-only bank workflow](enron-bank-building.md) and
-> [deep-verified performance workflow](performance.md#decision-grade-performance-benchmark-standard). The production
-> full-source capacity run is complete. Bank cards remain non-promotable until the frozen performance run, one-shot
-> 100-document sealed gold audit, final aggregate verification, and append-only lineage evidence are complete.
+> **Status: terminal do-not-ship decision.**
+> The full pinned-source preparation, immutable split, train-only bank build, capacity proof, decision-grade performance
+> run, one-shot 100-document sealed gold audit, prediction audit, and aggregate publication are complete. Performance and
+> capacity passed; open-world recall and leakage failed decisively. The evaluated bank must not be shipped for privacy
+> redaction. See the [verified aggregate evidence](enron-evidence.md).
 
 NERB's Enron benchmark is designed to demonstrate a privacy-first intelligence-cache workflow: a capable agent turns a
 large private organizational source into a reviewed entity bank once; an application compiles that bank once and reuses
-it for fast, deterministic scans. The implemented workflow does not become demonstration evidence until the frozen
-production-capacity and one-shot quality runs pass. The benchmark must show both sides of the proposition without
+it for fast, deterministic scans. The completed benchmark is demonstration evidence even though its bank failed: a
+decision-grade process must preserve an honest no-ship result. The benchmark shows both sides of the proposition without
 conflating them:
 
 1. how much sensitive information the construction process learned; and

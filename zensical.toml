@@ -21,6 +21,7 @@ nav = [
     { "Anonymization" = "anonymization.md" },
     { "Performance" = "performance.md" },
     { "Enron Charter" = "enron-benchmark.md" },
+    { "Enron Evidence" = "enron-evidence.md" },
     { "Enron Preparation" = "enron-preparation.md" },
     { "Enron Splits" = "enron-splits.md" },
     { "Enron Bank Construction" = "enron-bank-building.md" },

@@ -114,6 +114,22 @@ For detailed checklists, read `references/build-checklist.md` only when planning
    - Do not optimize against an Enron final-test score. Stop after train mining, validation-only policy selection,
      optional auxiliary-train diagnostics, and catalog conformance. Only a release steward may use the one-shot sealed
      final-test path after the bank, evaluator, thresholds, claims, and workloads are frozen.
+   - Treat the first sealed outcome as terminal for that bank and panel. A valid aggregate bundle may honestly encode a
+     quality failure; do not resample, relabel, tune, or rescore merely to obtain a passing result. Verify the evidence
+     normally, then use the explicit eligibility flag in any release gate:
+
+     ```shell
+     uv run nerb verify-enron-evidence --bundle evidence/enron
+     uv run nerb verify-enron-evidence \
+       --bundle evidence/enron \
+       --require-quality-eligible
+     uv run nerb render-enron-evidence \
+       --bundle evidence/enron \
+       --output-dir /tmp/nerb-enron-render
+     ```
+
+     The first command proves authenticity and arithmetic even for a terminal no-ship result. The second must fail for
+     such a result; performance or capacity success never overrides failed recall or leakage gates.
 
 8. Leave a handoff another agent can use.
    - Summarize entity classes, split policy, artifact locations, eval coverage, known false positives, and next candidate

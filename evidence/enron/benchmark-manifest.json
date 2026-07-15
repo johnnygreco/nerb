@@ -1,0 +1,427 @@
+{
+  "artifact_kind": "real_benchmark",
+  "audit_plan_sha256": "sha256:761d5b34f8e9cb8665d73d33e4a9e0d591f0ebf2de1eaa76052a522c49571b30",
+  "bank": {
+    "active_aliases": 1200,
+    "active_entities": 2,
+    "active_names": 13201,
+    "active_patterns": 13201,
+    "artifact_bytes": 35863690,
+    "artifact_sha256": "sha256:254499013e0c847dd95be371cf33cf00f59df0637e8a4e7cc841612256d58bd7",
+    "canonical_hash": "sha256:9e67747f90873fb6f2cd1bb52afa1cb9e882d6004708d7c22fa4ca08551af84d",
+    "canonical_json_bytes": 22947009,
+    "id": "enron_intelligence",
+    "native_source_bytes": 16505734
+  },
+  "benchmark_version": "enron",
+  "charter_version": "2",
+  "commands": [
+    {
+      "argv": [
+        "uv",
+        "run",
+        "nerb",
+        "run-enron-performance",
+        "--profile",
+        "decision",
+        "--require-decision-grade"
+      ],
+      "cwd": ".",
+      "elapsed_seconds": 0.0,
+      "exit_status": 0,
+      "id": "enron_performance_runner",
+      "timeout_seconds": 7200.0
+    }
+  ],
+  "conformance_plan": {
+    "label_artifact_id": "enron_catalog_conformance_labels",
+    "negative_cases": 1210,
+    "negative_cases_artifact": {
+      "bytes": 223555,
+      "id": "enron_catalog_conformance_negative_cases",
+      "sha256": "sha256:574597f98bfa30ef22270c820c7339581019599910e080cdc592d81ba02e9315"
+    },
+    "policy_sha256": "sha256:000104818195133cf270e3151ddf684418b55ced452d4f4adf3102287f14cf45",
+    "positive_cases": 39604,
+    "positive_cases_artifact": {
+      "bytes": 15003925,
+      "id": "enron_catalog_conformance_positive_cases",
+      "sha256": "sha256:7da2b0aec11da2ebecd0857482987e4bc2b0de8f0df4009c43ae2960ad650bcb"
+    }
+  },
+  "created_at": "2026-07-15T09:26:30.373967Z",
+  "environment": {
+    "architecture": "arm64",
+    "cpu_count": 10,
+    "cpu_model": "Apple M4",
+    "memory_bytes": 17179869184,
+    "os": "Darwin",
+    "python": "3.13.12"
+  },
+  "evaluator": {
+    "id": "nerb-enron-quality",
+    "label_schema_sha256": "sha256:35123a8a79d7c9187c0c5324a7aecd066838d9cc376261058ec0ff2d8f0037ca",
+    "source_sha256": "sha256:7814ee7ef36ad73ca89d353419f8e22da933bafc6e71b32d2d1faeb567e7d63c",
+    "version": "2.0.0"
+  },
+  "labels": [
+    {
+      "annotation_completeness": "exhaustive_within_scope",
+      "annotation_provenance": {
+        "adjudication_artifact": {
+          "bytes": 110908,
+          "id": "sealed_gold_adjudication",
+          "sha256": "sha256:2ee7faa97b2c904afd77bb3919b305e2d3ac151d11021711c01bd26dc291b54b"
+        },
+        "independently_reviewed": true,
+        "producer_id": "blind_annotation_pair",
+        "protocol_sha256": "sha256:0c8e33b780228adf0dcb9b55bc3a91224626e14812a0e6e091963f605e9e79ef",
+        "reviewer_id": "independent_gold_reviewer"
+      },
+      "annotation_scope": {
+        "document_regions": [
+          "subject",
+          "current_body"
+        ],
+        "entity_classes": [
+          "contact",
+          "person"
+        ],
+        "exclusions": [],
+        "span_policy_sha256": "sha256:0c8e33b780228adf0dcb9b55bc3a91224626e14812a0e6e091963f605e9e79ef"
+      },
+      "artifact": {
+        "bytes": 92451,
+        "id": "sealed_gold_annotations",
+        "sha256": "sha256:6c3e6176d0e4fb3f137bcf651934c4938b271b2949d79cf6f168e1eb6b1b6f9b"
+      },
+      "id": "enron_gold_person_contact",
+      "label_strength": "independent",
+      "role_populations": [
+        {
+          "documents": 100,
+          "role": "test",
+          "spans": 1393
+        }
+      ],
+      "roles": [
+        "test"
+      ],
+      "span_count": 1393
+    },
+    {
+      "annotation_completeness": "exhaustive_within_scope",
+      "annotation_provenance": {
+        "adjudication_artifact": {
+          "bytes": 110908,
+          "id": "sealed_gold_adjudication",
+          "sha256": "sha256:2ee7faa97b2c904afd77bb3919b305e2d3ac151d11021711c01bd26dc291b54b"
+        },
+        "independently_reviewed": true,
+        "producer_id": "blind_annotation_pair",
+        "protocol_sha256": "sha256:0c8e33b780228adf0dcb9b55bc3a91224626e14812a0e6e091963f605e9e79ef",
+        "reviewer_id": "independent_gold_reviewer"
+      },
+      "annotation_scope": {
+        "document_regions": [
+          "subject",
+          "current_body"
+        ],
+        "entity_classes": [
+          "contact"
+        ],
+        "exclusions": [],
+        "span_policy_sha256": "sha256:0c8e33b780228adf0dcb9b55bc3a91224626e14812a0e6e091963f605e9e79ef"
+      },
+      "artifact": {
+        "bytes": 92451,
+        "id": "sealed_gold_annotations",
+        "sha256": "sha256:6c3e6176d0e4fb3f137bcf651934c4938b271b2949d79cf6f168e1eb6b1b6f9b"
+      },
+      "id": "enron_gold_contact",
+      "label_strength": "independent",
+      "role_populations": [
+        {
+          "documents": 100,
+          "role": "test",
+          "spans": 126
+        }
+      ],
+      "roles": [
+        "test"
+      ],
+      "span_count": 126
+    },
+    {
+      "annotation_completeness": "exhaustive_within_scope",
+      "annotation_provenance": {
+        "adjudication_artifact": {
+          "bytes": 110908,
+          "id": "sealed_gold_adjudication",
+          "sha256": "sha256:2ee7faa97b2c904afd77bb3919b305e2d3ac151d11021711c01bd26dc291b54b"
+        },
+        "independently_reviewed": true,
+        "producer_id": "blind_annotation_pair",
+        "protocol_sha256": "sha256:0c8e33b780228adf0dcb9b55bc3a91224626e14812a0e6e091963f605e9e79ef",
+        "reviewer_id": "independent_gold_reviewer"
+      },
+      "annotation_scope": {
+        "document_regions": [
+          "subject",
+          "current_body"
+        ],
+        "entity_classes": [
+          "person"
+        ],
+        "exclusions": [],
+        "span_policy_sha256": "sha256:0c8e33b780228adf0dcb9b55bc3a91224626e14812a0e6e091963f605e9e79ef"
+      },
+      "artifact": {
+        "bytes": 92451,
+        "id": "sealed_gold_annotations",
+        "sha256": "sha256:6c3e6176d0e4fb3f137bcf651934c4938b271b2949d79cf6f168e1eb6b1b6f9b"
+      },
+      "id": "enron_gold_person",
+      "label_strength": "independent",
+      "role_populations": [
+        {
+          "documents": 100,
+          "role": "test",
+          "spans": 1267
+        }
+      ],
+      "roles": [
+        "test"
+      ],
+      "span_count": 1267
+    },
+    {
+      "annotation_completeness": "exhaustive_within_scope",
+      "annotation_provenance": {
+        "adjudication_artifact": {
+          "bytes": 2386,
+          "id": "enron_catalog_conformance_adjudication",
+          "sha256": "sha256:feb82a9c0f0c12c65159bd90127f1ede6ed43eba4ecd4ddfb5ad104eefeb15f1"
+        },
+        "independently_reviewed": true,
+        "producer_id": "deterministic_conformance_generator",
+        "protocol_sha256": "sha256:000104818195133cf270e3151ddf684418b55ced452d4f4adf3102287f14cf45",
+        "reviewer_id": "conformance_verifier"
+      },
+      "annotation_scope": {
+        "document_regions": [
+          "synthetic_cases"
+        ],
+        "entity_classes": [
+          "approved_catalog_patterns"
+        ],
+        "exclusions": [],
+        "span_policy_sha256": "sha256:000104818195133cf270e3151ddf684418b55ced452d4f4adf3102287f14cf45"
+      },
+      "artifact": {
+        "bytes": 15003925,
+        "id": "enron_catalog_conformance_positive_cases",
+        "sha256": "sha256:7da2b0aec11da2ebecd0857482987e4bc2b0de8f0df4009c43ae2960ad650bcb"
+      },
+      "id": "enron_catalog_conformance_labels",
+      "label_strength": "synthetic_conformance",
+      "role_populations": [
+        {
+          "documents": 39604,
+          "role": "conformance",
+          "spans": 39604
+        }
+      ],
+      "roles": [
+        "conformance"
+      ],
+      "span_count": 39604
+    }
+  ],
+  "performance_manifest_sha256": "sha256:e3e22da2c34e3ab1768904b8e1e434c71d58208b902a57a52655a7ce03ba8f1c",
+  "preparation": {
+    "cleaning_policy_sha256": "sha256:69574880955ce439a4e9ca2d74ade13f9c5fb21d3f0f3b57d083313b5de39f6d",
+    "grouping_policy_sha256": "sha256:52601553c9d225590f3bc721b3aececfa13914ac3e48ed1f78ca5c00edfe231e",
+    "output_records": 517179,
+    "prepared_artifact": {
+      "bytes": 6024376378,
+      "id": "prepared_records",
+      "sha256": "sha256:1aea11d7e9996b70de7076c0e69dc325c1db410ab188ac044cef3c0f8fbd5418"
+    },
+    "text_views": [
+      {
+        "answer_bearing_fields_included": false,
+        "artifact_sha256": "sha256:1304bf0973b9c08d113217601e9cf9d171efc9858dbadfbf2400c91cfb109692",
+        "content_policy_sha256": "sha256:69574880955ce439a4e9ca2d74ade13f9c5fb21d3f0f3b57d083313b5de39f6d",
+        "document_regions": [
+          "full_visible_body"
+        ],
+        "id": "full_visible_body",
+        "primary_for_quality": false
+      },
+      {
+        "answer_bearing_fields_included": false,
+        "artifact_sha256": "sha256:9b4685295b23f05067ad0554723278003e3b4d2e8ed4d7236df9022ab8187be5",
+        "content_policy_sha256": "sha256:69574880955ce439a4e9ca2d74ade13f9c5fb21d3f0f3b57d083313b5de39f6d",
+        "document_regions": [
+          "current_body"
+        ],
+        "id": "current_body",
+        "primary_for_quality": false
+      },
+      {
+        "answer_bearing_fields_included": false,
+        "artifact_sha256": "sha256:9e2beae0b5fa5e54fd8e94e5bf95c016b58953bc161e78dfaa1cb13595048387",
+        "content_policy_sha256": "sha256:69574880955ce439a4e9ca2d74ade13f9c5fb21d3f0f3b57d083313b5de39f6d",
+        "document_regions": [
+          "subject",
+          "current_body"
+        ],
+        "id": "subject_current_body",
+        "primary_for_quality": true
+      },
+      {
+        "answer_bearing_fields_included": false,
+        "artifact_sha256": "sha256:a381df72883597844cfc567a18a1e4bc147aef4177564ac81e3b7c07f095d80a",
+        "content_policy_sha256": "sha256:69574880955ce439a4e9ca2d74ade13f9c5fb21d3f0f3b57d083313b5de39f6d",
+        "document_regions": [
+          "current_body_core"
+        ],
+        "id": "current_body_core",
+        "primary_for_quality": false
+      }
+    ]
+  },
+  "privacy": {
+    "direct_identifiers_included": false,
+    "raw_text_included": false,
+    "report_sha256": "sha256:eda80724fde0c94e03b8edc6aaac00a870737abf558cf2e75932ba445b282004",
+    "scanner": "nerb-enron-contract",
+    "scanner_source_sha256": "sha256:c97785fd8515bffbb28027b8fe220dc592d94d33b0e2ed0de4828190692909c2",
+    "status": "passed",
+    "violation_count": 0
+  },
+  "quality_plan": [
+    {
+      "cohort": "all",
+      "entity_class": "person_contact",
+      "frame_documents": 51704,
+      "id": "person_contact_all_test",
+      "label_artifact_id": "enron_gold_person_contact",
+      "promotion_gate": true,
+      "sample_design": {
+        "membership_artifact": {
+          "bytes": 653325,
+          "id": "sealed_gold_sample_membership",
+          "sha256": "sha256:2cfb0953c7f750667b172ec5947003308b6df8080b0955e6f51d7306ee343136"
+        },
+        "method": "deterministic_stratified_without_replacement",
+        "policy_sha256": "sha256:f8d3faf7f201d16c4835b1e15fcf54c6af901401b5da2048477802252e3f5807",
+        "seed_sha256": "sha256:761d5b34f8e9cb8665d73d33e4a9e0d591f0ebf2de1eaa76052a522c49571b30"
+      },
+      "sample_documents": 100,
+      "split_role": "test",
+      "text_view": "subject_current_body"
+    },
+    {
+      "cohort": "all",
+      "entity_class": "contact",
+      "frame_documents": 51704,
+      "id": "contact_all_test",
+      "label_artifact_id": "enron_gold_contact",
+      "promotion_gate": false,
+      "sample_design": {
+        "membership_artifact": {
+          "bytes": 653325,
+          "id": "sealed_gold_sample_membership",
+          "sha256": "sha256:2cfb0953c7f750667b172ec5947003308b6df8080b0955e6f51d7306ee343136"
+        },
+        "method": "deterministic_stratified_without_replacement",
+        "policy_sha256": "sha256:f8d3faf7f201d16c4835b1e15fcf54c6af901401b5da2048477802252e3f5807",
+        "seed_sha256": "sha256:761d5b34f8e9cb8665d73d33e4a9e0d591f0ebf2de1eaa76052a522c49571b30"
+      },
+      "sample_documents": 100,
+      "split_role": "test",
+      "text_view": "subject_current_body"
+    },
+    {
+      "cohort": "all",
+      "entity_class": "person",
+      "frame_documents": 51704,
+      "id": "person_all_test",
+      "label_artifact_id": "enron_gold_person",
+      "promotion_gate": false,
+      "sample_design": {
+        "membership_artifact": {
+          "bytes": 653325,
+          "id": "sealed_gold_sample_membership",
+          "sha256": "sha256:2cfb0953c7f750667b172ec5947003308b6df8080b0955e6f51d7306ee343136"
+        },
+        "method": "deterministic_stratified_without_replacement",
+        "policy_sha256": "sha256:f8d3faf7f201d16c4835b1e15fcf54c6af901401b5da2048477802252e3f5807",
+        "seed_sha256": "sha256:761d5b34f8e9cb8665d73d33e4a9e0d591f0ebf2de1eaa76052a522c49571b30"
+      },
+      "sample_documents": 100,
+      "split_role": "test",
+      "text_view": "subject_current_body"
+    }
+  ],
+  "schema_version": "nerb.enron_manifest.v2",
+  "software": {
+    "engine_version": "0.0.11",
+    "git_commit": "f574b79caaf194f17ba8b8113939bd22c9380bc3",
+    "git_dirty": false,
+    "package_version": "0.0.11"
+  },
+  "source": {
+    "access": "public_huggingface",
+    "content_sha256": "sha256:589728f73f65d56bf6f57a537edf074b8aa20f7135a7db094e9adeefc77514e0",
+    "id": "corbt/enron-emails",
+    "input_records": 517401,
+    "owner": "corbt",
+    "revision": "cfc06c758093d90993abce1a43668fb7357258a6"
+  },
+  "splits": {
+    "leakage_audit_sha256": "sha256:ec9d4f691211fcc418c19a107c84037a420e2c16914a5734cf2fafc88331a466",
+    "leakage_groups_crossing": 0,
+    "manifest_sha256": "sha256:7ee7c08a69ebd1d789fa1974b43f9bf101a613b1fc3ac1b00475adf4b27b0db0",
+    "policy_sha256": "sha256:4e006156f3bda808120deef44b99a448b103634c2c2492d0bc48f925aca15d16",
+    "roles": {
+      "test": {
+        "artifact": {
+          "bytes": 674992975,
+          "id": "test",
+          "sha256": "sha256:65fd4b403661a42d9895cfc33d1e293d50952be48e00ca9679faa6778edccbcf"
+        },
+        "groups": 11625,
+        "records": 51704
+      },
+      "train": {
+        "artifact": {
+          "bytes": 4653922954,
+          "id": "train",
+          "sha256": "sha256:88924f5c564430b104154cab161744664899b543eab836a2d19103e69b671e65"
+        },
+        "groups": 113882,
+        "records": 413752
+      },
+      "validation": {
+        "artifact": {
+          "bytes": 695460449,
+          "id": "validation",
+          "sha256": "sha256:f1870325aa577ce9f4abf6a6c5e304af4c7c91aecd98017e617296a4758fb7ce"
+        },
+        "groups": 21824,
+        "records": 51723
+      }
+    },
+    "seed": "sha256:cb2caf65503471caee72ed1e8a9821d1bce2d8c5ad1ee1cbe3f6d8b5bafacabb",
+    "test_sealed": true
+  },
+  "thresholds_sha256": "sha256:db75046ed5e9d296cd6a650eae48c73767574eb15618896c4c13d82d9876e2a1",
+  "verifier": {
+    "id": "nerb-enron-contract",
+    "source_sha256": "sha256:c97785fd8515bffbb28027b8fe220dc592d94d33b0e2ed0de4828190692909c2",
+    "version": "2.2.0"
+  }
+}
