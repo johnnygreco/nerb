@@ -2664,26 +2664,59 @@ def test_preseal_receipt_is_pair_bound_and_postseal_verification_never_opens_tes
     assert pair["preseal_verification_sha256"] == _file_sha256(receipt_path)
     actual_open = enron_splitting.open_private_binary_input
     actual_open_at = enron_splitting.open_private_binary_input_at
+    sealed_identity = (run.sealed.stat().st_dev, run.sealed.stat().st_ino)
 
     def reject_test_open(path: Path, **kwargs: Any) -> Any:
-        if Path(path).name == "test.jsonl":
-            pytest.fail("post-seal verification opened test content")
+        candidate = Path(path)
+        if candidate.parent.resolve() == run.sealed.resolve() and candidate.name in {"test.jsonl", "memberships.jsonl"}:
+            pytest.fail("post-seal verification opened sealed test or membership content")
         return actual_open(path, **kwargs)
 
+    def reject_pinned_test_open(directory_fd: int, name: str, **kwargs: Any) -> Any:
+        directory_stat = os.fstat(directory_fd)
+        if (directory_stat.st_dev, directory_stat.st_ino) == sealed_identity and name in {
+            "test.jsonl",
+            "memberships.jsonl",
+        }:
+            pytest.fail("post-seal verification opened pinned test or membership content")
+        return actual_open_at(directory_fd, name, **kwargs)
+
     monkeypatch.setattr(enron_splitting, "open_private_binary_input", reject_test_open)
-    monkeypatch.setattr(
-        enron_splitting,
-        "open_private_binary_input_at",
-        lambda directory_fd, name, **kwargs: (
-            pytest.fail("post-seal verification opened pinned test content")
-            if name == "test.jsonl"
-            else actual_open_at(directory_fd, name, **kwargs)
-        ),
-    )
+    monkeypatch.setattr(enron_splitting, "open_private_binary_input_at", reject_pinned_test_open)
     assert verify_enron_splits(run.development, run.sealed, seed=run.seed)["valid"] is True
     assert (
         enron_splitting.project_enron_contract_splits(run.development, run.sealed, seed=run.seed)["test_sealed"] is True
     )
+
+
+def test_preseal_builder_identity_remains_verifiable_after_verifier_source_evolves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="preseal-source-evolution"))
+    run = _split(tmp_path, preparation)
+    receipt = json.loads((run.sealed / "PRESEAL_VERIFIED.json").read_text(encoding="utf-8"))
+    manifest = json.loads((run.sealed / "manifest.json").read_text(encoding="utf-8"))
+    assert receipt["implementation_sha256"] == manifest["policy"]["implementation_sha256"]
+
+    actual_hash_file = enron_splitting._hash_file  # noqa: SLF001
+    module_path = Path(enron_splitting.__file__).resolve()
+
+    def evolved_source_hash(path: Path, **kwargs: Any) -> str:
+        if Path(path).resolve() == module_path:
+            return "sha256:" + "f" * 64
+        return actual_hash_file(path, **kwargs)
+
+    monkeypatch.setattr(enron_splitting, "_hash_file", evolved_source_hash)
+
+    verified = verify_enron_splits(run.development, run.sealed, seed=run.seed)
+    assert verified["valid"] is True
+    assert verified["sealed_audit_inputs"]["membership_artifact"]["id"] == "test_memberships"
+    target = _frozen_target(run)
+    binding = enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target).bind_audit_plan(
+        target["audit_plan_sha256"]
+    )
+    assert binding["status"] == "evidence_bound"
 
 
 def test_preseal_verification_failure_is_atomic(
@@ -2736,6 +2769,42 @@ def test_changed_preseal_receipt_is_rejected_without_opening_test(tmp_path: Path
 
     with pytest.raises(EnronSplitError, match=r"(?i)(pre-seal|receipt|hash|bind)"):
         verify_enron_splits(run.development, run.sealed, seed=run.seed)
+    assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
+
+
+def test_coherently_rehashed_preseal_implementation_must_match_frozen_policy(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="preseal-implementation-tamper"))
+    run = _split(tmp_path, preparation)
+    receipt_path = run.sealed / "PRESEAL_VERIFIED.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["implementation_sha256"] = "sha256:" + "a" * 64
+    receipt_core = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
+    receipt["receipt_sha256"] = enron_splitting._hash_bytes(  # noqa: SLF001
+        enron_splitting._canonical_json(receipt_core).encode("utf-8")  # noqa: SLF001
+    )
+    receipt_path.write_text(
+        json.dumps(receipt, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    receipt_path.chmod(0o600)
+
+    pair_path = run.sealed / "PAIR_COMMITTED.json"
+    pair = json.loads(pair_path.read_text(encoding="utf-8"))
+    pair["preseal_verification_sha256"] = _file_sha256(receipt_path)
+    pair_path.write_text(
+        json.dumps(pair, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    pair_path.chmod(0o600)
+
+    with pytest.raises(EnronSplitError, match=r"(?i)(pre-seal|implementation|policy|bind)"):
+        verify_enron_splits(run.development, run.sealed, seed=run.seed)
+    target = _frozen_target(run)
+    with pytest.raises(EnronSplitError, match=r"(?i)(pre-seal|implementation|policy|bind)"):
+        enron_splitting.begin_enron_final_test_access(run.sealed, frozen_target=target).bind_audit_plan(
+            target["audit_plan_sha256"]
+        )
+    assert not (run.sealed / "EVIDENCE_BOUND.json").exists()
     assert not (run.sealed / "ACCESS_CLAIMED.json").exists()
 
 
