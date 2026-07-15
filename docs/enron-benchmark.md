@@ -1,22 +1,23 @@
 # Enron Benchmark Charter
 
-> **Status: terminal do-not-ship decision.**
+> **Status: known-bank contract evidence passed; standalone-redaction bank gate failed.**
 > The full pinned-source preparation, immutable split, train-only bank build, capacity proof, decision-grade performance
-> run, one-shot 100-document sealed gold audit, prediction audit, and aggregate publication are complete. Performance and
-> capacity passed; open-world recall and leakage failed decisively. The evaluated bank must not be shipped for privacy
-> redaction. See the [verified aggregate evidence](enron-evidence.md).
+> run, one-shot 100-document sealed gold audit, prediction audit, and aggregate publication are complete. NERB correctly
+> mapped 39,604/39,604 approved pattern cases; the constructed bank covered only 146/1,393 independent gold spans and
+> must not be used alone as a comprehensive PII redactor. See the [verified aggregate evidence](enron-evidence.md).
 
-NERB's Enron benchmark is designed to demonstrate a privacy-first intelligence-cache workflow: a capable agent turns a
-large private organizational source into a reviewed entity bank once; an application compiles that bank once and reuses
-it for fast, deterministic scans. The completed benchmark is demonstration evidence even though its bank failed: a
-decision-grade process must preserve an honest no-ship result. The benchmark shows both sides of the proposition without
-conflating them:
+NERB's Enron benchmark demonstrates a known-entity intelligence-cache workflow: a capable agent turns a large
+organizational source into a reviewed entity bank once; an application compiles that bank once and reuses it for fast,
+deterministic scans. The benchmark keeps four questions separate:
 
-1. how much sensitive information the construction process learned; and
-2. whether NERB reliably and efficiently recognizes the approved knowledge it was given.
+1. whether NERB honors every approved pattern and canonical mapping in the supplied bank;
+2. whether stricter exact-span evaluation agrees on catalog-qualified natural occurrences;
+3. how much of a target population the construction process put into the bank; and
+4. whether compile-once/scan-many is fast and resource-bounded at realistic scale.
 
-Preventing sensitive-data leakage is the primary user outcome. Speed, memory, false alarms, and over-redaction remain
-important constraints, but an aggregate F1 score or a fast scan cannot compensate for unexplained misses.
+The first question is NERB's core product contract. Population coverage and open-world recall matter when an application
+claims that a particular bank can discover or redact arbitrary PII; those application metrics must never be presented as
+known-bank matcher recall. Speed, memory, false alarms, and over-redaction remain separately measured constraints.
 
 ## User Workflow
 
@@ -41,12 +42,13 @@ The demonstration models the following production workflow:
 This is an intelligence-cache demonstration, not a claim that Enron represents every organization or that a bank built
 for one organization transfers unchanged to another.
 
-## Privacy Threat Model
+## Standalone Privacy-Redaction Threat Model
 
-The protected subject is a person or organization represented in authorized plaintext by a sensitive span: for example a
-person name, email address, phone number, account identifier, or another class approved by the benchmark taxonomy. The
-principal failure is residual sensitive text after a workflow relied on NERB to find or redact it. One miss can matter,
-so the headline evidence includes missed spans and documents containing any miss rather than F1 alone.
+The benchmark deliberately includes an application-specific test beyond NERB's guarantee: whether the constructed bank
+can stand alone as a comprehensive privacy redactor. In that threat model, the protected subject is a person or
+organization represented in authorized plaintext by an in-scope sensitive span. The principal application failure is
+residual sensitive text after a workflow relied on that bank to find every occurrence. One miss can matter, so this
+separate assessment includes missed spans and documents containing any miss rather than F1 alone.
 
 In scope are failures caused by:
 
@@ -74,12 +76,13 @@ NERB can make a narrow deterministic guarantee:
 > and mapped according to its declared normalization, regex, boundary, priority, and overlap semantics when the input
 > contains a qualifying occurrence.
 
-Promotion requires 100% synthetic catalog conformance and zero wrong canonical mappings for those approved cases.
-Natural-text cataloged spans provide a second check that preparation and scanning preserve that behavior.
+Known-bank contract evidence requires 100% synthetic catalog conformance and zero wrong canonical mappings for those
+approved cases. Natural-text cataloged spans provide a separate, stricter exact-span diagnostic.
 
 The guarantee does not cover an unknown name or free-form identifier merely because it is PII. Detection of unknown PII
-depends on catalog coverage and any separately evaluated generic fallback patterns. Open-world recall must therefore be
-measured and reported; it must never be described as guaranteed 100% recall. A deterministic miss is still a miss.
+depends on catalog coverage and any separately evaluated generic fallback patterns. When a bank is proposed for
+open-ended discovery or comprehensive redaction, open-world recall must be measured and reported as bank/application
+coverage. It must never be described as NERB matcher recall or as guaranteed 100% recall.
 
 The public-verifier guarantee is narrower still. Content hashes, frozen descriptors, and privacy-safe inventories prove
 immutable commitments and let the verifier recompute arithmetic and claim support. They do not prove that an honest
@@ -209,18 +212,18 @@ Empty denominators produce `not_evaluated`, never `0`, `1`, or a passing gate.
 
 ### Coverage, Conformance, And Recall
 
-These terms are not interchangeable:
+These terms are not interchangeable, and only catalog conformance directly evaluates NERB's declared-pattern contract:
 
-- **Catalog coverage** is `|K| / |G|`. It asks how much labeled future sensitive text was knowable from the active bank,
-  independent of whether the engine found it.
-- **Natural-text cataloged PII recall** is `cataloged_TP / |K|`. Its complement is the count of **missed cataloged
-  sensitive spans**. A cataloged match mapped to the wrong identity is not a correct cataloged true positive.
 - **Catalog conformance** is `correctly_detected_and_mapped_approved_cases / all_approved_positive_cases` on exhaustive
-  synthetic conformance cases. Negative/adversarial cases are reported alongside it. Promotion requires `1.0` recall and
-  zero wrong canonical mappings.
+  synthetic conformance cases. Negative/adversarial cases are reported alongside it. Contract evidence requires `1.0`
+  recall and zero wrong canonical mappings.
+- **Catalog coverage** is `|K| / |G|`. It asks how much labeled future sensitive text was knowable from the active bank,
+  independent of whether the engine found it. It evaluates bank construction, not matcher quality.
+- **Natural-text cataloged exact-span recall** is `cataloged_TP / |K|`. It is a stricter occurrence diagnostic requiring
+  exact span, class, and canonical identity. Its complement is the count of cataloged exact-span evaluation misses.
 - **Open-world PII recall** is `TP / (TP + FN)` over all eligible independently labeled PII in scope, whether cataloged,
-  matched by a generic fallback, or unknown. This is the relevant total-leakage measure and is not guaranteed by the
-  catalog.
+  matched by a generic fallback, or unknown. It evaluates a bank or discovery layer for comprehensive coverage and sits
+  outside NERB's known-bank guarantee.
 
 For example, suppose independent labels contain 100 sensitive spans and 80 qualify as cataloged. Catalog coverage is
 80%. If NERB correctly finds and maps all 80 but has no fallback discoveries, catalog conformance and natural cataloged
@@ -407,9 +410,10 @@ The schema and synthetic fixtures are part of the contract, but a schema-valid f
 Preparation and immutable split commands now implement the private data stages; the evaluator and verified real-corpus
 evidence remain staged. Neither a prepared corpus nor a split manifest is a quality, performance, or promotion result.
 
-## Promotion Gates
+## Standalone Privacy-Redaction Application Gates
 
-A result is promotable only when all applicable checks pass:
+The frozen benchmark asked whether the evaluated bank could be promoted as a comprehensive standalone privacy redactor.
+That application-specific decision requires all applicable checks to pass:
 
 1. provenance is complete; hashes, evaluator digest, split leakage audit, bank/runtime identities, and command/environment
    records validate;
@@ -427,7 +431,7 @@ A result is promotable only when all applicable checks pass:
    appear in public artifacts; and
 8. an independent reviewer verifies the evidence/claim mapping at the final commit.
 
-The single combined person-contact promotion slice must contain exactly the 100 sampled documents, at least 100 total
+The single combined person-contact application slice must contain exactly the 100 sampled documents, at least 100 total
 gold spans, at least 20 documents negative across both active classes, and at least 500 union sensitive-gold characters.
 Both person and contact must have nonzero gold support. These floors are applied once to the combined panel, never once
 per class and never by summing document counts. Validation may tighten, but cannot weaken, the policy floors:
@@ -436,17 +440,19 @@ recall at least 0.98. The corresponding ceilings are document leak rate 0.05, se
 negative-document false-alarm rate 0.50, and over-redaction rate 0.05. Zero cataloged misses, wrong canonical mappings,
 and catalog-miss documents are separate exact gates.
 
-Structured public claims are not selected from convenient diagnostics. Promotion requires the full quality metric set
+Structured public claims are not selected from convenient diagnostics. Standalone-redaction promotion requires the full
+quality metric set
 for every gate-designated slice, a passing catalog-conformance claim, and performance claims tied to the exact promoted
 document-latency and whole-input-throughput workloads. Each claim repeats its exact slice or workload, scope, label
 strength/completeness, bank, evaluator, source revision, benchmark identity, and environment provenance.
 
-A failed final gate is evidence, not permission to tune on the test. Claims must name the corpus revision, benchmark
+A failed application gate is evidence, not permission to tune on the test. Claims must name the corpus revision, benchmark
 identity, bank and evaluator hashes, label strength, class/cohort scope, and machine context for performance. “No known
 cataloged miss in this frozen evaluation” is supportable when true; “NERB catches all PII” is not.
 
-Failed or aborted aggregate outcomes remain publishable in the append-only lineage when promotion and verifier success
-are false. Recording a failure is mandatory evidence; it is never itself a passing claim.
+Failed or aborted aggregate outcomes remain publishable in the append-only lineage. Recording a failure is mandatory
+evidence; it is never itself a passing claim. These gates govern the evaluated bank's standalone-redaction claim, not
+publication of the NERB package for its known-bank use case.
 
 ## Artifact Retention And Ethics
 

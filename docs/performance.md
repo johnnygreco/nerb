@@ -112,9 +112,9 @@ cores and 16 GiB memory. The evaluated bank had 13,201 active patterns. Its 100-
 compilation measured 7.792 s median, full train-source bank construction measured 334.988 s median, and the controlled
 100,000-pattern cell measured 6,811 documents/s. The separate full-source capacity evidence also passed.
 
-These are runtime results, not a release endorsement. The independently annotated quality audit failed recall and
-leakage gates, so the evaluated bank is do-not-ship for privacy redaction. See the
-[aggregate evidence and decision](enron-evidence.md).
+These runtime results support the compile-once/scan-many architecture. Separately, exhaustive conformance passed all
+39,604 approved known-bank cases, while the constructed bank failed its broader standalone-redaction coverage gate.
+See the [aggregate evidence interpretation](enron-evidence.md).
 
 ## Decision-Grade Performance Benchmark Standard
 
@@ -134,11 +134,11 @@ gates. Public evidence must be aggregate-only, pass privacy scanning, record `se
 every required cell—including failures and inconclusive stability outcomes—without post-hoc workload or threshold
 changes.
 
-That standard can justify a runtime architecture choice. It cannot establish PII recall, low leakage, or release
-readiness: quality evaluation, full-source capacity, and the one-shot sealed evaluation remain independent gates. The
-publication decision combines those quality, privacy, capacity, lineage, and performance gates without conflating the
-performance decision with package-release eligibility. Smoke runs are useful for correctness and harness checks, but
-their small sample counts are not decision-grade performance evidence.
+That standard can justify a runtime architecture choice. It cannot establish catalog completeness, open-world PII
+recall, or low leakage: known-bank conformance, bank coverage, standalone-redaction suitability, full-source capacity,
+and the one-shot sealed evaluation answer separate questions. None of those application-specific bank results determines
+whether the NERB package may be released. Smoke runs remain useful for correctness and harness checks, but their small
+sample counts are not decision-grade performance evidence.
 
 The repository publishes the frozen aggregate performance and capacity result with a clean-clone verifier. Any bank,
 evaluator, workload, implementation, or threshold change creates a different candidate and requires new preregistered

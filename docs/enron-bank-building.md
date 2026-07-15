@@ -10,10 +10,10 @@ It mines candidates from **train only**, evaluates three frozen construction pol
 email-recall policy, and generates catalog-conformance evidence for every active pattern. It never accepts a sealed-test
 path or role.
 
-The resulting bank build is development evidence, not a benchmark decision. Its card is deliberately not release
-eligible because structured-header validation does not provide independent exhaustive open-world labels. The later
-one-shot audit supplied those labels and produced a terminal do-not-ship result for this bank; see the
-[aggregate evidence](enron-evidence.md).
+The resulting bank build is development evidence. Its structured-header validation supports candidate selection and
+known-bank diagnostics, but it does not establish population coverage for comprehensive redaction. The later one-shot
+audit found perfect synthetic catalog conformance, 142/146 cataloged exact matches in natural text, and only 146/1,393
+gold spans represented by the bank. See the [aggregate evidence interpretation](enron-evidence.md).
 
 ## Build and verify
 
@@ -567,8 +567,9 @@ uv run nerb verify-portable-enron-capacity \
 ```
 
 The artifact's status is `pre_terminal_non_decision`: it proves realistic construction and validation capacity, not
-sealed-test quality or a final ship/no-ship decision. See the [terminal evidence decision](enron-evidence.md) for how
-that capacity receipt is bound to the quality and performance result.
+known-bank conformance, population coverage, or standalone-redaction suitability. See the
+[terminal evidence interpretation](enron-evidence.md) for how that capacity receipt is bound to the quality and
+performance result.
 
 ## Regenerating bank evidence
 

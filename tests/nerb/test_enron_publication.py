@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -19,6 +20,35 @@ from nerb.enron_publication import (
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 COMMITTED_BUNDLE = REPOSITORY_ROOT / "evidence" / "enron"
+FROZEN_INPUT_SHA256 = {
+    "bank-card.json": "d3f23569eb060289a67b8eb902c75f9f75e74f01918abd2531c76566f9041aa2",
+    "benchmark-evidence.json": "c3634d83a3b57910d4860a852511451755c03e0734e5b391b5bdf7638a434e4f",
+    "benchmark-manifest.json": "d0706d2a6d7198645b21d49bfa111dd547f392218e2f6078cefeab4e00b6f1d6",
+    "capacity-decision.json": "441d90fc64d45d6febdd2a8ee13d9db25c712d195f4414ca6acb9bf1268ddca2",
+    "inventories/controlled_dense_medium_inventory.json": (
+        "877e6afd195300f2154250fceb471d90901c84f5d73c2543805a830ee00c9d9f"
+    ),
+    "inventories/controlled_negative_huge_inventory.json": (
+        "aaabd7497f69ca1f4069d321adcf8da54293f629e2f410717a89022210b45d49"
+    ),
+    "inventories/controlled_negative_large_inventory.json": (
+        "d7cdc7ca54d7b56503607ad0a26299e351430d2156821e5b065b918f9bc2a8c8"
+    ),
+    "inventories/controlled_negative_medium_inventory.json": (
+        "471cd812803b9aabf09a7d7b9c665fd6dec939873a80eed3d44d58ab503520c8"
+    ),
+    "inventories/controlled_negative_small_inventory.json": (
+        "6e35842bb2432f7fc0624a0caf0b0e8c82f0f078a123505a94bcdea92a1dea94"
+    ),
+    "inventories/controlled_normal_medium_inventory.json": (
+        "84e0ac3be64ad7854aeacdb5032b29a56af3708fc3e57934ea0ba4a70fd7f61c"
+    ),
+    "inventories/controlled_sparse_medium_inventory.json": (
+        "10a510d0e9199713f0a685374f830ca35983e93b507c5ff29cb05f6bf4134a8d"
+    ),
+    "inventories/real_validation_inventory.json": ("8c679dfb2f9fb7b51d53473b8f9fb1ffd024280b3ca0d9f553acfd5e651a3456"),
+    "performance-report.json": "cf8bc7308772800d0b89dfa29fca9313b044a2527d3f66c11f0c927c201d772c",
+}
 
 
 def _copy_bundle(tmp_path: Path) -> Path:
@@ -98,30 +128,32 @@ def fast_capacity(monkeypatch):
     return value
 
 
-def test_committed_publication_verifies_as_terminal_do_not_ship_evidence() -> None:
+def test_committed_publication_separates_known_bank_contract_from_standalone_redaction() -> None:
     result = verify_enron_publication(COMMITTED_BUNDLE)
 
     assert result["valid"] is True
-    assert result["artifacts_verified"] == 17
+    assert result["artifacts_verified"] == 18
     assert result["decision"] == {
-        "audit_status": "quality_gates_failed",
-        "bank_release_eligible": False,
+        "catalog_conformance_passed": True,
         "capacity_gates_passed": True,
-        "package_release_allowed": False,
-        "performance_decision_grade": True,
-        "quality_gates_passed": False,
-        "release": "do_not_ship",
+        "performance_gates_passed": True,
+        "standalone_privacy_audit_outcome": "do_not_ship",
+        "standalone_privacy_audit_status": "quality_gates_failed",
+        "standalone_privacy_redaction_allowed": False,
+        "standalone_privacy_redaction_quality_passed": False,
     }
+    assert "package_release_allowed" not in result["decision"]
+    assert "release" not in result["decision"]
     assert result["privacy"]["violation_count"] == 0
 
 
-def test_quality_eligibility_is_separate_from_evidence_validity(fast_capacity) -> None:
+def test_standalone_redaction_eligibility_is_separate_from_evidence_validity(fast_capacity) -> None:
     assert verify_enron_publication(COMMITTED_BUNDLE)["valid"] is True
 
-    with pytest.raises(EnronPublicationError, match="not quality-eligible") as raised:
-        verify_enron_publication(COMMITTED_BUNDLE, require_quality_eligible=True)
+    with pytest.raises(EnronPublicationError, match="not eligible for standalone privacy redaction") as raised:
+        verify_enron_publication(COMMITTED_BUNDLE, require_standalone_redaction_eligible=True)
 
-    assert raised.value.code == "enron_quality_ineligible"
+    assert raised.value.code == "enron_standalone_redaction_ineligible"
 
 
 @pytest.mark.parametrize(
@@ -131,7 +163,7 @@ def test_quality_eligibility_is_separate_from_evidence_validity(fast_capacity) -
         "bank-card.json",
         "inventories/real_validation_inventory.json",
         "summary.md",
-        "figures/quality-recall.svg",
+        "figures/known-bank-contract.svg",
     ],
 )
 def test_publication_rejects_artifact_tampering(tmp_path: Path, fast_capacity, relative_path: str) -> None:
@@ -145,7 +177,7 @@ def test_publication_rejects_artifact_tampering(tmp_path: Path, fast_capacity, r
 
 def test_publication_rejects_missing_and_undeclared_artifacts(tmp_path: Path, fast_capacity) -> None:
     missing = _copy_bundle(tmp_path / "missing")
-    (missing / "figures" / "leakage.svg").unlink()
+    (missing / "figures" / "bank-coverage.svg").unlink()
     with pytest.raises(EnronPublicationError):
         verify_enron_publication(missing)
 
@@ -172,11 +204,11 @@ def test_publication_privacy_scan_rejects_direct_identifier() -> None:
         publication._privacy_scan({"aggregate.json": b'{"value":"contact@example.invalid"}'})
 
 
-def test_publication_rejects_rehashed_release_overstatement(tmp_path: Path, fast_capacity) -> None:
+def test_publication_rejects_rehashed_standalone_redaction_overstatement(tmp_path: Path, fast_capacity) -> None:
     bundle = _copy_bundle(tmp_path)
     manifest_path = bundle / "publication.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["decision"]["package_release_allowed"] = True
+    manifest["decision"]["standalone_privacy_redaction_allowed"] = True
     manifest["publication_sha256"] = publication._canonical_hash(publication._without(manifest, "publication_sha256"))
     manifest_path.write_bytes(publication._pretty_json_bytes(manifest))
 
@@ -224,9 +256,10 @@ def test_render_is_deterministic_and_aggregate_only(tmp_path: Path, fast_capacit
     committed_publication = json.loads((COMMITTED_BUNDLE / "publication.json").read_text(encoding="utf-8"))
     assert first_result["source_publication_sha256"] == committed_publication["publication_sha256"]
     assert sorted(path.relative_to(first).as_posix() for path in first.rglob("*") if path.is_file()) == [
-        "figures/leakage.svg",
+        "figures/bank-coverage.svg",
+        "figures/known-bank-contract.svg",
         "figures/performance-scale.svg",
-        "figures/quality-recall.svg",
+        "figures/standalone-redaction.svg",
         "summary.md",
     ]
     for path in first.rglob("*"):
@@ -263,19 +296,20 @@ def test_insufficient_support_terminal_exports_and_renders_without_quality_rates
     )
 
     assert result["valid"] is True
-    assert result["decision"]["release"] == "do_not_ship"
-    assert result["decision"]["package_release_allowed"] is False
+    assert result["decision"]["standalone_privacy_audit_outcome"] == "do_not_ship"
+    assert result["decision"]["standalone_privacy_redaction_allowed"] is False
     publication_manifest = json.loads((output / "publication.json").read_text(encoding="utf-8"))
     assert publication_manifest["scope"]["gold_sample_documents"] is None
     assert publication_manifest["scope"]["gold_spans"] is None
     summary = (output / "summary.md").read_text(encoding="utf-8")
+    assert "Known-bank contract evidence: PASS" in summary
     assert "insufficient independent support" in summary
-    assert "rates and miss counts are intentionally shown as unavailable" in summary
+    assert "standalone-redaction rates and miss counts are intentionally unavailable" in summary
     rendered = tmp_path / "rendered"
     render_result = render_enron_publication(output, rendered)
     assert render_result["source_publication_sha256"] == publication_manifest["publication_sha256"]
-    assert (rendered / "figures" / "quality-recall.svg").read_bytes() == (
-        output / "figures" / "quality-recall.svg"
+    assert (rendered / "figures" / "known-bank-contract.svg").read_bytes() == (
+        output / "figures" / "known-bank-contract.svg"
     ).read_bytes()
 
 
@@ -329,13 +363,41 @@ def test_committed_bundle_has_no_direct_identifier_or_private_path_bytes() -> No
     publication._privacy_scan(files)
 
 
+def test_sealed_measurement_inputs_remain_byte_identical() -> None:
+    actual = {
+        relative_path: hashlib.sha256((COMMITTED_BUNDLE / relative_path).read_bytes()).hexdigest()
+        for relative_path in FROZEN_INPUT_SHA256
+    }
+
+    assert actual == FROZEN_INPUT_SHA256
+
+
 def test_public_claims_are_pinned_to_committed_evidence() -> None:
     root = REPOSITORY_ROOT
     expected = {
-        "README.md": ("10.19%", "21.34%", "89.86%", "143,057"),
-        "docs/index.md": ("10.19%", "21.34%", "89.86%"),
-        "docs/enron-evidence.md": ("10.19%", "21.34%", "89.86%", "1,251", "1,393", "143,057"),
-        "docs/performance.md": ("0.699 ms", "143,057", "9.021 µs", "55.250 µs", "7.792 s", "6,811"),
+        "README.md": ("39,604", "13,201", "1,210", "142/146", "146/1,393", "143,057"),
+        "docs/index.md": ("39,604", "13,201", "1,210", "142/146", "146/1,393"),
+        "docs/enron-evidence.md": (
+            "39,604",
+            "13,201",
+            "1,210",
+            "142/146",
+            "146/1,393",
+            "1,247",
+            "10.19%",
+            "21.34%",
+            "89.86%",
+            "143,057",
+        ),
+        "docs/performance.md": (
+            "39,604",
+            "0.699 ms",
+            "143,057",
+            "9.021 µs",
+            "55.250 µs",
+            "7.792 s",
+            "6,811",
+        ),
     }
 
     for relative_path, claims in expected.items():

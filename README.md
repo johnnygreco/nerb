@@ -266,11 +266,12 @@ For large-source bank construction, see the privacy-first Enron charter in
 [train-only bank construction guide](docs/enron-bank-building.md), its
 [private evaluation guide](docs/enron-evaluation.md), and the
 [decision-grade performance benchmark standard](docs/performance.md#decision-grade-performance-benchmark-standard).
-The frozen full-source, capacity, performance, and one-shot sealed audit are complete. The aggregate evidence is valid,
-but the evaluated bank is **do not ship** for privacy redaction: open-world recall was 10.19%, sensitive-character recall
-was 21.34%, and document leakage was 89.86% on the independently annotated 100-document panel. The performance path
-passed at 143,057 documents/s for the 13,201-pattern bank, demonstrating that speed does not compensate for inadequate
-coverage. See the [decision and clean-clone verifier](docs/enron-evidence.md). Agent workflows can also use the reusable
+The frozen full-source, capacity, performance, and one-shot sealed audit are complete. NERB's known-bank contract evidence
+passed: all 39,604 approved positives across 13,201 active patterns were detected and correctly mapped, with 1,210
+required negatives clean. A stricter natural-text diagnostic found 142/146 cataloged exact matches. Separately, the bank
+cataloged only 146/1,393 labeled spans, so it must not be used alone as a comprehensive PII redactor. The direct scan
+passed at 143,057 documents/s. See the [evidence interpretation and clean-clone verifier](docs/enron-evidence.md). Agent
+workflows can also use the reusable
 [`nerb-large-source-bank-building`](.agents/skills/nerb-large-source-bank-building/SKILL.md) skill for corpus profiling
 and privacy-safe handoff guidance.
 

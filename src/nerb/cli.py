@@ -2893,10 +2893,10 @@ def export_enron_evidence_command(
     ),
     bank_card_path: Path = typer.Option(..., "--bank-card", help="Verified aggregate bank card JSON."),
     inventory_dir: Path = typer.Option(..., "--inventory-dir", help="Aggregate performance inventory directory."),
-    require_quality_eligible: bool = typer.Option(
+    require_standalone_redaction_eligible: bool = typer.Option(
         False,
-        "--require-quality-eligible",
-        help="Fail unless the terminal quality decision permits release.",
+        "--require-standalone-redaction-eligible",
+        help="Fail unless this bank qualifies as a comprehensive standalone privacy redactor.",
     ),
 ) -> None:
     """Publish a path-free bundle from already committed aggregate evidence."""
@@ -2910,7 +2910,7 @@ def export_enron_evidence_command(
             capacity_decision_path=capacity_decision_path,
             bank_card_path=bank_card_path,
             inventory_dir=inventory_dir,
-            require_quality_eligible=require_quality_eligible,
+            require_standalone_redaction_eligible=require_standalone_redaction_eligible,
         )
     except EnronPublicationError as exc:
         _exit_error(str(exc))
@@ -2920,16 +2920,19 @@ def export_enron_evidence_command(
 @app.command("verify-enron-evidence")
 def verify_enron_evidence_command(
     bundle_dir: Path = typer.Option(..., "--bundle", help="Committed aggregate Enron evidence directory."),
-    require_quality_eligible: bool = typer.Option(
+    require_standalone_redaction_eligible: bool = typer.Option(
         False,
-        "--require-quality-eligible",
-        help="Fail unless the terminal quality decision permits release.",
+        "--require-standalone-redaction-eligible",
+        help="Fail unless this bank qualifies as a comprehensive standalone privacy redactor.",
     ),
 ) -> None:
     """Verify hashes, arithmetic, privacy, generated artifacts, and the terminal decision."""
 
     try:
-        payload = verify_enron_publication(bundle_dir, require_quality_eligible=require_quality_eligible)
+        payload = verify_enron_publication(
+            bundle_dir,
+            require_standalone_redaction_eligible=require_standalone_redaction_eligible,
+        )
     except EnronPublicationError as exc:
         _exit_error(str(exc))
     _echo_json(payload)

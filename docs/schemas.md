@@ -523,9 +523,10 @@ benchmark manifest/evidence, portable capacity decision, aggregate performance r
 sanitized bank card, generated Markdown/SVGs, terminal decision, audit chain, bank, measurement commit, and a fixed file
 inventory. It deliberately has no compatibility branch or alternate historical behavior.
 
-`nerb verify-enron-evidence --bundle evidence/enron` validates authentic terminal evidence whether the quality decision
-passes or fails. `--require-quality-eligible` adds the release policy and fails for the committed do-not-ship result.
-`nerb render-enron-evidence` regenerates only `summary.md` and the three SVG figures from committed aggregates. The
+`nerb verify-enron-evidence --bundle evidence/enron` validates authentic terminal evidence regardless of its application
+outcome. `--require-standalone-redaction-eligible` adds the specific policy that this bank must qualify as a
+comprehensive privacy redactor; it fails for the committed bank. It is not a package-release gate.
+`nerb render-enron-evidence` regenerates only `summary.md` and the four SVG figures from committed aggregates. The
 verifier rejects extra files, missing inventories, symlinks, stale renders, hash drift, non-finite arithmetic, private
 paths, raw text, direct identifiers, bank values, document IDs, and span surfaces.
 

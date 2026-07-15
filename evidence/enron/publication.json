@@ -22,19 +22,24 @@
       "sha256": "sha256:441d90fc64d45d6febdd2a8ee13d9db25c712d195f4414ca6acb9bf1268ddca2"
     },
     {
-      "bytes": 2133,
-      "path": "figures/leakage.svg",
-      "sha256": "sha256:f899f8fa42e4e5c6da5d406a143c4cb9482ec07156cf60f4863f57efb25e24fb"
+      "bytes": 2287,
+      "path": "figures/bank-coverage.svg",
+      "sha256": "sha256:cbc18ab67ea17af31c6a241a2ac2d9a117e06113180560ca59a891c9cb582d96"
     },
     {
-      "bytes": 1971,
+      "bytes": 2254,
+      "path": "figures/known-bank-contract.svg",
+      "sha256": "sha256:c48f1205dfcb4d0733661275fabad288c84e66f4227f574a606babe2e652a05f"
+    },
+    {
+      "bytes": 1933,
       "path": "figures/performance-scale.svg",
-      "sha256": "sha256:957e3e755025b9f213cb705ea6da50f45a1e5c16d68a176dd153b6c2b33c773c"
+      "sha256": "sha256:57eea5369f2c0f24baa379fe8d6ba850b38fa1504a24b22ba2560115621d13a2"
     },
     {
-      "bytes": 2154,
-      "path": "figures/quality-recall.svg",
-      "sha256": "sha256:045efe559fc12e4f8fa20c3e48161989642f0238cc0130195e4322a235c014d9"
+      "bytes": 2185,
+      "path": "figures/standalone-redaction.svg",
+      "sha256": "sha256:634a205308c844bd05d61577abca5ad72a5ae0dca33b2fb9a1982f5183ec88f2"
     },
     {
       "bytes": 2801,
@@ -82,9 +87,9 @@
       "sha256": "sha256:cf8bc7308772800d0b89dfa29fca9313b044a2527d3f66c11f0c927c201d772c"
     },
     {
-      "bytes": 3235,
+      "bytes": 5556,
       "path": "summary.md",
-      "sha256": "sha256:66e1c920887d6a0fd4723f73c4f085c6c371d0ad91ac09654fabe062f8c578aa"
+      "sha256": "sha256:90bea99d58dfa6e471ea4daaedf15344aac1a77ed252b73dd1240c49cd64bc30"
     }
   ],
   "bindings": {
@@ -102,13 +107,13 @@
     "score_manifest_sha256": "sha256:293912e59beeab3dd189cdc2ccbd69e09bdec4ac612979c83a34aaf0bc10bf7e"
   },
   "decision": {
-    "audit_status": "quality_gates_failed",
-    "bank_release_eligible": false,
     "capacity_gates_passed": true,
-    "package_release_allowed": false,
-    "performance_decision_grade": true,
-    "quality_gates_passed": false,
-    "release": "do_not_ship"
+    "catalog_conformance_passed": true,
+    "performance_gates_passed": true,
+    "standalone_privacy_audit_outcome": "do_not_ship",
+    "standalone_privacy_audit_status": "quality_gates_failed",
+    "standalone_privacy_redaction_allowed": false,
+    "standalone_privacy_redaction_quality_passed": false
   },
   "privacy": {
     "aggregate_only": true,
@@ -120,7 +125,7 @@
     "span_surfaces_included": false,
     "violation_count": 0
   },
-  "publication_sha256": "sha256:6c58e6869285611724e627193ce54d88ac9483b241b66ca9a51accd696d8204f",
+  "publication_sha256": "sha256:f55328eb1560a193a0c41436dde179b0ec3fc54512fce8a6f8dce305ebcff97e",
   "schema_version": "nerb.enron_publication",
   "scope": {
     "active_patterns": 13201,
