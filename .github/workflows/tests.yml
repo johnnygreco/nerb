@@ -219,18 +219,23 @@ jobs:
           with open(sys.argv[1], encoding="utf-8") as handle:
               report = json.load(handle)
           if report["ok"] is not True:
+              if "error_code" in report:
+                  diagnostic = {
+                      "command_exit_status": int(sys.argv[2]),
+                      "error_code": report["error_code"],
+                      "policy_constants_verified": report["policy_constants_verified"],
+                  }
+              else:
+                  diagnostic = {
+                      "command_exit_status": int(sys.argv[2]),
+                      "positive_soak": report["positive_soak"],
+                      "fail_closed_injection": report["fail_closed_injection"],
+                      "cleanup": report["cleanup"],
+                      "source_identity_stable": report["source_identity_stable"],
+                      "worker_sources_bound": report["worker_sources_bound"],
+                  }
               print(
-                  json.dumps(
-                      {
-                          "command_exit_status": int(sys.argv[2]),
-                          "positive_soak": report["positive_soak"],
-                          "fail_closed_injection": report["fail_closed_injection"],
-                          "cleanup": report["cleanup"],
-                          "source_identity_stable": report["source_identity_stable"],
-                          "worker_sources_bound": report["worker_sources_bound"],
-                      },
-                      sort_keys=True,
-                  )
+                  json.dumps(diagnostic, sort_keys=True)
               )
           assert int(sys.argv[2]) == 0
           assert report["ok"] is True
