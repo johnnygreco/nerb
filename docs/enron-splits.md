@@ -37,7 +37,9 @@ be supplied again to the steward verifier without being published in the develop
 The benchmark identity itself is fixed to `enron`; there is no alternate benchmark-version selector. The verifier's
 closed result includes both development and sealed manifest hashes plus the pre-seal verification hash, and it accepts
 an observational activity callback for large development-artifact hashing. Metadata verification never opens sealed
-test content.
+test content. The result also includes `sealed_audit_inputs`, a closed aggregate projection of the verified test and
+test-membership artifact commitments. Use those commitments to construct the frozen audit plan before the single
+controlled final-test access; do not hash or open either sealed JSONL artifact directly.
 
 For a tiny synthetic fixture, add `--fixture-mode` to `split-enron`. Fixture mode relaxes the production support floors
 so leakage and sealing behavior can be tested on small inputs. Its manifests are permanently marked non-promotable and

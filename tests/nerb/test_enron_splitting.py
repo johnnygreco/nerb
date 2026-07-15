@@ -1542,6 +1542,27 @@ def test_steward_projection_matches_the_closed_split_contract(tmp_path: Path) ->
     assert all(set(value["artifact"]) == {"id", "sha256", "bytes"} for value in projection["roles"].values())
 
 
+def test_steward_verification_projects_closed_sealed_audit_inputs(tmp_path: Path) -> None:
+    preparation = _prepare(tmp_path, _dated_rows(24, prefix="audit-inputs"))
+    run = _split(tmp_path, preparation)
+
+    verified = verify_enron_splits(run.development, run.sealed, seed=run.seed)
+    projected = verified["sealed_audit_inputs"]
+    manifest = json.loads((run.sealed / "manifest.json").read_text(encoding="utf-8"))
+
+    assert set(projected) == {"split_manifest_sha256", "test_artifact", "membership_artifact"}
+    assert projected["split_manifest_sha256"] == verified["manifest_sha256"]
+    assert projected["test_artifact"] == {
+        key: manifest["roles"]["test"]["artifact"][key] for key in ("id", "sha256", "bytes", "records")
+    }
+    assert projected["membership_artifact"] == {
+        key: manifest["artifacts"]["memberships"][key] for key in ("id", "sha256", "bytes", "records")
+    }
+    assert projected["test_artifact"]["id"] == "test"
+    assert projected["membership_artifact"]["id"] == "test_memberships"
+    assert projected["test_artifact"]["records"] == projected["membership_artifact"]["records"]
+
+
 def test_final_test_state_starts_explicitly_sealed_unbound(tmp_path: Path) -> None:
     preparation = _prepare(tmp_path, _dated_rows(24, prefix="sealed-unbound"))
     run = _split(tmp_path, preparation)

@@ -699,6 +699,8 @@ def test_split_enron_commands_create_and_verify_redacted_and_sealed_bundles(tmp_
     assert verified["valid"] is True
     assert verified["leakage_groups_crossing"] == 0
     assert verified["test_sealed"] is True
+    assert verified["sealed_audit_inputs"]["test_artifact"]["id"] == "test"
+    assert verified["sealed_audit_inputs"]["membership_artifact"]["id"] == "test_memberships"
     assert str(tmp_path) not in verify_result.output
     assert "@" not in verify_result.output
 

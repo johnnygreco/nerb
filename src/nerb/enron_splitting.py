@@ -4156,6 +4156,7 @@ def _verify_enron_splits_metadata(
     _assert_private_snapshot_current(sealed_root / "manifest.json", full_manifest_snapshot.file)
     _assert_private_snapshot_current(sealed_root / "PRESEAL_VERIFIED.json", preseal_snapshot.file)
     contract_splits = _contract_split_projection(full_manifest, manifest_sha256)
+    sealed_audit_inputs = _sealed_audit_input_projection(full_manifest, manifest_sha256)
     activity.boundary()
     return {
         "valid": True,
@@ -4175,6 +4176,7 @@ def _verify_enron_splits_metadata(
         "leakage_groups_crossing": 0,
         "test_sealed": True,
         "contract_splits": contract_splits,
+        "sealed_audit_inputs": sealed_audit_inputs,
         "access": access_state,
     }
 
@@ -4240,6 +4242,27 @@ def _contract_split_projection(manifest: Mapping[str, Any], manifest_sha256: str
         "test_sealed": True,
         "seed": manifest["policy"]["seed_sha256"],
         "roles": projected_roles,
+    }
+
+
+def _sealed_audit_input_projection(manifest: Mapping[str, Any], manifest_sha256: str) -> dict[str, Any]:
+    """Project the verified aggregate commitments required before sealed audit access."""
+
+    test_artifact = manifest["roles"]["test"]["artifact"]
+    membership_artifact = manifest["artifacts"]["memberships"]
+
+    def project(descriptor: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": descriptor["id"],
+            "sha256": descriptor["sha256"],
+            "bytes": descriptor["bytes"],
+            "records": descriptor["records"],
+        }
+
+    return {
+        "split_manifest_sha256": manifest_sha256,
+        "test_artifact": project(test_artifact),
+        "membership_artifact": project(membership_artifact),
     }
 
 
