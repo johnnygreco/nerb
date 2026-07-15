@@ -71,6 +71,7 @@ from .enron_performance_fixtures import (
 )
 from .enron_performance_worker import (
     DEFAULT_MAX_REQUEST_BYTES,
+    DEFAULT_MAX_SOURCE_BYTES,
     REQUEST_SCHEMA_VERSION,
     RESULT_SCHEMA_VERSION,
     normalize_peak_rss,
@@ -137,8 +138,7 @@ MAX_BUILD_TIMESTAMP_BYTES = 256
 MAX_PRIVATE_JSON_BYTES = 64 * 1024 * 1024
 MAX_INPUT_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 10 * 1024 * 1024
-MAX_SOURCE_PROFILE_BYTES = 2 * 1024 * 1024 * 1024
-MAX_SOURCE_SNAPSHOT_BYTES = 16 * 1024 * 1024 * 1024
+MAX_SOURCE_SNAPSHOT_BYTES = DEFAULT_MAX_SOURCE_BYTES
 MAX_SOURCE_BUILD_SECONDS = 24 * 60 * 60
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _NONCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -1926,7 +1926,7 @@ def prepare_enron_performance_manifest(options: EnronPerformancePrepareOptions) 
         development_root,
         "train.jsonl",
         development_tree,
-        maximum_bytes=MAX_SOURCE_PROFILE_BYTES,
+        maximum_bytes=MAX_SOURCE_SNAPSHOT_BYTES,
         description="Development train artifact",
     )
     if (

@@ -1233,6 +1233,14 @@ def _prepare_run(
             lambda fixtures: _fake_input_fixtures(fixtures),
         )
     monkeypatch.setattr(performance_module, "_source_sha256", lambda _paths: _HASH_1)
+    fingerprint_limits: dict[str, int] = {}
+    fingerprint_private_file = performance_module._fingerprint_performance_private_file
+
+    def capture_fingerprint_limit(*args: Any, **kwargs: Any) -> Any:
+        fingerprint_limits[str(kwargs["description"])] = int(kwargs["maximum_bytes"])
+        return fingerprint_private_file(*args, **kwargs)
+
+    monkeypatch.setattr(performance_module, "_fingerprint_performance_private_file", capture_fingerprint_limit)
     output = tmp_path / f"{name}-prepared-output"
     scratch_root = tmp_path / f"{name}-scratch"
     scratch_root.mkdir(mode=0o700)
@@ -1251,6 +1259,7 @@ def _prepare_run(
     assert summary["inputs"] == 11
     assert summary["decision_workloads"] == 42
     assert summary["sealed_test_accessed"] is False
+    assert fingerprint_limits["Development train artifact"] == performance_module.MAX_SOURCE_SNAPSHOT_BYTES
     assert verification_calls == [
         {
             "development_run": development_run,
