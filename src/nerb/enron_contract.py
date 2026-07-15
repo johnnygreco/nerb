@@ -55,6 +55,7 @@ MIN_DECISION_GRADE_DOCUMENTS = 100
 MIN_DECISION_GRADE_GOLD_SPANS = 100
 MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS = 20
 MIN_DECISION_GRADE_SENSITIVE_CHARACTERS = 500
+ENRON_FINAL_TEST_FRAME_DOCUMENTS = 51_704
 MIN_QUALITY_THRESHOLDS = {
     "open_world_recall": 0.95,
     "catalog_coverage": 0.80,
@@ -67,6 +68,16 @@ MAX_QUALITY_THRESHOLDS = {
     "negative_document_false_alarm_rate": 0.50,
     "over_redaction_rate": 0.05,
 }
+AUDIT_SUPPORT_FAILURE_ORDER = (
+    "production_document_count_mismatch",
+    "documents_below_minimum",
+    "gold_spans_below_minimum",
+    "negative_documents_below_minimum",
+    "sensitive_characters_below_minimum",
+    "contact_gold_support_missing",
+    "person_gold_support_missing",
+)
+EMPTY_AUDIT_ARTIFACTS_SHA256 = "sha256:" + sha256(b"{}").hexdigest()
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 GIT_COMMIT_PATTERN = r"^[0-9a-f]{40}$"
 ZERO_SHA256 = "sha256:" + "0" * 64
@@ -75,6 +86,8 @@ LABEL_ROLES = ("train", "validation", "test", "conformance")
 ANNOTATION_COMPLETENESS = ("exhaustive_within_scope", "partial", "not_applicable")
 CHARACTER_POSITION_SEMANTICS = "document_id_unicode_scalar_index"
 MATCHING_SEMANTICS = "one_to_one_exact_span_and_class"
+PERSON_CONTACT_SCOPE_ID = "person_contact"
+PERSON_CONTACT_ENTITY_CLASSES = ("contact", "person")
 PERFORMANCE_PHASES = (
     "source_profile",
     "source_build",
@@ -154,6 +167,13 @@ def _closed_object(required: Sequence[str], properties: Mapping[str, Any]) -> di
         "properties": dict(properties),
         "additionalProperties": False,
     }
+
+
+def _quality_scope_matches(entity_class: object, annotation_scope: Mapping[str, Any]) -> bool:
+    entity_classes = annotation_scope.get("entity_classes")
+    if entity_class == PERSON_CONTACT_SCOPE_ID:
+        return entity_classes == list(PERSON_CONTACT_ENTITY_CLASSES)
+    return isinstance(entity_class, str) and entity_classes == [entity_class]
 
 
 _HASH = {"type": "string", "pattern": SHA256_PATTERN}
@@ -402,6 +422,20 @@ _PREPARATION = _closed_object(
         "text_views": {"type": "array", "minItems": 1, "items": _PREPARED_TEXT_VIEW},
     },
 )
+_QUALITY_SAMPLE_DESIGN = _closed_object(
+    (
+        "method",
+        "policy_sha256",
+        "seed_sha256",
+        "membership_artifact",
+    ),
+    {
+        "method": {"const": "deterministic_stratified_without_replacement"},
+        "policy_sha256": _HASH,
+        "seed_sha256": _HASH,
+        "membership_artifact": _ARTIFACT_REF,
+    },
+)
 _QUALITY_PLAN_SLICE = _closed_object(
     (
         "id",
@@ -411,14 +445,9 @@ _QUALITY_PLAN_SLICE = _closed_object(
         "cohort",
         "text_view",
         "promotion_gate",
-        "documents",
-        "documents_with_sensitive_gold",
-        "negative_documents",
-        "gold_spans",
-        "cataloged_gold_spans",
-        "documents_with_cataloged_gold",
-        "sensitive_gold_characters",
-        "evaluated_characters",
+        "sample_design",
+        "sample_documents",
+        "frame_documents",
     ),
     {
         "id": {"type": "string", "minLength": 1},
@@ -428,14 +457,9 @@ _QUALITY_PLAN_SLICE = _closed_object(
         "cohort": {"type": "string", "minLength": 1},
         "text_view": {"type": "string", "minLength": 1},
         "promotion_gate": {"type": "boolean"},
-        "documents": _POSITIVE_INTEGER,
-        "documents_with_sensitive_gold": _NONNEGATIVE_INTEGER,
-        "negative_documents": _NONNEGATIVE_INTEGER,
-        "gold_spans": _NONNEGATIVE_INTEGER,
-        "cataloged_gold_spans": _NONNEGATIVE_INTEGER,
-        "documents_with_cataloged_gold": _NONNEGATIVE_INTEGER,
-        "sensitive_gold_characters": _NONNEGATIVE_INTEGER,
-        "evaluated_characters": _NONNEGATIVE_INTEGER,
+        "sample_design": _QUALITY_SAMPLE_DESIGN,
+        "sample_documents": _POSITIVE_INTEGER,
+        "frame_documents": _POSITIVE_INTEGER,
     },
 )
 _CONFORMANCE_PLAN = _closed_object(
@@ -474,6 +498,7 @@ ENRON_MANIFEST_SCHEMA: dict[str, Any] = {
             "preparation",
             "splits",
             "bank",
+            "audit_plan_sha256",
             "thresholds_sha256",
             "performance_manifest_sha256",
             "labels",
@@ -496,6 +521,7 @@ ENRON_MANIFEST_SCHEMA: dict[str, Any] = {
             "preparation": _PREPARATION,
             "splits": _SPLITS,
             "bank": _BANK,
+            "audit_plan_sha256": _HASH,
             "thresholds_sha256": _HASH,
             "performance_manifest_sha256": _HASH,
             "labels": {"type": "array", "minItems": 1, "items": _LABEL_ARTIFACT},
@@ -1155,7 +1181,7 @@ ENRON_PERFORMANCE_OUTPUT_SCHEMA: dict[str, Any] = {
 _FROZEN_TARGET = _closed_object(
     (
         "frozen_at",
-        "manifest_sha256",
+        "audit_plan_sha256",
         "bank_hash",
         "evaluator_source_sha256",
         "split_manifest_sha256",
@@ -1166,7 +1192,7 @@ _FROZEN_TARGET = _closed_object(
     ),
     {
         "frozen_at": _TIMESTAMP,
-        "manifest_sha256": _HASH,
+        "audit_plan_sha256": _HASH,
         "bank_hash": _HASH,
         "evaluator_source_sha256": _HASH,
         "split_manifest_sha256": _HASH,
@@ -1324,6 +1350,192 @@ _VERIFIER_RESULT = _closed_object(
     },
 )
 
+_NULLABLE_HASH = {"anyOf": [_HASH, {"type": "null"}]}
+_AUDIT_GOLD_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "sample_artifact_sha256",
+        "gold_sha256",
+        "annotation_policy_sha256",
+        "unresolved",
+    ),
+    {
+        "status": {"const": "completed"},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _HASH,
+        "manifest_sha256": _HASH,
+        "artifacts_sha256": _HASH,
+        "sample_artifact_sha256": _HASH,
+        "gold_sha256": _HASH,
+        "annotation_policy_sha256": _HASH,
+        "unresolved": _NONNEGATIVE_INTEGER,
+    },
+)
+_AUDIT_CATALOG_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "sample_artifact_sha256",
+        "gold_sha256",
+        "catalog_binding_sha256",
+        "binding_artifact_sha256",
+        "review_artifact_sha256",
+        "catalog_policy_sha256",
+        "unresolved",
+    ),
+    {
+        "status": {"const": "completed"},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _HASH,
+        "manifest_sha256": _HASH,
+        "artifacts_sha256": _HASH,
+        "sample_artifact_sha256": _HASH,
+        "gold_sha256": _HASH,
+        "catalog_binding_sha256": _HASH,
+        "binding_artifact_sha256": _HASH,
+        "review_artifact_sha256": _HASH,
+        "catalog_policy_sha256": _HASH,
+        "unresolved": _NONNEGATIVE_INTEGER,
+    },
+)
+_AUDIT_SCORE_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "sample_artifact_sha256",
+        "gold_sha256",
+        "catalog_binding_sha256",
+        "prediction_commitment_sha256",
+        "scoring_policy_sha256",
+        "thresholds_sha256",
+        "evaluator_source_sha256",
+        "quality_decision_sha256",
+        "quality_decision_passed",
+        "support_failure_codes",
+    ),
+    {
+        "status": {"type": "string", "enum": ["scored_pending_prediction_audit", "insufficient_support"]},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _HASH,
+        "manifest_sha256": _HASH,
+        "artifacts_sha256": _HASH,
+        "sample_artifact_sha256": _HASH,
+        "gold_sha256": _HASH,
+        "catalog_binding_sha256": _HASH,
+        "prediction_commitment_sha256": _NULLABLE_HASH,
+        "scoring_policy_sha256": _HASH,
+        "thresholds_sha256": _HASH,
+        "evaluator_source_sha256": _HASH,
+        "quality_decision_sha256": _NULLABLE_HASH,
+        "quality_decision_passed": {"type": "boolean"},
+        "support_failure_codes": _STRING_ARRAY,
+    },
+)
+_AUDIT_PREDICTION_STAGE = _closed_object(
+    (
+        "status",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "receipt_sha256",
+        "manifest_sha256",
+        "artifacts_sha256",
+        "gold_sha256",
+        "catalog_binding_sha256",
+        "score_manifest_sha256",
+        "prediction_commitment_sha256",
+        "prediction_audit_policy_sha256",
+        "unresolved_cases",
+        "gold_defects",
+        "decision_eligible",
+        "release",
+    ),
+    {
+        "status": {
+            "type": "string",
+            "enum": [
+                "accepted",
+                "quality_gates_failed",
+                "invalidated_gold_defect",
+                "not_run_insufficient_support",
+            ],
+        },
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "receipt_sha256": _NULLABLE_HASH,
+        "manifest_sha256": _NULLABLE_HASH,
+        "artifacts_sha256": _NULLABLE_HASH,
+        "gold_sha256": _HASH,
+        "catalog_binding_sha256": _HASH,
+        "score_manifest_sha256": _HASH,
+        "prediction_commitment_sha256": _NULLABLE_HASH,
+        "prediction_audit_policy_sha256": _HASH,
+        "unresolved_cases": _NONNEGATIVE_INTEGER,
+        "gold_defects": _NONNEGATIVE_INTEGER,
+        "decision_eligible": {"type": "boolean"},
+        "release": {"type": "string", "enum": ["quality_eligible", "do_not_ship"]},
+    },
+)
+_AUDIT_CHAIN_PRIVACY = _closed_object(
+    (
+        "aggregate_only",
+        "raw_text_included",
+        "document_ids_included",
+        "reviewer_ids_included",
+        "span_coordinates_included",
+        "span_surfaces_included",
+        "private_paths_included",
+    ),
+    {
+        "aggregate_only": {"const": True},
+        "raw_text_included": {"const": False},
+        "document_ids_included": {"const": False},
+        "reviewer_ids_included": {"const": False},
+        "span_coordinates_included": {"const": False},
+        "span_surfaces_included": {"const": False},
+        "private_paths_included": {"const": False},
+    },
+)
+_AUDIT_CHAIN = _closed_object(
+    (
+        "schema_version",
+        "audit_plan_sha256",
+        "audit_output_binding_sha256",
+        "gold",
+        "catalog",
+        "score",
+        "prediction_audit",
+        "privacy",
+        "chain_sha256",
+    ),
+    {
+        "schema_version": {"const": "nerb.enron_audit_chain.v1"},
+        "audit_plan_sha256": _HASH,
+        "audit_output_binding_sha256": _HASH,
+        "gold": _AUDIT_GOLD_STAGE,
+        "catalog": _AUDIT_CATALOG_STAGE,
+        "score": _AUDIT_SCORE_STAGE,
+        "prediction_audit": _AUDIT_PREDICTION_STAGE,
+        "privacy": _AUDIT_CHAIN_PRIVACY,
+        "chain_sha256": _HASH,
+    },
+)
+
 ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$id": "https://nerb.dev/schemas/enron-evidence.v2.schema.json",
@@ -1335,6 +1547,7 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "artifact_kind",
             "created_at",
             "manifest_sha256",
+            "audit_plan_sha256",
             "evaluator",
             "source",
             "preparation",
@@ -1350,6 +1563,7 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "performance",
             "performance_manifest_sha256",
             "thresholds_sha256",
+            "audit_chain",
             "promotion",
             "verifier",
         ),
@@ -1359,6 +1573,7 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "artifact_kind": _ARTIFACT_KIND,
             "created_at": _TIMESTAMP,
             "manifest_sha256": _HASH,
+            "audit_plan_sha256": _HASH,
             "evaluator": _EVALUATOR,
             "source": _SOURCE,
             "preparation": _PREPARATION,
@@ -1382,6 +1597,7 @@ ENRON_EVIDENCE_SCHEMA: dict[str, Any] = {
             "performance": _PERFORMANCE_OUTPUT,
             "performance_manifest_sha256": _HASH,
             "thresholds_sha256": _HASH,
+            "audit_chain": _AUDIT_CHAIN,
             "promotion": _closed_object(
                 ("passed", "checks", "claims"),
                 {
@@ -1988,6 +2204,14 @@ def hash_enron_thresholds(checks: Sequence[Mapping[str, Any]]) -> str:
     return _canonical_hash(configuration)
 
 
+def hash_enron_audit_chain(audit_chain: Mapping[str, Any]) -> str:
+    """Hash a closed public audit chain without its self-authenticating field."""
+
+    if not isinstance(audit_chain, Mapping) or "chain_sha256" not in audit_chain:
+        raise ValueError("Enron audit chain must contain its canonical hash field.")
+    return _canonical_hash({key: value for key, value in audit_chain.items() if key != "chain_sha256"})
+
+
 def hash_enron_test_lineage_entry(entry: Mapping[str, Any]) -> str:
     return _canonical_hash({key: value for key, value in entry.items() if key != "entry_sha256"})
 
@@ -2112,6 +2336,7 @@ def validate_enron_evidence(
             promotion_passed=promotion["passed"] or evidence["verifier"]["passed"],
         )
     )
+    diagnostics.extend(_audit_chain_diagnostics(evidence))
     diagnostics.extend(_gate_diagnostics(evidence, recomputed_performance_stats))
     diagnostics.extend(_promotion_diagnostics(evidence, recomputed_performance_stats))
     if promotion["passed"] or evidence["verifier"]["passed"]:
@@ -2283,12 +2508,15 @@ def _manifest_diagnostics(manifest: Mapping[str, Any]) -> list[Diagnostic]:
                     "Natural-text labels cannot use the synthetic conformance role.",
                 )
             )
-        if strength in {"independent", "structured_weak"} and len(label["annotation_scope"]["entity_classes"]) != 1:
+        natural_scope = label["annotation_scope"]["entity_classes"]
+        if strength in {"independent", "structured_weak"} and not (
+            len(natural_scope) == 1 or natural_scope == list(PERSON_CONTACT_ENTITY_CLASSES)
+        ):
             diagnostics.append(
                 _error(
                     "contract.natural_label_entity_population",
                     f"{path}/annotation_scope/entity_classes",
-                    "Each natural-text label artifact must expose one entity class so its populations are exact.",
+                    "Natural-text label artifacts must expose one entity class or the exact person-contact panel.",
                 )
             )
         review_is_separate = (
@@ -2365,7 +2593,7 @@ def _manifest_quality_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diag
                         "Quality-plan split role is outside the bound label population.",
                     )
                 )
-            if item["entity_class"] not in label["annotation_scope"]["entity_classes"]:
+            if not _quality_scope_matches(item["entity_class"], label["annotation_scope"]):
                 diagnostics.append(
                     _error(
                         "contract.quality_plan_entity_class",
@@ -2375,57 +2603,33 @@ def _manifest_quality_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diag
                 )
             populations = {str(population["role"]): population for population in label["role_populations"]}
             population = populations.get(str(item["split_role"]))
-            if (
-                population is None
-                or item["documents"] > population["documents"]
-                or item["gold_spans"] > population["spans"]
-            ):
+            if population is None or item["sample_documents"] > population["documents"]:
                 diagnostics.append(
                     _error(
                         "contract.quality_plan_population_bounds",
                         path,
-                        "Frozen quality denominators must fit the bound role-specific label population.",
+                        "The frozen audit sample cannot exceed the bound role-specific label population.",
                     )
                 )
-            elif item["cohort"] == "all" and (
-                item["documents"] != population["documents"] or item["gold_spans"] != population["spans"]
-            ):
+            elif item["cohort"] == "all" and item["sample_documents"] != population["documents"]:
                 diagnostics.append(
                     _error(
                         "contract.quality_plan_population_exactness",
                         path,
-                        "An all-document quality plan must equal its complete bound label population.",
+                        "An all-document quality plan must cover its complete frozen audit sample.",
                     )
                 )
-        open_world_eligible = (
-            label is not None
-            and label["label_strength"] == "independent"
-            and label["annotation_completeness"] == "exhaustive_within_scope"
-        )
-        invalid_denominators = (
-            item["documents_with_sensitive_gold"] > item["documents"]
-            or item["cataloged_gold_spans"] > item["gold_spans"]
-            or item["documents_with_cataloged_gold"] > item["documents_with_sensitive_gold"]
-            or (item["gold_spans"] == 0) != (item["documents_with_sensitive_gold"] == 0)
-            or (item["cataloged_gold_spans"] == 0) != (item["documents_with_cataloged_gold"] == 0)
-        )
-        if open_world_eligible:
-            invalid_denominators = invalid_denominators or (
-                item["documents_with_sensitive_gold"] + item["negative_documents"] != item["documents"]
-                or item["sensitive_gold_characters"] > item["evaluated_characters"]
-                or (item["gold_spans"] == 0) != (item["sensitive_gold_characters"] == 0)
-            )
-        else:
-            invalid_denominators = invalid_denominators or any(
-                item[field] != 0
-                for field in ("negative_documents", "sensitive_gold_characters", "evaluated_characters")
-            )
-        if invalid_denominators:
+        role = manifest["splits"]["roles"].get(str(item["split_role"]))
+        if (
+            not isinstance(role, Mapping)
+            or item["frame_documents"] != role["records"]
+            or item["sample_documents"] > item["frame_documents"]
+        ):
             diagnostics.append(
                 _error(
-                    "contract.quality_plan_denominators",
+                    "contract.quality_plan_sample_frame",
                     path,
-                    "Frozen quality document, span, and character denominators are internally inconsistent.",
+                    "The frozen audit sample must fit and bind the exact split-role frame.",
                 )
             )
         if text_view is None:
@@ -2472,7 +2676,7 @@ def _manifest_quality_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diag
                 _error(
                     "contract.invalid_quality_plan_gate",
                     f"{path}/promotion_gate",
-                    "A quality-plan gate must cover the all-document independent exhaustive primary final-test view.",
+                    "A quality-plan gate must cover the complete independent exhaustive primary-view audit sample.",
                 )
             )
         if item["promotion_gate"] and label is not None:
@@ -2480,27 +2684,57 @@ def _manifest_quality_plan_diagnostics(manifest: Mapping[str, Any]) -> list[Diag
             population = populations.get("test")
             if (
                 population is None
-                or population["documents"] != manifest["splits"]["roles"]["test"]["records"]
-                or item["documents"] != manifest["splits"]["roles"]["test"]["records"]
+                or population["documents"] != item["sample_documents"]
+                or item["sample_documents"] != MIN_DECISION_GRADE_DOCUMENTS
+                or item["frame_documents"] != ENRON_FINAL_TEST_FRAME_DOCUMENTS
+                or item["frame_documents"] != manifest["splits"]["roles"]["test"]["records"]
             ):
                 diagnostics.append(
                     _error(
                         "contract.quality_gate_test_population",
                         f"{path}/label_artifact_id",
-                        "A quality-plan gate must label every document in the bound final-test split artifact.",
+                        "A quality-plan gate must bind all 100 documents in the frozen deterministic audit sample "
+                        "to the exact 51,704-document final-test frame.",
                     )
                 )
-            if (
-                item["documents"] < MIN_DECISION_GRADE_DOCUMENTS
-                or item["gold_spans"] < MIN_DECISION_GRADE_GOLD_SPANS
-                or item["negative_documents"] < MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS
-                or item["sensitive_gold_characters"] < MIN_DECISION_GRADE_SENSITIVE_CHARACTERS
+    promotion_plans = [item for item in manifest["quality_plan"] if item["promotion_gate"]]
+    if promotion_plans:
+        if len(promotion_plans) != 1 or promotion_plans[0]["entity_class"] != PERSON_CONTACT_SCOPE_ID:
+            diagnostics.append(
+                _error(
+                    "contract.quality_panel_promotion_gate",
+                    "/quality_plan",
+                    "Exactly one person-contact combined slice must be the quality promotion gate.",
+                )
+            )
+        else:
+            combined = promotion_plans[0]
+            panel_diagnostics = [
+                item
+                for item in manifest["quality_plan"]
+                if not item["promotion_gate"]
+                and item["entity_class"] in PERSON_CONTACT_ENTITY_CLASSES
+                and item["split_role"] == combined["split_role"]
+                and item["cohort"] == combined["cohort"]
+                and item["text_view"] == combined["text_view"]
+            ]
+            by_class = {
+                entity_class: [item for item in panel_diagnostics if item["entity_class"] == entity_class]
+                for entity_class in PERSON_CONTACT_ENTITY_CLASSES
+            }
+            shared_fields = ("sample_design", "sample_documents", "frame_documents")
+            if any(len(by_class[entity_class]) != 1 for entity_class in PERSON_CONTACT_ENTITY_CLASSES) or any(
+                item[field] != combined[field]
+                for entity_class in PERSON_CONTACT_ENTITY_CLASSES
+                for item in by_class[entity_class]
+                for field in shared_fields
             ):
                 diagnostics.append(
                     _error(
-                        "contract.quality_gate_minimum_support",
-                        path,
-                        "A quality-plan gate lacks the minimum frozen document, span, negative, or character support.",
+                        "contract.quality_panel_sample_binding",
+                        "/quality_plan",
+                        "Person-contact promotion requires one person and one contact diagnostic on the identical "
+                        "frozen sample design and membership.",
                     )
                 )
     expected_planned_labels = {
@@ -2698,7 +2932,7 @@ def _quality_diagnostics(quality: Mapping[str, Any], *, manifest: Mapping[str, A
                     "Unlabeled and synthetic-conformance evidence cannot produce natural-text quality slices.",
                 )
             )
-        if item["entity_class"] not in item["annotation_scope"]["entity_classes"]:
+        if not _quality_scope_matches(item["entity_class"], item["annotation_scope"]):
             diagnostics.append(
                 _error(
                     "contract.annotation_scope_mismatch",
@@ -2724,21 +2958,16 @@ def _quality_diagnostics(quality: Mapping[str, Any], *, manifest: Mapping[str, A
                 "cohort",
                 "text_view",
                 "promotion_gate",
-                "documents",
-                "documents_with_sensitive_gold",
-                "negative_documents",
-                "gold_spans",
-                "cataloged_gold_spans",
-                "documents_with_cataloged_gold",
-                "sensitive_gold_characters",
-                "evaluated_characters",
             )
-            if any(item[field] != planned[field] for field in planned_fields):
+            if (
+                any(item[field] != planned[field] for field in planned_fields)
+                or item["documents"] != planned["sample_documents"]
+            ):
                 diagnostics.append(
                     _error(
                         "contract.quality_plan_binding",
                         path,
-                        "Quality evidence differs from its frozen manifest slice descriptor.",
+                        "Quality evidence differs from its frozen audit-sample descriptor.",
                     )
                 )
         if labels and label is None:
@@ -3243,7 +3472,7 @@ def _test_access_diagnostics(
         )
     frozen = access["frozen_target"]
     expected = {
-        "manifest_sha256": evidence["manifest_sha256"],
+        "audit_plan_sha256": evidence["audit_plan_sha256"],
         "bank_hash": evidence["bank"]["canonical_hash"],
         "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
         "split_manifest_sha256": evidence["splits"]["manifest_sha256"],
@@ -5347,6 +5576,65 @@ def _performance_promotion_diagnostics(
     return diagnostics, required_gate_specs
 
 
+def _is_insufficient_support_terminal(chain: Mapping[str, Any]) -> bool:
+    score = chain["score"]
+    prediction = chain["prediction_audit"]
+    support_failure_codes = score["support_failure_codes"]
+    canonical_support_failure_codes = [code for code in AUDIT_SUPPORT_FAILURE_ORDER if code in support_failure_codes]
+    prediction_hashes = (
+        prediction["receipt_sha256"],
+        prediction["manifest_sha256"],
+        prediction["artifacts_sha256"],
+        prediction["prediction_commitment_sha256"],
+    )
+    return (
+        score["status"] == "insufficient_support"
+        and bool(support_failure_codes)
+        and support_failure_codes == canonical_support_failure_codes
+        and score["artifacts_sha256"] == EMPTY_AUDIT_ARTIFACTS_SHA256
+        and score["prediction_commitment_sha256"] is None
+        and score["quality_decision_sha256"] is None
+        and score["quality_decision_passed"] is False
+        and prediction["status"] == "not_run_insufficient_support"
+        and all(value is None for value in prediction_hashes)
+        and prediction["gold_defects"] == 0
+        and prediction["decision_eligible"] is False
+        and prediction["release"] == "do_not_ship"
+    )
+
+
+def _is_frozen_quality_gate_target(target: str) -> bool:
+    parts = target.split("/")
+    if len(parts) == 5 and parts[1:4] == ["quality", "slices", "0"]:
+        return parts[4] in {
+            "cataloged_false_negative",
+            "cataloged_wrong_canonical",
+            "documents_with_any_cataloged_miss",
+        }
+    return (
+        len(parts) == 6
+        and parts[1:5] == ["quality", "slices", "0", "metrics"]
+        and parts[5] in MIN_QUALITY_THRESHOLDS.keys() | MAX_QUALITY_THRESHOLDS.keys()
+    )
+
+
+def _allows_unresolved_insufficient_support_quality_gate(evidence: Mapping[str, Any], check: Mapping[str, Any]) -> bool:
+    quality = evidence["quality"]
+    promotion = evidence["promotion"]
+    return (
+        _is_insufficient_support_terminal(evidence["audit_chain"])
+        and quality["evaluated"] is False
+        and quality["slices"] == []
+        and promotion["passed"] is False
+        and evidence["verifier"]["passed"] is False
+        and promotion["claims"] == []
+        and check["category"] == "quality"
+        and _is_frozen_quality_gate_target(str(check["target"]))
+        and check["actual"] is None
+        and check["passed"] is False
+    )
+
+
 def _gate_diagnostics(
     evidence: Mapping[str, Any], recomputed_statistics: Mapping[str, Mapping[str, Any]]
 ) -> list[Diagnostic]:
@@ -5402,6 +5690,8 @@ def _gate_diagnostics(
         try:
             actual = _resolve_pointer(evidence, check["target"])
         except (KeyError, IndexError, TypeError, ValueError):
+            if _allows_unresolved_insufficient_support_quality_gate(evidence, check):
+                continue
             diagnostics.append(
                 _error("contract.gate_target", f"{path}/target", "Gate target does not resolve to evidence.")
             )
@@ -5432,6 +5722,101 @@ def _gate_diagnostics(
                     "Gate result does not match the recomputed source-value comparison.",
                 )
             )
+    return diagnostics
+
+
+def _audit_chain_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
+    chain = evidence["audit_chain"]
+    gold = chain["gold"]
+    catalog = chain["catalog"]
+    score = chain["score"]
+    prediction = chain["prediction_audit"]
+    diagnostics: list[Diagnostic] = []
+
+    def mismatch(path: str, message: str) -> None:
+        diagnostics.append(_error("contract.audit_chain_mismatch", path, message))
+
+    if chain["chain_sha256"] != hash_enron_audit_chain(chain):
+        mismatch("/audit_chain/chain_sha256", "Audit-chain hash does not match the canonical stage commitments.")
+    if chain["audit_plan_sha256"] != evidence["audit_plan_sha256"]:
+        mismatch("/audit_chain/audit_plan_sha256", "Audit chain differs from the preregistered audit plan.")
+    for stage_name, stage in (("gold", gold), ("catalog", catalog), ("score", score), ("prediction_audit", prediction)):
+        if stage["audit_plan_sha256"] != chain["audit_plan_sha256"]:
+            mismatch(
+                f"/audit_chain/{stage_name}/audit_plan_sha256",
+                "Audit stage differs from the shared preregistered plan.",
+            )
+        if stage["audit_output_binding_sha256"] != chain["audit_output_binding_sha256"]:
+            mismatch(
+                f"/audit_chain/{stage_name}/audit_output_binding_sha256",
+                "Audit stage differs from the shared sealed sample output.",
+            )
+    if score["thresholds_sha256"] != evidence["thresholds_sha256"]:
+        mismatch("/audit_chain/score/thresholds_sha256", "Scored thresholds differ from the frozen evidence checks.")
+    if score["evaluator_source_sha256"] != evidence["evaluator"]["source_sha256"]:
+        mismatch("/audit_chain/score/evaluator_source_sha256", "Scored evaluator differs from evidence provenance.")
+
+    shared_sample = gold["sample_artifact_sha256"]
+    if catalog["sample_artifact_sha256"] != shared_sample or score["sample_artifact_sha256"] != shared_sample:
+        mismatch("/audit_chain", "Gold, catalog, and score stages do not bind one sampled artifact.")
+    if catalog["gold_sha256"] != gold["gold_sha256"] or score["gold_sha256"] != gold["gold_sha256"]:
+        mismatch("/audit_chain", "Catalog or score stage does not bind the committed gold output.")
+    if prediction["gold_sha256"] != gold["gold_sha256"]:
+        mismatch("/audit_chain/prediction_audit/gold_sha256", "Prediction audit does not bind the committed gold.")
+    if score["catalog_binding_sha256"] != catalog["catalog_binding_sha256"]:
+        mismatch("/audit_chain/score/catalog_binding_sha256", "Score does not bind the catalog qualification.")
+    if prediction["catalog_binding_sha256"] != catalog["catalog_binding_sha256"]:
+        mismatch(
+            "/audit_chain/prediction_audit/catalog_binding_sha256",
+            "Prediction audit does not bind the catalog qualification.",
+        )
+    if prediction["score_manifest_sha256"] != score["manifest_sha256"]:
+        mismatch("/audit_chain/prediction_audit/score_manifest_sha256", "Prediction audit does not bind the score.")
+    if gold["unresolved"] != 0 or catalog["unresolved"] != 0 or prediction["unresolved_cases"] != 0:
+        mismatch("/audit_chain", "Every audit stage must commit zero unresolved decisions.")
+
+    score_status = score["status"]
+    prediction_status = prediction["status"]
+    if score_status == "insufficient_support":
+        valid_terminal = _is_insufficient_support_terminal(chain)
+    else:
+        prediction_hashes = (
+            prediction["receipt_sha256"],
+            prediction["manifest_sha256"],
+            prediction["artifacts_sha256"],
+            prediction["prediction_commitment_sha256"],
+        )
+        hashes_complete = (
+            score["prediction_commitment_sha256"] is not None
+            and score["quality_decision_sha256"] is not None
+            and all(value is not None for value in prediction_hashes)
+            and prediction["prediction_commitment_sha256"] == score["prediction_commitment_sha256"]
+        )
+        if prediction_status == "accepted":
+            terminal_consistent = (
+                score["quality_decision_passed"] is True
+                and prediction["gold_defects"] == 0
+                and prediction["decision_eligible"] is True
+                and prediction["release"] == "quality_eligible"
+            )
+        elif prediction_status == "quality_gates_failed":
+            terminal_consistent = (
+                score["quality_decision_passed"] is False
+                and prediction["gold_defects"] == 0
+                and prediction["decision_eligible"] is False
+                and prediction["release"] == "do_not_ship"
+            )
+        elif prediction_status == "invalidated_gold_defect":
+            terminal_consistent = (
+                prediction["gold_defects"] > 0
+                and prediction["decision_eligible"] is False
+                and prediction["release"] == "do_not_ship"
+            )
+        else:
+            terminal_consistent = False
+        valid_terminal = not score["support_failure_codes"] and hashes_complete and terminal_consistent
+    if not valid_terminal:
+        mismatch("/audit_chain", "Audit stages do not form a valid accepted or terminal do-not-ship chain.")
     return diagnostics
 
 
@@ -5551,6 +5936,8 @@ def _recomputed_performance_gate_value(
 
 def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any] | None) -> list[Diagnostic]:
     promotion = evidence["promotion"]
+    audit_chain = evidence["audit_chain"]
+    prediction_audit = audit_chain["prediction_audit"]
     diagnostics: list[Diagnostic] = []
     current_version = evidence["test_access"]["benchmark_version"]
     lineage = evidence["test_access"]["lineage"]
@@ -5575,6 +5962,17 @@ def _decision_grade_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[s
         "clean git state": evidence["software"]["git_dirty"] is False,
         "one-shot final test": evidence["test_access"]["current_version_access_count"] == 1,
         "matching passed current lineage": current_lineage_passed,
+        "accepted audit chain": (
+            audit_chain["gold"]["status"] == "completed"
+            and audit_chain["catalog"]["status"] == "completed"
+            and audit_chain["score"]["status"] == "scored_pending_prediction_audit"
+            and audit_chain["score"]["quality_decision_passed"] is True
+            and prediction_audit["status"] == "accepted"
+            and prediction_audit["unresolved_cases"] == 0
+            and prediction_audit["gold_defects"] == 0
+            and prediction_audit["decision_eligible"] is True
+            and prediction_audit["release"] == "quality_eligible"
+        ),
         "real benchmark artifact": evidence["artifact_kind"] == "real_benchmark",
         "exact valid manifest binding": manifest_bound,
     }
@@ -5800,17 +6198,19 @@ def _quality_decision_grade_diagnostics(
             _error(
                 "contract.missing_quality_gate",
                 "/quality/slices",
-                "Decision-grade evidence requires an independent exhaustive final-test quality gate slice.",
+                "Decision-grade evidence requires one combined person-contact final-test quality gate slice.",
             )
         )
     manifest_valid = manifest is not None and validate_enron_manifest(manifest)["valid"]
     primary_view: Mapping[str, Any] | None = None
+    planned_gates: dict[str, Mapping[str, Any]] = {}
     if manifest_valid and manifest is not None:
         bound_primary_view: Mapping[str, Any] = next(
             item for item in manifest["preparation"]["text_views"] if item["primary_for_quality"]
         )
         primary_view = bound_primary_view
-        planned_gate_ids = {str(item["id"]) for item in manifest["quality_plan"] if item["promotion_gate"]}
+        planned_gates = {str(item["id"]): item for item in manifest["quality_plan"] if item["promotion_gate"]}
+        planned_gate_ids = set(planned_gates)
         observed_gate_ids = {str(slices[index]["id"]) for index in gate_indices}
         if observed_gate_ids != planned_gate_ids:
             diagnostics.append(
@@ -5841,8 +6241,11 @@ def _quality_decision_grade_diagnostics(
     for index in gate_indices:
         item = slices[index]
         path = f"/quality/slices/{index}"
+        planned_gate = planned_gates.get(str(item["id"]))
         if (
-            item["label_strength"] != "independent"
+            item["entity_class"] != PERSON_CONTACT_SCOPE_ID
+            or not _quality_scope_matches(item["entity_class"], item["annotation_scope"])
+            or item["label_strength"] != "independent"
             or item["annotation_completeness"] != "exhaustive_within_scope"
             or item["split_role"] != "test"
             or item["cohort"] != "all"
@@ -5851,7 +6254,8 @@ def _quality_decision_grade_diagnostics(
                 _error(
                     "contract.invalid_quality_gate",
                     f"{path}/promotion_gate",
-                    "Decision-grade quality must use the all-document independent exhaustive final-test cohort.",
+                    "Decision-grade quality must use the combined person-contact scope over the complete independent "
+                    "exhaustive final-test audit sample.",
                 )
             )
         if primary_view is not None and item["text_view"] != primary_view["id"]:
@@ -5873,19 +6277,29 @@ def _quality_decision_grade_diagnostics(
                     "Decision-grade quality must annotate every region in the exact primary view without exclusions.",
                 )
             )
-        if (
-            manifest_valid
-            and manifest is not None
-            and item["documents"] != manifest["splits"]["roles"]["test"]["records"]
-        ):
+        if planned_gate is not None and item["documents"] != planned_gate["sample_documents"]:
             diagnostics.append(
                 _error(
                     "contract.quality_gate_split_population",
                     f"{path}/documents",
-                    "Decision-grade quality must aggregate the entire bound final-test split artifact.",
+                    "Decision-grade quality must aggregate every document in the frozen audit sample.",
                 )
             )
-        if (
+        if item["entity_class"] == PERSON_CONTACT_SCOPE_ID and (
+            item["documents"] != MIN_DECISION_GRADE_DOCUMENTS
+            or item["gold_spans"] < MIN_DECISION_GRADE_GOLD_SPANS
+            or item["negative_documents"] < MIN_DECISION_GRADE_NEGATIVE_DOCUMENTS
+            or item["sensitive_gold_characters"] < MIN_DECISION_GRADE_SENSITIVE_CHARACTERS
+        ):
+            diagnostics.append(
+                _error(
+                    "contract.quality_gate_minimum_support",
+                    path,
+                    "The combined person-contact audit panel lacks its exact document count or minimum total span, "
+                    "joint-negative-document, or union-character support.",
+                )
+            )
+        if item["entity_class"] == PERSON_CONTACT_SCOPE_ID and (
             item["gold_spans"] <= 0
             or item["cataloged_gold_spans"] <= 0
             or item["negative_documents"] <= 0
@@ -5898,23 +6312,80 @@ def _quality_decision_grade_diagnostics(
                 _error(
                     "contract.natural_catalog_gate",
                     path,
-                    "Decision-grade slices require positive gold/negative support plus zero cataloged misses and "
-                    "wrong mappings.",
+                    "The combined decision-grade slice requires positive gold/negative support plus zero cataloged "
+                    "misses and wrong mappings.",
                 )
             )
-        for field in (
-            "cataloged_false_negative",
-            "cataloged_wrong_canonical",
-            "documents_with_any_cataloged_miss",
-        ):
-            required_gate_specs[f"{path}/{field}"] = ("eq", 0)
-        for field in quality_metric_fields:
-            operator = (
-                "gte"
-                if field in {"open_world_recall", "catalog_coverage", "cataloged_recall", "sensitive_character_recall"}
-                else "lte"
+        if item["entity_class"] == PERSON_CONTACT_SCOPE_ID:
+            for field in (
+                "cataloged_false_negative",
+                "cataloged_wrong_canonical",
+                "documents_with_any_cataloged_miss",
+            ):
+                required_gate_specs[f"{path}/{field}"] = ("eq", 0)
+            for field in quality_metric_fields:
+                operator = (
+                    "gte"
+                    if field
+                    in {"open_world_recall", "catalog_coverage", "cataloged_recall", "sensitive_character_recall"}
+                    else "lte"
+                )
+                required_gate_specs[f"{path}/metrics/{field}"] = (operator, None)
+
+    combined_gate_indices = [
+        index for index in gate_indices if slices[index]["entity_class"] == PERSON_CONTACT_SCOPE_ID
+    ]
+    if len(gate_indices) != 1 or len(combined_gate_indices) != 1:
+        diagnostics.append(
+            _error(
+                "contract.quality_panel_promotion_gate",
+                "/quality/slices",
+                "Exactly one combined person-contact slice may be a quality promotion gate.",
             )
-            required_gate_specs[f"{path}/metrics/{field}"] = (operator, None)
+        )
+    else:
+        combined = slices[combined_gate_indices[0]]
+        class_slices = {
+            entity_class: [
+                item
+                for item in slices
+                if not item["promotion_gate"]
+                and item["entity_class"] == entity_class
+                and item["split_role"] == combined["split_role"]
+                and item["cohort"] == combined["cohort"]
+                and item["text_view"] == combined["text_view"]
+            ]
+            for entity_class in PERSON_CONTACT_ENTITY_CLASSES
+        }
+        if any(len(class_slices[entity_class]) != 1 for entity_class in PERSON_CONTACT_ENTITY_CLASSES):
+            diagnostics.append(
+                _error(
+                    "contract.quality_panel_diagnostics",
+                    "/quality/slices",
+                    "The combined promotion gate requires one person and one contact diagnostic on the same sample.",
+                )
+            )
+        else:
+            contact, person = (class_slices[entity_class][0] for entity_class in PERSON_CONTACT_ENTITY_CLASSES)
+            if (
+                combined["documents"] != contact["documents"]
+                or combined["documents"] != person["documents"]
+                or combined["gold_spans"] != contact["gold_spans"] + person["gold_spans"]
+                or combined["sensitive_gold_characters"]
+                != contact["sensitive_gold_characters"] + person["sensitive_gold_characters"]
+                or combined["negative_documents"] > contact["negative_documents"]
+                or combined["negative_documents"] > person["negative_documents"]
+                or contact["gold_spans"] <= 0
+                or person["gold_spans"] <= 0
+            ):
+                diagnostics.append(
+                    _error(
+                        "contract.quality_panel_support",
+                        f"/quality/slices/{combined_gate_indices[0]}",
+                        "Combined person-contact support must bind the shared document panel, additive class spans and "
+                        "disjoint sensitive characters, joint negatives, and nonzero support for both classes.",
+                    )
+                )
     return diagnostics, required_gate_specs
 
 
@@ -6123,6 +6594,14 @@ def _binding_diagnostics(evidence: Mapping[str, Any], manifest: Mapping[str, Any
         diagnostics.append(
             _error(
                 "contract.manifest_hash_mismatch", "/manifest_sha256", "Evidence does not bind the supplied manifest."
+            )
+        )
+    if evidence["audit_plan_sha256"] != manifest["audit_plan_sha256"]:
+        diagnostics.append(
+            _error(
+                "contract.audit_plan_hash_mismatch",
+                "/audit_plan_sha256",
+                "Evidence does not bind the manifest's preregistered audit plan.",
             )
         )
     for field in ("thresholds_sha256", "performance_manifest_sha256"):
@@ -7185,9 +7664,12 @@ __all__ = [
     "ENRON_VERIFIER_ID",
     "ENRON_VERIFIER_VERSION",
     "MATCHING_SEMANTICS",
+    "PERSON_CONTACT_ENTITY_CLASSES",
+    "PERSON_CONTACT_SCOPE_ID",
     "calculate_enron_breakeven",
     "calculate_enron_performance_comparison",
     "calculate_enron_performance_statistics",
+    "hash_enron_audit_chain",
     "hash_enron_environment",
     "hash_enron_breakeven_plan",
     "hash_enron_manifest",

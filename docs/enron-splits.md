@@ -37,7 +37,9 @@ be supplied again to the steward verifier without being published in the develop
 The benchmark identity itself is fixed to `enron`; there is no alternate benchmark-version selector. The verifier's
 closed result includes both development and sealed manifest hashes plus the pre-seal verification hash, and it accepts
 an observational activity callback for large development-artifact hashing. Metadata verification never opens sealed
-test content.
+test content. The result also includes `sealed_audit_inputs`, a closed aggregate projection of the verified test and
+test-membership artifact commitments. Use those commitments to construct the frozen audit plan before the single
+controlled final-test access; do not hash or open either sealed JSONL artifact directly.
 
 For a tiny synthetic fixture, add `--fixture-mode` to `split-enron`. Fixture mode relaxes the production support floors
 so leakage and sealing behavior can be tested on small inputs. Its manifests are permanently marked non-promotable and
@@ -131,14 +133,21 @@ stage marks the negative-document cohort unsupported. An empty structured header
 prediction is not evidence that a message contains no PII. A later evaluator may add a negative cohort only from an
 independently and exhaustively labeled population with a declared annotation scope.
 
-Bounded review samples are diagnostics, not the quality population. The sampler apportions its per-role budget across
+The split bundle's bounded review samples are diagnostics, not quality evidence. That sampler apportions its per-role budget across
 declared non-empty base strata with deterministic Hamilton largest-remainder allocation, then selects records by seeded
 minimum hash. Before that allocation it reserves deterministic coverage for every non-empty date-status,
 identity-frequency, natural/structured-availability, and challenge-family margin. This guarantees rare named cohorts a
 review surface without creating a potentially explosive Cartesian stratum. The default ceiling is 10,000 records per
 role; a production run fails if that budget cannot cover all required reservations. This makes the sample representative
-and row-order independent without exposing arbitrary first rows. It does not authorize sample-only recall, precision,
-false-alarm, or promotion claims: quality gates use every applicable document in the frozen full role/cohort population.
+and row-order independent without exposing arbitrary first rows. It does not authorize recall, precision, false-alarm,
+or promotion claims.
+
+Final quality uses a different preregistered sample created only after the bank, evaluator, thresholds, execution policy,
+and performance plan are frozen. The steward streams all 51,704 test records with their bound membership rows, retains
+one minimum-hash representative per leakage group, stratifies representatives by identity recurrence, primary-view size,
+and structural risk, and selects exactly 100 distinct groups by the frozen base-plus-Hamilton policy. Two bank-blind
+passes then exhaustively annotate the complete `subject_current_body` view. Claims are scoped to that fixed stratified
+panel; it is not the existing `samples.jsonl`, the full test role, an iid sample, or a corpus-wide estimate.
 
 ## Production support floors
 
@@ -162,15 +171,19 @@ the steward environment, but it must not return test records, identities, member
 diagnostics to development callers.
 
 Final-test bytes are available only through the explicit steward release-access path for a fully frozen benchmark
-target, including the exact final-test artifact hash. That path durably creates the one-shot access claim **before**
-yielding the first test byte. A crash, exception, partial read, or caller cancellation after the claim still counts as
-the benchmark's single access. There is no retry for that frozen target, because retry semantics would turn failures
-into selective test access. An aborted or failed outcome enters the append-only benchmark lineage; further tuning
-requires a newly frozen test population whose artifact hash has not already appeared in the trusted lineage.
+target, including the exact final-test artifact hash and preregistered audit-plan hash. The steward must pass that exact
+hash to `bind_audit_plan` before entering the access context; a different plan is rejected before any binding or access
+receipt is published. The path durably creates the one-shot access claim **before** yielding the first test byte. A
+crash, exception, partial read, or caller cancellation after the claim still counts as the benchmark's single access.
+There is no retry for that frozen target, because retry semantics would turn failures into selective test access. An
+aborted or failed outcome enters the append-only benchmark lineage; further tuning requires a newly frozen test
+population whose artifact hash has not already appeared in the trusted lineage.
 
-The durable transition is `sealed_unbound → evidence_bound → claimed → completed | failed | aborted`. Transition
-validation and publication use one pinned, exclusively locked steward directory. A crash finalizer can write `aborted`
-only after the live owner lock has been released; it never opens the test artifact.
+The durable transition is `sealed_unbound → evidence_bound → claimed → completed | failed | aborted`. A completed
+transition additionally binds the committed audit sample output; exhausting the stream without that post-commit binding
+is a failed access, not a successful but unattached read. Transition validation and publication use one pinned,
+exclusively locked steward directory. A crash finalizer can write `aborted` only after the live owner lock has been
+released; it never opens the test artifact.
 
 If a steward process dies after the valid claim is durable but before an outcome is written, the claim still consumes
 the one permitted access. `finalize_aborted_enron_final_test_access` can append an `aborted` outcome after validating the

@@ -20,6 +20,7 @@ from nerb.enron_contract import (
     calculate_enron_breakeven,
     calculate_enron_performance_comparison,
     calculate_enron_performance_statistics,
+    hash_enron_audit_chain,
     hash_enron_breakeven_plan,
     hash_enron_environment,
     hash_enron_manifest,
@@ -46,6 +47,7 @@ from nerb.enron_contract import (
 
 JsonObject = dict[str, Any]
 JsonPath = tuple[str | int, ...]
+_AUDIT_PLAN_SHA256 = "sha256:" + "7" * 64
 _PROMOTABLE_FIXTURE_CACHE: dict[
     str,
     tuple[JsonObject, JsonObject, dict[str, list[JsonObject]]],
@@ -63,14 +65,61 @@ class _ExplodingMapping(Mapping[str, Any]):
         raise RuntimeError("unexpected resolver length access")
 
 
+def _sample_design(number: int = 880) -> JsonObject:
+    return {
+        "method": "deterministic_stratified_without_replacement",
+        "policy_sha256": "sha256:" + f"{number:064x}",
+        "seed_sha256": "sha256:" + f"{number + 1:064x}",
+        "membership_artifact": {
+            "id": "frozen_audit_sample_memberships",
+            "sha256": "sha256:" + f"{number + 2:064x}",
+            "bytes": 4096,
+        },
+    }
+
+
+def _with_sampled_quality_plan(value: JsonObject) -> JsonObject:
+    for index, plan in enumerate(value["quality_plan"]):
+        sample_documents = int(plan.pop("documents"))
+        for field in (
+            "documents_with_sensitive_gold",
+            "negative_documents",
+            "gold_spans",
+            "cataloged_gold_spans",
+            "documents_with_cataloged_gold",
+            "sensitive_gold_characters",
+            "evaluated_characters",
+        ):
+            plan.pop(field)
+        plan.update(
+            {
+                "sample_design": _sample_design(880 + index * 10),
+                "sample_documents": sample_documents,
+                "frame_documents": value["splits"]["roles"][plan["split_role"]]["records"],
+            }
+        )
+    return value
+
+
 @pytest.fixture
 def manifest(test_data_path: Path) -> JsonObject:
-    return json.loads((test_data_path / "enron_manifest.json").read_text(encoding="utf-8"))
+    value = json.loads((test_data_path / "enron_manifest.json").read_text(encoding="utf-8"))
+    value = _with_sampled_quality_plan(value)
+    value["audit_plan_sha256"] = _AUDIT_PLAN_SHA256
+    return value
 
 
 @pytest.fixture
 def evidence(test_data_path: Path) -> JsonObject:
-    return json.loads((test_data_path / "enron_evidence.json").read_text(encoding="utf-8"))
+    value = json.loads((test_data_path / "enron_evidence.json").read_text(encoding="utf-8"))
+    manifest_value = _with_sampled_quality_plan(
+        json.loads((test_data_path / "enron_manifest.json").read_text(encoding="utf-8"))
+    )
+    manifest_value["audit_plan_sha256"] = _AUDIT_PLAN_SHA256
+    value["audit_plan_sha256"] = _AUDIT_PLAN_SHA256
+    value["manifest_sha256"] = hash_enron_manifest(manifest_value)
+    _refresh_frozen_contract(value)
+    return value
 
 
 def _codes(result: JsonObject) -> set[str]:
@@ -274,11 +323,21 @@ def _normalize_lineage(evidence: JsonObject) -> None:
 def _refresh_frozen_contract(evidence: JsonObject) -> None:
     evidence["performance_manifest_sha256"] = hash_enron_performance_manifest(evidence["performance"])
     evidence["thresholds_sha256"] = hash_enron_thresholds(evidence["promotion"]["checks"])
+    audit_chain = evidence["audit_chain"]
+    audit_chain["audit_plan_sha256"] = evidence["audit_plan_sha256"]
+    for stage in ("gold", "catalog", "score", "prediction_audit"):
+        audit_chain[stage]["audit_plan_sha256"] = audit_chain["audit_plan_sha256"]
+        audit_chain[stage]["audit_output_binding_sha256"] = audit_chain["audit_output_binding_sha256"]
+    audit_chain["score"]["thresholds_sha256"] = evidence["thresholds_sha256"]
+    audit_chain["score"]["evaluator_source_sha256"] = evidence["evaluator"]["source_sha256"]
     access = evidence["test_access"]
     frozen = access["frozen_target"]
+    frozen_at = frozen["frozen_at"]
+    frozen.clear()
     frozen.update(
         {
-            "manifest_sha256": evidence["manifest_sha256"],
+            "frozen_at": frozen_at,
+            "audit_plan_sha256": evidence["audit_plan_sha256"],
             "bank_hash": evidence["bank"]["canonical_hash"],
             "evaluator_source_sha256": evidence["evaluator"]["source_sha256"],
             "split_manifest_sha256": evidence["splits"]["manifest_sha256"],
@@ -292,9 +351,40 @@ def _refresh_frozen_contract(evidence: JsonObject) -> None:
         if entry["benchmark_version"] == access["benchmark_version"]:
             entry["frozen_target"] = copy.deepcopy(frozen)
     _normalize_lineage(evidence)
+    audit_chain["chain_sha256"] = hash_enron_audit_chain(audit_chain)
+
+
+def _accept_audit_chain(evidence: JsonObject) -> None:
+    chain = evidence["audit_chain"]
+    score = chain["score"]
+    prediction = chain["prediction_audit"]
+    prediction_commitment = "sha256:" + "2" * 64
+    score.update(
+        {
+            "status": "scored_pending_prediction_audit",
+            "prediction_commitment_sha256": prediction_commitment,
+            "quality_decision_sha256": "sha256:" + "3" * 64,
+            "quality_decision_passed": True,
+            "support_failure_codes": [],
+        }
+    )
+    prediction.update(
+        {
+            "status": "accepted",
+            "receipt_sha256": "sha256:" + "4" * 64,
+            "manifest_sha256": "sha256:" + "5" * 64,
+            "artifacts_sha256": "sha256:" + "6" * 64,
+            "prediction_commitment_sha256": prediction_commitment,
+            "unresolved_cases": 0,
+            "gold_defects": 0,
+            "decision_eligible": True,
+            "release": "quality_eligible",
+        }
+    )
 
 
 def _sync_bound_manifest(manifest: JsonObject, evidence: JsonObject) -> None:
+    manifest["audit_plan_sha256"] = evidence["audit_plan_sha256"]
     manifest["thresholds_sha256"] = evidence["thresholds_sha256"]
     manifest["performance_manifest_sha256"] = evidence["performance_manifest_sha256"]
     evidence["manifest_sha256"] = hash_enron_manifest(manifest)
@@ -1103,16 +1193,59 @@ def _promotable(
     value["software"]["git_commit"] = release_commit
     bound_manifest["commands"] = copy.deepcopy(value["commands"])
 
-    bound_manifest["source"]["input_records"] = 145
-    bound_manifest["preparation"]["output_records"] = 145
-    bound_manifest["splits"]["roles"]["test"].update({"records": 120, "groups": 120})
+    bound_manifest["source"]["input_records"] = 51_729
+    bound_manifest["preparation"]["output_records"] = 51_729
+    bound_manifest["splits"]["roles"]["test"].update({"records": 51_704, "groups": 51_704})
     natural_label = bound_manifest["labels"][0]
-    natural_label["role_populations"][0].update({"documents": 120, "spans": 200})
-    natural_label["span_count"] = 200
-    natural_label["annotation_scope"]["document_regions"] = copy.deepcopy(
-        bound_manifest["preparation"]["text_views"][0]["document_regions"]
+    natural_label.update(
+        {
+            "id": "independent_person_contact_labels",
+            "annotation_scope": {
+                **natural_label["annotation_scope"],
+                "entity_classes": ["contact", "person"],
+                "document_regions": copy.deepcopy(bound_manifest["preparation"]["text_views"][0]["document_regions"]),
+                "exclusions": [],
+            },
+            "role_populations": [{"role": "test", "documents": 100, "spans": 200}],
+            "artifact": {
+                "id": "independent_person_contact_labels",
+                "sha256": _sha256_number(930),
+                "bytes": 2048,
+            },
+            "span_count": 200,
+        }
     )
-    natural_label["annotation_scope"]["exclusions"] = []
+    natural_label["annotation_provenance"]["adjudication_artifact"] = {
+        "id": "independent_person_contact_adjudication",
+        "sha256": _sha256_number(931),
+        "bytes": 1024,
+    }
+    class_labels: list[JsonObject] = []
+    for number, entity_class in enumerate(("person", "contact"), start=932):
+        label = copy.deepcopy(natural_label)
+        label.update(
+            {
+                "id": f"independent_{entity_class}_labels",
+                "annotation_scope": {
+                    **label["annotation_scope"],
+                    "entity_classes": [entity_class],
+                },
+                "role_populations": [{"role": "test", "documents": 100, "spans": 100}],
+                "artifact": {
+                    "id": f"independent_{entity_class}_labels",
+                    "sha256": _sha256_number(number),
+                    "bytes": 1024,
+                },
+                "span_count": 100,
+            }
+        )
+        label["annotation_provenance"]["adjudication_artifact"] = {
+            "id": f"independent_{entity_class}_adjudication",
+            "sha256": _sha256_number(number + 10),
+            "bytes": 512,
+        }
+        class_labels.append(label)
+    bound_manifest["labels"] = [natural_label, *class_labels, *bound_manifest["labels"][1:]]
     value["source"] = copy.deepcopy(bound_manifest["source"])
     value["preparation"] = copy.deepcopy(bound_manifest["preparation"])
     value["splits"] = copy.deepcopy(bound_manifest["splits"])
@@ -1120,13 +1253,16 @@ def _promotable(
     quality["annotation_scope"] = copy.deepcopy(natural_label["annotation_scope"])
     quality.update(
         {
+            "id": "person_contact_all_test",
+            "label_artifact_id": natural_label["id"],
+            "entity_class": "person_contact",
             "promotion_gate": True,
-            "documents": 120,
-            "documents_with_sensitive_gold": 100,
-            "documents_with_any_miss": 5,
+            "documents": 100,
+            "documents_with_sensitive_gold": 80,
+            "documents_with_any_miss": 4,
             "documents_with_cataloged_gold": 80,
             "documents_with_any_cataloged_miss": 0,
-            "documents_with_any_leaked_character": 5,
+            "documents_with_any_leaked_character": 4,
             "gold_spans": 200,
             "predicted_spans": 200,
             "true_positive": 190,
@@ -1159,19 +1295,80 @@ def _promotable(
             },
         }
     )
-    bound_manifest["quality_plan"][0].update(
+    diagnostic_slices: list[JsonObject] = []
+    for entity_class, label in zip(("person", "contact"), class_labels, strict=True):
+        diagnostic = copy.deepcopy(quality)
+        diagnostic.update(
+            {
+                "id": f"{entity_class}_all_test",
+                "label_artifact_id": label["id"],
+                "annotation_scope": copy.deepcopy(label["annotation_scope"]),
+                "entity_class": entity_class,
+                "promotion_gate": False,
+                "documents_with_sensitive_gold": 40,
+                "documents_with_any_miss": 2,
+                "documents_with_cataloged_gold": 40,
+                "documents_with_any_cataloged_miss": 0,
+                "documents_with_any_leaked_character": 2,
+                "gold_spans": 100,
+                "predicted_spans": 100,
+                "true_positive": 95,
+                "false_positive": 5,
+                "false_negative": 5,
+                "cataloged_gold_spans": 80,
+                "cataloged_true_positive": 80,
+                "cataloged_false_negative": 0,
+                "cataloged_wrong_canonical": 0,
+                "sensitive_gold_characters": 500,
+                "covered_sensitive_characters": 490,
+                "leaked_sensitive_characters": 10,
+                "predicted_characters": 555,
+                "over_redacted_characters": 65,
+                "negative_documents": 60,
+                "negative_documents_with_predictions": 5,
+                "metrics": {
+                    "precision": 0.95,
+                    "open_world_recall": 0.95,
+                    "f1": 0.95,
+                    "catalog_coverage": 0.8,
+                    "cataloged_recall": 1.0,
+                    "document_leak_rate": 0.05,
+                    "cataloged_document_leak_rate": 0.0,
+                    "sensitive_character_recall": 0.98,
+                    "sensitive_character_leak_rate": 0.02,
+                    "negative_document_false_alarm_rate": 5 / 60,
+                    "over_redaction_rate": 0.0065,
+                },
+            }
+        )
+        diagnostic_slices.append(diagnostic)
+    value["quality"]["slices"] = [quality, *diagnostic_slices]
+
+    combined_plan = bound_manifest["quality_plan"][0]
+    combined_plan.update(
         {
+            "id": quality["id"],
+            "label_artifact_id": natural_label["id"],
+            "entity_class": "person_contact",
             "promotion_gate": True,
-            "documents": quality["documents"],
-            "documents_with_sensitive_gold": quality["documents_with_sensitive_gold"],
-            "negative_documents": quality["negative_documents"],
-            "gold_spans": quality["gold_spans"],
-            "cataloged_gold_spans": quality["cataloged_gold_spans"],
-            "documents_with_cataloged_gold": quality["documents_with_cataloged_gold"],
-            "sensitive_gold_characters": quality["sensitive_gold_characters"],
-            "evaluated_characters": quality["evaluated_characters"],
+            "sample_design": _sample_design(920),
+            "sample_documents": quality["documents"],
+            "frame_documents": bound_manifest["splits"]["roles"]["test"]["records"],
         }
     )
+    diagnostic_plans: list[JsonObject] = []
+    for diagnostic, label in zip(diagnostic_slices, class_labels, strict=True):
+        plan = copy.deepcopy(combined_plan)
+        plan.update(
+            {
+                "id": diagnostic["id"],
+                "label_artifact_id": label["id"],
+                "entity_class": diagnostic["entity_class"],
+                "promotion_gate": False,
+            }
+        )
+        diagnostic_plans.append(plan)
+    bound_manifest["quality_plan"] = [combined_plan, *diagnostic_plans]
     inventories = _add_required_performance_matrix(value)
 
     quality_index = 0
@@ -1326,6 +1523,7 @@ def _promotable(
     ]
     value["promotion"]["passed"] = True
     value["verifier"]["passed"] = True
+    _accept_audit_chain(value)
     _refresh_frozen_contract(value)
     _sync_bound_manifest(bound_manifest, value)
     result = (bound_manifest, value, inventories)
@@ -1427,6 +1625,25 @@ def _unevaluated(evidence: JsonObject) -> JsonObject:
     return value
 
 
+def _insufficient_support_without_quality(evidence: JsonObject) -> JsonObject:
+    value = copy.deepcopy(evidence)
+    value["quality"] = {
+        "evaluated": False,
+        "matching_semantics": value["quality"]["matching_semantics"],
+        "character_position_semantics": value["quality"]["character_position_semantics"],
+        "slices": [],
+    }
+    value["promotion"]["passed"] = False
+    value["promotion"]["claims"] = []
+    value["verifier"]["passed"] = False
+    for check in value["promotion"]["checks"]:
+        if check["category"] == "quality":
+            check["actual"] = None
+            check["passed"] = False
+    _refresh_frozen_contract(value)
+    return value
+
+
 def _drop_performance_assertions(evidence: JsonObject) -> None:
     evidence["promotion"]["checks"] = [
         check for check in evidence["promotion"]["checks"] if check["category"] != "performance"
@@ -1491,6 +1708,8 @@ def test_contract_rejects_non_json_or_out_of_range_numeric_values(
 @pytest.mark.parametrize(
     "field",
     [
+        "audit_plan_sha256",
+        "audit_chain",
         "artifact_kind",
         "evaluator",
         "source",
@@ -1510,6 +1729,12 @@ def test_evidence_requires_each_provenance_family(evidence: JsonObject, field: s
     _assert_code(validate_enron_evidence(evidence), "contract.schema.required")
 
 
+def test_manifest_requires_preregistered_audit_plan_hash(manifest: JsonObject) -> None:
+    del manifest["audit_plan_sha256"]
+
+    _assert_code(validate_enron_manifest(manifest), "contract.schema.required")
+
+
 def test_synthetic_fixtures_are_valid_exactly_bound_and_nonclaimable(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
@@ -1519,8 +1744,127 @@ def test_synthetic_fixtures_are_valid_exactly_bound_and_nonclaimable(
     assert evidence["manifest_sha256"] == hash_enron_manifest(manifest)
     assert evidence["promotion"]["passed"] is False
     assert evidence["verifier"]["passed"] is False
+    assert evidence["audit_chain"]["score"]["status"] == "insufficient_support"
+    assert evidence["audit_chain"]["prediction_audit"]["release"] == "do_not_ship"
     assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
     assert validate_enron_evidence(evidence, manifest=manifest) == {"valid": True, "diagnostics": []}
+
+
+def test_truthful_insufficient_support_preserves_frozen_quality_checks_without_scanning(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    value = _insufficient_support_without_quality(evidence)
+    quality_checks = [check for check in value["promotion"]["checks"] if check["category"] == "quality"]
+
+    assert quality_checks
+    assert all(check["target"].startswith("/quality/slices/0/") for check in quality_checks)
+    assert all(check["actual"] is None and check["passed"] is False for check in quality_checks)
+    assert value["thresholds_sha256"] == evidence["thresholds_sha256"]
+    assert validate_enron_evidence(value, manifest=manifest) == {"valid": True, "diagnostics": []}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("score_status", "contract.gate_target"),
+        ("prediction_status", "contract.gate_target"),
+        ("quality_evaluated", "contract.gate_target"),
+        ("quality_slices", "contract.gate_actual"),
+        ("quality_actual", "contract.gate_target"),
+        ("quality_passed", "contract.gate_target"),
+        ("claims", "contract.gate_target"),
+        ("promotion_passed", "contract.gate_target"),
+        ("verifier_passed", "contract.gate_target"),
+        ("support_failure_code", "contract.gate_target"),
+        ("score_artifacts", "contract.gate_target"),
+        ("non_quality_target", "contract.gate_target"),
+    ],
+)
+def test_insufficient_support_quality_gate_exception_rejects_near_misses(
+    evidence: JsonObject, mutation: str, code: str
+) -> None:
+    value = _insufficient_support_without_quality(evidence)
+    quality_check = next(check for check in value["promotion"]["checks"] if check["category"] == "quality")
+    if mutation == "score_status":
+        value["audit_chain"]["score"]["status"] = "scored_pending_prediction_audit"
+    elif mutation == "prediction_status":
+        value["audit_chain"]["prediction_audit"]["status"] = "quality_gates_failed"
+    elif mutation == "quality_evaluated":
+        value["quality"]["evaluated"] = True
+    elif mutation == "quality_slices":
+        value["quality"]["slices"] = copy.deepcopy(evidence["quality"]["slices"])
+    elif mutation == "quality_actual":
+        quality_check["actual"] = 0.0
+    elif mutation == "quality_passed":
+        quality_check["passed"] = True
+    elif mutation == "claims":
+        value["promotion"]["claims"] = [_catalog_claim(value)]
+    elif mutation == "promotion_passed":
+        value["promotion"]["passed"] = True
+    elif mutation == "verifier_passed":
+        value["verifier"]["passed"] = True
+    elif mutation == "support_failure_code":
+        value["audit_chain"]["score"]["support_failure_codes"] = ["not_a_support_floor"]
+    elif mutation == "score_artifacts":
+        value["audit_chain"]["score"]["artifacts_sha256"] = "sha256:" + "f" * 64
+    else:
+        non_quality_check = next(check for check in value["promotion"]["checks"] if check["category"] == "privacy")
+        non_quality_check.update({"target": "/privacy/missing", "actual": None, "passed": False})
+    _refresh_frozen_contract(value)
+
+    _assert_code(validate_enron_evidence(value), code)
+
+
+def test_audit_chain_hash_detects_stage_tampering(evidence: JsonObject) -> None:
+    evidence["audit_chain"]["gold"]["gold_sha256"] = "sha256:" + "f" * 64
+
+    _assert_code(validate_enron_evidence(evidence), "contract.audit_chain_mismatch")
+
+
+@pytest.mark.parametrize(
+    ("path", "replacement"),
+    [
+        (("catalog", "gold_sha256"), "sha256:" + "a" * 64),
+        (("score", "catalog_binding_sha256"), "sha256:" + "b" * 64),
+        (("prediction_audit", "score_manifest_sha256"), "sha256:" + "c" * 64),
+        (("catalog", "audit_output_binding_sha256"), "sha256:" + "d" * 64),
+        (("gold", "unresolved"), 1),
+    ],
+)
+def test_audit_chain_rejects_swapped_or_unresolved_stage(
+    evidence: JsonObject, path: tuple[str, str], replacement: Any
+) -> None:
+    stage, field = path
+    evidence["audit_chain"][stage][field] = replacement
+    evidence["audit_chain"]["chain_sha256"] = hash_enron_audit_chain(evidence["audit_chain"])
+
+    _assert_code(validate_enron_evidence(evidence), "contract.audit_chain_mismatch")
+
+
+def test_audit_chain_requires_every_closed_stage(evidence: JsonObject) -> None:
+    del evidence["audit_chain"]["catalog"]
+
+    _assert_code(validate_enron_evidence(evidence), "contract.schema.required")
+
+
+@pytest.mark.parametrize("terminal_status", ["quality_gates_failed", "invalidated_gold_defect"])
+def test_terminal_do_not_ship_audit_cannot_be_promoted(
+    manifest: JsonObject, evidence: JsonObject, terminal_status: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    prediction = promoted["audit_chain"]["prediction_audit"]
+    prediction["status"] = terminal_status
+    prediction["decision_eligible"] = False
+    prediction["release"] = "do_not_ship"
+    prediction["gold_defects"] = 1 if terminal_status == "invalidated_gold_defect" else 0
+    if terminal_status == "quality_gates_failed":
+        promoted["audit_chain"]["score"]["quality_decision_passed"] = False
+    promoted["audit_chain"]["chain_sha256"] = hash_enron_audit_chain(promoted["audit_chain"])
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.decision_grade_prerequisite",
+    )
 
 
 def test_synthetic_fixture_cannot_self_promote_or_claim_verifier_success(
@@ -1699,6 +2043,63 @@ def test_manifest_quality_plan_is_closed_over_labels_views_and_unique_descriptor
     _assert_code(validate_enron_manifest(manifest), code)
 
 
+def test_promotion_plan_freezes_sample_design_not_postannotation_outcomes(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, _, _ = _promotable(manifest, evidence)
+    plan = bound_manifest["quality_plan"][0]
+
+    assert set(plan) == {
+        "id",
+        "label_artifact_id",
+        "split_role",
+        "entity_class",
+        "cohort",
+        "text_view",
+        "promotion_gate",
+        "sample_design",
+        "sample_documents",
+        "frame_documents",
+    }
+    assert plan["sample_documents"] == 100
+    assert plan["frame_documents"] == 51_704
+    assert plan["sample_documents"] < plan["frame_documents"]
+    assert validate_enron_manifest(bound_manifest) == {"valid": True, "diagnostics": []}
+
+
+def test_quality_plan_rejects_preaccess_observed_denominator(manifest: JsonObject) -> None:
+    manifest["quality_plan"][0]["gold_spans"] = 20
+
+    _assert_code(validate_enron_manifest(manifest), "contract.schema.additionalProperties")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("sample_size", "contract.quality_gate_test_population"),
+        ("frame_size", "contract.quality_plan_sample_frame"),
+        ("selection_method", "contract.schema.const"),
+        ("sample_design_extra", "contract.schema.additionalProperties"),
+    ],
+)
+def test_promotion_plan_sample_design_fails_closed(
+    manifest: JsonObject, evidence: JsonObject, mutation: str, code: str
+) -> None:
+    bound_manifest, _, _ = _promotable(manifest, evidence)
+    plan = bound_manifest["quality_plan"][0]
+    if mutation == "sample_size":
+        plan["sample_documents"] = 101
+        bound_manifest["labels"][0]["role_populations"][0]["documents"] = 101
+    elif mutation == "frame_size":
+        plan["frame_documents"] -= 1
+    elif mutation == "selection_method":
+        plan["sample_design"]["method"] = "prediction_ranked"
+    else:
+        plan["sample_design"]["predictions_consulted"] = False
+
+    _assert_code(validate_enron_manifest(bound_manifest), code)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -1708,42 +2109,166 @@ def test_manifest_quality_plan_is_closed_over_labels_views_and_unique_descriptor
         ("sensitive_gold_characters", 499),
     ],
 )
-def test_decision_grade_quality_plan_rejects_tiny_privacy_support(
+def test_decision_grade_quality_evidence_rejects_tiny_postannotation_support(
     manifest: JsonObject, evidence: JsonObject, field: str, value: int
 ) -> None:
-    bound_manifest, _, _ = _promotable(manifest, evidence)
-    plan = bound_manifest["quality_plan"][0]
-    plan[field] = value
-    label = bound_manifest["labels"][0]
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    quality = promoted["quality"]["slices"][0]
+    quality[field] = value
     if field == "documents":
-        bound_manifest["source"]["input_records"] = 124
-        bound_manifest["preparation"]["output_records"] = 124
-        bound_manifest["splits"]["roles"]["test"].update({"records": value, "groups": value})
-        label["role_populations"][0]["documents"] = value
-        plan["documents_with_sensitive_gold"] = 79
-        plan["negative_documents"] = 20
+        quality["documents_with_sensitive_gold"] = 79
     elif field == "gold_spans":
-        label["role_populations"][0]["spans"] = value
-        label["span_count"] = value
-        plan["cataloged_gold_spans"] = value
+        quality["true_positive"] = 89
     elif field == "negative_documents":
-        plan["documents_with_sensitive_gold"] = plan["documents"] - value
+        quality["documents_with_sensitive_gold"] = quality["documents"] - value
 
-    _assert_code(validate_enron_manifest(bound_manifest), "contract.quality_gate_minimum_support")
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.quality_gate_minimum_support",
+    )
 
 
-def test_quality_gate_must_label_the_entire_frozen_final_test_population(manifest: JsonObject) -> None:
+def test_combined_panel_exact_boundary_passes_with_each_class_below_combined_floors(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    combined, person, contact = promoted["quality"]["slices"]
+
+    def set_span_and_character_support(
+        item: JsonObject,
+        *,
+        gold_spans: int,
+        true_positive: int,
+        false_positive: int,
+        cataloged_gold_spans: int,
+        sensitive_characters: int,
+        covered_characters: int,
+        over_redacted_characters: int,
+    ) -> None:
+        false_negative = gold_spans - true_positive
+        negative_documents_with_predictions = min(item["negative_documents_with_predictions"], false_positive)
+        item.update(
+            {
+                "gold_spans": gold_spans,
+                "predicted_spans": true_positive + false_positive,
+                "true_positive": true_positive,
+                "false_positive": false_positive,
+                "false_negative": false_negative,
+                "cataloged_gold_spans": cataloged_gold_spans,
+                "cataloged_true_positive": cataloged_gold_spans,
+                "cataloged_false_negative": 0,
+                "cataloged_wrong_canonical": 0,
+                "sensitive_gold_characters": sensitive_characters,
+                "covered_sensitive_characters": covered_characters,
+                "leaked_sensitive_characters": sensitive_characters - covered_characters,
+                "predicted_characters": covered_characters + over_redacted_characters,
+                "over_redacted_characters": over_redacted_characters,
+                "negative_documents_with_predictions": negative_documents_with_predictions,
+            }
+        )
+        item["metrics"].update(
+            {
+                "precision": true_positive / item["predicted_spans"],
+                "open_world_recall": true_positive / gold_spans,
+                "f1": 2 * true_positive / (2 * true_positive + false_positive + false_negative),
+                "catalog_coverage": cataloged_gold_spans / gold_spans,
+                "cataloged_recall": 1.0,
+                "sensitive_character_recall": covered_characters / sensitive_characters,
+                "sensitive_character_leak_rate": (sensitive_characters - covered_characters) / sensitive_characters,
+                "negative_document_false_alarm_rate": negative_documents_with_predictions / item["negative_documents"],
+                "over_redaction_rate": over_redacted_characters / item["evaluated_characters"],
+            }
+        )
+
+    set_span_and_character_support(
+        combined,
+        gold_spans=100,
+        true_positive=95,
+        false_positive=5,
+        cataloged_gold_spans=80,
+        sensitive_characters=500,
+        covered_characters=490,
+        over_redacted_characters=65,
+    )
+    for diagnostic in (person, contact):
+        set_span_and_character_support(
+            diagnostic,
+            gold_spans=50,
+            true_positive=48,
+            false_positive=2,
+            cataloged_gold_spans=40,
+            sensitive_characters=250,
+            covered_characters=245,
+            over_redacted_characters=35,
+        )
+    for label, spans in zip(bound_manifest["labels"][:3], (100, 50, 50), strict=True):
+        label["role_populations"][0]["spans"] = spans
+        label["span_count"] = spans
+    for claim in promoted["promotion"]["claims"]:
+        if claim["kind"] == "open_world_quality":
+            claim["value"] = combined["metrics"][claim["metric"]]
+    _refresh_check_actuals(promoted, target_prefix="/quality/")
+    _sync_bound_manifest(bound_manifest, promoted)
+
+    plans = bound_manifest["quality_plan"]
+    assert [item["entity_class"] for item in plans if item["promotion_gate"]] == ["person_contact"]
+    assert {item["sample_documents"] for item in plans} == {100}
+    assert {item["sample_design"]["membership_artifact"]["sha256"] for item in plans} == {
+        plans[0]["sample_design"]["membership_artifact"]["sha256"]
+    }
+    assert person["gold_spans"] < enron_contract.MIN_DECISION_GRADE_GOLD_SPANS
+    assert contact["sensitive_gold_characters"] < enron_contract.MIN_DECISION_GRADE_SENSITIVE_CHARACTERS
+    assert _validate_promoted(promoted, bound_manifest, inventories) == {"valid": True, "diagnostics": []}
+
+
+@pytest.mark.parametrize("mutation", ["span_sum", "character_sum", "joint_negatives", "zero_class"])
+def test_combined_panel_cross_class_support_is_recomputed(
+    manifest: JsonObject, evidence: JsonObject, mutation: str
+) -> None:
+    bound_manifest, promoted, inventories = _promotable(manifest, evidence)
+    combined, person, contact = promoted["quality"]["slices"]
+    if mutation == "span_sum":
+        combined["gold_spans"] += 1
+        combined["false_negative"] += 1
+    elif mutation == "character_sum":
+        combined["sensitive_gold_characters"] += 1
+        combined["leaked_sensitive_characters"] += 1
+    elif mutation == "joint_negatives":
+        combined["negative_documents"] = contact["negative_documents"] + 1
+        combined["documents_with_sensitive_gold"] = combined["documents"] - combined["negative_documents"]
+    else:
+        person["gold_spans"] = 0
+
+    _assert_code(
+        _validate_promoted(promoted, bound_manifest, inventories),
+        "contract.quality_panel_support",
+    )
+
+
+def test_combined_panel_manifest_binds_one_gate_and_identical_sample_membership(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    bound_manifest, _, _ = _promotable(manifest, evidence)
+    bound_manifest["quality_plan"][1]["sample_design"]["membership_artifact"]["sha256"] = _sha256_number(999)
+    _assert_code(validate_enron_manifest(bound_manifest), "contract.quality_panel_sample_binding")
+
+    bound_manifest, _, _ = _promotable(manifest, evidence)
+    bound_manifest["quality_plan"][1]["promotion_gate"] = True
+    _assert_code(validate_enron_manifest(bound_manifest), "contract.quality_panel_promotion_gate")
+
+
+def test_quality_gate_must_label_the_entire_frozen_audit_sample(manifest: JsonObject) -> None:
     label = manifest["labels"][0]
-    label["role_populations"][0]["documents"] = 4
+    label["role_populations"][0]["documents"] = 99
     plan = manifest["quality_plan"][0]
     plan.update(
         {
             "promotion_gate": True,
-            "documents": 4,
-            "documents_with_sensitive_gold": 4,
-            "negative_documents": 0,
+            "sample_documents": 99,
+            "frame_documents": 51_704,
         }
     )
+    manifest["splits"]["roles"]["test"].update({"records": 51_704, "groups": 51_704})
 
     _assert_code(validate_enron_manifest(manifest), "contract.quality_gate_test_population")
 
@@ -1815,9 +2340,11 @@ def test_answer_bearing_view_cannot_be_promoted_by_relabeling_it_primary(
         }
     )
     bound_manifest["preparation"]["text_views"].append(injected_view)
-    bound_manifest["quality_plan"][0]["text_view"] = injected_view["id"]
+    for plan in bound_manifest["quality_plan"]:
+        plan["text_view"] = injected_view["id"]
     promoted["preparation"] = copy.deepcopy(bound_manifest["preparation"])
-    promoted["quality"]["slices"][0]["text_view"] = injected_view["id"]
+    for quality_slice in promoted["quality"]["slices"]:
+        quality_slice["text_view"] = injected_view["id"]
     for claim in promoted["promotion"]["claims"]:
         if claim["kind"] == "open_world_quality":
             claim["scope"]["text_view"] = injected_view["id"]
@@ -1869,9 +2396,6 @@ def test_quality_semantics_lock_exact_spans_and_document_disjoint_positions(
 
 def test_partial_independent_slice_is_diagnostic_only(manifest: JsonObject, evidence: JsonObject) -> None:
     manifest["labels"][0]["annotation_completeness"] = "partial"
-    manifest["quality_plan"][0]["negative_documents"] = 0
-    manifest["quality_plan"][0]["sensitive_gold_characters"] = 0
-    manifest["quality_plan"][0]["evaluated_characters"] = 0
     item = evidence["quality"]["slices"][0]
     item["annotation_completeness"] = "partial"
     item["promotion_gate"] = False
@@ -2054,7 +2578,6 @@ def test_quality_all_cohort_exactly_matches_bound_label_population(
 @pytest.mark.parametrize(
     "field",
     [
-        "documents",
         "documents_with_sensitive_gold",
         "negative_documents",
         "gold_spans",
@@ -2064,10 +2587,21 @@ def test_quality_all_cohort_exactly_matches_bound_label_population(
         "evaluated_characters",
     ],
 )
-def test_quality_evidence_cannot_drift_from_frozen_plan_denominators(
+def test_observed_quality_denominators_are_not_precommitted_in_the_plan(
     manifest: JsonObject, evidence: JsonObject, field: str
 ) -> None:
     evidence["quality"]["slices"][0][field] += 1
+
+    result = validate_enron_evidence(evidence, manifest=manifest)
+
+    assert result["valid"] is False
+    assert "contract.quality_plan_binding" not in _codes(result)
+
+
+def test_quality_evidence_document_population_must_equal_frozen_sample(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    evidence["quality"]["slices"][0]["documents"] += 1
 
     _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.quality_plan_binding")
 
@@ -2305,9 +2839,7 @@ def test_promotion_requires_the_complete_privacy_utility_and_speed_claim_scoreca
     )
 
 
-def test_complete_quality_claim_suite_is_required_for_each_promoted_gate(
-    manifest: JsonObject, evidence: JsonObject
-) -> None:
+def test_exactly_one_combined_quality_gate_is_allowed(manifest: JsonObject, evidence: JsonObject) -> None:
     bound_manifest, promoted, inventories = _promotable(manifest, evidence)
     second_label = copy.deepcopy(bound_manifest["labels"][0])
     second_label["id"] = "independent_person_labels_second"
@@ -2350,10 +2882,7 @@ def test_complete_quality_claim_suite_is_required_for_each_promoted_gate(
         promoted["promotion"]["checks"].append(duplicate)
     _sync_bound_manifest(bound_manifest, promoted)
 
-    _assert_code(
-        _validate_promoted(promoted, bound_manifest, inventories),
-        "contract.missing_required_claim",
-    )
+    _assert_code(_validate_promoted(promoted, bound_manifest, inventories), "contract.quality_panel_promotion_gate")
 
 
 @pytest.mark.parametrize(
@@ -2468,9 +2997,6 @@ def test_quality_gate_uses_exact_count_ratio_at_gte_threshold(manifest: JsonObje
     label = bound_manifest["labels"][0]
     next(item for item in label["role_populations"] if item["role"] == "test")["spans"] = quality["gold_spans"]
     label["span_count"] = quality["gold_spans"]
-    plan = bound_manifest["quality_plan"][0]
-    plan["gold_spans"] = quality["gold_spans"]
-    plan["cataloged_gold_spans"] = quality["cataloged_gold_spans"]
     for claim in promoted["promotion"]["claims"]:
         if claim["kind"] == "open_world_quality":
             claim["value"] = quality["metrics"][claim["metric"]]
@@ -3392,6 +3918,13 @@ def test_bound_evidence_detects_manifest_and_verifier_identity_drift(
     _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.provenance_mismatch")
 
 
+def test_bound_evidence_must_match_manifest_audit_plan(manifest: JsonObject, evidence: JsonObject) -> None:
+    evidence["audit_plan_sha256"] = "sha256:" + "0" * 64
+    _refresh_frozen_contract(evidence)
+
+    _assert_code(validate_enron_evidence(evidence, manifest=manifest), "contract.audit_plan_hash_mismatch")
+
+
 def test_evidence_commands_must_equal_the_frozen_sanitized_manifest_plan(
     manifest: JsonObject, evidence: JsonObject
 ) -> None:
@@ -3411,6 +3944,7 @@ def test_manifest_hash_is_deterministic_and_content_sensitive(manifest: JsonObje
 @pytest.mark.parametrize(
     "field",
     [
+        "audit_plan_sha256",
         "bank_hash",
         "evaluator_source_sha256",
         "split_manifest_sha256",
@@ -5555,9 +6089,22 @@ def test_referenced_input_inventory_collection_limit_fails_closed(evidence: Json
     )
 
 
-def test_contract_loaders_accept_bound_sanitized_fixtures(test_data_path: Path) -> None:
-    manifest = load_enron_manifest(test_data_path / "enron_manifest.json")
-    evidence = load_enron_evidence(test_data_path / "enron_evidence.json", manifest=manifest)
+def test_contract_loaders_accept_bound_sanitized_fixtures(test_data_path: Path, tmp_path: Path) -> None:
+    manifest_value = _with_sampled_quality_plan(
+        json.loads((test_data_path / "enron_manifest.json").read_text(encoding="utf-8"))
+    )
+    evidence_value = json.loads((test_data_path / "enron_evidence.json").read_text(encoding="utf-8"))
+    manifest_value["audit_plan_sha256"] = _AUDIT_PLAN_SHA256
+    evidence_value["audit_plan_sha256"] = _AUDIT_PLAN_SHA256
+    evidence_value["manifest_sha256"] = hash_enron_manifest(manifest_value)
+    _refresh_frozen_contract(evidence_value)
+    manifest_path = tmp_path / "manifest.json"
+    evidence_path = tmp_path / "evidence.json"
+    manifest_path.write_text(json.dumps(manifest_value), encoding="utf-8")
+    evidence_path.write_text(json.dumps(evidence_value), encoding="utf-8")
+
+    manifest = load_enron_manifest(manifest_path)
+    evidence = load_enron_evidence(evidence_path, manifest=manifest)
 
     assert manifest["artifact_kind"] == "synthetic_fixture"
     assert evidence["manifest_sha256"] == hash_enron_manifest(manifest)

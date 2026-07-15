@@ -364,6 +364,21 @@ def _result(phase: str, *, commitments: Mapping[str, Any] | None = None) -> Enro
     )
 
 
+def test_capacity_requires_exact_current_sealed_access_projection() -> None:
+    current = {
+        "status": "sealed_unbound",
+        "access_count": 0,
+        "accessed_at": None,
+        "audit_plan_sha256": None,
+        "audit_output_binding_sha256": None,
+    }
+    assert enron_capacity._sealed_unbound_access({"access": current}) == current  # noqa: SLF001
+
+    missing_plan_field = {key: value for key, value in current.items() if key != "audit_plan_sha256"}
+    with pytest.raises(enron_capacity._CapacityAbort, match="phase_commitment_invalid"):  # noqa: SLF001
+        enron_capacity._sealed_unbound_access({"access": missing_plan_field})  # noqa: SLF001
+
+
 def _checkpoint_all(context: EnronCapacityPhaseContext, probe: _Probe, records: int, *, slow: bool = False) -> None:
     completed = 0
     while completed < records:

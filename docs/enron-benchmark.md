@@ -5,9 +5,9 @@
 > The manifest/evidence schemas, semantic verifier, deterministic private [preparation pipeline](enron-preparation.md),
 > [group-aware split and sealing workflow](enron-splits.md), and [privacy evaluation workflow](enron-evaluation.md) are
 > implemented alongside the [train-only bank workflow](enron-bank-building.md) and
-> [deep-verified performance workflow](performance.md#decision-grade-performance-benchmark-standard). A fresh production-capacity
-> result is required, and bank cards remain non-promotable until the mandatory full-source streaming/resource proof,
-> one-shot sealed evaluation, final privacy verification, and append-only lineage evidence are complete.
+> [deep-verified performance workflow](performance.md#decision-grade-performance-benchmark-standard). The production
+> full-source capacity run is complete. Bank cards remain non-promotable until the frozen performance run, one-shot
+> 100-document sealed gold audit, final aggregate verification, and append-only lineage evidence are complete.
 
 NERB's Enron benchmark is designed to demonstrate a privacy-first intelligence-cache workflow: a capable agent turns a
 large private organizational source into a reviewed entity bank once; an application compiles that bank once and reuses
@@ -128,11 +128,12 @@ from different strengths, scopes, or completeness states stay separate.
 | `synthetic_conformance` | Positive, negative, boundary, normalization, overlap, and adversarial cases derived from the frozen active bank contract. | Catalog conformance and canonical-mapping guarantees. Not catalog coverage or open-world recall. |
 | `unlabeled` | Text with no exhaustive gold spans. Absence of a label is not evidence that a prediction is wrong. | Throughput, memory, robustness, and qualitative inspection only; no precision, recall, or F1. |
 
-The manifest binds exact document and span populations for each role covered by a label artifact. Every natural-text
-`independent` or `structured_weak` artifact covers one entity class so those populations cannot be hidden in a vague
-multi-class total. Annotation provenance records the protocol and producer, reviewer, review status, and adjudication
-artifact. `independent` and `synthetic_conformance` labels require a distinct reviewer and content-addressed
-adjudication evidence; declaring a label independently reviewed is not enough by itself.
+The manifest binds exact document and span populations for each role covered by a label artifact. The promoted Enron
+panel has one combined `person_contact` artifact and gate so document and character unions are measured once across the
+active privacy scope. Separate person and contact artifacts and diagnostic slices expose each class's support; neither
+class can be hidden in the combined total. Annotation provenance records the protocol and producer, reviewer, review
+status, and adjudication artifact. `independent` and `synthetic_conformance` labels require a distinct reviewer and
+content-addressed adjudication evidence; declaring a label independently reviewed is not enough by itself.
 
 Only an `independent`, `exhaustive_within_scope` slice may support open-world PII recall, precision/F1, negative-document
 false-alarm rate, leaked-sensitive-character measures, or over-redaction measures. A `partial` independent slice may
@@ -177,18 +178,19 @@ changes and decisions informed by its outcome; it never replaces or hides that r
 final test or selectively surfacing only successful runs invalidates promotion.
 
 Before access, the manifest designates exactly one prepared primary natural-content view and binds its artifact and
-content policy. A promoted quality run must attest that this view contains no answer-bearing fields. The manifest also
-freezes each quality slice's label artifact, role, class, cohort, text view, gate status, and exact document, span,
-cataloged-span, sensitive-positive, catalog-positive, negative-document, sensitive-character, and evaluated-character
-denominators. Evidence must preserve the plan's order and membership; each gate slice is the complete independently and
-exhaustively labeled final-test role, not a favorable subsample. Its annotation regions must equal the complete primary
-view, and its annotation scope cannot exclude any part of that view.
+content policy. A promoted quality run must attest that this view contains no answer-bearing fields. The preregistered
+plan freezes the deterministic 100-document, 100-distinct-group sample design and its 51,704-document frame, plus the
+bank, evaluator, thresholds, performance plan, annotation/catalog/execution policies, resource ceilings, and no-tuning
+rule. Outcome-dependent span, catalog, negative-document, and character denominators are bound only after independent
+annotation. Evidence must preserve the exact sample membership. The combined gate and its person/contact diagnostics
+cover every sampled document and the complete primary view without exclusions.
 
 The conformance plan separately freezes content-addressed positive and negative/adversarial case artifacts, their
 counts, the exhaustive synthetic label artifact, and the conformance policy hash. It requires positive support for every
-active pattern. The final-test frozen target and every lineage entry bind the manifest hash alongside the bank,
-evaluator, split, exact final-test artifact, thresholds, performance plan, source commit, and freeze time. Reusing that
-test artifact for another release candidate invalidates the lineage.
+active pattern. The final-test frozen target and every lineage entry bind the preregistered audit-plan hash alongside
+the bank, evaluator, split, exact final-test artifact, thresholds, performance plan, source commit, and freeze time.
+The final evidence separately binds both that audit plan and the complete supplied manifest. Reusing that test artifact
+for another release candidate invalidates the lineage.
 
 ## Quality Metrics
 
@@ -252,9 +254,10 @@ The evidence also reports total positive/negative documents, gold/predicted span
 numerators and denominators for every rate. Per-class, head/tail, seen/unseen identity, temporal/future, document-size,
 hit-density, and challenge slices are required when applicable. Micro averages never replace these slices.
 
-The benchmark does not assert a binomial confidence interval for quality. The sealed test is a fixed finite evaluation, and
-the contract makes no independent-and-identically-distributed sampling claim that would justify one. This does not
-excuse small evidence: raw support counts and promotion support floors are mandatory and stay visible beside every rate.
+The benchmark does not assert a binomial confidence interval for quality. Its quality result is descriptive evidence for
+one fixed, deterministic stratified 100-document panel selected from the 51,704-document frame. It is not an iid sample,
+a corpus census, or an estimator of corpus-wide prevalence or recall. Raw support counts, stratum counts, and promotion
+support floors remain visible beside every rate.
 
 ## Performance And Scale Protocol
 
@@ -375,12 +378,13 @@ The benchmark has two JSON contracts:
 - `nerb.enron_manifest.v2` binds evaluator ID/digest; source ID, revision, and content hashes;
   cleaning/group/split policy hashes; the split-manifest hash; train/validation/test artifact hashes and counts; the
   primary prepared text view; bank hash; exact per-role label populations and annotation provenance; quality-denominator
-  and positive/negative conformance plans; package, native-engine, commit, and schema identities; exact commands;
-  environment; and privacy-safe validation status.
-- `nerb.enron_evidence.v2` binds one manifest hash to evaluation status, aggregate quality slices, catalog-conformance
-  results, the final-test frozen target and lineage, performance banks and inputs, raw timing samples or references plus
-  raw RSS samples, frozen command/spec/source-bound performance harnesses, exact baseline comparisons and additive value
-  models, configured thresholds, promotion-gate results, verifier status, and supportable claims.
+  and positive/negative conformance plans; the preregistered audit-plan hash; package, native-engine, commit, and schema
+  identities; exact commands; environment; and privacy-safe validation status.
+- `nerb.enron_evidence.v2` cross-binds the manifest and preregistered audit-plan hashes to evaluation status, aggregate
+  quality slices, catalog-conformance results, the final-test frozen target and lineage, performance banks and inputs,
+  raw timing samples or references plus raw RSS samples, frozen command/spec/source-bound performance harnesses, exact
+  baseline comparisons and additive value models, configured thresholds, promotion-gate results, verifier status, and
+  supportable claims.
 
 Bank provenance separately records the byte count of the physical content-addressed bank artifact and the byte count of
 its canonical serialization. The performance-bank artifact reference binds the physical file hash and size; it must not
@@ -426,12 +430,14 @@ A result is promotable only when all applicable checks pass:
    appear in public artifacts; and
 8. an independent reviewer verifies the evidence/claim mapping at the final commit.
 
-Every promotion-gate quality slice must contain at least 100 documents, 100 gold spans, 20 negative documents, and 500
-sensitive-gold characters. Validation may tighten, but cannot weaken, the policy floors: open-world recall at least
-0.95, catalog coverage at least 0.80, cataloged recall exactly 1.0, and sensitive-character recall at least 0.98. The
-corresponding ceilings are document leak rate 0.05, sensitive-character leak rate 0.02, negative-document false-alarm
-rate 0.50, and over-redaction rate 0.05. Zero cataloged misses, wrong canonical mappings, and catalog-miss documents are
-separate exact gates.
+The single combined person-contact promotion slice must contain exactly the 100 sampled documents, at least 100 total
+gold spans, at least 20 documents negative across both active classes, and at least 500 union sensitive-gold characters.
+Both person and contact must have nonzero gold support. These floors are applied once to the combined panel, never once
+per class and never by summing document counts. Validation may tighten, but cannot weaken, the policy floors:
+open-world recall at least 0.95, catalog coverage at least 0.80, cataloged recall exactly 1.0, and sensitive-character
+recall at least 0.98. The corresponding ceilings are document leak rate 0.05, sensitive-character leak rate 0.02,
+negative-document false-alarm rate 0.50, and over-redaction rate 0.05. Zero cataloged misses, wrong canonical mappings,
+and catalog-miss documents are separate exact gates.
 
 Structured public claims are not selected from convenient diagnostics. Promotion requires the full quality metric set
 for every gate-designated slice, a passing catalog-conformance claim, and performance claims tied to the exact promoted
@@ -447,10 +453,11 @@ are false. Recording a failure is mandatory evidence; it is never itself a passi
 
 ## Artifact Retention And Ethics
 
-Enron data contains real communications and personal information. Historical public availability does not imply consent
-to republish, contact, rank, or profile people. The benchmark is for aggregate software evaluation only. Known annotation
-gaps, historical-domain bias, source integrity limitations, access terms, and intended use must be recorded with every
-manifest.
+The pinned Enron dataset is already public and authorized for this benchmark. That permits agent inspection of sampled
+messages; it does not create a product need to republish message text, identifiers, ranks, or per-document failure
+material. Those details remain outside public benchmark evidence to preserve the blinded protocol and minimize needless
+redistribution. Known annotation gaps, historical-domain bias, source integrity limitations, access terms, and intended
+use must be recorded with every manifest.
 
 Raw downloads, cleaned text, annotations, split files, real banks, aliases, match records, failure examples, and
 optimization logs stay under ignored `.nerb/` paths or an equivalently access-controlled store. Encrypt them at rest

@@ -30,7 +30,13 @@ from .bank import hash_bank
 from .engine import DEFAULT_MAX_SCAN_INPUT_BYTES
 from .engines import compile_bank, extraction_semantics_sha256
 from .enron_activity import ACTIVITY_RECORD_INTERVAL
-from .enron_contract import CHARACTER_POSITION_SEMANTICS, MATCHING_SEMANTICS, validate_enron_quality_output
+from .enron_contract import (
+    CHARACTER_POSITION_SEMANTICS,
+    MATCHING_SEMANTICS,
+    PERSON_CONTACT_ENTITY_CLASSES,
+    PERSON_CONTACT_SCOPE_ID,
+    validate_enron_quality_output,
+)
 from .enron_private_io import (
     EnronPrivateIOError,
     PrivateRun,
@@ -42,14 +48,18 @@ from .enron_private_io import (
 __all__ = [
     "EnronQualitySession",
     "EnronQualityError",
+    "PREDICTION_COMMITMENT_SCHEMA_VERSION",
+    "enron_quality_evaluator_identity",
     "evaluate_cmu_enron_training_quality",
     "evaluate_cmu_enron_training_quality_files",
     "evaluate_enron_quality",
     "evaluate_enron_quality_files",
+    "hash_enron_quality_predictions",
     "prepare_enron_quality",
 ]
 
 QUALITY_EXECUTION_SCHEMA_VERSION = "nerb.enron_quality_execution.v2"
+PREDICTION_COMMITMENT_SCHEMA_VERSION = "nerb.enron-prediction-commitment.v1"
 EVALUATOR_ID = "nerb-enron-quality"
 EVALUATOR_VERSION = "2.0.0"
 DEFAULT_MAX_QUALITY_LINE_BYTES = 16 * 1024 * 1024
@@ -68,6 +78,9 @@ _METADATA_COMMITMENT_MODULUS = 1 << 512
 
 _DOCUMENT_FIELDS = frozenset({"document_id", "text", "text_view", "split_role"})
 _GOLD_FIELDS = frozenset({"document_id", "entity_class", "start", "end", "catalog_identity"})
+_PREDICTION_PAYLOAD_FIELDS = frozenset(
+    {"document_id", "entity_class", "start", "end", "entity_id", "name_id", "pattern_id"}
+)
 _CATALOG_IDENTITY_FIELDS = frozenset({"entity_id", "name_id", "pattern_id"})
 _ANNOTATION_SCOPE_FIELDS = frozenset({"entity_classes", "document_regions", "span_policy_sha256", "exclusions"})
 _UNSUPPORTED_SLICE_FIELDS = frozenset({"id", "dimension", "reason_code"})
@@ -116,6 +129,11 @@ _LABEL_SCHEMA_DESCRIPTOR = {
 _POLICY_DESCRIPTOR = {
     "version": "nerb.enron-quality-policy.v2",
     "matching": MATCHING_SEMANTICS,
+    "combined_scope": {
+        "id": PERSON_CONTACT_SCOPE_ID,
+        "entity_classes": list(PERSON_CONTACT_ENTITY_CLASSES),
+        "character_accounting": "cross_class_interval_union",
+    },
     "native_offsets": "utf8_byte",
     "quality_offsets": CHARACTER_POSITION_SEMANTICS,
     "catalog_eligibility": "explicit_frozen_gold_active_entity_name_and_pattern_qualification_or_null",
@@ -128,6 +146,19 @@ _POLICY_DESCRIPTOR = {
     "prediction_limits": {
         "per_document": DEFAULT_MAX_QUALITY_PREDICTIONS_PER_DOCUMENT,
         "total": DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL,
+    },
+    "prediction_commitment": {
+        "schema_version": PREDICTION_COMMITMENT_SCHEMA_VERSION,
+        "order": "document_consume_order_then_deterministic_scan_order",
+        "fields": [
+            "document_id",
+            "entity_class",
+            "start",
+            "end",
+            "entity_id",
+            "name_id",
+            "pattern_id",
+        ],
     },
 }
 
@@ -272,6 +303,10 @@ class _SliceSpec:
             "primary_for_quality": self.text_view_primary_for_quality,
             "answer_bearing_fields_included": self.text_view_answer_bearing_fields_included,
         }
+
+
+def _slice_entity_classes(spec: _SliceSpec) -> tuple[str, ...]:
+    return PERSON_CONTACT_ENTITY_CLASSES if spec.entity_class == PERSON_CONTACT_SCOPE_ID else (spec.entity_class,)
 
 
 @dataclass(slots=True)
@@ -611,6 +646,7 @@ class EnronQualitySession:
         "_spool_cleanup",
         "_policy_sha256",
         "_prediction_count",
+        "_prediction_digest",
         "_result",
         "_spec_by_id",
         "_specs",
@@ -671,6 +707,7 @@ class EnronQualitySession:
         self._diagnostics = _DiagnosticReservoir(max_diagnostics)
         self._accumulators = {spec.id: _SliceAccumulator() for spec in specs}
         self._prediction_count = 0
+        self._prediction_digest = _new_prediction_digest()
         self._gold_count = 0
         self._membership_count = 0
         self._metadata_accumulator = 0
@@ -746,6 +783,33 @@ class EnronQualitySession:
     ) -> None:
         """Consume one document and its complete gold/membership envelope."""
 
+        self._consume(document, gold_spans, slice_ids, return_predictions=False)
+
+    def consume_with_predictions(
+        self,
+        document: Mapping[str, Any],
+        gold_spans: Iterable[Mapping[str, Any]],
+        slice_ids: Sequence[str],
+    ) -> tuple[dict[str, Any], ...]:
+        """Consume once and return private coordinate/identity predictions.
+
+        This is the steward path for a post-score error audit.  It exposes no
+        matched strings, and it avoids rescanning a frozen gold document merely
+        to recover the predictions used by the score.
+        """
+
+        return self._consume(document, gold_spans, slice_ids, return_predictions=True)
+
+    def _consume(
+        self,
+        document: Mapping[str, Any],
+        gold_spans: Iterable[Mapping[str, Any]],
+        slice_ids: Sequence[str],
+        *,
+        return_predictions: bool,
+    ) -> tuple[dict[str, Any], ...]:
+        """Implement the single scan shared by aggregate and audit callers."""
+
         self._require_active()
         try:
             if self._stream_records >= DEFAULT_MAX_QUALITY_DOCUMENTS:
@@ -773,6 +837,7 @@ class EnronQualitySession:
             self._prediction_count += len(predictions)
             if self._prediction_count > self._max_predictions_total:
                 raise EnronQualityError("Quality scan exceeded the cumulative prediction limit.")
+            self._commit_predictions(predictions)
             for spec in assigned_specs:
                 reasons = _accumulate_slice_document(
                     self._accumulators[spec.id],
@@ -789,6 +854,9 @@ class EnronQualitySession:
             if self._stream_records % 1_024 == 0:
                 self._connection.commit()
                 self._assert_spool_current()
+            if not return_predictions:
+                return ()
+            return tuple(_prediction_payload(item) for item in predictions)
         except BaseException as exc:
             if self._state != "active":
                 raise exc
@@ -844,12 +912,17 @@ class EnronQualitySession:
             }
             if any(spec.promotion_gate for spec in self._specs) and contract_validation["valid"] is not True:
                 raise EnronQualityError("Promotion-gated quality output failed standalone contract validation.")
+            prediction_commitment = _finish_prediction_commitment(
+                self._prediction_digest,
+                self._prediction_count,
+            )
             run_sha256 = _canonical_hash(
                 {
                     "protocol_sha256": protocol_sha256,
                     "catalog_binding_sha256": catalog_binding_sha256,
                     "canonical_bank_sha256": self._canonical_bank_sha256,
                     "engine_bank_sha256": self._engine_bank_sha256,
+                    "prediction_commitment": prediction_commitment,
                     "quality": quality,
                     "contract_validation": contract_validation,
                     "unsupported_slices": unsupported_slices,
@@ -862,6 +935,7 @@ class EnronQualitySession:
                 "policy_sha256": self._policy_sha256,
                 "protocol_sha256": protocol_sha256,
                 "catalog_binding_sha256": catalog_binding_sha256,
+                "prediction_commitment": prediction_commitment,
                 "run_sha256": run_sha256,
                 "bank": {
                     "canonical_sha256": self._canonical_bank_sha256,
@@ -881,6 +955,17 @@ class EnronQualitySession:
             if self._state != "active":
                 raise exc
             self._fail(exc)
+
+    def _commit_predictions(self, predictions: Sequence[_Prediction]) -> None:
+        """Bind every text-free prediction in the exact scan stream order."""
+
+        previous_count = self._prediction_count - len(predictions)
+        for index, item in enumerate(predictions):
+            _update_prediction_digest(
+                self._prediction_digest,
+                previous_count + index,
+                _prediction_payload(item),
+            )
 
     def _record_commitment_metadata(
         self,
@@ -1559,15 +1644,24 @@ def _prepare_slices(values: Sequence[Mapping[str, Any]]) -> tuple[_SliceSpec, ..
             raise EnronQualityError(f"Slice spec {index} split_role is invalid.")
         if type(promotion_gate) is not bool:
             raise EnronQualityError(f"Slice spec {index} promotion_gate must be a boolean.")
+        if entity_class == PERSON_CONTACT_SCOPE_ID:
+            if annotation_scope["entity_classes"] != PERSON_CONTACT_ENTITY_CLASSES:
+                raise EnronQualityError(
+                    f"Slice spec {index} person-contact scope must contain exact contact and person classes."
+                )
+        elif len(annotation_scope["entity_classes"]) != 1 or annotation_scope["entity_classes"] != (entity_class,):
+            raise EnronQualityError(f"Slice spec {index} must expose exactly its declared entity class.")
         if promotion_gate and (
-            label_strength != "independent" or completeness != "exhaustive_within_scope" or split_role != "test"
+            entity_class != PERSON_CONTACT_SCOPE_ID
+            or label_strength != "independent"
+            or completeness != "exhaustive_within_scope"
+            or split_role != "test"
         ):
             raise EnronQualityError(
-                f"Slice spec {index} promotion gate requires independent exhaustive final-test evidence."
+                f"Slice spec {index} promotion gate requires combined independent exhaustive final-test evidence."
             )
         if promotion_gate and (
-            annotation_scope["entity_classes"] != (entity_class,)
-            or set(annotation_scope["document_regions"]) != set(text_view_descriptor["document_regions"])
+            set(annotation_scope["document_regions"]) != set(text_view_descriptor["document_regions"])
             or annotation_scope["exclusions"]
             or cohort != "all"
             or not text_view_descriptor["primary_for_quality"]
@@ -1576,9 +1670,7 @@ def _prepare_slices(values: Sequence[Mapping[str, Any]]) -> tuple[_SliceSpec, ..
             raise EnronQualityError(
                 f"Slice spec {index} promotion gate requires a complete unexcluded annotation scope."
             )
-        if entity_class not in annotation_scope["entity_classes"] or not set(
-            annotation_scope["document_regions"]
-        ).issubset(text_view_descriptor["document_regions"]):
+        if not set(annotation_scope["document_regions"]).issubset(text_view_descriptor["document_regions"]):
             raise EnronQualityError(f"Slice spec {index} is outside its annotation scope.")
         slices.append(
             _SliceSpec(
@@ -1676,7 +1768,7 @@ def _validate_stream_coverage(
 ) -> None:
     if any(spec.split_role != document.split_role or spec.text_view != document.text_view for spec in assigned_specs):
         raise EnronQualityError("A quality slice membership differs from the document role or text view.")
-    covered_classes = {spec.entity_class for spec in assigned_specs}
+    covered_classes = {entity_class for spec in assigned_specs for entity_class in _slice_entity_classes(spec)}
     if any(gold.entity_class not in covered_classes for gold in gold_spans):
         raise EnronQualityError("Every gold span must be assigned to an in-class supported slice.")
     assigned_ids = {spec.id for spec in assigned_specs}
@@ -1810,6 +1902,79 @@ def _scan_document(
     )
 
 
+def _prediction_payload(item: _Prediction) -> dict[str, Any]:
+    return {
+        "document_id": item.document_id,
+        "entity_class": item.entity_class,
+        "start": item.start,
+        "end": item.end,
+        "entity_id": item.entity_id,
+        "name_id": item.name_id,
+        "pattern_id": item.pattern_id,
+    }
+
+
+def _new_prediction_digest() -> Any:
+    digest = sha256()
+    digest.update(b'{"predictions":[')
+    return digest
+
+
+def _update_prediction_digest(digest: Any, count: int, payload: Mapping[str, Any]) -> None:
+    if count:
+        digest.update(b",")
+    digest.update(_canonical_json_bytes(payload))
+
+
+def _finish_prediction_commitment(digest: Any, count: int) -> dict[str, Any]:
+    finalized = digest.copy()
+    finalized.update(b'],"schema_version":' + _canonical_json_bytes(PREDICTION_COMMITMENT_SCHEMA_VERSION) + b"}")
+    return {"count": count, "sha256": "sha256:" + finalized.hexdigest()}
+
+
+def hash_enron_quality_predictions(predictions: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Commit a closed, ordered, text-free quality prediction artifact."""
+
+    digest = _new_prediction_digest()
+    count = 0
+    try:
+        for index, value in enumerate(predictions):
+            if index >= DEFAULT_MAX_QUALITY_PREDICTIONS_TOTAL:
+                raise EnronQualityError("Prediction artifact exceeds the cumulative quality limit.")
+            payload = _prepare_prediction_payload(value, index)
+            _update_prediction_digest(digest, count, payload)
+            count += 1
+    except EnronQualityError:
+        raise
+    except Exception:
+        raise EnronQualityError("Prediction artifact could not be committed safely.") from None
+    return _finish_prediction_commitment(digest, count)
+
+
+def _prepare_prediction_payload(value: Mapping[str, Any], index: int) -> dict[str, Any]:
+    _require_closed_mapping(value, _PREDICTION_PAYLOAD_FIELDS, "prediction", index)
+    document_id = _required_id(value["document_id"], "document_id", index)
+    entity_class = _required_id(value["entity_class"], "entity_class", index)
+    entity_id = _required_id(value["entity_id"], "entity_id", index)
+    name_id = _required_id(value["name_id"], "name_id", index)
+    pattern_id = _required_id(value["pattern_id"], "pattern_id", index)
+    start = _nonnegative_integer(value["start"], "start", index)
+    end = _nonnegative_integer(value["end"], "end", index)
+    if end <= start:
+        raise EnronQualityError(f"Item {index} prediction offsets must define a non-empty span.")
+    if entity_class != entity_id:
+        raise EnronQualityError(f"Item {index} prediction class must equal its entity identifier.")
+    return {
+        "document_id": document_id,
+        "entity_class": entity_class,
+        "start": start,
+        "end": end,
+        "entity_id": entity_id,
+        "name_id": name_id,
+        "pattern_id": pattern_id,
+    }
+
+
 def _selected_byte_to_scalar_boundaries(text: str, requested: set[int]) -> dict[int, int]:
     targets = sorted(requested)
     boundaries: dict[int, int] = {}
@@ -1839,8 +2004,9 @@ def _accumulate_slice_document(
     document_gold: Sequence[_GoldSpan],
     document_predictions: Sequence[_Prediction],
 ) -> tuple[str, ...]:
-    gold = tuple(item for item in document_gold if item.entity_class == spec.entity_class)
-    predictions = tuple(item for item in document_predictions if item.entity_class == spec.entity_class)
+    entity_classes = frozenset(_slice_entity_classes(spec))
+    gold = tuple(item for item in document_gold if item.entity_class in entity_classes)
+    predictions = tuple(item for item in document_predictions if item.entity_class in entity_classes)
     prediction_indices: dict[tuple[str, str, int, int], list[int]] = defaultdict(list)
     for index, prediction in enumerate(predictions):
         prediction_indices[prediction.key].append(index)
@@ -2532,6 +2698,12 @@ def _evaluator_identity() -> dict[str, str]:
         "contract_schema_sha256": _canonical_hash(enron_contract.ENRON_QUALITY_OUTPUT_SCHEMA),
         "execution_semantics_sha256": execution_semantics_sha256,
     }
+
+
+def enron_quality_evaluator_identity() -> dict[str, str]:
+    """Return the frozen evaluator identity used by preregistered audits."""
+
+    return _evaluator_identity()
 
 
 def _normalized_source_sha256(path: Path) -> str:

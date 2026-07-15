@@ -79,7 +79,7 @@ _ANGLE_MESSAGE_ID_RE = re.compile(r"<[^<>\s]{1,512}>")
 _FROZEN_TARGET_KEYS = frozenset(
     {
         "frozen_at",
-        "manifest_sha256",
+        "audit_plan_sha256",
         "bank_hash",
         "evaluator_source_sha256",
         "split_manifest_sha256",
@@ -3830,7 +3830,7 @@ def _verify_evidence_binding(
         "schema_version",
         "benchmark_version",
         "bound_at",
-        "aggregate_sha256",
+        "audit_plan_sha256",
         "frozen_target",
         "preseal_verification_sha256",
         "binding_sha256",
@@ -3839,8 +3839,8 @@ def _verify_evidence_binding(
         set(binding) != expected_keys
         or binding.get("schema_version") != FINAL_TEST_EVIDENCE_BINDING_SCHEMA_VERSION
         or binding.get("benchmark_version") != manifest.get("benchmark_version")
-        or not isinstance(binding.get("aggregate_sha256"), str)
-        or not _SHA256_RE.fullmatch(str(binding["aggregate_sha256"]))
+        or not isinstance(binding.get("audit_plan_sha256"), str)
+        or not _SHA256_RE.fullmatch(str(binding["audit_plan_sha256"]))
         or binding.get("preseal_verification_sha256") != preseal_verification_sha256
     ):
         raise EnronSplitError("Final-test evidence binding schema is invalid.")
@@ -3853,6 +3853,8 @@ def _verify_evidence_binding(
         manifest_sha256,
         str(test_artifact.get("sha256")),
     )
+    if binding["audit_plan_sha256"] != normalized_target["audit_plan_sha256"]:
+        raise EnronSplitError("Final-test audit-plan binding does not match its frozen target.")
     binding_core = {key: binding[key] for key in binding if key != "binding_sha256"}
     expected_binding_sha256 = _hash_bytes(_canonical_json(binding_core).encode("utf-8"))
     if binding.get("binding_sha256") != expected_binding_sha256:
@@ -3904,7 +3906,8 @@ def _verify_access_state(
             "status": "sealed_unbound" if binding is None else "evidence_bound",
             "access_count": 0,
             "accessed_at": None,
-            "aggregate_sha256": None if binding is None else binding["aggregate_sha256"],
+            "audit_plan_sha256": None if binding is None else binding["audit_plan_sha256"],
+            "audit_output_binding_sha256": None,
         }
     assert binding is not None
     claim = (
@@ -3966,7 +3969,8 @@ def _verify_access_state(
             "status": "claimed",
             "access_count": 1,
             "accessed_at": claim["accessed_at"],
-            "aggregate_sha256": binding["aggregate_sha256"],
+            "audit_plan_sha256": binding["audit_plan_sha256"],
+            "audit_output_binding_sha256": None,
         }
     outcome = (
         _read_json_object_snapshot_at(directory_fd, "ACCESS_OUTCOME.json").value
@@ -3983,6 +3987,7 @@ def _verify_access_state(
             "frozen_target_sha256",
             "evidence_binding_sha256",
             "claim_sha256",
+            "audit_output_binding_sha256",
         }
         or outcome.get("schema_version") != FINAL_TEST_ACCESS_SCHEMA_VERSION
     ):
@@ -3996,11 +4001,18 @@ def _verify_access_state(
         or outcome.get("status") not in {"completed", "failed", "aborted"}
     ):
         raise EnronSplitError("Final-test access outcome does not bind its claim.")
+    audit_output_binding_sha256 = outcome.get("audit_output_binding_sha256")
+    if (
+        outcome["status"] == "completed"
+        and (not isinstance(audit_output_binding_sha256, str) or not _SHA256_RE.fullmatch(audit_output_binding_sha256))
+    ) or (outcome["status"] != "completed" and audit_output_binding_sha256 is not None):
+        raise EnronSplitError("Final-test access outcome has an invalid audit-output binding.")
     return {
         "status": outcome["status"],
         "access_count": 1,
         "accessed_at": claim["accessed_at"],
-        "aggregate_sha256": binding["aggregate_sha256"],
+        "audit_plan_sha256": binding["audit_plan_sha256"],
+        "audit_output_binding_sha256": audit_output_binding_sha256,
     }
 
 
@@ -4144,6 +4156,7 @@ def _verify_enron_splits_metadata(
     _assert_private_snapshot_current(sealed_root / "manifest.json", full_manifest_snapshot.file)
     _assert_private_snapshot_current(sealed_root / "PRESEAL_VERIFIED.json", preseal_snapshot.file)
     contract_splits = _contract_split_projection(full_manifest, manifest_sha256)
+    sealed_audit_inputs = _sealed_audit_input_projection(full_manifest, manifest_sha256)
     activity.boundary()
     return {
         "valid": True,
@@ -4163,6 +4176,7 @@ def _verify_enron_splits_metadata(
         "leakage_groups_crossing": 0,
         "test_sealed": True,
         "contract_splits": contract_splits,
+        "sealed_audit_inputs": sealed_audit_inputs,
         "access": access_state,
     }
 
@@ -4228,6 +4242,27 @@ def _contract_split_projection(manifest: Mapping[str, Any], manifest_sha256: str
         "test_sealed": True,
         "seed": manifest["policy"]["seed_sha256"],
         "roles": projected_roles,
+    }
+
+
+def _sealed_audit_input_projection(manifest: Mapping[str, Any], manifest_sha256: str) -> dict[str, Any]:
+    """Project the verified aggregate commitments required before sealed audit access."""
+
+    test_artifact = manifest["roles"]["test"]["artifact"]
+    membership_artifact = manifest["artifacts"]["memberships"]
+
+    def project(descriptor: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "id": descriptor["id"],
+            "sha256": descriptor["sha256"],
+            "bytes": descriptor["bytes"],
+            "records": descriptor["records"],
+        }
+
+    return {
+        "split_manifest_sha256": manifest_sha256,
+        "test_artifact": project(test_artifact),
+        "membership_artifact": project(membership_artifact),
     }
 
 
@@ -4615,6 +4650,69 @@ def _write_exclusive_private_json(root: Path, name: str, value: Mapping[str, Any
         os.close(directory_fd)
 
 
+def _validate_final_test_membership(row: Mapping[str, Any]) -> str:
+    expected_keys = {
+        "schema_version",
+        "document_id",
+        "group_id",
+        "role",
+        "occurrence_count",
+        "temporal",
+        "mailbox",
+        "mailbox_recurrence",
+        "size",
+        "group_size",
+        "identities",
+        "views",
+        "challenges",
+    }
+    temporal = row.get("temporal")
+    identities = row.get("identities")
+    views = row.get("views")
+    document_id = row.get("document_id")
+    group_id = row.get("group_id")
+    occurrence_count = row.get("occurrence_count")
+    challenges = row.get("challenges")
+    if (
+        set(row) != expected_keys
+        or row.get("schema_version") != SPLIT_MEMBERSHIP_SCHEMA_VERSION
+        or not isinstance(document_id, str)
+        or not _DOCUMENT_ID_RE.fullmatch(document_id)
+        or not isinstance(group_id, str)
+        or not _SHA256_RE.fullmatch(group_id)
+        or row.get("role") != "test"
+        or type(occurrence_count) is not int
+        or occurrence_count <= 0
+        or not isinstance(temporal, Mapping)
+        or set(temporal) != {"eligible", "status", "anchor_utc"}
+        or type(temporal.get("eligible")) is not bool
+        or not isinstance(temporal.get("status"), str)
+        or not temporal["status"]
+        or (temporal.get("anchor_utc") is not None and not isinstance(temporal.get("anchor_utc"), str))
+        or any(
+            not isinstance(row.get(field), str) or not row[field]
+            for field in ("mailbox", "mailbox_recurrence", "size", "group_size")
+        )
+        or not isinstance(identities, Mapping)
+        or set(identities) != {"recurrence", "count", "contains_frequency"}
+        or not isinstance(identities.get("recurrence"), str)
+        or not identities["recurrence"]
+        or type(identities.get("count")) is not int
+        or identities["count"] < 0
+        or not isinstance(identities.get("contains_frequency"), list)
+        or any(not isinstance(value, str) or not value for value in identities["contains_frequency"])
+        or identities["contains_frequency"] != sorted(set(identities["contains_frequency"]))
+        or not isinstance(views, Mapping)
+        or set(views) != {"natural", "structured"}
+        or any(type(views.get(field)) is not bool for field in ("natural", "structured"))
+        or not isinstance(challenges, list)
+        or any(not isinstance(value, str) or not value for value in challenges)
+        or challenges != sorted(set(challenges))
+    ):
+        raise EnronSplitError("Sealed test membership schema or role is invalid.")
+    return document_id
+
+
 class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
     """One-shot, preverified final-test descriptor owned by a release steward."""
 
@@ -4622,13 +4720,20 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         "_root",
         "_target",
         "_handle",
+        "_membership_handle",
+        "_membership_descriptor",
         "_expected_records",
         "_expected_sha256",
         "_expected_bytes",
+        "_expected_membership_records",
+        "_expected_membership_sha256",
+        "_expected_membership_bytes",
         "_opened_identity",
+        "_opened_membership_identity",
         "_benchmark_version",
         "_accessed_at",
         "_evidence_binding_sha256",
+        "_audit_output_binding_sha256",
         "_claim_sha256",
         "_claim_published",
         "_directory_fd",
@@ -4642,13 +4747,20 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         self._root = root
         self._target = dict(target)
         self._handle: BinaryIO | None = None
+        self._membership_handle: BinaryIO | None = None
+        self._membership_descriptor: Any = None
         self._expected_records = 0
         self._expected_sha256 = ""
         self._expected_bytes = 0
+        self._expected_membership_records = 0
+        self._expected_membership_sha256 = ""
+        self._expected_membership_bytes = 0
         self._opened_identity: tuple[int, int, int, int, int, int, int] | None = None
+        self._opened_membership_identity: tuple[int, int, int, int, int, int, int] | None = None
         self._benchmark_version = ""
         self._accessed_at = ""
         self._evidence_binding_sha256 = ""
+        self._audit_output_binding_sha256: str | None = None
         self._claim_sha256 = ""
         self._claim_published = False
         self._directory_fd: int | None = None
@@ -4657,23 +4769,23 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
         self._exhausted = False
         self._stream_failed = False
 
-    def bind_evidence(self, aggregate_sha256: str) -> dict[str, Any]:
-        """Durably bind evidence through a stable, path-free error boundary."""
+    def bind_audit_plan(self, audit_plan_sha256: str) -> dict[str, Any]:
+        """Durably bind the preregistered audit plan through a stable error boundary."""
 
         try:
-            return self._bind_evidence(aggregate_sha256)
+            return self._bind_audit_plan(audit_plan_sha256)
         except EnronSplitError:
             raise
         except Exception:
-            raise EnronSplitError("Final-test evidence binding failed safely.") from None
+            raise EnronSplitError("Final-test audit-plan binding failed safely.") from None
 
-    def _bind_evidence(self, aggregate_sha256: str) -> dict[str, Any]:
-        """Durably bind the frozen evaluator/bank aggregate before access."""
+    def _bind_audit_plan(self, audit_plan_sha256: str) -> dict[str, Any]:
+        """Durably bind the exact frozen audit plan before access."""
 
         if self._entered:
             raise EnronSplitError("Final-test evidence must be bound before entering the access context.")
-        if not isinstance(aggregate_sha256, str) or not _SHA256_RE.fullmatch(aggregate_sha256):
-            raise EnronSplitError("Final-test evidence aggregate hash is invalid.")
+        if not isinstance(audit_plan_sha256, str) or not _SHA256_RE.fullmatch(audit_plan_sha256):
+            raise EnronSplitError("Final-test audit plan hash is invalid.")
         root, directory_fd = _open_locked_transition_root(self._root)
         try:
             try:
@@ -4690,6 +4802,8 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
                 manifest_snapshot.file.sha256,
                 str(artifact.get("sha256")),
             )
+            if audit_plan_sha256 != target["audit_plan_sha256"]:
+                raise EnronSplitError("Final-test audit plan hash does not match the frozen target.")
             preseal_snapshot = _verify_preseal_access_metadata(
                 root,
                 manifest=manifest,
@@ -4721,7 +4835,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
                 "schema_version": FINAL_TEST_EVIDENCE_BINDING_SCHEMA_VERSION,
                 "benchmark_version": manifest["benchmark_version"],
                 "bound_at": bound_at,
-                "aggregate_sha256": aggregate_sha256,
+                "audit_plan_sha256": audit_plan_sha256,
                 "frozen_target": target,
                 "preseal_verification_sha256": preseal_snapshot.file.sha256,
             }
@@ -4738,7 +4852,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             self._evidence_binding_sha256 = str(binding["binding_sha256"])
             return {
                 "status": "evidence_bound",
-                "aggregate_sha256": aggregate_sha256,
+                "audit_plan_sha256": audit_plan_sha256,
                 "binding_sha256": binding["binding_sha256"],
             }
         finally:
@@ -4756,8 +4870,40 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             "frozen_target_sha256": _hash_bytes(_canonical_json(self._target).encode("utf-8")),
             "evidence_binding_sha256": self._evidence_binding_sha256,
             "claim_sha256": self._claim_sha256,
+            "audit_output_binding_sha256": (self._audit_output_binding_sha256 if status == "completed" else None),
         }
         _write_exclusive_private_json_at(directory_fd, "ACCESS_OUTCOME.json", outcome)
+
+    def bind_audit_output(self, audit_output_binding_sha256: str) -> dict[str, Any]:
+        """Bind the committed audit output after the complete sealed stream was consumed."""
+
+        try:
+            return self._bind_audit_output(audit_output_binding_sha256)
+        except EnronSplitError:
+            raise
+        except Exception:
+            raise EnronSplitError("Final-test audit-output binding failed safely.") from None
+
+    def _bind_audit_output(self, audit_output_binding_sha256: str) -> dict[str, Any]:
+        if (
+            not self._entered
+            or self._directory_fd is None
+            or not self._claim_published
+            or not self._exhausted
+            or self._stream_failed
+        ):
+            raise EnronSplitError(
+                "Final-test audit output can be bound only after the complete sealed stream was consumed."
+            )
+        if self._audit_output_binding_sha256 is not None:
+            raise EnronSplitError("Final-test audit output has already been bound.")
+        if not isinstance(audit_output_binding_sha256, str) or not _SHA256_RE.fullmatch(audit_output_binding_sha256):
+            raise EnronSplitError("Final-test audit-output binding hash is invalid.")
+        self._audit_output_binding_sha256 = audit_output_binding_sha256
+        return {
+            "status": "audit_output_bound",
+            "audit_output_binding_sha256": audit_output_binding_sha256,
+        }
 
     def _claim_and_open(self) -> EnronFinalTestAccess:
         root, directory_fd = _open_locked_transition_root(self._root)
@@ -4805,6 +4951,7 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             )
             if artifacts.get("test") != artifact:
                 raise EnronSplitError("Sealed test artifact binding is invalid.")
+            self._membership_descriptor = artifacts.get("memberships")
             _verify_descriptor_metadata(
                 root,
                 artifact,
@@ -4913,6 +5060,108 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             raise
         self._exhausted = True
 
+    def iter_records_with_memberships(self) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+        """Yield each final-test record with its exact bound test membership."""
+
+        if self._handle is None or not self._entered:
+            raise EnronSplitError("Final-test access context is not active.")
+        if self._iterated:
+            raise EnronSplitError("Final-test records can be iterated only once.")
+        self._iterated = True
+        try:
+            membership_handle = self._open_membership_stream()
+            yield from self._consume_record_membership_pairs(self._handle, membership_handle)
+        except GeneratorExit:
+            raise
+        except EnronSplitError:
+            self._stream_failed = True
+            raise
+        except (EnronPrivateIOError, OSError, OverflowError, ValueError):
+            self._stream_failed = True
+            raise EnronSplitError("Sealed test content and memberships could not be consumed safely.") from None
+        except BaseException:
+            self._stream_failed = True
+            raise
+        self._exhausted = True
+
+    def _open_membership_stream(self) -> BinaryIO:
+        directory_fd = self._directory_fd
+        descriptor = self._membership_descriptor
+        if directory_fd is None:
+            raise EnronSplitError("Final-test access directory is no longer pinned.")
+        if not isinstance(descriptor, Mapping) or descriptor.get("id") != "test_memberships":
+            raise EnronSplitError("Sealed test membership artifact binding is invalid.")
+        _verify_descriptor_metadata(
+            self._root,
+            descriptor,
+            "memberships.jsonl",
+            self._expected_records,
+            directory_fd=directory_fd,
+        )
+        self._expected_membership_records = int(descriptor["records"])
+        self._expected_membership_sha256 = str(descriptor["sha256"])
+        self._expected_membership_bytes = int(descriptor["bytes"])
+        handle = open_private_binary_input_at(directory_fd, "memberships.jsonl")
+        try:
+            if os.fstat(handle.fileno()).st_size != self._expected_membership_bytes:
+                raise EnronSplitError("Sealed test memberships changed after final access was claimed.")
+            self._opened_membership_identity = _private_regular_identity(os.fstat(handle.fileno()))
+            self._membership_handle = handle
+            return handle
+        except BaseException:
+            try:
+                handle.close()
+            except OSError:
+                pass
+            raise
+
+    def _consume_record_membership_pairs(
+        self,
+        record_handle: BinaryIO,
+        membership_handle: BinaryIO,
+    ) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+        records = self._consume_records(record_handle)
+        memberships = self._consume_memberships(membership_handle)
+        while True:
+            record = next(records, None)
+            membership = next(memberships, None)
+            if record is None or membership is None:
+                if record is not None or membership is not None:
+                    raise EnronSplitError("Sealed test records and memberships differ in length.")
+                return
+            if record.get("document_id") != membership.get("document_id"):
+                raise EnronSplitError("Sealed test records and memberships are not aligned.")
+            yield record, membership
+
+    def _consume_memberships(self, handle: BinaryIO) -> Iterator[dict[str, Any]]:
+        records = 0
+        digest = hashlib.sha256()
+        byte_count = 0
+        previous: str | None = None
+        path = Path("memberships.jsonl")
+        while raw := handle.readline(DEFAULT_MAX_PREPARED_LINE_BYTES + 1):
+            if len(raw) > DEFAULT_MAX_PREPARED_LINE_BYTES:
+                raise EnronSplitError("Sealed test membership record exceeds its byte limit.")
+            row = _parse_frozen_jsonl_object(path, records + 1, raw)
+            if raw != _canonical_line(row):
+                raise EnronSplitError("Sealed test membership record is not canonical.")
+            document_id = _validate_final_test_membership(row)
+            if previous is not None and document_id <= previous:
+                raise EnronSplitError("Sealed test memberships are not canonically ordered.")
+            previous = document_id
+            digest.update(raw)
+            byte_count += len(raw)
+            records += 1
+            yield row
+        if (
+            records != self._expected_membership_records
+            or byte_count != self._expected_membership_bytes
+            or "sha256:" + digest.hexdigest() != self._expected_membership_sha256
+            or self._opened_membership_identity is None
+            or _private_regular_identity(os.fstat(handle.fileno())) != self._opened_membership_identity
+        ):
+            raise EnronSplitError("Sealed test memberships changed during final access.")
+
     def _consume_records(self, handle: BinaryIO) -> Iterator[dict[str, Any]]:
         records = 0
         digest = hashlib.sha256()
@@ -4965,21 +5214,28 @@ class EnronFinalTestAccess(AbstractContextManager["EnronFinalTestAccess"]):
             raise EnronSplitError("Final-test access directory is no longer pinned.")
         close_failed = False
         try:
-            if self._handle is not None:
-                try:
-                    self._handle.close()
-                except OSError:
-                    close_failed = True
-                self._handle = None
-            if exc is None and self._exhausted and not close_failed:
+            for attribute in ("_membership_handle", "_handle"):
+                handle = getattr(self, attribute)
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        close_failed = True
+                    setattr(self, attribute, None)
+            missing_audit_output_binding = (
+                exc is None and self._exhausted and not close_failed and self._audit_output_binding_sha256 is None
+            )
+            if exc is None and self._exhausted and not close_failed and self._audit_output_binding_sha256 is not None:
                 status = "completed"
-            elif exc is not None or self._stream_failed or close_failed:
+            elif exc is not None or self._stream_failed or close_failed or missing_audit_output_binding:
                 status = "failed"
             else:
                 status = "aborted"
             self._publish_outcome(status)
             if close_failed and exc is None:
                 raise EnronSplitError("Final-test content handle could not be closed safely.")
+            if missing_audit_output_binding:
+                raise EnronSplitError("Final-test access exhausted without a committed audit-output binding.")
         except EnronSplitError:
             if exc is None:
                 raise
@@ -5001,6 +5257,79 @@ def begin_enron_final_test_access(
         raise
     except Exception:
         raise EnronSplitError("Final-test access request is invalid.") from None
+
+
+def verify_enron_final_test_access_outcome(
+    sealed_path: Path,
+    *,
+    expected_audit_plan_sha256: str,
+    expected_audit_output_binding_sha256: str,
+) -> dict[str, Any]:
+    """Verify the closed completed-access metadata without reopening sealed content."""
+
+    try:
+        return _verify_enron_final_test_access_outcome(
+            sealed_path,
+            expected_audit_plan_sha256=expected_audit_plan_sha256,
+            expected_audit_output_binding_sha256=expected_audit_output_binding_sha256,
+        )
+    except EnronSplitError:
+        raise
+    except Exception:
+        raise EnronSplitError("Final-test access outcome verification failed safely.") from None
+
+
+def _verify_enron_final_test_access_outcome(
+    sealed_path: Path,
+    *,
+    expected_audit_plan_sha256: str,
+    expected_audit_output_binding_sha256: str,
+) -> dict[str, Any]:
+    if (
+        not isinstance(sealed_path, Path)
+        or not isinstance(expected_audit_plan_sha256, str)
+        or not _SHA256_RE.fullmatch(expected_audit_plan_sha256)
+        or not isinstance(expected_audit_output_binding_sha256, str)
+        or not _SHA256_RE.fullmatch(expected_audit_output_binding_sha256)
+    ):
+        raise EnronSplitError("Final-test access outcome verification options are invalid.")
+    root, directory_fd = _open_locked_transition_root(sealed_path)
+    try:
+        manifest_snapshot = _read_json_object_snapshot_at(directory_fd, "manifest.json")
+        manifest = manifest_snapshot.value
+        _validate_sealed_access_manifest(manifest)
+        preseal_snapshot = _verify_preseal_access_metadata(
+            root,
+            manifest=manifest,
+            manifest_sha256=manifest_snapshot.file.sha256,
+            directory_fd=directory_fd,
+        )
+        _verify_pair_receipt(
+            root,
+            manifest_snapshot.file.sha256,
+            str(manifest.get("benchmark_version")),
+            preseal_verification_sha256=preseal_snapshot.file.sha256,
+            development_manifest_sha256=str(preseal_snapshot.value["development_manifest_sha256"]),
+            development_freeze_receipt_sha256=str(preseal_snapshot.value["freeze_receipt_sha256"]),
+            directory_fd=directory_fd,
+        )
+        result = _verify_access_state(
+            root,
+            manifest,
+            manifest_snapshot.file.sha256,
+            preseal_verification_sha256=preseal_snapshot.file.sha256,
+            directory_fd=directory_fd,
+        )
+        if (
+            result.get("status") != "completed"
+            or result.get("audit_plan_sha256") != expected_audit_plan_sha256
+            or result.get("audit_output_binding_sha256") != expected_audit_output_binding_sha256
+        ):
+            raise EnronSplitError("Final-test access outcome does not match the expected audit output.")
+        _validate_aggregate_privacy(result)
+        return result
+    finally:
+        os.close(directory_fd)
 
 
 def finalize_aborted_enron_final_test_access(sealed_path: Path) -> dict[str, Any]:
@@ -5065,6 +5394,7 @@ def _finalize_aborted_enron_final_test_access(sealed_path: Path) -> dict[str, An
             "frozen_target_sha256": _hash_bytes(_canonical_json(frozen_target).encode("utf-8")),
             "evidence_binding_sha256": claim["evidence_binding_sha256"],
             "claim_sha256": claim["claim_sha256"],
+            "audit_output_binding_sha256": None,
         }
         _assert_private_snapshot_current_at(directory_fd, "manifest.json", manifest_snapshot.file)
         _assert_private_snapshot_current_at(directory_fd, "PRESEAL_VERIFIED.json", preseal_snapshot.file)
