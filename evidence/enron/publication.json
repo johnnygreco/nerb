@@ -22,24 +22,24 @@
       "sha256": "sha256:441d90fc64d45d6febdd2a8ee13d9db25c712d195f4414ca6acb9bf1268ddca2"
     },
     {
-      "bytes": 2287,
+      "bytes": 2928,
       "path": "figures/bank-coverage.svg",
-      "sha256": "sha256:cbc18ab67ea17af31c6a241a2ac2d9a117e06113180560ca59a891c9cb582d96"
+      "sha256": "sha256:9436c8d7b17e0bba23fd5222617f151aea681a34558cb51d5144e0f1483e88f5"
     },
     {
-      "bytes": 2254,
+      "bytes": 3110,
       "path": "figures/known-bank-contract.svg",
-      "sha256": "sha256:c48f1205dfcb4d0733661275fabad288c84e66f4227f574a606babe2e652a05f"
+      "sha256": "sha256:38f0af16b7e514eed280f0061d100767ecc600161d5056275598855f4e9a22a7"
     },
     {
-      "bytes": 1933,
+      "bytes": 2732,
       "path": "figures/performance-scale.svg",
-      "sha256": "sha256:57eea5369f2c0f24baa379fe8d6ba850b38fa1504a24b22ba2560115621d13a2"
+      "sha256": "sha256:d0a1c3a581f84eb2eb593b097f3dce6b2e6f4ea19bed9b0a5da151549787103d"
     },
     {
-      "bytes": 2185,
+      "bytes": 2962,
       "path": "figures/standalone-redaction.svg",
-      "sha256": "sha256:634a205308c844bd05d61577abca5ad72a5ae0dca33b2fb9a1982f5183ec88f2"
+      "sha256": "sha256:e7b0120a5db3f025fc7d2b5fa0f2579afb9132e776498271c33b88beebcf27fa"
     },
     {
       "bytes": 2801,
@@ -87,9 +87,9 @@
       "sha256": "sha256:cf8bc7308772800d0b89dfa29fca9313b044a2527d3f66c11f0c927c201d772c"
     },
     {
-      "bytes": 5556,
+      "bytes": 6107,
       "path": "summary.md",
-      "sha256": "sha256:90bea99d58dfa6e471ea4daaedf15344aac1a77ed252b73dd1240c49cd64bc30"
+      "sha256": "sha256:bddf68cd7eca8fcba0846c6fa2752a826e07a6b177e4a56ca57cfa7af38a0862"
     }
   ],
   "bindings": {
@@ -125,7 +125,7 @@
     "span_surfaces_included": false,
     "violation_count": 0
   },
-  "publication_sha256": "sha256:f55328eb1560a193a0c41436dde179b0ec3fc54512fce8a6f8dce305ebcff97e",
+  "publication_sha256": "sha256:20c62969666c4c6c7345f58a98abbf44eadaa690fc360ec49553fdd21d5abcae",
   "schema_version": "nerb.enron_publication",
   "scope": {
     "active_patterns": 13201,

@@ -1,6 +1,6 @@
 # NERB Enron evidence
 
-**Known-bank contract evidence: PASS.** NERB detected and correctly mapped 39,604 approved cases across all 13,201 active patterns. It produced 0 wrong canonical mappings and 0 unexpected matches on 1,210 required negative and adversarial cases.
+**Known-bank contract evidence: PASS.** NERB detected and correctly mapped 39,604 of 39,604 approved cases across 13,201 of 13,201 active patterns. It produced 0 wrong canonical mappings and 0 unexpected matches on 1,210 required negative and adversarial cases.
 
 This is the contract NERB is built to make: given the same validated bank, engine, scan options, and input bytes, qualifying occurrences are detected and mapped under the bank's declared normalization, boundary, priority, and overlap semantics. It is not a guarantee to discover entities absent from the bank.
 
@@ -17,7 +17,13 @@ The source corpus is public. This bundle remains aggregate-only so the same publ
 | Required negative/adversarial cases without unexpected matches | 1,210 / 1,210 |
 | Wrong canonical mappings | 0 |
 
-The independent natural-text panel adds a stricter exact-span, class, and canonical-mapping diagnostic. It found 142 of 146 catalog-qualified occurrences exactly (97.26%), with 4 contact exact-span evaluation misses and zero wrong canonical mappings. Person occurrences were 20/20; contacts were 122/126. The contact slice still covered 100% of sensitive characters, so exact-span record recall and character coverage answer different questions.
+The independent natural-text panel adds a stricter exact-span, class, and canonical-mapping diagnostic. It found 142 of 146 catalog-qualified occurrences exactly and with the expected canonical mapping (97.26%).
+
+| Class | Catalog-qualified | Correct exact + mapping | Exact-span miss | Wrong mapping |
+|---|---:|---:|---:|---:|
+| Combined | 146 | 142 | 4 | 0 |
+| Contact | 126 | 122 | 4 | 0 |
+| Person | 20 | 20 | 0 | 0 |
 
 ![Known-bank contract evidence](figures/known-bank-contract.svg)
 
@@ -31,7 +37,7 @@ Catalog coverage asks how much of the independently labeled population the const
 | Contact | 126 | 126 | 0 | 100.00% |
 | Person | 1,267 | 20 | 1,247 | 1.58% |
 
-Of the 1,251 exact-span misses, 1,247 were person mentions outside the bank and four were catalog-qualified contact diagnostics.
+The combined panel contained 1,247 spans outside the bank, 4 catalog-qualified exact-span misses, and 0 catalog-qualified wrong canonical mappings.
 
 ![Coverage decomposition](figures/bank-coverage.svg)
 
@@ -50,11 +56,27 @@ The preregistered application gate deliberately asked a broader question: could 
 | Precision | 95.30% | 95.31% | 95.24% | diagnostic |
 | Over-redaction | 0.04% | 0.04% | 0.00% | ≤5% |
 
+The combined application rates above come from these raw counts:
+
+| Combined application count | Result |
+|---|---:|
+| Labeled spans detected exactly | 142 / 1,393 |
+| Sensitive characters covered | 3,183 / 14,916 |
+| Documents without an exact-span miss | 7 / 69 |
+| Predicted spans that were exact | 142 / 149 |
+
 ![Standalone privacy-redaction assessment](figures/standalone-redaction.svg)
 
 ## 4. Scale and reuse
 
 The evaluated 13,201-pattern bank scanned the 100-document throughput input in a median 0.699 ms (143,057.2 documents/s). Per-document direct-scan latency was 9.021 µs median and 55.250 µs p95. Cold compilation took 7.792 s. At 100,000 patterns, throughput remained 6,810.8 documents/s on the recorded Apple M4 environment.
+
+| Bank size | Direct-scan throughput |
+|---:|---:|
+| 1,000 patterns | 932,400.9 documents/s |
+| 10,000 patterns | 53,299.6 documents/s |
+| 25,000 patterns | 26,714.8 documents/s |
+| 100,000 patterns | 6,810.8 documents/s |
 
 ![Scale throughput](figures/performance-scale.svg)
 

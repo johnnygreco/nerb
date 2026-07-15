@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import shutil
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,25 @@ def _copy_bundle(tmp_path: Path) -> Path:
     target = tmp_path / "bundle"
     shutil.copytree(COMMITTED_BUNDLE, target)
     return target
+
+
+def _committed_json(relative_path: str) -> dict[str, Any]:
+    return json.loads((COMMITTED_BUNDLE / relative_path).read_text(encoding="utf-8"))
+
+
+def _committed_inventories() -> dict[str, list[dict[str, int]]]:
+    return {
+        path.stem: json.loads(path.read_text(encoding="utf-8"))
+        for path in (COMMITTED_BUNDLE / "inventories").glob("*.json")
+    }
+
+
+def _assert_contract_valid(evidence: dict[str, Any]) -> None:
+    assert validate_enron_evidence(
+        evidence,
+        manifest=_committed_json("benchmark-manifest.json"),
+        referenced_input_inventories=_committed_inventories(),
+    ) == {"valid": True, "diagnostics": []}
 
 
 def _rewrite_publication_artifact(
@@ -216,6 +236,41 @@ def test_publication_rejects_rehashed_standalone_redaction_overstatement(tmp_pat
         verify_enron_publication(bundle)
 
 
+def test_publication_rejects_rehashed_upstream_quality_decision_overstatement(tmp_path: Path, fast_capacity) -> None:
+    evidence = _committed_json("benchmark-evidence.json")
+    score = evidence["audit_chain"]["score"]
+    score["quality_decision_passed"] = True
+    prediction = evidence["audit_chain"]["prediction_audit"]
+    prediction.update(
+        {
+            "status": "accepted",
+            "decision_eligible": True,
+            "release": "quality_eligible",
+        }
+    )
+    evidence["audit_chain"]["chain_sha256"] = hash_enron_audit_chain(evidence["audit_chain"])
+    validation = validate_enron_evidence(
+        evidence,
+        manifest=_committed_json("benchmark-manifest.json"),
+        referenced_input_inventories=_committed_inventories(),
+    )
+
+    assert validation["valid"] is False
+    assert any(item["path"] == "/audit_chain/score/quality_decision_passed" for item in validation["diagnostics"])
+    evidence_path = tmp_path / "overstated-evidence.json"
+    evidence_path.write_bytes(publication._pretty_json_bytes(evidence))
+    with pytest.raises(EnronPublicationError, match="semantic contract validation"):
+        export_enron_publication(
+            tmp_path / "output",
+            benchmark_manifest_path=COMMITTED_BUNDLE / "benchmark-manifest.json",
+            benchmark_evidence_path=evidence_path,
+            performance_report_path=COMMITTED_BUNDLE / "performance-report.json",
+            capacity_decision_path=COMMITTED_BUNDLE / "capacity-decision.json",
+            bank_card_path=COMMITTED_BUNDLE / "bank-card.json",
+            inventory_dir=COMMITTED_BUNDLE / "inventories",
+        )
+
+
 def test_publication_rejects_rehashed_performance_decision_corruption(tmp_path: Path, fast_capacity) -> None:
     bundle = _copy_bundle(tmp_path)
     report = json.loads((bundle / "performance-report.json").read_text(encoding="utf-8"))
@@ -269,6 +324,150 @@ def test_render_is_deterministic_and_aggregate_only(tmp_path: Path, fast_capacit
             assert path.read_bytes() == (COMMITTED_BUNDLE / path.relative_to(first)).read_bytes()
 
 
+def test_renderer_reports_failed_and_unevaluated_conformance_honestly() -> None:
+    evidence = _committed_json("benchmark-evidence.json")
+    conformance = evidence["catalog_conformance"]
+    conformance["correctly_mapped"] -= 1
+    conformance["missed"] = 1
+    conformance["recall"] = conformance["correctly_mapped"] / conformance["approved_positive_cases"]
+    conformance["passed"] = False
+    check = next(item for item in evidence["promotion"]["checks"] if item["id"] == "catalog_conformance")
+    check["actual"] = False
+    check["passed"] = False
+    _assert_contract_valid(evidence)
+
+    summary = publication._render_summary(
+        _committed_json("benchmark-manifest.json"),
+        evidence,
+        _committed_json("performance-report.json"),
+        _committed_json("bank-card.json"),
+        _committed_json("capacity-decision.json"),
+    ).decode()
+    assert "Known-bank contract evidence: FAIL" in summary
+    assert "39,603 of 39,604 approved cases" in summary
+    assert "correctly mapped 39,604 approved cases" not in summary
+    failed_svg = publication._render_figures(evidence, _committed_json("performance-report.json"))[
+        "figures/known-bank-contract.svg"
+    ].decode()
+    assert "#f05b67" in failed_svg
+    assert "39,603 of 39,604 approved cases" in failed_svg
+
+    unevaluated = _committed_json("benchmark-evidence.json")
+    conformance = unevaluated["catalog_conformance"]
+    for field in (
+        "active_patterns",
+        "patterns_with_positive_cases",
+        "approved_positive_cases",
+        "correctly_mapped",
+        "missed",
+        "wrong_canonical",
+        "negative_cases",
+        "unexpected_negative_matches",
+    ):
+        conformance[field] = 0
+    for field in (
+        "label_artifact_id",
+        "positive_cases_artifact",
+        "negative_cases_artifact",
+        "policy_sha256",
+        "recall",
+    ):
+        conformance[field] = None
+    conformance["evaluated"] = False
+    conformance["passed"] = False
+    check = next(item for item in unevaluated["promotion"]["checks"] if item["id"] == "catalog_conformance")
+    check["actual"] = False
+    check["passed"] = False
+    _assert_contract_valid(unevaluated)
+
+    unavailable_svg = publication._render_figures(unevaluated, _committed_json("performance-report.json"))[
+        "figures/known-bank-contract.svg"
+    ].decode()
+    assert "Known-bank contract evidence unavailable" in unavailable_svg
+    assert "0 / 0" not in unavailable_svg
+
+
+def test_renderer_accounts_for_cataloged_wrong_mappings() -> None:
+    evidence = _committed_json("benchmark-evidence.json")
+    for slice_id in ("person_contact_all_test", "contact_all_test"):
+        quality_slice = next(item for item in evidence["quality"]["slices"] if item["id"] == slice_id)
+        quality_slice["cataloged_true_positive"] -= 1
+        quality_slice["cataloged_wrong_canonical"] += 1
+        quality_slice["metrics"]["cataloged_recall"] = (
+            quality_slice["cataloged_true_positive"] / quality_slice["cataloged_gold_spans"]
+        )
+    for check in evidence["promotion"]["checks"]:
+        if check["id"] == "cataloged_recall":
+            check["actual"] = evidence["quality"]["slices"][0]["metrics"]["cataloged_recall"]
+        elif check["id"] == "cataloged_wrong_canonical":
+            check["actual"] = 1
+            check["passed"] = False
+    _assert_contract_valid(evidence)
+
+    summary = publication._render_summary(
+        _committed_json("benchmark-manifest.json"),
+        evidence,
+        _committed_json("performance-report.json"),
+        _committed_json("bank-card.json"),
+        _committed_json("capacity-decision.json"),
+    ).decode()
+    coverage_svg = publication._render_figures(evidence, _committed_json("performance-report.json"))[
+        "figures/bank-coverage.svg"
+    ].decode()
+    assert "1 catalog-qualified wrong canonical mappings" in summary
+    assert "1 wrong mapping" in coverage_svg
+
+
+def test_rendered_plots_expose_values_thresholds_and_high_contrast_labels() -> None:
+    summary = publication._render_summary(
+        _committed_json("benchmark-manifest.json"),
+        _committed_json("benchmark-evidence.json"),
+        _committed_json("performance-report.json"),
+        _committed_json("bank-card.json"),
+        _committed_json("capacity-decision.json"),
+    ).decode()
+    for value in ("142 / 1,393", "3,183 / 14,916", "7 / 69", "142 / 149"):
+        assert value in summary
+    for value in ("932,400.9", "53,299.6", "26,714.8", "6,810.8"):
+        assert value in summary
+
+    figures = publication._render_figures(
+        _committed_json("benchmark-evidence.json"), _committed_json("performance-report.json")
+    )
+    namespace = {"svg": "http://www.w3.org/2000/svg"}
+
+    def svg_description(payload: bytes) -> str:
+        description = ET.fromstring(payload).find("svg:desc", namespace)
+        assert description is not None
+        return description.text or ""
+
+    descriptions = {path: svg_description(payload) for path, payload in figures.items()}
+    assert "13,201 of 13,201 active patterns" in descriptions["figures/known-bank-contract.svg"]
+    assert "minimum threshold 100.00%" in descriptions["figures/known-bank-contract.svg"]
+    assert "1,247 outside the bank" in descriptions["figures/bank-coverage.svg"]
+    assert "142 of 1,393 labeled spans" in descriptions["figures/standalone-redaction.svg"]
+    assert "minimum threshold 95.00%" in descriptions["figures/standalone-redaction.svg"]
+    for value in ("932,401", "53,300", "26,715", "6,811"):
+        assert value in descriptions["figures/performance-scale.svg"]
+
+    def luminance(color: str) -> float:
+        channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+        linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4 for channel in channels]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    foreground = luminance(publication._SVG_TEXT)
+    background = luminance(publication._SVG_VALUE_BACKGROUND)
+    contrast = (max(foreground, background) + 0.05) / (min(foreground, background) + 0.05)
+    assert contrast >= 4.5
+    for path in (
+        "figures/known-bank-contract.svg",
+        "figures/standalone-redaction.svg",
+        "figures/performance-scale.svg",
+    ):
+        svg = figures[path].decode()
+        assert svg.count('class="value-bg"') == svg.count('class="value"')
+
+
 def test_insufficient_support_terminal_exports_and_renders_without_quality_rates(tmp_path: Path, fast_capacity) -> None:
     evidence = _insufficient_support_evidence()
     manifest = json.loads((COMMITTED_BUNDLE / "benchmark-manifest.json").read_text(encoding="utf-8"))
@@ -298,6 +497,7 @@ def test_insufficient_support_terminal_exports_and_renders_without_quality_rates
     assert result["valid"] is True
     assert result["decision"]["standalone_privacy_audit_outcome"] == "do_not_ship"
     assert result["decision"]["standalone_privacy_redaction_allowed"] is False
+    assert result["decision"]["standalone_privacy_redaction_quality_passed"] is False
     publication_manifest = json.loads((output / "publication.json").read_text(encoding="utf-8"))
     assert publication_manifest["scope"]["gold_sample_documents"] is None
     assert publication_manifest["scope"]["gold_spans"] is None
