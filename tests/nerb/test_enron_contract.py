@@ -1625,6 +1625,25 @@ def _unevaluated(evidence: JsonObject) -> JsonObject:
     return value
 
 
+def _insufficient_support_without_quality(evidence: JsonObject) -> JsonObject:
+    value = copy.deepcopy(evidence)
+    value["quality"] = {
+        "evaluated": False,
+        "matching_semantics": value["quality"]["matching_semantics"],
+        "character_position_semantics": value["quality"]["character_position_semantics"],
+        "slices": [],
+    }
+    value["promotion"]["passed"] = False
+    value["promotion"]["claims"] = []
+    value["verifier"]["passed"] = False
+    for check in value["promotion"]["checks"]:
+        if check["category"] == "quality":
+            check["actual"] = None
+            check["passed"] = False
+    _refresh_frozen_contract(value)
+    return value
+
+
 def _drop_performance_assertions(evidence: JsonObject) -> None:
     evidence["promotion"]["checks"] = [
         check for check in evidence["promotion"]["checks"] if check["category"] != "performance"
@@ -1729,6 +1748,65 @@ def test_synthetic_fixtures_are_valid_exactly_bound_and_nonclaimable(
     assert evidence["audit_chain"]["prediction_audit"]["release"] == "do_not_ship"
     assert validate_enron_manifest(manifest) == {"valid": True, "diagnostics": []}
     assert validate_enron_evidence(evidence, manifest=manifest) == {"valid": True, "diagnostics": []}
+
+
+def test_truthful_insufficient_support_preserves_frozen_quality_checks_without_scanning(
+    manifest: JsonObject, evidence: JsonObject
+) -> None:
+    value = _insufficient_support_without_quality(evidence)
+    quality_checks = [check for check in value["promotion"]["checks"] if check["category"] == "quality"]
+
+    assert quality_checks
+    assert all(check["target"].startswith("/quality/slices/0/") for check in quality_checks)
+    assert all(check["actual"] is None and check["passed"] is False for check in quality_checks)
+    assert value["thresholds_sha256"] == evidence["thresholds_sha256"]
+    assert validate_enron_evidence(value, manifest=manifest) == {"valid": True, "diagnostics": []}
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        ("score_status", "contract.gate_target"),
+        ("prediction_status", "contract.gate_target"),
+        ("quality_evaluated", "contract.gate_target"),
+        ("quality_slices", "contract.gate_actual"),
+        ("quality_actual", "contract.gate_target"),
+        ("quality_passed", "contract.gate_target"),
+        ("claims", "contract.gate_target"),
+        ("promotion_passed", "contract.gate_target"),
+        ("verifier_passed", "contract.gate_target"),
+        ("non_quality_target", "contract.gate_target"),
+    ],
+)
+def test_insufficient_support_quality_gate_exception_rejects_near_misses(
+    evidence: JsonObject, mutation: str, code: str
+) -> None:
+    value = _insufficient_support_without_quality(evidence)
+    quality_check = next(check for check in value["promotion"]["checks"] if check["category"] == "quality")
+    if mutation == "score_status":
+        value["audit_chain"]["score"]["status"] = "scored_pending_prediction_audit"
+    elif mutation == "prediction_status":
+        value["audit_chain"]["prediction_audit"]["status"] = "quality_gates_failed"
+    elif mutation == "quality_evaluated":
+        value["quality"]["evaluated"] = True
+    elif mutation == "quality_slices":
+        value["quality"]["slices"] = copy.deepcopy(evidence["quality"]["slices"])
+    elif mutation == "quality_actual":
+        quality_check["actual"] = 0.0
+    elif mutation == "quality_passed":
+        quality_check["passed"] = True
+    elif mutation == "claims":
+        value["promotion"]["claims"] = [_catalog_claim(value)]
+    elif mutation == "promotion_passed":
+        value["promotion"]["passed"] = True
+    elif mutation == "verifier_passed":
+        value["verifier"]["passed"] = True
+    else:
+        non_quality_check = next(check for check in value["promotion"]["checks"] if check["category"] == "privacy")
+        non_quality_check.update({"target": "/privacy/missing", "actual": None, "passed": False})
+    _refresh_frozen_contract(value)
+
+    _assert_code(validate_enron_evidence(value), code)
 
 
 def test_audit_chain_hash_detects_stage_tampering(evidence: JsonObject) -> None:

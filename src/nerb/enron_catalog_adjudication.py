@@ -8,11 +8,11 @@ cannot cause an otherwise cataloged occurrence to be relabeled as unknown.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
 import stat
-import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -23,6 +23,7 @@ from .bank import canonicalize_bank, hash_bank
 from .enron_gold_annotations import (
     EnronGoldAnnotationError,
     _load_verified_enron_gold_annotations_files,
+    _load_verified_enron_gold_role_identities,
     enron_gold_annotation_policy_sha256,
 )
 from .enron_private_io import (
@@ -88,9 +89,9 @@ CATALOG_QUALIFICATION_POLICY: dict[str, Any] = {
     "schema_version": CATALOG_POLICY_SCHEMA_VERSION,
     "input": "immutable_independent_gold",
     "prediction_visibility": "forbidden",
-    "review": "one_bounded_private_reviewer_exactly_replays_active_bank_qualification",
+    "review": "one_bounded_private_reviewer_distinct_from_all_gold_roles_exactly_replays_active_bank_qualification",
     "bank_scope": "active_bank_entity_name_pattern_chain",
-    "literal_matching": "rust_equivalent_conservative_ascii_fold_exact_whitespace_and_unicode_word_boundary",
+    "literal_matching": "native_rust_conservative_ascii_fold_exact_whitespace_and_regex_syntax_word_boundary",
     "regex_matching": "closed_ascii_exact_context_subset",
     "winner": "ascending_priority_then_name_id_then_pattern_id",
     "catalog_identity": "entity_name_and_one_qualifying_active_pattern",
@@ -98,6 +99,8 @@ CATALOG_QUALIFICATION_POLICY: dict[str, Any] = {
     + hashlib.sha256(_SUPPORTED_GENERIC_EMAIL_REGEX.encode("ascii")).hexdigest(),
     "unsupported_semantics": "never_qualify_or_reject_bank",
 }
+
+_native_engine = importlib.import_module("nerb._engine")
 
 
 class EnronCatalogAdjudicationError(ValueError):
@@ -283,6 +286,10 @@ def finalize_enron_catalog_qualification_files(
             documents,
             qualification,
         )
+        _reject_gold_role_reuse(
+            reviewer_id,
+            _load_verified_enron_gold_role_identities(Path(gold_run_dir), gold_receipt),
+        )
         review_payload = _canonical_jsonl(canonical_review_rows)
         review_artifact = _artifact_descriptor("catalog-review.jsonl", review_payload, len(canonical_review_rows))
         review_provenance = _catalog_review_provenance(reviewer_id, review_artifact, review_counts)
@@ -355,6 +362,10 @@ def verify_enron_catalog_qualification(
             stored_review_rows,
             documents,
             expected,
+        )
+        _reject_gold_role_reuse(
+            reviewer_id,
+            _load_verified_enron_gold_role_identities(Path(gold_run_dir), gold_receipt),
         )
         if stored_review_rows != list(canonical_review_rows):
             raise EnronCatalogAdjudicationError("Stored catalog review rows are not in canonical order.")
@@ -1154,16 +1165,22 @@ def _rust_word_boundary(text: str, offset: int) -> bool:
 
 
 def _rust_word_character(character: str) -> bool:
-    if len(character) != 1:
+    if not isinstance(character, str) or len(character) != 1:
         raise EnronCatalogAdjudicationError("Catalog word-boundary input is invalid.")
-    category = unicodedata.category(character)
-    if len(category) != 2:
-        raise EnronCatalogAdjudicationError("Catalog word-boundary Unicode semantics are unsupported.")
-    return (
-        category[0] in {"L", "M"}
-        or category in {"Nl", "Nd", "Pc"}
-        or character in {"\N{ZERO WIDTH NON-JOINER}", "\N{ZERO WIDTH JOINER}"}
-    )
+    try:
+        result = _native_engine._is_word_character(character)
+    except Exception:
+        raise EnronCatalogAdjudicationError("Catalog word-boundary input is invalid.") from None
+    if type(result) is not bool:
+        raise EnronCatalogAdjudicationError("Catalog word-boundary input is invalid.")
+    return result
+
+
+def _reject_gold_role_reuse(reviewer_id: str, gold_role_identities: set[str]) -> None:
+    if reviewer_id in gold_role_identities:
+        raise EnronCatalogAdjudicationError(
+            "Catalog reviewer must be distinct from every gold annotation and review role."
+        )
 
 
 def _prepare_documents(values: Sequence[Mapping[str, Any]]) -> dict[str, str]:

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import nerb.enron_catalog_adjudication as catalog_adjudication
 from nerb.bank import hash_bank
 from nerb.engine import Bank
 from nerb.enron_catalog_adjudication import (
@@ -455,6 +456,7 @@ def test_conservative_literal_qualification_matches_rust_subset(
         ("-Alice", 1, 6, True),
         ("xAlice", 1, 6, False),
         ("éAlice", 1, 6, False),
+        ("\N{CIRCLED LATIN CAPITAL LETTER A}Alice", 1, 6, False),
         ("\N{COMBINING ACUTE ACCENT}Alice", 1, 6, False),
         ("\N{ARABIC-INDIC DIGIT ONE}Alice", 1, 6, False),
         ("\N{UNDERTIE}Alice", 1, 6, False),
@@ -477,6 +479,20 @@ def test_unicode_word_boundaries_match_rust_regex_syntax(
 
     assert qualified is expected
     assert qualified is _rust_exact_match(bank, text, "person", start, end)
+
+
+def test_catalog_word_character_collapses_native_domain_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        catalog_adjudication._native_engine,
+        "_is_word_character",
+        lambda _character: (_ for _ in ()).throw(ValueError("native detail")),
+    )
+
+    with pytest.raises(EnronCatalogAdjudicationError, match="word-boundary input is invalid"):
+        catalog_adjudication._rust_word_character("A")
+
+    with pytest.raises(EnronCatalogAdjudicationError, match="word-boundary input is invalid"):
+        catalog_adjudication._rust_word_character("AA")
 
 
 def test_production_email_regex_qualification_matches_rust() -> None:
@@ -564,6 +580,61 @@ def test_catalog_file_finalizer_commits_and_replays_mapping_or_path(tmp_path: Pa
     }
     assert os.stat(output).st_mode & 0o777 == 0o700
     assert all(os.stat(path).st_mode & 0o777 == 0o600 for path in output.iterdir())
+
+
+@pytest.mark.parametrize("reviewer_id", ["pass_a", "pass_b", "adjudicator", "reviewer"])
+def test_catalog_file_finalizer_rejects_every_gold_role_identity(tmp_path: Path, reviewer_id: str) -> None:
+    sample_run, gold_run, bank, _documents, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
+    rows = [json.loads(line) for line in catalog_review.read_text().splitlines()]
+    for row in rows:
+        row["reviewer_id"] = reviewer_id
+    _write_private_jsonl(catalog_review, rows)
+
+    with pytest.raises(EnronCatalogAdjudicationError, match="distinct from every gold"):
+        finalize_enron_catalog_qualification_files(
+            sample_run,
+            gold_run,
+            bank,
+            catalog_review,
+            tmp_path / "catalog-run",
+            expected_gold_commitment=gold_commitment,
+            allow_unignored_output=True,
+        )
+
+
+def test_catalog_file_verifier_replays_gold_role_separation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample_run, gold_run, bank, _documents, catalog_review, gold_commitment, _audit_binding = _qualification_runs(
+        tmp_path
+    )
+    output = tmp_path / "catalog-run"
+    original = catalog_adjudication._load_verified_enron_gold_role_identities
+    monkeypatch.setattr(catalog_adjudication, "_load_verified_enron_gold_role_identities", lambda *_args: set())
+    finalize_enron_catalog_qualification_files(
+        sample_run,
+        gold_run,
+        bank,
+        catalog_review,
+        output,
+        expected_gold_commitment=gold_commitment,
+        allow_unignored_output=True,
+    )
+    monkeypatch.setattr(catalog_adjudication, "_load_verified_enron_gold_role_identities", original)
+    monkeypatch.setattr(
+        catalog_adjudication,
+        "_load_verified_enron_gold_role_identities",
+        lambda *args: original(*args) | {"catalog_reviewer"},
+    )
+
+    with pytest.raises(EnronCatalogAdjudicationError, match="distinct from every gold"):
+        verify_enron_catalog_qualification(
+            output,
+            sample_run,
+            gold_run,
+            bank,
+            expected_gold_commitment=gold_commitment,
+        )
 
 
 def test_catalog_file_verifier_rejects_tampering(tmp_path: Path) -> None:

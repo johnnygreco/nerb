@@ -92,6 +92,11 @@ def test_native_engine_module_imports():
 
     assert engine.ENGINE_NAME == "nerb_engine"
     assert engine.__version__ == importlib.metadata.version("nerb") == nerb.__version__
+    assert engine._is_word_character("\N{CIRCLED LATIN CAPITAL LETTER A}") is True
+    assert engine._is_word_character("\N{EM DASH}") is False
+    for invalid in ("", "ab"):
+        with pytest.raises(ValueError, match="exactly one Unicode scalar"):
+            engine._is_word_character(invalid)
 
 
 def test_public_bank_projects_byte_and_char_records_and_scans_paths(tmp_path):

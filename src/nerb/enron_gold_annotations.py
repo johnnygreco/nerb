@@ -1111,6 +1111,62 @@ def _load_verified_enron_gold_annotations_files(
     return documents, gold, verified_receipt
 
 
+def _load_verified_enron_gold_role_identities(
+    run_dir: Path,
+    expected_gold_commitment: Mapping[str, Any],
+) -> set[str]:
+    """Load private role identities from the exact bound gold artifacts."""
+
+    if not isinstance(expected_gold_commitment, Mapping):
+        raise EnronGoldAnnotationError("Bound gold commitment is invalid.")
+    root = _validate_private_run_tree(Path(run_dir), _GOLD_RUN_FILES, "Gold annotation run")
+    manifest, manifest_raw = _load_strict_json_object(root / "manifest.json", "Gold annotation manifest")
+    receipt, receipt_raw = _load_strict_json_object(root / "receipt.json", "Gold annotation receipt")
+    if manifest_raw != _canonical_json_file(manifest) or receipt_raw != _canonical_json_file(receipt):
+        raise EnronGoldAnnotationError("Gold annotation metadata is not canonically encoded.")
+    actual_commitment = {
+        "gold_sha256": manifest.get("gold_sha256"),
+        "manifest_sha256": _canonical_hash(manifest),
+        "artifacts_sha256": _canonical_hash(manifest.get("artifacts")),
+    }
+    expected_commitment = {key: expected_gold_commitment.get(key) for key in sorted(_GOLD_COMMITMENT_FIELDS)}
+    if (
+        any(not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None for value in expected_commitment.values())
+        or actual_commitment != expected_commitment
+        or receipt != _gold_run_receipt(manifest)
+    ):
+        raise EnronGoldAnnotationError("Gold annotation run differs from the bound gold commitment.")
+
+    definitions = {
+        "pass_a": (_PASS_FIELDS, "reviewer_id"),
+        "pass_b": (_PASS_FIELDS, "reviewer_id"),
+        "adjudication": (_ADJUDICATION_FIELDS, "adjudicator_id"),
+        "review": (_REVIEW_FIELDS, "reviewer_id"),
+        "gold": (None, None),
+    }
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping) or set(artifacts) != set(definitions):
+        raise EnronGoldAnnotationError("Gold annotation artifact inventory is invalid.")
+    identities: set[str] = set()
+    for key, (fields, identity_field) in definitions.items():
+        filename = _ARTIFACT_FILENAMES[key]
+        rows, descriptor = _load_jsonl(
+            root / filename,
+            description=f"Gold annotation {key}",
+            require_canonical=True,
+        )
+        if artifacts.get(key) != {"name": filename, **descriptor}:
+            raise EnronGoldAnnotationError(f"Gold annotation {key} artifact differs from its manifest.")
+        if fields is not None and identity_field is not None:
+            for index, row in enumerate(rows):
+                if set(row) != fields:
+                    raise EnronGoldAnnotationError(f"Gold annotation {key} row {index} schema is invalid.")
+                identities.add(_identifier(row[identity_field], identity_field))
+    if not identities:
+        raise EnronGoldAnnotationError("Gold annotation role identities are missing.")
+    return identities
+
+
 def _prepare_documents(values: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
     _require_sequence(values, "Sample documents")
     documents: dict[str, dict[str, Any]] = {}

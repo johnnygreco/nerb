@@ -5566,6 +5566,61 @@ def _performance_promotion_diagnostics(
     return diagnostics, required_gate_specs
 
 
+def _is_insufficient_support_terminal(chain: Mapping[str, Any]) -> bool:
+    score = chain["score"]
+    prediction = chain["prediction_audit"]
+    prediction_hashes = (
+        prediction["receipt_sha256"],
+        prediction["manifest_sha256"],
+        prediction["artifacts_sha256"],
+        prediction["prediction_commitment_sha256"],
+    )
+    return (
+        score["status"] == "insufficient_support"
+        and bool(score["support_failure_codes"])
+        and score["prediction_commitment_sha256"] is None
+        and score["quality_decision_sha256"] is None
+        and score["quality_decision_passed"] is False
+        and prediction["status"] == "not_run_insufficient_support"
+        and all(value is None for value in prediction_hashes)
+        and prediction["gold_defects"] == 0
+        and prediction["decision_eligible"] is False
+        and prediction["release"] == "do_not_ship"
+    )
+
+
+def _is_frozen_quality_gate_target(target: str) -> bool:
+    parts = target.split("/")
+    if len(parts) == 5 and parts[1:4] == ["quality", "slices", "0"]:
+        return parts[4] in {
+            "cataloged_false_negative",
+            "cataloged_wrong_canonical",
+            "documents_with_any_cataloged_miss",
+        }
+    return (
+        len(parts) == 6
+        and parts[1:5] == ["quality", "slices", "0", "metrics"]
+        and parts[5] in MIN_QUALITY_THRESHOLDS.keys() | MAX_QUALITY_THRESHOLDS.keys()
+    )
+
+
+def _allows_unresolved_insufficient_support_quality_gate(evidence: Mapping[str, Any], check: Mapping[str, Any]) -> bool:
+    quality = evidence["quality"]
+    promotion = evidence["promotion"]
+    return (
+        _is_insufficient_support_terminal(evidence["audit_chain"])
+        and quality["evaluated"] is False
+        and quality["slices"] == []
+        and promotion["passed"] is False
+        and evidence["verifier"]["passed"] is False
+        and promotion["claims"] == []
+        and check["category"] == "quality"
+        and _is_frozen_quality_gate_target(str(check["target"]))
+        and check["actual"] is None
+        and check["passed"] is False
+    )
+
+
 def _gate_diagnostics(
     evidence: Mapping[str, Any], recomputed_statistics: Mapping[str, Mapping[str, Any]]
 ) -> list[Diagnostic]:
@@ -5621,6 +5676,8 @@ def _gate_diagnostics(
         try:
             actual = _resolve_pointer(evidence, check["target"])
         except (KeyError, IndexError, TypeError, ValueError):
+            if _allows_unresolved_insufficient_support_quality_gate(evidence, check):
+                continue
             diagnostics.append(
                 _error("contract.gate_target", f"{path}/target", "Gate target does not resolve to evidence.")
             )
@@ -5706,25 +5763,15 @@ def _audit_chain_diagnostics(evidence: Mapping[str, Any]) -> list[Diagnostic]:
 
     score_status = score["status"]
     prediction_status = prediction["status"]
-    prediction_hashes = (
-        prediction["receipt_sha256"],
-        prediction["manifest_sha256"],
-        prediction["artifacts_sha256"],
-        prediction["prediction_commitment_sha256"],
-    )
     if score_status == "insufficient_support":
-        valid_terminal = (
-            bool(score["support_failure_codes"])
-            and score["prediction_commitment_sha256"] is None
-            and score["quality_decision_sha256"] is None
-            and score["quality_decision_passed"] is False
-            and prediction_status == "not_run_insufficient_support"
-            and all(value is None for value in prediction_hashes)
-            and prediction["gold_defects"] == 0
-            and prediction["decision_eligible"] is False
-            and prediction["release"] == "do_not_ship"
-        )
+        valid_terminal = _is_insufficient_support_terminal(chain)
     else:
+        prediction_hashes = (
+            prediction["receipt_sha256"],
+            prediction["manifest_sha256"],
+            prediction["artifacts_sha256"],
+            prediction["prediction_commitment_sha256"],
+        )
         hashes_complete = (
             score["prediction_commitment_sha256"] is not None
             and score["quality_decision_sha256"] is not None

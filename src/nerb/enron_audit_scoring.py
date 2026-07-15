@@ -2074,51 +2074,15 @@ def _load_insufficient_score_run(path: Path) -> dict[str, Any]:
 
 
 def _load_bound_gold_reviewer_identities(gold_run_dir: Path, score_receipt: Mapping[str, Any]) -> set[str]:
-    root = _validate_private_run_tree(gold_run_dir, _gold._GOLD_RUN_FILES, "Gold annotation")
-    manifest, manifest_raw = _load_json_object(root / "manifest.json", "Gold annotation manifest")
-    receipt, receipt_raw = _load_json_object(root / "receipt.json", "Gold annotation receipt")
-    if manifest_raw != _canonical_json_file(manifest) or receipt_raw != _canonical_json_file(receipt):
-        raise EnronAuditScoringError("Gold annotation metadata is not canonically encoded.")
-    if (
-        _canonical_hash(manifest) != score_receipt.get("gold_manifest_sha256")
-        or manifest.get("gold_sha256") != score_receipt.get("gold_sha256")
-        or manifest.get("gold_sha256") != receipt.get("gold_sha256")
-        or manifest.get("artifacts") is None
-        or _canonical_hash(manifest["artifacts"]) != score_receipt.get("gold_artifacts_sha256")
-        or receipt != _gold._gold_run_receipt(manifest)
-    ):
-        raise EnronAuditScoringError("Gold annotation run differs from the score-bound gold evidence.")
-    definitions = {
-        "pass_a": (_gold._ARTIFACT_FILENAMES["pass_a"], _gold._PASS_FIELDS, "reviewer_id"),
-        "pass_b": (_gold._ARTIFACT_FILENAMES["pass_b"], _gold._PASS_FIELDS, "reviewer_id"),
-        "adjudication": (
-            _gold._ARTIFACT_FILENAMES["adjudication"],
-            _gold._ADJUDICATION_FIELDS,
-            "adjudicator_id",
-        ),
-        "review": (_gold._ARTIFACT_FILENAMES["review"], _gold._REVIEW_FIELDS, "reviewer_id"),
-        "gold": (_gold._ARTIFACT_FILENAMES["gold"], None, None),
+    commitment = {
+        "gold_sha256": score_receipt.get("gold_sha256"),
+        "manifest_sha256": score_receipt.get("gold_manifest_sha256"),
+        "artifacts_sha256": score_receipt.get("gold_artifacts_sha256"),
     }
-    artifacts = manifest["artifacts"]
-    if not isinstance(artifacts, Mapping) or set(artifacts) != set(definitions):
-        raise EnronAuditScoringError("Gold annotation artifact inventory is invalid.")
-    identities: set[str] = set()
-    for key, (filename, fields, identity_field) in definitions.items():
-        rows, descriptor = _load_jsonl(
-            root / filename,
-            description=f"Gold annotation {key}",
-            fields=fields,
-            maximum_rows=_MAX_ROWS,
-        )
-        expected_descriptor = {"name": filename, **descriptor}
-        if artifacts.get(key) != expected_descriptor:
-            raise EnronAuditScoringError(f"Gold annotation {key} artifact differs from its manifest.")
-        if identity_field is not None:
-            for row in rows:
-                identities.add(_identifier(row[identity_field], identity_field))
-    if not identities:
-        raise EnronAuditScoringError("Gold annotation reviewer identities are missing.")
-    return identities
+    try:
+        return _gold._load_verified_enron_gold_role_identities(gold_run_dir, commitment)
+    except _gold.EnronGoldAnnotationError:
+        raise EnronAuditScoringError("Gold annotation run differs from the score-bound gold evidence.") from None
 
 
 def _require_trusted_score_receipt(

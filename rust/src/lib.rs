@@ -122,6 +122,28 @@ fn ffi_boundary<T>(operation: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
     }
 }
 
+#[pyfunction]
+fn _is_word_character(character: &str) -> PyResult<bool> {
+    ffi_boundary(|| {
+        let mut characters = character.chars();
+        let Some(character) = characters.next() else {
+            return Err(PyValueError::new_err(
+                "Native word-character input must contain exactly one Unicode scalar",
+            ));
+        };
+        if characters.next().is_some() {
+            return Err(PyValueError::new_err(
+                "Native word-character input must contain exactly one Unicode scalar",
+            ));
+        }
+        Ok(native_is_word_character(character))
+    })
+}
+
+fn native_is_word_character(character: char) -> bool {
+    regex_syntax::is_word_character(character)
+}
+
 #[cfg(unix)]
 fn write_status_bytes(status: &Bound<'_, PyByteArray>, value: &[u8]) -> PyResult<()> {
     if status.len() != value.len() {
@@ -870,6 +892,7 @@ fn _engine(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     module.add_class::<PyBank>()?;
     module.add_class::<PyMatchBuffer>()?;
+    module.add_function(wrap_pyfunction!(_is_word_character, module)?)?;
     module.add_function(wrap_pyfunction!(_close_fd_once, module)?)?;
     module.add_function(wrap_pyfunction!(_fsync_fd_commit, module)?)?;
     module.add_function(wrap_pyfunction!(_open_directory_fd_once, module)?)?;
@@ -883,4 +906,18 @@ fn _engine(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod word_character_tests {
+    use super::native_is_word_character;
+
+    #[test]
+    fn regex_syntax_word_semantics_cover_non_category_alphabetics() {
+        assert!(native_is_word_character('\u{24B6}'));
+        assert!(native_is_word_character('\u{0301}'));
+        assert!(native_is_word_character('\u{200C}'));
+        assert!(native_is_word_character('\u{200D}'));
+        assert!(!native_is_word_character('\u{2014}'));
+    }
 }
