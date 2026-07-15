@@ -1558,10 +1558,25 @@ def _build_state(
     )
 
 
-def _split_policy(options: EnronSplitOptions) -> dict[str, Any]:
+def _split_policy_implementation_sha256(policy: Mapping[str, Any]) -> str:
+    implementation_sha256 = policy.get("implementation_sha256")
+    if not isinstance(implementation_sha256, str) or not _SHA256_RE.fullmatch(implementation_sha256):
+        raise EnronSplitError("Recorded split implementation hash is invalid.")
+    return implementation_sha256
+
+
+def _split_policy(
+    options: EnronSplitOptions,
+    *,
+    implementation_sha256: str | None = None,
+) -> dict[str, Any]:
+    if implementation_sha256 is None:
+        implementation_sha256 = _hash_file(Path(__file__))
+    elif not isinstance(implementation_sha256, str) or not _SHA256_RE.fullmatch(implementation_sha256):
+        raise EnronSplitError("Recorded split implementation hash is invalid.")
     policy = {
         "version": "nerb.enron-split-policy.v2",
-        "implementation_sha256": _hash_file(Path(__file__)),
+        "implementation_sha256": implementation_sha256,
         "seed_sha256": _hash_value("nerb/enron/split-seed/v2", options.seed),
         "train_fraction": options.train_fraction,
         "validation_fraction": options.validation_fraction,
@@ -2072,7 +2087,7 @@ def _preseal_verification_receipt(
         },
         "leakage_groups_crossing": 0,
         "test_content_verified_before_seal": True,
-        "implementation_sha256": _hash_file(Path(__file__)),
+        "implementation_sha256": _split_policy_implementation_sha256(policy),
     }
     return {**core, "receipt_sha256": _hash_bytes(_canonical_json(core).encode("utf-8"))}
 
@@ -3621,6 +3636,7 @@ def _verify_preseal_receipt(
         manifest.get("artifacts"),
         "Sealed artifact inventory is invalid for pre-seal verification.",
     )
+    policy = _require_split_mapping(manifest.get("policy"), "Sealed split policy is invalid for pre-seal verification.")
     role_values = {
         role: _require_split_mapping(roles.get(role), "Pre-seal manifest role descriptor is invalid.")
         for role in _ROLE_NAMES
@@ -3662,7 +3678,7 @@ def _verify_preseal_receipt(
         "roles": expected_roles,
         "leakage_groups_crossing": 0,
         "test_content_verified_before_seal": True,
-        "implementation_sha256": _hash_file(Path(__file__)),
+        "implementation_sha256": _split_policy_implementation_sha256(policy),
     }
     if any(receipt.get(field) != value for field, value in expected.items()):
         raise EnronSplitError("Pre-seal verification receipt does not bind the committed split.")
@@ -3728,7 +3744,7 @@ def _verify_preseal_access_metadata(
         or receipt.get("roles") != expected_roles
         or receipt.get("test_content_verified_before_seal") is not True
         or receipt.get("leakage_groups_crossing") != 0
-        or receipt.get("implementation_sha256") != _hash_file(Path(__file__))
+        or receipt.get("implementation_sha256") != _split_policy_implementation_sha256(policy)
         or not isinstance(receipt.get("artifact_commitments_sha256"), str)
         or not _SHA256_RE.fullmatch(str(receipt["artifact_commitments_sha256"]))
         or any(
@@ -4143,7 +4159,9 @@ def _verify_enron_splits_metadata(
         allow_unignored_output=True,
     )
     _validate_options(rebuild_options)
-    if _canonical_json(policy) != _canonical_json(_split_policy(rebuild_options)):
+    if _canonical_json(policy) != _canonical_json(
+        _split_policy(rebuild_options, implementation_sha256=_split_policy_implementation_sha256(policy))
+    ):
         raise EnronSplitError("Frozen split policy does not match its canonical implementation and hash.")
 
     access_state = _verify_access_state(

@@ -41,6 +41,11 @@ test content. The result also includes `sealed_audit_inputs`, a closed aggregate
 test-membership artifact commitments. Use those commitments to construct the frozen audit plan before the single
 controlled final-test access; do not hash or open either sealed JSONL artifact directly.
 
+The pre-seal receipt retains the exact implementation hash that built and verified the split, and the pair receipt
+binds that recorded construction identity. Later metadata verification reconstructs the frozen policy with that value;
+it does not require the installed verifier module to remain byte-for-byte identical. This keeps immutable splits
+verifiable after verifier-only source changes without weakening the receipt, manifest, descriptor, or pair bindings.
+
 For a tiny synthetic fixture, add `--fixture-mode` to `split-enron`. Fixture mode relaxes the production support floors
 so leakage and sealing behavior can be tested on small inputs. Its manifests are permanently marked non-promotable and
 cannot support a quality, privacy, performance, or product claim.
