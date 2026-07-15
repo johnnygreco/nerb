@@ -173,7 +173,8 @@ jobs:
 
   macos-containment:
     name: macOS process containment and observer smoke
-    runs-on: macos-latest
+    # Keep timing-sensitive resource probes on the stable arm64 image also used by release wheel builds.
+    runs-on: macos-14
     steps:
       - name: Checkout
         # actions/checkout@v6
@@ -209,13 +210,34 @@ jobs:
 
       - name: Run aggregate observer smoke
         run: |
-          uv run --group enron-capacity python scripts/soak_enron_resource_observer.py --duration-seconds 0.2 > "$RUNNER_TEMP/soak.json"
-          uv run --group enron-capacity python - "$RUNNER_TEMP/soak.json" <<'PY'
+          soak_status=0
+          uv run --group enron-capacity python scripts/soak_enron_resource_observer.py --duration-seconds 0.2 > "$RUNNER_TEMP/soak.json" || soak_status=$?
+          uv run --group enron-capacity python - "$RUNNER_TEMP/soak.json" "$soak_status" <<'PY'
           import json
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as handle:
               report = json.load(handle)
+          if report["ok"] is not True:
+              if "error_code" in report:
+                  diagnostic = {
+                      "command_exit_status": int(sys.argv[2]),
+                      "error_code": report["error_code"],
+                      "policy_constants_verified": report["policy_constants_verified"],
+                  }
+              else:
+                  diagnostic = {
+                      "command_exit_status": int(sys.argv[2]),
+                      "positive_soak": report["positive_soak"],
+                      "fail_closed_injection": report["fail_closed_injection"],
+                      "cleanup": report["cleanup"],
+                      "source_identity_stable": report["source_identity_stable"],
+                      "worker_sources_bound": report["worker_sources_bound"],
+                  }
+              print(
+                  json.dumps(diagnostic, sort_keys=True)
+              )
+          assert int(sys.argv[2]) == 0
           assert report["ok"] is True
           assert report["decision_grade"] is False
           assert report["platform"]["system"] == "darwin"

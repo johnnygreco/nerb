@@ -190,7 +190,7 @@
     "label_strength": "structured_weak",
     "protocol_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000001",
     "quality_run_sha256": "sha256:3000000000000000000000000000000000000000000000000000000000000002",
-    "evaluator_sha256": "sha256:800453f505245e14304c44620dbc4eec49adc604cc5d7783431c298326c4a8b6",
+    "evaluator_sha256": "sha256:011dd2af11cd44da194be5ef9fa0a001c54cd0e58ed1c3ffa27de459d484c12c",
     "contact": {
       "documents": 2,
       "documents_with_sensitive_gold": 2,
@@ -272,5 +272,5 @@
     "violation_count": 0,
     "report_sha256": "sha256:40d5bbf0d593acb184740b14cacdb7925a4ea1e5206ce688ee98bcfd0f3ef3f8"
   },
-  "run_sha256": "sha256:e4fb00bacd9fdff794d622c1b687e666e39d6c0619fb70d8ab8199974a3d9af3"
+  "run_sha256": "sha256:b716a5b368e6e181cf378619a94700069e95c3c65911e47eeb5ab798351c4ca2"
 }
